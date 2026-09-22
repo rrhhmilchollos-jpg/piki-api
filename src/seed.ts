@@ -1,6 +1,6 @@
 import "dotenv/config";
 import mongoose from "mongoose";
-import { Restaurant, ensureIndexes } from "./models.js";
+import { Restaurant, Zone, ensureIndexes } from "./models.js";
 
 export const pikiRestaurants = [
   { slug: "solera", name: "Solera Cocina Viva", cuisine: "Mediterránea · Tapas", category: "Mediterránea", tagline: "Producto local, fuego lento y mucho verde.", etaMinutes: [18, 28], deliveryFeeCents: 0, rating: 4.8, reviews: 182, promoted: true, image: "/manus-storage/mesago-hero_6c5f0245.jpg", accent: "#171715", menu: [{ id: "solera-1", name: "Berenjena ahumada", description: "Miel de romero, yogur cítrico y avellana.", price: 9.5, vegetarian: true, popular: true }, { id: "solera-2", name: "Pollo al limón", description: "Patatas bravas, alioli suave y hierbas frescas.", price: 13.9 }, { id: "solera-3", name: "Ensalada de tomate", description: "Tomate de temporada, stracciatella y albahaca.", price: 10.5, vegetarian: true }, { id: "solera-4", name: "Tarta vasca", description: "Queso cremoso, sal marina y aceite de oliva.", price: 6.5, vegetarian: true }] },
@@ -12,7 +12,11 @@ export const pikiRestaurants = [
 ] as const;
 
 export async function seedCatalog() {
-  for (const restaurant of pikiRestaurants) await Restaurant.updateOne({ slug: restaurant.slug }, { $set: restaurant }, { upsert: true });
+  const locations: Record<string, [number, number]> = {
+    solera: [-0.5188, 38.9898], "taller-verde": [-0.5201, 38.9911], "forno-rossi": [-0.5212, 38.9904], "nori-club": [-0.5192, 38.9920], "brasa-callejera": [-0.5178, 38.9915], "miga-dulce": [-0.5207, 38.9899],
+  };
+  for (const restaurant of pikiRestaurants) await Restaurant.updateOne({ slug: restaurant.slug }, { $set: { ...restaurant, address: "Xàtiva, València", location: { type: "Point", coordinates: locations[restaurant.slug] } } }, { upsert: true });
+  await Zone.updateOne({ slug: "xativa-centro" }, { $set: { name: "Xàtiva Centro", slug: "xativa-centro", isActive: true, serviceFeeCents: 0, maxEtaMinutes: 60, polygon: { type: "Polygon", coordinates: [[[-0.545, 38.975], [-0.495, 38.975], [-0.495, 39.010], [-0.545, 39.010], [-0.545, 38.975]]] } } }, { upsert: true });
   return pikiRestaurants.length;
 }
 
