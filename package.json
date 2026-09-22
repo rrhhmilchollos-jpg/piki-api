@@ -1,0 +1,28 @@
+{
+  "name": "piki-api",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "build": "esbuild src/server.ts --platform=node --packages=external --bundle --format=esm --outdir=dist",
+    "start": "node dist/server.js",
+    "check": "tsc --noEmit",
+    "seed": "tsx src/seed.ts"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.6.1",
+    "express": "^4.22.1",
+    "mongoose": "^8.18.0",
+    "zod": "^4.2.1"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.19",
+    "@types/express": "^5.0.4",
+    "@types/node": "^22.19.3",
+    "esbuild": "^0.25.12",
+    "tsx": "^4.21.0",
+    "typescript": "~5.9.3"
+  }
+}
