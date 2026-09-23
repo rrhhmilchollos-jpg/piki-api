@@ -1,5 +1,5 @@
 import "dotenv/config";
-import { createHash } from "node:crypto";
+import { createHash, randomInt } from "node:crypto";
 import cors from "cors";
 import express from "express";
 import mongoose from "mongoose";
@@ -53,6 +53,29 @@ function allowRiderApplication(ip: string) {
   const now = Date.now(); const current = riderApplicationAttempts.get(ip);
   if (!current || current.resetAt <= now) { riderApplicationAttempts.set(ip, { count: 1, resetAt: now + 15 * 60_000 }); return true; }
   if (current.count >= 5) return false; current.count += 1; return true;
+}
+
+async function createDailyDisplayCode() {
+  const today = madridNow().date;
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    const displayCode = String(randomInt(100, 1000));
+    if (!(await Order.exists({ displayCodeDate: today, displayCode }))) return { displayCode, displayCodeDate: today };
+  }
+  throw new Error("DAILY_ORDER_CODE_CAPACITY_REACHED");
+}
+
+async function dispatchLoadPolicy() {
+  const [queuedOrders, activeRiders] = await Promise.all([
+    Order.countDocuments({ riderId: null, paymentState: "paid", status: { $in: ["accepted", "preparing", "ready_for_pickup"] } }),
+    Rider.countDocuments({ status: { $in: ["available", "busy"] } }),
+  ]);
+  const saturated = queuedOrders >= Math.max(3, Math.ceil(Math.max(activeRiders, 1) * 1.5));
+  return { maxConcurrentOrders: saturated ? 2 as const : 1 as const, saturated, queuedOrders, activeRiders };
+}
+
+async function activeOrderCounts(riderIds: mongoose.Types.ObjectId[]) {
+  const rows = await Order.aggregate([{ $match: { riderId: { $in: riderIds }, status: { $nin: ["delivered", "cancelled"] }, assignmentState: { $in: ["offered", "assigned"] } } }, { $group: { _id: "$riderId", count: { $sum: 1 } } }]);
+  return new Map(rows.map((row: any) => [String(row._id), Number(row.count)]));
 }
 
 app.get("/health", (_req, res) => res.json({ service: "piki-api", status: "ok", version: "0.2.0", environment: process.env.NODE_ENV || "development" }));
@@ -279,8 +302,9 @@ app.post("/api/v1/orders", async (req, res) => {
   const serviceFeeCents = 79;
   const totalCents = subtotalCents + deliveryFeeCents + serviceFeeCents;
   const publicCode = `PIKI-${Date.now().toString(36).toUpperCase()}`;
-  const order = await Order.create({ publicCode, restaurantId: restaurant._id, customerId: parsed.data.customerId || null, items: normalizedItems, deliveryAddress: parsed.data.deliveryAddress, deliveryLocation: { type: "Point", coordinates: [parsed.data.deliveryLocation.longitude, parsed.data.deliveryLocation.latitude] }, subtotalCents, deliveryFeeCents, totalCents, paymentState: "pending", statusHistory: [{ status: "pending", actorRole: "customer", reason: "Pedido creado" }] });
-  res.status(201).json({ order: { id: order.id, publicCode, status: order.status, paymentState: order.paymentState, subtotalCents, deliveryFeeCents, serviceFeeCents, totalCents, etaMinutes: calculateEtaRange([restaurant.etaMinutes[0] || 20, restaurant.etaMinutes[1] || 35], [5, 20]) } });
+  const dailyCode = await createDailyDisplayCode();
+  const order = await Order.create({ publicCode, ...dailyCode, restaurantId: restaurant._id, customerId: parsed.data.customerId || null, items: normalizedItems, deliveryAddress: parsed.data.deliveryAddress, deliveryLocation: { type: "Point", coordinates: [parsed.data.deliveryLocation.longitude, parsed.data.deliveryLocation.latitude] }, subtotalCents, deliveryFeeCents, totalCents, paymentState: "pending", statusHistory: [{ status: "pending", actorRole: "customer", reason: "Pedido creado" }] });
+  res.status(201).json({ order: { id: order.id, publicCode, displayCode: order.displayCode, displayCodeDate: order.displayCodeDate, status: order.status, paymentState: order.paymentState, subtotalCents, deliveryFeeCents, serviceFeeCents, totalCents, etaMinutes: calculateEtaRange([restaurant.etaMinutes[0] || 20, restaurant.etaMinutes[1] || 35], [5, 20]) } });
 });
 
 const checkoutSchema = z.object({ orderId: z.string().min(1), origin: z.string().url(), customerEmail: z.string().email().optional() });
@@ -328,6 +352,10 @@ app.post("/api/v1/orders/:id/transitions", requireRole("admin", "partner", "ride
   if (parsed.data.status === "cancelled") update.$set = { status: "cancelled", cancelledAt: new Date() };
   const updated = await Order.findOneAndUpdate({ _id: id, version: order.version, status: order.status }, update, { new: true }).lean().exec();
   if (!updated) return res.status(409).json({ error: "ORDER_CHANGED_RETRY" });
+  if (["delivered", "cancelled"].includes(parsed.data.status) && order.riderId) {
+    const remainingOrder = await Order.findOne({ riderId: order.riderId, _id: { $ne: order._id }, status: { $nin: ["delivered", "cancelled"] }, assignmentState: { $in: ["offered", "assigned"] } }).select("_id").lean().exec() as any;
+    await Rider.findByIdAndUpdate(order.riderId, { $set: { status: remainingOrder ? "busy" : "available", activeOrderId: remainingOrder?._id || null } }).exec();
+  }
   return res.json({ order: updated });
 });
 
@@ -466,10 +494,12 @@ app.get("/api/v1/dispatch/orders/:id/preview", requireRole("admin", "fleet"), as
   const restaurant = await Restaurant.findById(order.restaurantId).lean().exec() as any;
   if (!restaurant?.location?.coordinates || !order.deliveryLocation?.coordinates) return res.status(409).json({ error: "MISSING_GEOLOCATION" });
   const freshness = new Date(Date.now() - 90_000);
-  const riders = await Rider.find({ status: "available", activeOrderId: null, lastLocationAt: { $gte: freshness }, location: { $exists: true } }).limit(100).lean().exec() as any[];
-  const ranked = rankDispatchCandidates(riders.map((rider) => ({ id: String(rider._id), status: rider.status, vehicle: rider.vehicle, location: rider.location, lastLocationAt: rider.lastLocationAt, reliabilityScore: rider.reliabilityScore, activeOrderCount: 0, zoneFit: 1, servicePriority: 0.5 })), { restaurantLocation: [restaurant.location.coordinates[0], restaurant.location.coordinates[1]], customerLocation: [order.deliveryLocation.coordinates[0], order.deliveryLocation.coordinates[1]], preparationMinutes: parsed.data.preparationMinutes, maxCustomerEtaMinutes: parsed.data.maxCustomerEtaMinutes });
+  const policy = await dispatchLoadPolicy();
+  const riders = await Rider.find({ status: { $in: ["available", "busy"] }, lastLocationAt: { $gte: freshness }, location: { $exists: true } }).limit(100).lean().exec() as any[];
+  const counts = await activeOrderCounts(riders.map((rider) => rider._id));
+  const ranked = rankDispatchCandidates(riders.map((rider) => ({ id: String(rider._id), status: rider.status, vehicle: rider.vehicle, location: rider.location, lastLocationAt: rider.lastLocationAt, reliabilityScore: rider.reliabilityScore, activeOrderCount: counts.get(String(rider._id)) || 0, zoneFit: 1, servicePriority: 0.5 })), { restaurantLocation: [restaurant.location.coordinates[0], restaurant.location.coordinates[1]], customerLocation: [order.deliveryLocation.coordinates[0], order.deliveryLocation.coordinates[1]], preparationMinutes: parsed.data.preparationMinutes, maxCustomerEtaMinutes: parsed.data.maxCustomerEtaMinutes, maxConcurrentOrders: policy.maxConcurrentOrders });
   await DispatchDecision.insertMany(ranked.map((decision) => ({ orderId: order._id, ...decision, riderId: objectId(decision.riderId), outcome: "preview", actorRole: req.auth?.role || "system" })));
-  return res.json({ algorithmVersion: ranked[0]?.algorithmVersion || "piki-jarvis-v1", orderId: order._id, candidatesConsidered: riders.length, eligibleCandidates: ranked.length, candidates: ranked });
+  return res.json({ algorithmVersion: ranked[0]?.algorithmVersion || "piki-jarvis-v1", orderId: order._id, policy, candidatesConsidered: riders.length, eligibleCandidates: ranked.length, candidates: ranked });
 });
 
 app.get("/api/v1/dispatch/orders/:id/decisions", requireRole("admin", "fleet"), async (req, res) => {
@@ -493,17 +523,22 @@ app.post("/api/v1/dispatch/orders/:id/assign", requireRole("admin", "fleet"), as
   const restaurant = await Restaurant.findById(order.restaurantId).lean().exec() as any;
   if (!restaurant?.location?.coordinates || !order.deliveryLocation?.coordinates) return res.status(409).json({ error: "MISSING_GEOLOCATION" });
   const freshness = new Date(Date.now() - 90_000);
-  const riders = await Rider.find({ status: "available", activeOrderId: null, lastLocationAt: { $gte: freshness }, location: { $exists: true } }).limit(100).lean().exec() as any[];
-  const ranked = rankDispatchCandidates(riders.map((rider) => ({ id: String(rider._id), status: rider.status, vehicle: rider.vehicle, location: rider.location, lastLocationAt: rider.lastLocationAt, reliabilityScore: rider.reliabilityScore, activeOrderCount: 0, zoneFit: 1, servicePriority: 0.5 })), { restaurantLocation: [restaurant.location.coordinates[0], restaurant.location.coordinates[1]], customerLocation: [order.deliveryLocation.coordinates[0], order.deliveryLocation.coordinates[1]], preparationMinutes: parsed.data.preparationMinutes });
+  const policy = await dispatchLoadPolicy();
+  const riders = await Rider.find({ status: { $in: ["available", "busy"] }, lastLocationAt: { $gte: freshness }, location: { $exists: true } }).limit(100).lean().exec() as any[];
+  const counts = await activeOrderCounts(riders.map((rider) => rider._id));
+  const ranked = rankDispatchCandidates(riders.map((rider) => ({ id: String(rider._id), status: rider.status, vehicle: rider.vehicle, location: rider.location, lastLocationAt: rider.lastLocationAt, reliabilityScore: rider.reliabilityScore, activeOrderCount: counts.get(String(rider._id)) || 0, zoneFit: 1, servicePriority: 0.5 })), { restaurantLocation: [restaurant.location.coordinates[0], restaurant.location.coordinates[1]], customerLocation: [order.deliveryLocation.coordinates[0], order.deliveryLocation.coordinates[1]], preparationMinutes: parsed.data.preparationMinutes, maxConcurrentOrders: policy.maxConcurrentOrders });
   if (!ranked.length) return res.status(409).json({ error: "NO_ELIGIBLE_RIDER", candidatesConsidered: riders.length });
   for (const decision of ranked) {
-    const rider = await Rider.findOneAndUpdate({ _id: objectId(decision.riderId), status: "available", activeOrderId: null }, { $set: { status: "busy", activeOrderId: order._id } }, { new: true }).lean().exec() as any;
+    const currentLoad = counts.get(decision.riderId) || 0;
+    const riderUpdate = currentLoad === 0 ? { $set: { status: "busy", activeOrderId: order._id } } : { $set: { status: "busy" } };
+    const riderFilter = currentLoad === 0 ? { _id: objectId(decision.riderId), status: { $in: ["available", "busy"] }, activeOrderId: null } : { _id: objectId(decision.riderId), status: { $in: ["available", "busy"] }, activeOrderId: { $ne: null } };
+    const rider = await Rider.findOneAndUpdate(riderFilter, riderUpdate, { new: true }).lean().exec() as any;
     if (!rider) continue;
     const expiresAt = new Date(Date.now() + parsed.data.offerSeconds * 1000);
     const assigned = await Order.findOneAndUpdate({ _id: order._id, riderId: null, assignmentState: { $in: ["unassigned", "expired", "rejected"] } }, { $set: { riderId: rider._id, assignmentState: "offered", assignmentExpiresAt: expiresAt, dispatchScore: decision.score }, $inc: { dispatchAttempts: 1, version: 1 } }, { new: true }).lean().exec() as any;
     if (!assigned) { await Rider.updateOne({ _id: rider._id, activeOrderId: order._id }, { $set: { status: "available", activeOrderId: null } }).exec(); continue; }
     await DispatchDecision.create({ orderId: assigned._id, ...decision, riderId: rider._id, outcome: "offered", actorRole: req.auth?.role || "system" });
-    return res.status(201).json({ assignment: { orderId: assigned._id, riderId: rider._id, state: assigned.assignmentState, expiresAt, score: decision.score, pickupDistanceKm: decision.pickupDistanceKm, pickupEtaMinutes: decision.pickupEtaMinutes, customerEtaMinutes: decision.customerEtaMinutes, totalEtaMinutes: decision.totalEtaMinutes, algorithmVersion: decision.algorithmVersion, reasons: decision.reasons } });
+    return res.status(201).json({ assignment: { orderId: assigned._id, riderId: rider._id, state: assigned.assignmentState, expiresAt, score: decision.score, pickupDistanceKm: decision.pickupDistanceKm, pickupEtaMinutes: decision.pickupEtaMinutes, customerEtaMinutes: decision.customerEtaMinutes, totalEtaMinutes: decision.totalEtaMinutes, algorithmVersion: decision.algorithmVersion, maxConcurrentOrders: policy.maxConcurrentOrders, saturated: policy.saturated, reasons: decision.reasons } });
   }
   return res.status(409).json({ error: "RIDER_RESERVATION_RACE", message: "Los candidatos cambiaron mientras se asignaba el pedido; reintenta." });
 });

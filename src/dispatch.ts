@@ -21,6 +21,7 @@ export type DispatchInput = {
   now?: Date;
   maxGpsAgeSeconds?: number;
   maxCustomerEtaMinutes?: number;
+  maxConcurrentOrders?: 1 | 2;
 };
 
 export type DispatchWeights = {
@@ -80,7 +81,7 @@ function freshnessSeconds(candidate: DispatchCandidate, now: Date) {
 
 export function scoreDispatchCandidate(candidate: DispatchCandidate, input: DispatchInput): DispatchDecision | null {
   const now = input.now || new Date();
-  if (candidate.status !== "available") return null;
+  if (candidate.status !== "available" && candidate.status !== "busy") return null;
   if (!candidate.location?.coordinates || candidate.location.coordinates.length < 2) return null;
   if (freshnessSeconds(candidate, now) > (input.maxGpsAgeSeconds ?? 90)) return null;
 
@@ -92,7 +93,11 @@ export function scoreDispatchCandidate(candidate: DispatchCandidate, input: Disp
   const totalEtaMinutes = input.preparationMinutes + Math.max(input.preparationMinutes, pickupEtaMinutes) + customerEtaMinutes;
   if (input.maxCustomerEtaMinutes && totalEtaMinutes > input.maxCustomerEtaMinutes) return null;
 
-  const load = Math.min(1, Math.max(0, (candidate.activeOrderCount || 0) / 2));
+  const activeOrderCount = Math.max(0, candidate.activeOrderCount || 0);
+  const maxConcurrentOrders = input.maxConcurrentOrders ?? 1;
+  if (candidate.status === "busy" && maxConcurrentOrders < 2) return null;
+  if (activeOrderCount >= maxConcurrentOrders) return null;
+  const load = Math.min(1, activeOrderCount / maxConcurrentOrders);
   const reliability = bounded(candidate.reliabilityScore ?? 0.75, 0.75);
   const zoneFit = bounded(candidate.zoneFit ?? 1, 1);
   const priority = bounded(candidate.servicePriority ?? 0.5, 0.5);
@@ -123,7 +128,7 @@ export function scoreDispatchCandidate(candidate: DispatchCandidate, input: Disp
       `entrega estimada en ${totalEtaMinutes} min`,
       `distancia de recogida ${pickupDistanceKm.toFixed(2)} km`,
       `espera de preparación ${preparationWait} min`,
-      `carga activa ${candidate.activeOrderCount || 0}`,
+      `carga activa ${activeOrderCount}/${maxConcurrentOrders}`,
       `fiabilidad ${(reliability * 100).toFixed(0)}%`,
       `versión ${DISPATCH_ALGORITHM_VERSION}`,
     ],
