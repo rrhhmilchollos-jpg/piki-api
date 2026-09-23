@@ -2,7 +2,7 @@ import type { NextFunction, Request, Response } from "express";
 import { EmployeeAccount } from "./models.js";
 import { hashSessionToken } from "./employeeAuth.js";
 
-export const apiRoles = ["admin", "partner", "rider", "fleet"] as const;
+export const apiRoles = ["admin", "partner", "rider", "fleet", "commercial"] as const;
 export type ApiRole = (typeof apiRoles)[number];
 
 declare global {
@@ -18,6 +18,7 @@ const tokenEntries: Array<[ApiRole, string | undefined]> = [
   ["partner", process.env.PARTNER_API_TOKEN],
   ["rider", process.env.RIDER_API_TOKEN],
   ["fleet", process.env.FLEET_API_TOKEN],
+  ["commercial", process.env.COMMERCIAL_API_TOKEN],
 ];
 
 async function resolveRole(request: Request): Promise<{ role: ApiRole; employeeId?: string; mustChangePassword?: boolean } | null> {

@@ -26,7 +26,7 @@ function inputOf(req: Request): any {
   return body;
 }
 function reply(res: Response, value: unknown) { return res.json({ result: { data: { json: value } } }); }
-function fail(res: Response, message: string, code = "BAD_REQUEST") { return res.status(400).json({ error: { json: { message, data: { code } } } }); }
+function fail(res: Response, message: string, code = "BAD_REQUEST") { const status = code === "UNAUTHORIZED" || code === "AUTH_REQUIRED" ? 401 : code === "CONFLICT" ? 409 : code === "NOT_FOUND" ? 404 : code === "STRIPE_UNAVAILABLE" ? 503 : 400; return res.status(status).json({ error: { json: { message, code: -32000, data: { code, httpStatus: status } } } }); }
 function getSession(req: Request) {
   const header = req.header("x-piki-session");
   if (header) return header;
