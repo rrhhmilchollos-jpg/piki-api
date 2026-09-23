@@ -18,6 +18,8 @@ restaurantSchema.index({ isActive: 1, category: 1, rating: -1 });
 
 const riderSchema = new Schema({ name: { type: String, required: true }, email: { type: String, required: true, unique: true }, fleetId: { type: Schema.Types.ObjectId, ref: "Fleet", default: null }, status: { type: String, enum: ["offline", "available", "busy", "paused"], default: "offline", index: true }, vehicle: { type: String, enum: ["bike", "scooter", "car"], default: "scooter" }, location: { type: geoPoint, default: undefined }, lastLocationAt: { type: Date, default: null }, activeOrderId: { type: Schema.Types.ObjectId, ref: "Order", default: null }, reliabilityScore: { type: Number, min: 0, max: 1, default: 0.75 } }, { timestamps: true, collection: "riders" });
 riderSchema.index({ location: "2dsphere" }, { sparse: true });
+const riderSlotSchema = new Schema({ riderId: { type: Schema.Types.ObjectId, ref: "Rider", required: true, index: true }, zoneSlug: { type: String, required: true }, date: { type: String, required: true }, startTime: { type: String, required: true }, endTime: { type: String, required: true }, status: { type: String, enum: ["planned", "active", "completed", "cancelled"], default: "planned" }, notes: { type: String, default: "" } }, { timestamps: true, collection: "rider_slots" });
+riderSlotSchema.index({ riderId: 1, date: 1, startTime: 1 }, { unique: true });
 
 const fleetSchema = new Schema({ name: { type: String, required: true, unique: true }, managerName: { type: String, default: "" }, isActive: { type: Boolean, default: true }, serviceZones: { type: [String], default: [] } }, { timestamps: true, collection: "fleets" });
 
@@ -40,5 +42,6 @@ export const StripeEvent = mongoose.models.StripeEvent || mongoose.model("Stripe
 export const RiderIncident = mongoose.models.RiderIncident || mongoose.model("RiderIncident", riderIncidentSchema);
 export const RiderApplication = mongoose.models.RiderApplication || mongoose.model("RiderApplication", riderApplicationSchema);
 export const CustomerAccount = mongoose.models.CustomerAccount || mongoose.model("CustomerAccount", customerAccountSchema);
+export const RiderSlot = mongoose.models.RiderSlot || mongoose.model("RiderSlot", riderSlotSchema);
 
-export async function ensureIndexes() { await Promise.all([Restaurant.init(), Rider.init(), Fleet.init(), Order.init(), Zone.init(), StripeEvent.init(), RiderIncident.init(), RiderApplication.init(), CustomerAccount.init()]); }
+export async function ensureIndexes() { await Promise.all([Restaurant.init(), Rider.init(), Fleet.init(), Order.init(), Zone.init(), StripeEvent.init(), RiderIncident.init(), RiderApplication.init(), CustomerAccount.init(), RiderSlot.init()]); }

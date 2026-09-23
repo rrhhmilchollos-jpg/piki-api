@@ -3,7 +3,7 @@ import cors from "cors";
 import express from "express";
 import mongoose from "mongoose";
 import { z } from "zod";
-import { Fleet, Order, Restaurant, Rider, RiderApplication, RiderIncident, Zone, ensureIndexes } from "./models.js";
+import { Fleet, Order, Restaurant, Rider, RiderApplication, RiderIncident, RiderSlot, Zone, ensureIndexes } from "./models.js";
 import { seedCatalog } from "./seed.js";
 import { assertTransition, calculateEtaRange, transitionSchema, validateCoordinates } from "./workflow.js";
 import { configuredAuthRoles, requireRole } from "./auth.js";
@@ -41,6 +41,7 @@ const riderLocationSchema = locationSchema.extend({ riderId: z.string().min(1) }
 const zoneSchema = z.object({ name: z.string().min(2).max(120), slug: z.string().regex(/^[a-z0-9-]+$/), serviceFeeCents: z.number().int().min(0).max(10000).default(0), maxEtaMinutes: z.number().int().min(1).max(240).default(60), polygon: z.object({ coordinates: z.array(z.array(z.array(z.number()))).min(1) }) });
 const dispatchSchema = z.object({ preparationMinutes: z.number().int().min(1).max(180).default(15), offerSeconds: z.number().int().min(15).max(180).default(60) });
 const riderIncidentSchema = z.object({ reason: z.enum(["late_acceptance", "late_delivery", "no_show", "unsafe_driving", "fraud_signal", "customer_complaint", "document_expired", "other"]), evidence: z.array(z.string().url()).max(10).default([]), occurredAt: z.coerce.date().optional() });
+const riderSlotSchema = z.object({ zoneSlug: z.string().regex(/^[a-z0-9-]+$/), date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/), startTime: z.string().regex(/^\d{2}:\d{2}$/), endTime: z.string().regex(/^\d{2}:\d{2}$/), status: z.enum(["planned", "active", "completed", "cancelled"]).default("planned"), notes: z.string().max(500).default("") });
 const riderApplicationSchema = z.object({ name: z.string().min(2).max(160), email: z.string().email(), phone: z.string().min(6).max(40), city: z.string().min(2).max(120), vehicle: z.enum(["bike", "scooter", "car"]), availability: z.string().min(2).max(160), website: z.string().max(0).optional() });
 const riderApplicationAttempts = new Map<string, { count: number; resetAt: number }>();
 
@@ -190,6 +191,32 @@ app.post("/api/v1/riders/:id/location", requireRole("admin", "rider", "fleet"), 
   const rider = await Rider.findByIdAndUpdate(id, { $set: { location: { type: "Point", coordinates: [parsed.data.longitude, parsed.data.latitude] }, lastLocationAt: new Date() } }, { new: true }).lean().exec() as any;
   if (!rider) return res.status(404).json({ error: "RIDER_NOT_FOUND" });
   return res.json({ rider: { id: rider._id, status: rider.status, location: rider.location, lastLocationAt: rider.lastLocationAt } });
+});
+
+app.get("/api/v1/riders/:id/slots", requireRole("admin", "rider", "fleet"), async (req, res) => {
+  const riderIdParam = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+  const riderId = objectId(riderIdParam); if (!riderId) return res.status(400).json({ error: "INVALID_RIDER_ID" });
+  const slots = await RiderSlot.find({ riderId }).sort({ date: 1, startTime: 1 }).limit(100).lean().exec();
+  return res.json({ riderId, slots });
+});
+
+app.post("/api/v1/riders/:id/slots", requireRole("admin", "fleet"), async (req, res) => {
+  const riderIdParam = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+  const riderId = objectId(riderIdParam); if (!riderId) return res.status(400).json({ error: "INVALID_RIDER_ID" });
+  const parsed = riderSlotSchema.safeParse(req.body); if (!parsed.success) return res.status(400).json({ error: "INVALID_RIDER_SLOT", details: parsed.error.flatten() });
+  const rider = await Rider.findById(riderId).lean().exec(); if (!rider) return res.status(404).json({ error: "RIDER_NOT_FOUND" });
+  const overlap = await RiderSlot.findOne({ riderId, date: parsed.data.date, status: { $nin: ["cancelled", "completed"] }, $or: [{ startTime: { $lt: parsed.data.endTime }, endTime: { $gt: parsed.data.startTime } }] }).lean().exec();
+  if (overlap) return res.status(409).json({ error: "RIDER_SLOT_OVERLAP", slot: overlap });
+  const slot = await RiderSlot.create({ riderId, ...parsed.data });
+  return res.status(201).json({ slot });
+});
+
+app.get("/api/v1/fleet/heatmap", requireRole("admin", "fleet"), async (_req, res) => {
+  const since = new Date(Date.now() - 24 * 60 * 60 * 1000);
+  const rows = await Order.find({ createdAt: { $gte: since }, deliveryLocation: { $exists: true }, status: { $ne: "cancelled" } }).select("deliveryLocation status createdAt").lean().exec();
+  const bins = new Map<string, { latitude: number; longitude: number; demand: number; active: number }>();
+  for (const row of rows as any[]) { const [longitude, latitude] = row.deliveryLocation.coordinates || []; if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) continue; const key = `${latitude.toFixed(3)}:${longitude.toFixed(3)}`; const current = bins.get(key) || { latitude: Number(latitude.toFixed(3)), longitude: Number(longitude.toFixed(3)), demand: 0, active: 0 }; current.demand += 1; if (row.status !== "delivered") current.active += 1; bins.set(key, current); }
+  return res.json({ since, points: [...bins.values()].sort((a, b) => b.demand - a.demand) });
 });
 
 app.post("/api/v1/riders/:id/incidents", requireRole("admin", "fleet"), async (req, res) => {
