@@ -79,13 +79,13 @@ app.post("/api/v1/auth/employee/change-password", requireRole("admin", "partner"
   employee.passwordHash = hashPassword(parsed.data.newPassword); employee.mustChangePassword = false; employee.passwordChangedAt = new Date(); await employee.save();
   return res.json({ changed: true });
 });
-const employeeCreateSchema = z.object({ name: z.string().min(2).max(160), email: z.string().email(), jobRole: z.enum(["admin", "partner", "rider", "fleet", "zone_manager", "commercial"]), apiRole: z.enum(["admin", "partner", "rider", "fleet"]).optional() });
+const employeeCreateSchema = z.object({ name: z.string().min(2).max(160), email: z.string().email(), jobRole: z.enum(["admin", "partner", "rider", "fleet", "zone_manager", "commercial"]), apiRole: z.enum(["admin", "partner", "rider", "fleet"]).optional(), restaurantId: z.string().regex(/^[a-f\d]{24}$/).nullable().optional() });
 app.post("/api/v1/admin/employees", requireRole("admin"), async (req, res) => {
   const parsed = employeeCreateSchema.safeParse(req.body); if (!parsed.success) return res.status(400).json({ error: "INVALID_EMPLOYEE", details: parsed.error.flatten() });
   const apiRole = parsed.data.apiRole || (parsed.data.jobRole === "zone_manager" || parsed.data.jobRole === "commercial" ? "admin" : parsed.data.jobRole);
   const temporaryPassword = generateTemporaryPassword();
   try {
-    const employee = await EmployeeAccount.create({ ...parsed.data, apiRole, passwordHash: hashPassword(temporaryPassword), mustChangePassword: true, active: true });
+    const employee = await EmployeeAccount.create({ ...parsed.data, restaurantId: parsed.data.restaurantId ? objectId(parsed.data.restaurantId) : null, apiRole, passwordHash: hashPassword(temporaryPassword), mustChangePassword: true, active: true });
     return res.status(201).json({ employee: { id: employee.id, name: employee.name, email: employee.email, jobRole: employee.jobRole, apiRole: employee.apiRole, active: employee.active }, temporaryPassword, warning: "Mostrar esta contraseña una sola vez y entregarla por un canal seguro." });
   } catch (error) { if ((error as any)?.code === 11000) return res.status(409).json({ error: "EMPLOYEE_EMAIL_ALREADY_EXISTS" }); throw error; }
 });
