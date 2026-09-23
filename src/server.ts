@@ -42,7 +42,7 @@ const zoneSchema = z.object({ name: z.string().min(2).max(120), slug: z.string()
 const dispatchSchema = z.object({ preparationMinutes: z.number().int().min(1).max(180).default(15), offerSeconds: z.number().int().min(15).max(180).default(60) });
 const riderIncidentSchema = z.object({ reason: z.enum(["late_acceptance", "late_delivery", "no_show", "unsafe_driving", "fraud_signal", "customer_complaint", "document_expired", "other"]), evidence: z.array(z.string().url()).max(10).default([]), occurredAt: z.coerce.date().optional() });
 const riderSlotSchema = z.object({ zoneSlug: z.string().regex(/^[a-z0-9-]+$/), date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/), startTime: z.string().regex(/^\d{2}:\d{2}$/), endTime: z.string().regex(/^\d{2}:\d{2}$/), status: z.enum(["planned", "active", "completed", "cancelled"]).default("planned"), notes: z.string().max(500).default("") });
-const riderApplicationSchema = z.object({ name: z.string().min(2).max(160), email: z.string().email(), phone: z.string().min(6).max(40), city: z.string().min(2).max(120), vehicle: z.enum(["bike", "scooter", "car"]), availability: z.string().min(2).max(160), website: z.string().max(0).optional() });
+const riderApplicationSchema = z.object({ name: z.string().min(2).max(160), email: z.string().email(), phone: z.string().min(6).max(40), city: z.string().min(2).max(120), vehicle: z.enum(["bike", "electric_bike", "electric_scooter", "motorcycle", "scooter", "car"]), availability: z.string().min(2).max(160), website: z.string().max(0).optional() });
 const riderApplicationAttempts = new Map<string, { count: number; resetAt: number }>();
 
 function allowRiderApplication(ip: string) {
@@ -110,9 +110,11 @@ app.get("/api/v1/rider-applications", requireRole("admin", "fleet"), async (req,
 app.patch("/api/v1/rider-applications/:id/status", requireRole("admin", "fleet"), async (req, res) => {
   const idParam = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
   const id = objectId(idParam); if (!id) return res.status(400).json({ error: "INVALID_APPLICATION_ID" });
-  const parsed = z.object({ status: z.enum(["pending", "contacted", "approved", "rejected"]), notes: z.string().max(1000).optional() }).safeParse(req.body);
+  const parsed = z.object({ status: z.enum(["pending", "contacted", "approved", "rejected"]), notes: z.string().max(1000).optional(), assignedFleetId: z.string().regex(/^[a-f\d]{24}$/).nullable().optional() }).safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_APPLICATION_STATUS", details: parsed.error.flatten() });
-  const application = await RiderApplication.findByIdAndUpdate(id, { $set: parsed.data }, { new: true }).lean().exec();
+  const update: Record<string, unknown> = { status: parsed.data.status, notes: parsed.data.notes };
+  if (parsed.data.assignedFleetId !== undefined) update.assignedFleetId = parsed.data.assignedFleetId ? objectId(parsed.data.assignedFleetId) : null;
+  const application = await RiderApplication.findByIdAndUpdate(id, { $set: update }, { new: true }).lean().exec();
   if (!application) return res.status(404).json({ error: "APPLICATION_NOT_FOUND" });
   return res.json({ application });
 });

@@ -3,7 +3,7 @@ import { distanceKm } from "./workflow.js";
 export type DispatchCandidate = {
   id: string;
   status: "offline" | "available" | "busy" | "paused";
-  vehicle: "bike" | "scooter" | "car";
+  vehicle: "bike" | "electric_bike" | "electric_scooter" | "motorcycle" | "scooter" | "car";
   location?: { coordinates?: number[] } | null;
   lastLocationAt?: Date | null;
   activeOrderCount?: number;
@@ -29,7 +29,7 @@ export type DispatchDecision = {
   reasons: string[];
 };
 
-const speedKmh: Record<DispatchCandidate["vehicle"], number> = { bike: 16, scooter: 22, car: 28 };
+const speedKmh: Record<DispatchCandidate["vehicle"], number> = { bike: 16, electric_bike: 19, electric_scooter: 23, motorcycle: 28, scooter: 22, car: 28 };
 
 function travelMinutes(distance: number, vehicle: DispatchCandidate["vehicle"]) {
   return Math.max(1, Math.ceil((distance / speedKmh[vehicle]) * 60));
