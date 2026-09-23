@@ -41,7 +41,8 @@ const riderLocationSchema = locationSchema.extend({ riderId: z.string().min(1) }
 const zoneSchema = z.object({ name: z.string().min(2).max(120), slug: z.string().regex(/^[a-z0-9-]+$/), serviceFeeCents: z.number().int().min(0).max(10000).default(0), maxEtaMinutes: z.number().int().min(1).max(240).default(60), polygon: z.object({ coordinates: z.array(z.array(z.array(z.number()))).min(1) }) });
 const dispatchSchema = z.object({ preparationMinutes: z.number().int().min(1).max(180).default(15), offerSeconds: z.number().int().min(15).max(180).default(60) });
 const riderIncidentSchema = z.object({ reason: z.enum(["late_acceptance", "late_delivery", "no_show", "unsafe_driving", "fraud_signal", "customer_complaint", "document_expired", "other"]), evidence: z.array(z.string().url()).max(10).default([]), occurredAt: z.coerce.date().optional() });
-const riderSlotSchema = z.object({ riderId: z.string().regex(/^[a-f\d]{24}$/), zoneSlug: z.string().regex(/^[a-z0-9-]+$/), date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/), startTime: z.string().regex(/^\d{2}:\d{2}$/), endTime: z.string().regex(/^\d{2}:\d{2}$/), status: z.enum(["planned", "active", "completed", "cancelled"]).default("planned"), notes: z.string().max(500).default("") });
+const riderSlotSchema = z.object({ zoneSlug: z.string().regex(/^[a-z0-9-]+$/), date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/), startTime: z.string().regex(/^\d{2}:\d{2}$/), endTime: z.string().regex(/^\d{2}:\d{2}$/), status: z.enum(["planned", "active", "completed", "cancelled"]).default("planned"), notes: z.string().max(500).default("") });
+const riderSlotCreateSchema = riderSlotSchema.extend({ riderId: z.string().regex(/^[a-f\d]{24}$/) });
 const riderApplicationSchema = z.object({ name: z.string().min(2).max(160), email: z.string().email(), phone: z.string().min(6).max(40), city: z.string().min(2).max(120), vehicle: z.enum(["bike", "electric_bike", "electric_scooter", "motorcycle", "scooter", "car"]), availability: z.string().min(2).max(160), website: z.string().max(0).optional() });
 const riderApplicationAttempts = new Map<string, { count: number; resetAt: number }>();
 
@@ -131,7 +132,7 @@ app.patch("/api/v1/rider-applications/:id/status", requireRole("admin", "fleet")
   if (!parsed.success) return res.status(400).json({ error: "INVALID_APPLICATION_STATUS", details: parsed.error.flatten() });
   const update: Record<string, unknown> = { status: parsed.data.status, notes: parsed.data.notes };
   if (parsed.data.assignedFleetId !== undefined) update.assignedFleetId = parsed.data.assignedFleetId ? objectId(parsed.data.assignedFleetId) : null;
-  const application = await RiderApplication.findByIdAndUpdate(id, { $set: update }, { new: true }).lean().exec();
+  const application = await RiderApplication.findByIdAndUpdate(id, { $set: update }, { new: true }).lean().exec() as any;
   if (!application) return res.status(404).json({ error: "APPLICATION_NOT_FOUND" });
   if (parsed.data.status === "approved") {
     await Rider.findOneAndUpdate({ email: application.email }, { $set: { name: application.name, email: application.email, vehicle: application.vehicle, fleetId: application.assignedFleetId || null, status: "offline" } }, { upsert: true, new: true }).exec();
@@ -153,12 +154,13 @@ app.get("/api/v1/rider-slots", requireRole("admin", "fleet", "rider"), async (re
 });
 
 app.post("/api/v1/rider-slots", requireRole("admin", "fleet"), async (req, res) => {
-  const parsed = riderSlotSchema.safeParse(req.body);
+  const parsed = riderSlotCreateSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_RIDER_SLOT", details: parsed.error.flatten() });
   const riderId = objectId(parsed.data.riderId); if (!riderId) return res.status(400).json({ error: "INVALID_RIDER_ID" });
   const rider = await Rider.findById(riderId).lean().exec(); if (!rider) return res.status(404).json({ error: "RIDER_NOT_FOUND" });
-  const zone = await Zone.findOne({ slug: parsed.data.zoneSlug, isActive: true }).lean().exec(); if (!zone) return res.status(404).json({ error: "ZONE_NOT_FOUND" });
-  const slot = await RiderSlot.findOneAndUpdate({ riderId, date: parsed.data.date, startTime: parsed.data.startTime }, { $set: { ...parsed.data, riderId, zoneSlug: zone.slug } }, { upsert: true, new: true }).lean().exec();
+  const zone = await Zone.findOne({ slug: parsed.data.zoneSlug, isActive: true }).lean().exec() as any; if (!zone) return res.status(404).json({ error: "ZONE_NOT_FOUND" });
+  const { riderId: _riderId, ...slotData } = parsed.data;
+  const slot = await RiderSlot.findOneAndUpdate({ riderId, date: parsed.data.date, startTime: parsed.data.startTime }, { $set: { ...slotData, riderId, zoneSlug: zone.slug } }, { upsert: true, new: true }).lean().exec();
   return res.status(201).json({ slot });
 });
 
@@ -252,7 +254,7 @@ app.post("/api/v1/riders/:id/slots", requireRole("admin", "fleet"), async (req, 
   const rider = await Rider.findById(riderId).lean().exec(); if (!rider) return res.status(404).json({ error: "RIDER_NOT_FOUND" });
   const overlap = await RiderSlot.findOne({ riderId, date: parsed.data.date, status: { $nin: ["cancelled", "completed"] }, $or: [{ startTime: { $lt: parsed.data.endTime }, endTime: { $gt: parsed.data.startTime } }] }).lean().exec();
   if (overlap) return res.status(409).json({ error: "RIDER_SLOT_OVERLAP", slot: overlap });
-  const slot = await RiderSlot.create({ riderId, ...parsed.data });
+  const slot = await RiderSlot.create({ ...parsed.data, riderId });
   return res.status(201).json({ slot });
 });
 
@@ -360,7 +362,7 @@ app.patch("/api/v1/rider-applications/:id/assign-fleet", requireRole("admin", "f
   const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id); if (!id) return res.status(400).json({ error: "INVALID_APPLICATION_ID" });
   const fleetId = objectId(typeof req.body?.fleetId === "string" ? req.body.fleetId : ""); if (!fleetId) return res.status(400).json({ error: "INVALID_FLEET_ID" });
   const fleet = await Fleet.findById(fleetId).lean().exec(); if (!fleet) return res.status(404).json({ error: "FLEET_NOT_FOUND" });
-  const application = await RiderApplication.findByIdAndUpdate(id, { $set: { assignedFleetId: fleetId } }, { new: true }).lean().exec();
+  const application = await RiderApplication.findByIdAndUpdate(id, { $set: { assignedFleetId: fleetId } }, { new: true }).lean().exec() as any;
   if (!application) return res.status(404).json({ error: "APPLICATION_NOT_FOUND" });
   if (application.status === "approved") await Rider.updateOne({ email: application.email }, { $set: { fleetId } }).exec();
   return res.json({ application, fleet });
