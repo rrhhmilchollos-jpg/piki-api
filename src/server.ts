@@ -319,6 +319,10 @@ app.patch("/api/v1/riders/:id/status", requireRole("admin", "rider", "fleet"), a
   const id = objectId(idParam); if (!id) return res.status(400).json({ error: "INVALID_RIDER_ID" });
   const parsed = z.object({ status: z.enum(["offline", "available", "busy", "paused"]) }).safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_RIDER_STATUS" });
+  if (parsed.data.status === "available") {
+    const { now, slot } = await findCurrentRiderSlot(id);
+    if (!slot) return res.status(409).json({ error: "SHIFT_RESERVATION_REQUIRED", message: "El rider necesita un slot reservado activo para ponerse disponible.", now });
+  }
   const rider = await Rider.findByIdAndUpdate(id, { $set: { status: parsed.data.status } }, { new: true }).lean().exec() as any;
   if (!rider) return res.status(404).json({ error: "RIDER_NOT_FOUND" });
   return res.json({ rider: { id: rider._id, name: rider.name, status: rider.status, fleetId: rider.fleetId, lastLocationAt: rider.lastLocationAt } });
@@ -329,6 +333,59 @@ app.get("/api/v1/riders/:id/slots", requireRole("admin", "rider", "fleet"), asyn
   const riderId = objectId(riderIdParam); if (!riderId) return res.status(400).json({ error: "INVALID_RIDER_ID" });
   const slots = await RiderSlot.find({ riderId }).sort({ date: 1, startTime: 1 }).limit(100).lean().exec();
   return res.json({ riderId, slots });
+});
+
+function madridNow() {
+  const parts = new Intl.DateTimeFormat("en-CA", { timeZone: "Europe/Madrid", year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false }).formatToParts(new Date());
+  const values = Object.fromEntries(parts.filter((part) => part.type !== "literal").map((part) => [part.type, part.value]));
+  return { date: `${values.year}-${values.month}-${values.day}`, time: `${values.hour}:${values.minute}` };
+}
+
+async function findCurrentRiderSlot(riderId: mongoose.Types.ObjectId) {
+  const now = madridNow();
+  const slot = await RiderSlot.findOne({ riderId, date: now.date, status: { $in: ["planned", "active"] }, startTime: { $lte: now.time }, endTime: { $gt: now.time } }).sort({ startTime: 1 }).lean().exec();
+  return { now, slot };
+}
+
+app.get("/api/v1/riders/session", requireRole("rider"), async (req, res) => {
+  const employeeId = req.auth?.employeeId;
+  if (!employeeId) return res.status(403).json({ error: "RIDER_EMPLOYEE_SESSION_REQUIRED" });
+  const employee = await EmployeeAccount.findById(employeeId).lean().exec() as any;
+  const rider = employee ? await Rider.findOne({ email: employee.email }).lean().exec() as any : null;
+  if (!rider) return res.status(404).json({ error: "RIDER_ACCOUNT_NOT_LINKED" });
+  return res.json({ rider: { id: rider._id, name: rider.name, email: rider.email, status: rider.status, fleetId: rider.fleetId } });
+});
+
+app.get("/api/v1/riders/:id/shift", requireRole("admin", "rider", "fleet"), async (req, res) => {
+  const riderId = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
+  if (!riderId) return res.status(400).json({ error: "INVALID_RIDER_ID" });
+  const rider = await Rider.findById(riderId).lean().exec() as any;
+  if (!rider) return res.status(404).json({ error: "RIDER_NOT_FOUND" });
+  const { now, slot } = await findCurrentRiderSlot(riderId);
+  return res.json({ rider: { id: rider._id, status: rider.status }, now, eligible: Boolean(slot), shift: slot });
+});
+
+app.post("/api/v1/riders/:id/shift/start", requireRole("admin", "rider", "fleet"), async (req, res) => {
+  const riderId = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
+  if (!riderId) return res.status(400).json({ error: "INVALID_RIDER_ID" });
+  const rider = await Rider.findById(riderId).lean().exec() as any;
+  if (!rider) return res.status(404).json({ error: "RIDER_NOT_FOUND" });
+  const { now, slot } = await findCurrentRiderSlot(riderId);
+  if (!slot) return res.status(409).json({ error: "SHIFT_RESERVATION_REQUIRED", message: "No puedes iniciar la jornada fuera de tu horario reservado.", now });
+  const currentSlot = slot as any;
+  const updatedSlot = await RiderSlot.findOneAndUpdate({ _id: currentSlot._id, status: "planned" }, { $set: { status: "active" } }, { new: true }).lean().exec();
+  await Rider.findByIdAndUpdate(riderId, { $set: { status: "available" } }).exec();
+  return res.json({ message: "Jornada iniciada", warningSound: "start_shift", rider: { id: riderId, status: "available" }, shift: updatedSlot });
+});
+
+app.post("/api/v1/riders/:id/shift/stop", requireRole("admin", "rider", "fleet"), async (req, res) => {
+  const riderId = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
+  if (!riderId) return res.status(400).json({ error: "INVALID_RIDER_ID" });
+  const { slot } = await findCurrentRiderSlot(riderId);
+  if (slot) await RiderSlot.updateOne({ _id: (slot as any)._id }, { $set: { status: "completed" } }).exec();
+  const rider = await Rider.findByIdAndUpdate(riderId, { $set: { status: "offline", activeOrderId: null } }, { new: true }).lean().exec() as any;
+  if (!rider) return res.status(404).json({ error: "RIDER_NOT_FOUND" });
+  return res.json({ message: "Jornada finalizada", rider: { id: rider._id, status: rider.status } });
 });
 
 app.post("/api/v1/riders/:id/slots", requireRole("admin", "fleet"), async (req, res) => {
