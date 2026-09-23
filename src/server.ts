@@ -6,6 +6,7 @@ import { z } from "zod";
 import { Fleet, Order, Restaurant, Rider, Zone, ensureIndexes } from "./models.js";
 import { seedCatalog } from "./seed.js";
 import { assertTransition, calculateEtaRange, transitionSchema, validateCoordinates } from "./workflow.js";
+import { configuredAuthRoles, requireRole } from "./auth.js";
 
 const app = express();
 const port = Number(process.env.PORT || 3000);
@@ -30,6 +31,8 @@ app.get("/ready", (_req, res) => {
   return res.json({ service: "piki-api", status: "ready", database: "connected" });
 });
 app.get("/api/v1", (_req, res) => res.json({ name: "PIKI API", version: "v1", status: databaseReady ? "ready" : "initializing" }));
+
+app.get("/api/v1/auth/status", (_req, res) => res.json({ authentication: "bearer", configured_roles: configuredAuthRoles() }));
 
 app.get("/api/v1/catalog/restaurants", async (req, res) => {
   const query = typeof req.query.q === "string" ? req.query.q.trim() : "";
@@ -77,7 +80,7 @@ app.post("/api/v1/orders", async (req, res) => {
   res.status(201).json({ order: { id: order.id, publicCode, status: order.status, subtotalCents, deliveryFeeCents, serviceFeeCents: 79, totalCents, etaMinutes: calculateEtaRange([restaurant.etaMinutes[0] || 20, restaurant.etaMinutes[1] || 35], [5, 20]) } });
 });
 
-app.get("/api/v1/orders", async (req, res) => {
+app.get("/api/v1/orders", requireRole("admin", "partner", "rider", "fleet"), async (req, res) => {
   const filter: Record<string, unknown> = {};
   if (typeof req.query.customerId === "string") filter.customerId = req.query.customerId;
   if (typeof req.query.status === "string") filter.status = req.query.status;
@@ -91,13 +94,16 @@ app.get("/api/v1/orders/:id", async (req, res) => {
   return res.json({ order });
 });
 
-app.post("/api/v1/orders/:id/transitions", async (req, res) => {
+app.post("/api/v1/orders/:id/transitions", requireRole("admin", "partner", "rider", "fleet"), async (req, res) => {
   const parsed = transitionSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_TRANSITION", details: parsed.error.flatten() });
-  const id = objectId(req.params.id); if (!id) return res.status(400).json({ error: "INVALID_ORDER_ID" });
+  const orderId = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+  const id = objectId(orderId); if (!id) return res.status(400).json({ error: "INVALID_ORDER_ID" });
   const order = await Order.findById(id); if (!order) return res.status(404).json({ error: "ORDER_NOT_FOUND" });
-  try { assertTransition(order.status, parsed.data.status, parsed.data.actorRole); } catch (error) { return res.status(409).json({ error: "INVALID_ORDER_TRANSITION", message: error instanceof Error ? error.message : "Transition not allowed" }); }
-  const update: Record<string, unknown> = { $set: { status: parsed.data.status }, $inc: { version: 1 }, $push: { statusHistory: { status: parsed.data.status, actorRole: parsed.data.actorRole, reason: parsed.data.reason || "" } } };
+  const actorRole = req.auth?.role === "admin" ? parsed.data.actorRole : req.auth?.role;
+  if (!actorRole) return res.status(401).json({ error: "AUTHENTICATION_REQUIRED" });
+  try { assertTransition(order.status, parsed.data.status, actorRole); } catch (error) { return res.status(409).json({ error: "INVALID_ORDER_TRANSITION", message: error instanceof Error ? error.message : "Transition not allowed" }); }
+  const update: Record<string, unknown> = { $set: { status: parsed.data.status }, $inc: { version: 1 }, $push: { statusHistory: { status: parsed.data.status, actorRole, reason: parsed.data.reason || "" } } };
   if (parsed.data.status === "delivered") update.$set = { status: "delivered", deliveredAt: new Date() };
   if (parsed.data.status === "cancelled") update.$set = { status: "cancelled", cancelledAt: new Date() };
   const updated = await Order.findOneAndUpdate({ _id: id, version: order.version, status: order.status }, update, { new: true }).lean().exec();
@@ -105,7 +111,7 @@ app.post("/api/v1/orders/:id/transitions", async (req, res) => {
   return res.json({ order: updated });
 });
 
-app.post("/api/v1/riders/:id/location", async (req, res) => {
+app.post("/api/v1/riders/:id/location", requireRole("admin", "rider", "fleet"), async (req, res) => {
   const parsed = riderLocationSchema.safeParse({ ...req.body, riderId: req.params.id });
   if (!parsed.success) return res.status(400).json({ error: "INVALID_LOCATION", details: parsed.error.flatten() });
   const id = objectId(parsed.data.riderId); if (!id) return res.status(400).json({ error: "INVALID_RIDER_ID" });
@@ -114,25 +120,25 @@ app.post("/api/v1/riders/:id/location", async (req, res) => {
   return res.json({ rider: { id: rider._id, status: rider.status, location: rider.location, lastLocationAt: rider.lastLocationAt } });
 });
 
-app.post("/api/v1/zones", async (req, res) => {
+app.post("/api/v1/zones", requireRole("admin", "fleet"), async (req, res) => {
   const parsed = zoneSchema.safeParse(req.body); if (!parsed.success) return res.status(400).json({ error: "INVALID_ZONE", details: parsed.error.flatten() });
   const zone = await Zone.findOneAndUpdate({ slug: parsed.data.slug }, { $set: { ...parsed.data, polygon: { type: "Polygon", coordinates: parsed.data.polygon.coordinates } } }, { upsert: true, new: true }).lean().exec();
   return res.status(201).json({ zone });
 });
 
-app.get("/api/v1/admin/overview", async (_req, res) => {
+app.get("/api/v1/admin/overview", requireRole("admin"), async (_req, res) => {
   const startOfDay = new Date(); startOfDay.setHours(0, 0, 0, 0);
   const [activeRestaurants, pendingRestaurants, riders, openOrders, deliveredToday] = await Promise.all([Restaurant.countDocuments({ isActive: true, onboardingStatus: "approved" }), Restaurant.countDocuments({ onboardingStatus: "pending_review" }), Rider.countDocuments(), Order.countDocuments({ status: { $in: ["pending", "accepted", "preparing", "ready_for_pickup", "picked_up", "on_the_way"] } }), Order.countDocuments({ status: "delivered", deliveredAt: { $gte: startOfDay } })]);
   res.json({ service: "piki-api", overview: { active_restaurants: activeRestaurants, pending_restaurants: pendingRestaurants, riders, open_orders: openOrders, delivered_today: deliveredToday } });
 });
 
-app.get("/api/v1/riders/overview", async (_req, res) => {
+app.get("/api/v1/riders/overview", requireRole("admin", "rider", "fleet"), async (_req, res) => {
   const startOfDay = new Date(); startOfDay.setHours(0, 0, 0, 0);
   const [registered, unassigned, active, completed] = await Promise.all([Rider.countDocuments(), Order.countDocuments({ riderId: null, status: "ready_for_pickup" }), Order.countDocuments({ riderId: { $ne: null }, status: { $in: ["picked_up", "on_the_way"] } }), Order.countDocuments({ riderId: { $ne: null }, status: "delivered", deliveredAt: { $gte: startOfDay } })]);
   res.json({ service: "piki-api", overview: { registered_riders: registered, unassigned_orders: unassigned, active_deliveries: active, completed_today: completed } });
 });
 
-app.get("/api/v1/fleets/overview", async (_req, res) => {
+app.get("/api/v1/fleets/overview", requireRole("admin", "fleet"), async (_req, res) => {
   const [fleets, assignedRiders, zones, liveOrders] = await Promise.all([Fleet.countDocuments({ isActive: true }), Rider.countDocuments({ fleetId: { $ne: null } }), Zone.countDocuments({ isActive: true }), Order.countDocuments({ status: { $in: ["pending", "accepted", "preparing", "ready_for_pickup", "picked_up", "on_the_way"] } })]);
   res.json({ service: "piki-api", overview: { active_fleets: fleets, assigned_riders: assignedRiders, active_zones: zones, live_orders: liveOrders } });
 });
