@@ -1,32 +1,36 @@
 # TODO PIKI Delivery
 
-## Completado
+## Completado y verificado
 
 - [x] Rebranding de la portada cliente a PIKI.
-- [x] Portada tipo marketplace: categorías, búsqueda, establecimientos, cesta y checkout.
-- [x] Catálogo inicial migrado desde la fuente local de Yavoy: Solera Cocina Viva, Taller Verde, Forno Rossi, Nori Club, Brasa Callejera y Miga Dulce.
-- [x] DNS de `pikidelivery.com` preparado en Cloudflare con los subdominios principales.
-- [x] Dominios principales asociados a los proyectos Vercel cliente, Partners, Admin, Riders y Fleet.
+- [x] Catálogo inicial migrado a la semilla: Solera Cocina Viva, Taller Verde, Forno Rossi, Nori Club, Brasa Callejera y Miga Dulce.
+- [x] Máquina de estados de pedidos, control de versión y transiciones con validación de rol.
+- [x] Endpoints de catálogo, cobertura geográfica, pedidos, localización de riders y resúmenes operativos.
+- [x] API compilada y publicada en GitHub: `piki-api`.
+- [x] Frontends Partners, Admin, Riders y Fleet compilados, conectados a `https://piki-api-e0yg.onrender.com` y publicados en GitHub.
+- [x] Proyectos Vercel creados y variables `VITE_API_URL` configuradas para Customer, Partners, Admin, Riders y Fleet.
+- [x] Dominios personalizados añadidos y verificados dentro de Vercel.
+- [x] Repositorios separados creados para API, Customer, Partner, Admin, Rider, Fleet, Web pública, Staging y Docs.
 - [x] Documento de algoritmos del ecosistema creado.
 
-## En curso
+## Bloqueos actuales, verificados
 
-- [ ] Verificar visualmente la portada PIKI publicada y revisar responsive.
-- [ ] Añadir dominios personalizados al servicio API de Render.
-- [ ] Crear el proyecto Atlas `PIKI DELIVERY` y el clúster operativo.
-- [ ] Conectar `MONGODB_URI` de producción en Render.
-- [ ] Ejecutar seed idempotente del catálogo inicial.
+- [ ] **MongoDB Atlas:** falta crear el proyecto `PIKI DELIVERY`, el clúster y obtener `MONGODB_URI` desde la cuenta Atlas del propietario. Sin esto `/ready`, catálogo real, cobertura y paneles operativos no pueden funcionar con datos persistentes.
+- [ ] **DNS:** `pikidelivery.com` continúa pendiente en Cloudflare; los subdominios no resuelven públicamente. El registrador debe usar `cameron.ns.cloudflare.com` y `khloe.ns.cloudflare.com`.
+- [ ] **Vercel:** los despliegues nuevos aparecen `BLOCKED` por la protección SSO del equipo. Hay despliegues anteriores `READY`; los dominios personalizados permanecen asociados y verificados. Hay que ajustar la protección del equipo o desplegar con acceso autorizado.
+- [ ] **API custom domain:** `api.pikidelivery.com` requiere que DNS esté activo y asociarlo al servicio Render `piki-api-e0yg`.
 
-## Siguiente fase
+## Siguiente ejecución cuando Atlas y DNS estén listos
 
-- [ ] Separar configuración de producción y staging.
-- [ ] Añadir autenticación y roles reales por aplicación.
-- [ ] Implementar máquina de estados de pedidos y eventos idempotentes.
-- [ ] Implementar cobertura, capacidad, ETA y asignación de riders.
-- [ ] Publicar iconos y manifiestos definitivos de Customer, Partner, Rider, Admin y Fleet en sus builds móviles.
-- [ ] Configurar pagos, mapas, notificaciones y observabilidad con credenciales de producción.
+1. Guardar `MONGODB_URI` como secreto en Render, nunca en Git.
+2. Activar `SEED_DEMO_DATA=true` solo durante el primer arranque controlado y volver a desactivarlo después.
+3. Comprobar `/ready`, `/api/v1/catalog/restaurants` y `/api/v1/coverage`.
+4. Ejecutar el seed idempotente y validar índices geoespaciales.
+5. Conectar el API custom domain y actualizar CORS definitivo.
+6. Resolver la protección SSO de Vercel y promover los despliegues nuevos.
+7. Crear API y datos de staging aislados.
+8. Añadir autenticación real, roles, pagos, mapas, notificaciones y observabilidad.
 
-## Bloqueos externos
+## Importante
 
-- Cloudflare muestra la zona como `pending`: el registrador debe usar `cameron.ns.cloudflare.com` y `khloe.ns.cloudflare.com`.
-- MongoDB Atlas requiere crear el proyecto y el clúster desde la sesión autenticada del propietario.
+No se deben introducir contraseñas, URI de MongoDB ni claves de pagos en repositorios Git, archivos `.env` versionados, logs o chats.
