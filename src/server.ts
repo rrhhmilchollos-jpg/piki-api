@@ -133,6 +133,24 @@ app.get("/api/v1/catalog/restaurants", async (req, res) => {
   res.json({ restaurants });
 });
 
+app.get("/api/v1/locations/search", async (req, res) => {
+  const query = typeof req.query.q === "string" ? req.query.q.trim() : "";
+  if (query.length < 3) return res.status(400).json({ error: "QUERY_TOO_SHORT" });
+  const url = new URL("https://nominatim.openstreetmap.org/search");
+  url.searchParams.set("q", `${query}, Comunitat Valenciana, España`);
+  url.searchParams.set("format", "jsonv2");
+  url.searchParams.set("addressdetails", "1");
+  url.searchParams.set("limit", "8");
+  try {
+    const response = await fetch(url, { headers: { "User-Agent": "PIKI-Delivery/0.2 (+https://pikidelivery.com)" } });
+    if (!response.ok) return res.status(502).json({ error: "GEOCODER_UNAVAILABLE" });
+    const rows = await response.json() as Array<{ place_id: number; display_name: string; lat: string; lon: string; type?: string; address?: Record<string, string> }>;
+    return res.json({ results: rows.map((row) => ({ id: row.place_id, label: row.display_name, latitude: Number(row.lat), longitude: Number(row.lon), type: row.type || "address", address: row.address || {} })) });
+  } catch (error) {
+    return res.status(502).json({ error: "GEOCODER_UNAVAILABLE", message: error instanceof Error ? error.message : "Geocoder unavailable" });
+  }
+});
+
 app.get("/api/v1/coverage", async (req, res) => {
   const latitude = Number(req.query.latitude); const longitude = Number(req.query.longitude);
   if (!validateCoordinates(latitude, longitude)) return res.status(400).json({ error: "INVALID_COORDINATES" });
