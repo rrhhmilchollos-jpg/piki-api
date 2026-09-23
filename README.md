@@ -33,6 +33,20 @@ npm run seed
 | `GET` | `/api/v1/admin/overview` | Resume comercios, riders y pedidos de operaciones. |
 | `GET` | `/api/v1/riders/overview` | Resume carga y actividad de riders. |
 | `GET` | `/api/v1/fleets/overview` | Resume flotas y pedidos operativos. |
+| `POST` | `/api/v1/orders` | Valida catálogo, recalcula importes y crea un pedido pendiente de pago. |
+| `POST` | `/api/v1/payments/checkout` | Crea una Checkout Session de Stripe usando los importes guardados en MongoDB. |
+| `POST` | `/api/v1/payments/webhook` | Verifica `Stripe-Signature`, deduplica eventos y actualiza el estado de pago. |
+
+## Configuración Stripe en modo test
+
+La API no activa pagos por defecto. Para un entorno de pruebas se deben configurar únicamente en el gestor de secretos del entorno:
+
+```text
+STRIPE_SECRET_KEY=sk_test_...
+STRIPE_WEBHOOK_SECRET=whsec_...
+```
+
+El endpoint público del webhook es `https://api.pikidelivery.com/api/v1/payments/webhook`. Stripe requiere el cuerpo crudo para verificar la firma; por eso la ruta se registra antes de `express.json()`. Los eventos se deduplican en la colección `stripe_events` usando `event.id`. El cliente no debe marcar un pedido como pagado a partir de `success_url`: la confirmación válida es el webhook verificado.
 
 ## Seguridad de configuración
 

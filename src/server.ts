@@ -3,10 +3,13 @@ import cors from "cors";
 import express from "express";
 import mongoose from "mongoose";
 import { z } from "zod";
-import { Fleet, Order, Restaurant, Rider, Zone, ensureIndexes } from "./models.js";
+import { Fleet, Order, Restaurant, Rider, RiderIncident, Zone, ensureIndexes } from "./models.js";
 import { seedCatalog } from "./seed.js";
 import { assertTransition, calculateEtaRange, transitionSchema, validateCoordinates } from "./workflow.js";
 import { configuredAuthRoles, requireRole } from "./auth.js";
+import { createCheckoutSession, processStripeWebhook, stripeConfigured } from "./stripe.js";
+import { rankDispatchCandidates } from "./dispatch.js";
+import { calculateSanctionDecision, defaultSanctionPolicy } from "./sanctions.js";
 
 const app = express();
 const port = Number(process.env.PORT || 3000);
@@ -16,6 +19,16 @@ const databaseName = process.env.MONGODB_DB || "piki";
 let databaseReady = false;
 
 app.use(cors({ origin: allowedOrigins.length ? allowedOrigins : true }));
+app.post("/api/v1/payments/webhook", express.raw({ type: "application/json" }), async (req, res) => {
+  const signature = req.header("stripe-signature");
+  if (!signature || !stripeConfigured()) return res.status(503).json({ error: "STRIPE_WEBHOOK_NOT_CONFIGURED" });
+  try {
+    const result = await processStripeWebhook(req.body as Buffer, signature);
+    return res.status(200).json({ received: true, ...result });
+  } catch (error) {
+    return res.status(400).json({ error: "INVALID_STRIPE_WEBHOOK", message: error instanceof Error ? error.message : "Webhook rejected" });
+  }
+});
 app.use(express.json({ limit: "1mb" }));
 
 const objectId = (value: string) => mongoose.isValidObjectId(value) ? new mongoose.Types.ObjectId(value) : null;
@@ -24,6 +37,8 @@ const orderItemSchema = z.object({ itemId: z.string().min(1), quantity: z.number
 const createOrderSchema = z.object({ restaurantId: z.string().min(1), customerId: z.string().max(160).optional(), deliveryAddress: z.string().min(5).max(280), deliveryLocation: locationSchema, items: z.array(orderItemSchema).min(1).max(50) });
 const riderLocationSchema = locationSchema.extend({ riderId: z.string().min(1) });
 const zoneSchema = z.object({ name: z.string().min(2).max(120), slug: z.string().regex(/^[a-z0-9-]+$/), serviceFeeCents: z.number().int().min(0).max(10000).default(0), maxEtaMinutes: z.number().int().min(1).max(240).default(60), polygon: z.object({ coordinates: z.array(z.array(z.array(z.number()))).min(1) }) });
+const dispatchSchema = z.object({ preparationMinutes: z.number().int().min(1).max(180).default(15), offerSeconds: z.number().int().min(15).max(180).default(60) });
+const riderIncidentSchema = z.object({ reason: z.enum(["late_acceptance", "late_delivery", "no_show", "unsafe_driving", "fraud_signal", "customer_complaint", "document_expired", "other"]), evidence: z.array(z.string().url()).max(10).default([]), occurredAt: z.coerce.date().optional() });
 
 app.get("/health", (_req, res) => res.json({ service: "piki-api", status: "ok", version: "0.2.0", environment: process.env.NODE_ENV || "development" }));
 app.get("/ready", (_req, res) => {
@@ -74,10 +89,28 @@ app.post("/api/v1/orders", async (req, res) => {
   const normalizedItems = items as Array<{ itemId: string; name: string; quantity: number; unitPriceCents: number }>;
   const subtotalCents = normalizedItems.reduce((sum, item) => sum + item.unitPriceCents * item.quantity, 0);
   const deliveryFeeCents = restaurant.deliveryFeeCents;
-  const totalCents = subtotalCents + deliveryFeeCents + 79;
+  const serviceFeeCents = 79;
+  const totalCents = subtotalCents + deliveryFeeCents + serviceFeeCents;
   const publicCode = `PIKI-${Date.now().toString(36).toUpperCase()}`;
-  const order = await Order.create({ publicCode, restaurantId: restaurant._id, customerId: parsed.data.customerId || null, items: normalizedItems, deliveryAddress: parsed.data.deliveryAddress, deliveryLocation: { type: "Point", coordinates: [parsed.data.deliveryLocation.longitude, parsed.data.deliveryLocation.latitude] }, subtotalCents, deliveryFeeCents, totalCents, statusHistory: [{ status: "pending", actorRole: "customer", reason: "Pedido creado" }] });
-  res.status(201).json({ order: { id: order.id, publicCode, status: order.status, subtotalCents, deliveryFeeCents, serviceFeeCents: 79, totalCents, etaMinutes: calculateEtaRange([restaurant.etaMinutes[0] || 20, restaurant.etaMinutes[1] || 35], [5, 20]) } });
+  const order = await Order.create({ publicCode, restaurantId: restaurant._id, customerId: parsed.data.customerId || null, items: normalizedItems, deliveryAddress: parsed.data.deliveryAddress, deliveryLocation: { type: "Point", coordinates: [parsed.data.deliveryLocation.longitude, parsed.data.deliveryLocation.latitude] }, subtotalCents, deliveryFeeCents, totalCents, paymentState: "pending", statusHistory: [{ status: "pending", actorRole: "customer", reason: "Pedido creado" }] });
+  res.status(201).json({ order: { id: order.id, publicCode, status: order.status, paymentState: order.paymentState, subtotalCents, deliveryFeeCents, serviceFeeCents, totalCents, etaMinutes: calculateEtaRange([restaurant.etaMinutes[0] || 20, restaurant.etaMinutes[1] || 35], [5, 20]) } });
+});
+
+const checkoutSchema = z.object({ orderId: z.string().min(1), origin: z.string().url(), customerEmail: z.string().email().optional() });
+app.post("/api/v1/payments/checkout", async (req, res) => {
+  const parsed = checkoutSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "INVALID_CHECKOUT_REQUEST", details: parsed.error.flatten() });
+  const id = objectId(parsed.data.orderId);
+  const order = (id ? await Order.findById(id).lean().exec() : await Order.findOne({ publicCode: parsed.data.orderId }).lean().exec()) as any;
+  if (!order) return res.status(404).json({ error: "ORDER_NOT_FOUND" });
+  if (order.paymentState === "paid") return res.status(409).json({ error: "ORDER_ALREADY_PAID" });
+  try {
+    const session = await createCheckoutSession({ orderId: String(order._id), publicCode: order.publicCode, origin: parsed.data.origin, customerEmail: parsed.data.customerEmail, items: order.items, deliveryFeeCents: order.deliveryFeeCents, serviceFeeCents: 79 });
+    await Order.updateOne({ _id: order._id }, { $set: { stripeCheckoutSessionId: session.id } }).exec();
+    return res.status(201).json({ checkout: { id: session.id, url: session.url, expiresAt: session.expires_at } });
+  } catch (error) {
+    return res.status(503).json({ error: "STRIPE_UNAVAILABLE", message: error instanceof Error ? error.message : "Stripe unavailable" });
+  }
 });
 
 app.get("/api/v1/orders", requireRole("admin", "partner", "rider", "fleet"), async (req, res) => {
@@ -118,6 +151,75 @@ app.post("/api/v1/riders/:id/location", requireRole("admin", "rider", "fleet"), 
   const rider = await Rider.findByIdAndUpdate(id, { $set: { location: { type: "Point", coordinates: [parsed.data.longitude, parsed.data.latitude] }, lastLocationAt: new Date() } }, { new: true }).lean().exec() as any;
   if (!rider) return res.status(404).json({ error: "RIDER_NOT_FOUND" });
   return res.json({ rider: { id: rider._id, status: rider.status, location: rider.location, lastLocationAt: rider.lastLocationAt } });
+});
+
+app.post("/api/v1/riders/:id/incidents", requireRole("admin", "fleet"), async (req, res) => {
+  const parsed = riderIncidentSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "INVALID_RIDER_INCIDENT", details: parsed.error.flatten() });
+  const riderIdParam = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+  const riderId = objectId(riderIdParam); if (!riderId) return res.status(400).json({ error: "INVALID_RIDER_ID" });
+  const rider = await Rider.findById(riderId).lean().exec();
+  if (!rider) return res.status(404).json({ error: "RIDER_NOT_FOUND" });
+  const incident = await RiderIncident.create({ riderId, ...parsed.data, createdByRole: req.auth?.role || "admin" });
+  const incidents = await RiderIncident.find({ riderId }).lean().exec();
+  const decision = calculateSanctionDecision(incidents.map((item: any) => ({ id: String(item._id), riderId: String(item.riderId), reason: item.reason, occurredAt: item.occurredAt, evidence: item.evidence, acknowledged: item.acknowledged, resolved: item.resolved })), new Date(), defaultSanctionPolicy);
+  return res.status(201).json({ incident, sanction: decision });
+});
+
+app.get("/api/v1/riders/:id/sanction-status", requireRole("admin", "fleet", "rider"), async (req, res) => {
+  const riderIdParam = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+  const riderId = objectId(riderIdParam); if (!riderId) return res.status(400).json({ error: "INVALID_RIDER_ID" });
+  const rider = await Rider.findById(riderId).lean().exec();
+  if (!rider) return res.status(404).json({ error: "RIDER_NOT_FOUND" });
+  const incidents = await RiderIncident.find({ riderId }).sort({ occurredAt: -1 }).limit(100).lean().exec();
+  const decision = calculateSanctionDecision(incidents.map((item: any) => ({ id: String(item._id), riderId: String(item.riderId), reason: item.reason, occurredAt: item.occurredAt, evidence: item.evidence, acknowledged: item.acknowledged, resolved: item.resolved })), new Date(), defaultSanctionPolicy);
+  return res.json({ riderId, policy: defaultSanctionPolicy, incidents, sanction: decision });
+});
+
+app.post("/api/v1/dispatch/orders/:id/assign", requireRole("admin", "fleet"), async (req, res) => {
+  const parsed = dispatchSchema.safeParse(req.body || {});
+  if (!parsed.success) return res.status(400).json({ error: "INVALID_DISPATCH_REQUEST", details: parsed.error.flatten() });
+  const orderIdParam = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+  const orderId = objectId(orderIdParam);
+  if (!orderId) return res.status(400).json({ error: "INVALID_ORDER_ID" });
+  const order = await Order.findById(orderId).lean().exec() as any;
+  if (!order) return res.status(404).json({ error: "ORDER_NOT_FOUND" });
+  if (order.paymentState !== "paid") return res.status(409).json({ error: "ORDER_NOT_PAID" });
+  if (!["accepted", "preparing", "ready_for_pickup"].includes(order.status)) return res.status(409).json({ error: "ORDER_NOT_DISPATCHABLE", status: order.status });
+  if (order.riderId || order.assignmentState === "assigned") return res.status(409).json({ error: "ORDER_ALREADY_ASSIGNED" });
+  const restaurant = await Restaurant.findById(order.restaurantId).lean().exec() as any;
+  if (!restaurant?.location?.coordinates || !order.deliveryLocation?.coordinates) return res.status(409).json({ error: "MISSING_GEOLOCATION" });
+  const freshness = new Date(Date.now() - 90_000);
+  const riders = await Rider.find({ status: "available", activeOrderId: null, lastLocationAt: { $gte: freshness }, location: { $exists: true } }).limit(100).lean().exec() as any[];
+  const ranked = rankDispatchCandidates(riders.map((rider) => ({ id: String(rider._id), status: rider.status, vehicle: rider.vehicle, location: rider.location, lastLocationAt: rider.lastLocationAt, reliabilityScore: rider.reliabilityScore, activeOrderCount: 0, zoneFit: 1, servicePriority: 0.5 })), { restaurantLocation: [restaurant.location.coordinates[0], restaurant.location.coordinates[1]], customerLocation: [order.deliveryLocation.coordinates[0], order.deliveryLocation.coordinates[1]], preparationMinutes: parsed.data.preparationMinutes });
+  if (!ranked.length) return res.status(409).json({ error: "NO_ELIGIBLE_RIDER", candidatesConsidered: riders.length });
+  for (const decision of ranked) {
+    const rider = await Rider.findOneAndUpdate({ _id: objectId(decision.riderId), status: "available", activeOrderId: null }, { $set: { status: "busy", activeOrderId: order._id } }, { new: true }).lean().exec() as any;
+    if (!rider) continue;
+    const expiresAt = new Date(Date.now() + parsed.data.offerSeconds * 1000);
+    const assigned = await Order.findOneAndUpdate({ _id: order._id, riderId: null, assignmentState: { $in: ["unassigned", "expired", "rejected"] } }, { $set: { riderId: rider._id, assignmentState: "offered", assignmentExpiresAt: expiresAt, dispatchScore: decision.score }, $inc: { dispatchAttempts: 1, version: 1 } }, { new: true }).lean().exec() as any;
+    if (!assigned) { await Rider.updateOne({ _id: rider._id, activeOrderId: order._id }, { $set: { status: "available", activeOrderId: null } }).exec(); continue; }
+    return res.status(201).json({ assignment: { orderId: assigned._id, riderId: rider._id, state: assigned.assignmentState, expiresAt, score: decision.score, pickupDistanceKm: decision.pickupDistanceKm, pickupEtaMinutes: decision.pickupEtaMinutes, customerEtaMinutes: decision.customerEtaMinutes, reasons: decision.reasons } });
+  }
+  return res.status(409).json({ error: "RIDER_RESERVATION_RACE", message: "Los candidatos cambiaron mientras se asignaba el pedido; reintenta." });
+});
+
+app.post("/api/v1/dispatch/orders/:id/offer-response", requireRole("rider", "admin", "fleet"), async (req, res) => {
+  const decisionSchema = z.object({ accept: z.boolean() });
+  const parsed = decisionSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "INVALID_OFFER_RESPONSE" });
+  const orderIdParam = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+  const orderId = objectId(orderIdParam); if (!orderId) return res.status(400).json({ error: "INVALID_ORDER_ID" });
+  const order = await Order.findById(orderId).lean().exec() as any;
+  if (!order || !order.riderId || order.assignmentState !== "offered") return res.status(404).json({ error: "ACTIVE_RIDER_OFFER_NOT_FOUND" });
+  if (new Date(order.assignmentExpiresAt || 0).getTime() < Date.now()) parsed.data.accept = false;
+  if (parsed.data.accept) {
+    const updated = await Order.findOneAndUpdate({ _id: orderId, assignmentState: "offered", riderId: order.riderId }, { $set: { assignmentState: "assigned" }, $inc: { version: 1 } }, { new: true }).lean().exec() as any;
+    return updated ? res.json({ assignment: { state: "assigned", orderId: updated._id, riderId: updated.riderId } }) : res.status(409).json({ error: "OFFER_CHANGED_RETRY" });
+  }
+  await Order.findOneAndUpdate({ _id: orderId, assignmentState: "offered", riderId: order.riderId }, { $set: { assignmentState: "rejected", riderId: null, assignmentExpiresAt: null }, $inc: { version: 1 } }).exec();
+  await Rider.updateOne({ _id: order.riderId, activeOrderId: orderId }, { $set: { status: "available", activeOrderId: null } }).exec();
+  return res.json({ assignment: { state: "rejected", orderId } });
 });
 
 app.post("/api/v1/zones", requireRole("admin", "fleet"), async (req, res) => {
