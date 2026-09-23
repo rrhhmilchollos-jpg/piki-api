@@ -68,6 +68,8 @@ export async function handleCustomerTrpc(req: Request, res: Response) {
     }
     if (procedure === "auth.logout") { res.clearCookie(COOKIE); return reply(res, { success: true }); }
     if (procedure === "order.create" || procedure === "order.checkout") {
+      const user = await currentUser(req) as any;
+      if (!user) return fail(res, "Debes iniciar sesión para realizar pedidos", "AUTH_REQUIRED");
       const restaurant = await Restaurant.findById(input?.restaurantId).lean().exec() as any;
       if (!restaurant) return fail(res, "Restaurante no encontrado", "NOT_FOUND");
       const requested = Array.isArray(input?.items) ? input.items : [];
@@ -75,7 +77,7 @@ export async function handleCustomerTrpc(req: Request, res: Response) {
       if (!items.length || items.some((item: any) => !item || !Number.isInteger(item.quantity) || item.quantity < 1)) return fail(res, "La cesta no es válida");
       const normalized = items as Array<{itemId: string; name: string; quantity: number; unitPriceCents: number}>;
       const subtotalCents = normalized.reduce((sum, item) => sum + item.unitPriceCents * item.quantity, 0); const deliveryCents = restaurant.deliveryFeeCents || 0; const serviceCents = 79; const totalCents = subtotalCents + deliveryCents + serviceCents;
-      const user = await currentUser(req) as any; const code = `PIKI-${Date.now().toString(36).toUpperCase()}`;
+      const code = `PIKI-${Date.now().toString(36).toUpperCase()}`;
       const order = await Order.create({ publicCode: code, restaurantId: restaurant._id, customerId: user ? String(user._id) : null, items: normalized, deliveryAddress: input.address, subtotalCents, deliveryFeeCents: deliveryCents, totalCents, paymentState: "pending", statusHistory: [{ status: "pending", actorRole: "customer", reason: "Pedido creado" }] });
       if (procedure === "order.create") return reply(res, { id: code, restaurant: restaurant.name, eta: `${restaurant.etaMinutes?.[0] || 20}–${restaurant.etaMinutes?.[1] || 35} min`, createdAt: Date.now(), status: order.status, totalCents });
       try {
