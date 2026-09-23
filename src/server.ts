@@ -344,6 +344,28 @@ app.get("/api/v1/zones", requireRole("admin", "fleet"), async (_req, res) => {
   return res.json({ zones });
 });
 
+app.get("/api/v1/fleets", requireRole("admin", "fleet"), async (_req, res) => {
+  const fleets = await Fleet.find({}).sort({ name: 1 }).lean().exec();
+  return res.json({ fleets });
+});
+
+app.post("/api/v1/fleets", requireRole("admin", "fleet"), async (req, res) => {
+  const parsed = z.object({ name: z.string().min(2).max(120), managerName: z.string().max(120).default(""), serviceZones: z.array(z.string().regex(/^[a-z0-9-]+$/)).default([]) }).safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "INVALID_FLEET", details: parsed.error.flatten() });
+  const fleet = await Fleet.findOneAndUpdate({ name: parsed.data.name }, { $set: parsed.data }, { upsert: true, new: true }).lean().exec();
+  return res.status(201).json({ fleet });
+});
+
+app.patch("/api/v1/rider-applications/:id/assign-fleet", requireRole("admin", "fleet"), async (req, res) => {
+  const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id); if (!id) return res.status(400).json({ error: "INVALID_APPLICATION_ID" });
+  const fleetId = objectId(typeof req.body?.fleetId === "string" ? req.body.fleetId : ""); if (!fleetId) return res.status(400).json({ error: "INVALID_FLEET_ID" });
+  const fleet = await Fleet.findById(fleetId).lean().exec(); if (!fleet) return res.status(404).json({ error: "FLEET_NOT_FOUND" });
+  const application = await RiderApplication.findByIdAndUpdate(id, { $set: { assignedFleetId: fleetId } }, { new: true }).lean().exec();
+  if (!application) return res.status(404).json({ error: "APPLICATION_NOT_FOUND" });
+  if (application.status === "approved") await Rider.updateOne({ email: application.email }, { $set: { fleetId } }).exec();
+  return res.json({ application, fleet });
+});
+
 app.get("/api/v1/admin/overview", requireRole("admin"), async (_req, res) => {
   const startOfDay = new Date(); startOfDay.setHours(0, 0, 0, 0);
   const [activeRestaurants, pendingRestaurants, riders, openOrders, deliveredToday] = await Promise.all([Restaurant.countDocuments({ isActive: true, onboardingStatus: "approved" }), Restaurant.countDocuments({ onboardingStatus: "pending_review" }), Rider.countDocuments(), Order.countDocuments({ status: { $in: ["pending", "accepted", "preparing", "ready_for_pickup", "picked_up", "on_the_way"] } }), Order.countDocuments({ status: "delivered", deliveredAt: { $gte: startOfDay } })]);
