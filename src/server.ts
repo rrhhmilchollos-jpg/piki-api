@@ -10,6 +10,7 @@ import { configuredAuthRoles, requireRole } from "./auth.js";
 import { createCheckoutSession, processStripeWebhook, stripeConfigured } from "./stripe.js";
 import { rankDispatchCandidates } from "./dispatch.js";
 import { calculateSanctionDecision, defaultSanctionPolicy } from "./sanctions.js";
+import { handleCustomerTrpc } from "./customerCompat.js";
 
 const app = express();
 const port = Number(process.env.PORT || 3000);
@@ -18,7 +19,7 @@ const allowedOrigins = (process.env.CORS_ORIGINS || defaultOrigins).split(",").m
 const databaseName = process.env.MONGODB_DB || "piki";
 let databaseReady = false;
 
-app.use(cors({ origin: allowedOrigins.length ? allowedOrigins : true }));
+app.use(cors({ origin: allowedOrigins.length ? allowedOrigins : true, credentials: true }));
 app.post("/api/v1/payments/webhook", express.raw({ type: "application/json" }), async (req, res) => {
   const signature = req.header("stripe-signature");
   if (!signature || !stripeConfigured()) return res.status(503).json({ error: "STRIPE_WEBHOOK_NOT_CONFIGURED" });
@@ -30,6 +31,7 @@ app.post("/api/v1/payments/webhook", express.raw({ type: "application/json" }), 
   }
 });
 app.use(express.json({ limit: "1mb" }));
+app.all("/api/trpc/:procedure", handleCustomerTrpc);
 
 const objectId = (value: string) => mongoose.isValidObjectId(value) ? new mongoose.Types.ObjectId(value) : null;
 const locationSchema = z.object({ latitude: z.number().min(-90).max(90), longitude: z.number().min(-180).max(180) });
