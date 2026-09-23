@@ -38,7 +38,7 @@ export function requireRole(...allowedRoles: ApiRole[]) {
       return response.status(401).json({ error: "AUTHENTICATION_REQUIRED" });
     }
     if (!allowedRoles.includes(auth.role)) return response.status(403).json({ error: "FORBIDDEN", role: auth.role });
-    if (auth.mustChangePassword && !request.path.endsWith("/auth/change-password") && !request.path.endsWith("/auth/me")) return response.status(428).json({ error: "PASSWORD_CHANGE_REQUIRED" });
+    if (auth.mustChangePassword && !request.path.endsWith("/employee/change-password") && !request.path.endsWith("/employee/me")) return response.status(428).json({ error: "PASSWORD_CHANGE_REQUIRED" });
     request.auth = auth;
     return next();
   };
