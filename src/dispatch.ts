@@ -1,5 +1,7 @@
 import { distanceKm } from "./workflow.js";
 
+export const DISPATCH_ALGORITHM_VERSION = "piki-jarvis-v1";
+
 export type DispatchCandidate = {
   id: string;
   status: "offline" | "available" | "busy" | "paused";
@@ -18,18 +20,54 @@ export type DispatchInput = {
   preparationMinutes: number;
   now?: Date;
   maxGpsAgeSeconds?: number;
+  maxCustomerEtaMinutes?: number;
+};
+
+export type DispatchWeights = {
+  riderDistance: number;
+  riderEta: number;
+  customerEta: number;
+  preparationWait: number;
+  load: number;
+  zoneMismatch: number;
+  reliability: number;
+  priority: number;
 };
 
 export type DispatchDecision = {
   riderId: string;
+  algorithmVersion: string;
   score: number;
   pickupDistanceKm: number;
   pickupEtaMinutes: number;
   customerEtaMinutes: number;
+  totalEtaMinutes: number;
   reasons: string[];
 };
 
-const speedKmh: Record<DispatchCandidate["vehicle"], number> = { bike: 16, electric_bike: 19, electric_scooter: 23, motorcycle: 28, scooter: 22, car: 28 };
+export const dispatchWeights: DispatchWeights = {
+  riderDistance: 0.22,
+  riderEta: 0.24,
+  customerEta: 0.26,
+  preparationWait: 0.08,
+  load: 0.08,
+  zoneMismatch: 0.04,
+  reliability: 0.05,
+  priority: 0.03,
+};
+
+const speedKmh: Record<DispatchCandidate["vehicle"], number> = {
+  bike: 16,
+  electric_bike: 19,
+  electric_scooter: 23,
+  motorcycle: 28,
+  scooter: 22,
+  car: 28,
+};
+
+function bounded(value: number, fallback: number) {
+  return Number.isFinite(value) ? Math.min(1, Math.max(0, value)) : fallback;
+}
 
 function travelMinutes(distance: number, vehicle: DispatchCandidate["vehicle"]) {
   return Math.max(1, Math.ceil((distance / speedKmh[vehicle]) * 60));
@@ -51,38 +89,50 @@ export function scoreDispatchCandidate(candidate: DispatchCandidate, input: Disp
   const customerDistanceKm = distanceKm(input.restaurantLocation, input.customerLocation);
   const pickupEtaMinutes = travelMinutes(pickupDistanceKm, candidate.vehicle);
   const customerEtaMinutes = travelMinutes(customerDistanceKm, candidate.vehicle);
-  const currentLoad = Math.min(1, Math.max(0, (candidate.activeOrderCount || 0) / 2));
-  const reliability = Math.min(1, Math.max(0, candidate.reliabilityScore ?? 0.75));
-  const zoneFit = Math.min(1, Math.max(0, candidate.zoneFit ?? 1));
-  const priority = Math.min(1, Math.max(0, candidate.servicePriority ?? 0.5));
-  const waitPenalty = Math.max(0, pickupEtaMinutes - input.preparationMinutes);
-  const lateRisk = Math.max(0, pickupEtaMinutes + customerEtaMinutes - 60);
+  const totalEtaMinutes = input.preparationMinutes + Math.max(input.preparationMinutes, pickupEtaMinutes) + customerEtaMinutes;
+  if (input.maxCustomerEtaMinutes && totalEtaMinutes > input.maxCustomerEtaMinutes) return null;
 
-  // Lower is better. The weights are deliberately explicit and auditable for Phase 1.
+  const load = Math.min(1, Math.max(0, (candidate.activeOrderCount || 0) / 2));
+  const reliability = bounded(candidate.reliabilityScore ?? 0.75, 0.75);
+  const zoneFit = bounded(candidate.zoneFit ?? 1, 1);
+  const priority = bounded(candidate.servicePriority ?? 0.5, 0.5);
+  const preparationWait = Math.max(0, pickupEtaMinutes - input.preparationMinutes);
+  const lateRisk = Math.max(0, totalEtaMinutes - 60);
+
+  // Lower is better. Every term is normalized or intentionally bounded and logged.
   const score =
-    0.35 * pickupEtaMinutes +
-    0.25 * lateRisk +
-    0.15 * currentLoad * 20 +
-    0.10 * (1 - zoneFit) * 20 +
-    0.10 * (1 - reliability) * 20 +
-    0.05 * (1 - priority) * 20 +
-    0.05 * waitPenalty;
+    dispatchWeights.riderDistance * pickupDistanceKm * 5 +
+    dispatchWeights.riderEta * pickupEtaMinutes +
+    dispatchWeights.customerEta * (customerEtaMinutes + lateRisk) +
+    dispatchWeights.preparationWait * preparationWait +
+    dispatchWeights.load * load * 20 +
+    dispatchWeights.zoneMismatch * (1 - zoneFit) * 20 +
+    dispatchWeights.reliability * (1 - reliability) * 20 +
+    dispatchWeights.priority * (1 - priority) * 20;
 
   return {
     riderId: candidate.id,
+    algorithmVersion: DISPATCH_ALGORITHM_VERSION,
     score: Math.round(score * 100) / 100,
     pickupDistanceKm: Math.round(pickupDistanceKm * 100) / 100,
     pickupEtaMinutes,
     customerEtaMinutes,
+    totalEtaMinutes,
     reasons: [
-      `llega al comercio en ${pickupEtaMinutes} min`,
+      `recogida en ${pickupEtaMinutes} min`,
+      `entrega estimada en ${totalEtaMinutes} min`,
       `distancia de recogida ${pickupDistanceKm.toFixed(2)} km`,
+      `espera de preparación ${preparationWait} min`,
       `carga activa ${candidate.activeOrderCount || 0}`,
       `fiabilidad ${(reliability * 100).toFixed(0)}%`,
+      `versión ${DISPATCH_ALGORITHM_VERSION}`,
     ],
   };
 }
 
 export function rankDispatchCandidates(candidates: DispatchCandidate[], input: DispatchInput) {
-  return candidates.map((candidate) => scoreDispatchCandidate(candidate, input)).filter((decision): decision is DispatchDecision => Boolean(decision)).sort((a, b) => a.score - b.score);
+  return candidates
+    .map((candidate) => scoreDispatchCandidate(candidate, input))
+    .filter((decision): decision is DispatchDecision => Boolean(decision))
+    .sort((a, b) => a.score - b.score);
 }
