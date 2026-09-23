@@ -3,7 +3,7 @@ import cors from "cors";
 import express from "express";
 import mongoose from "mongoose";
 import { z } from "zod";
-import { Fleet, Order, Restaurant, Rider, RiderIncident, Zone, ensureIndexes } from "./models.js";
+import { Fleet, Order, Restaurant, Rider, RiderApplication, RiderIncident, Zone, ensureIndexes } from "./models.js";
 import { seedCatalog } from "./seed.js";
 import { assertTransition, calculateEtaRange, transitionSchema, validateCoordinates } from "./workflow.js";
 import { configuredAuthRoles, requireRole } from "./auth.js";
@@ -39,6 +39,14 @@ const riderLocationSchema = locationSchema.extend({ riderId: z.string().min(1) }
 const zoneSchema = z.object({ name: z.string().min(2).max(120), slug: z.string().regex(/^[a-z0-9-]+$/), serviceFeeCents: z.number().int().min(0).max(10000).default(0), maxEtaMinutes: z.number().int().min(1).max(240).default(60), polygon: z.object({ coordinates: z.array(z.array(z.array(z.number()))).min(1) }) });
 const dispatchSchema = z.object({ preparationMinutes: z.number().int().min(1).max(180).default(15), offerSeconds: z.number().int().min(15).max(180).default(60) });
 const riderIncidentSchema = z.object({ reason: z.enum(["late_acceptance", "late_delivery", "no_show", "unsafe_driving", "fraud_signal", "customer_complaint", "document_expired", "other"]), evidence: z.array(z.string().url()).max(10).default([]), occurredAt: z.coerce.date().optional() });
+const riderApplicationSchema = z.object({ name: z.string().min(2).max(160), email: z.string().email(), phone: z.string().min(6).max(40), city: z.string().min(2).max(120), vehicle: z.enum(["bike", "scooter", "car"]), availability: z.string().min(2).max(160), website: z.string().max(0).optional() });
+const riderApplicationAttempts = new Map<string, { count: number; resetAt: number }>();
+
+function allowRiderApplication(ip: string) {
+  const now = Date.now(); const current = riderApplicationAttempts.get(ip);
+  if (!current || current.resetAt <= now) { riderApplicationAttempts.set(ip, { count: 1, resetAt: now + 15 * 60_000 }); return true; }
+  if (current.count >= 5) return false; current.count += 1; return true;
+}
 
 app.get("/health", (_req, res) => res.json({ service: "piki-api", status: "ok", version: "0.2.0", environment: process.env.NODE_ENV || "development" }));
 app.get("/ready", (_req, res) => {
@@ -75,6 +83,35 @@ app.post("/api/v1/partners/onboarding", async (req, res) => {
   const slug = `${parsed.data.name.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "")}-${Date.now().toString(36)}`;
   const partner = await Restaurant.create({ slug, name: parsed.data.name, cuisine: "Pendiente de configurar", category: "Otros", address: parsed.data.address || "", tagline: "Solicitud recibida por PIKI", onboardingStatus: "pending_review", isActive: false, email: parsed.data.email, phone: parsed.data.phone });
   res.status(201).json({ message: "Solicitud recibida para revisión.", partner: { id: partner.id, name: partner.name, email: partner.email, phone: partner.phone, onboarding_status: partner.onboardingStatus } });
+});
+
+app.post("/api/v1/riders/applications", async (req, res) => {
+  const ip = req.ip || req.socket.remoteAddress || "unknown";
+  if (!allowRiderApplication(ip)) return res.status(429).json({ error: "APPLICATION_RATE_LIMITED", retryAfterSeconds: 900 });
+  const parsed = riderApplicationSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "INVALID_RIDER_APPLICATION", details: parsed.error.flatten() });
+  if (parsed.data.website) return res.status(400).json({ error: "INVALID_RIDER_APPLICATION" });
+  const duplicate = await RiderApplication.findOne({ email: parsed.data.email.toLowerCase(), status: { $in: ["pending", "contacted", "approved"] } }).lean().exec();
+  if (duplicate) return res.status(409).json({ error: "APPLICATION_ALREADY_EXISTS" });
+  const application = await RiderApplication.create({ ...parsed.data, email: parsed.data.email.toLowerCase(), status: "pending", source: "rider_landing" });
+  return res.status(201).json({ message: "Solicitud recibida. El equipo Fleet se pondrá en contacto contigo.", application: { id: application.id, status: application.status } });
+});
+
+app.get("/api/v1/rider-applications", requireRole("admin", "fleet"), async (req, res) => {
+  const status = typeof req.query.status === "string" ? req.query.status : undefined;
+  const filter = status ? { status } : {};
+  const applications = await RiderApplication.find(filter).sort({ createdAt: -1 }).limit(200).lean().exec();
+  return res.json({ applications });
+});
+
+app.patch("/api/v1/rider-applications/:id/status", requireRole("admin", "fleet"), async (req, res) => {
+  const idParam = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+  const id = objectId(idParam); if (!id) return res.status(400).json({ error: "INVALID_APPLICATION_ID" });
+  const parsed = z.object({ status: z.enum(["pending", "contacted", "approved", "rejected"]), notes: z.string().max(1000).optional() }).safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "INVALID_APPLICATION_STATUS", details: parsed.error.flatten() });
+  const application = await RiderApplication.findByIdAndUpdate(id, { $set: parsed.data }, { new: true }).lean().exec();
+  if (!application) return res.status(404).json({ error: "APPLICATION_NOT_FOUND" });
+  return res.json({ application });
 });
 
 app.post("/api/v1/orders", async (req, res) => {
