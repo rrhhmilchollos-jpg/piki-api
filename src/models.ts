@@ -8,6 +8,25 @@ const partnerProfile = new Schema({ legalName: { type: String, required: true, t
 const orderItem = new Schema({ itemId: { type: String, required: true }, name: { type: String, required: true }, quantity: { type: Number, min: 1, max: 20, required: true }, unitPriceCents: { type: Number, min: 0, required: true } }, { _id: false });
 const orderEvent = new Schema({ status: { type: String, required: true }, actorRole: { type: String, required: true }, reason: { type: String, default: "" }, at: { type: Date, default: Date.now } }, { _id: false });
 const stripeEventSchema = new Schema({ stripeEventId: { type: String, required: true, unique: true, index: true }, type: { type: String, required: true }, orderCode: { type: String, default: null }, receivedAt: { type: Date, default: Date.now } }, { timestamps: true, collection: "stripe_events" });
+const passkeyCredentialSchema = new Schema({
+  ownerType: { type: String, enum: ["customer", "employee"], required: true, index: true },
+  ownerId: { type: Schema.Types.ObjectId, required: true, index: true },
+  credentialId: { type: String, required: true, unique: true, index: true },
+  publicKey: { type: Buffer, required: true },
+  counter: { type: Number, required: true, default: 0 },
+  transports: { type: [String], default: [] },
+  deviceName: { type: String, default: "" },
+}, { timestamps: true, collection: "passkey_credentials" });
+passkeyCredentialSchema.index({ ownerType: 1, ownerId: 1 });
+const riderAssignmentReservationSchema = new Schema({
+  riderId: { type: Schema.Types.ObjectId, ref: "Rider", required: true, index: true },
+  orderId: { type: Schema.Types.ObjectId, ref: "Order", required: true, unique: true, index: true },
+  slot: { type: Number, enum: [1, 2], required: true },
+  mode: { type: String, enum: ["normal", "saturated"], required: true },
+  status: { type: String, enum: ["reserved", "released", "completed", "cancelled"], default: "reserved", index: true },
+  expiresAt: { type: Date, default: null, index: true },
+}, { timestamps: true, collection: "rider_assignment_reservations" });
+riderAssignmentReservationSchema.index({ riderId: 1, status: 1, slot: 1 }, { unique: true, partialFilterExpression: { status: "reserved" } });
 const dispatchDecisionSchema = new Schema({ orderId: { type: Schema.Types.ObjectId, ref: "Order", required: true, index: true }, riderId: { type: Schema.Types.ObjectId, ref: "Rider", default: null, index: true }, algorithmVersion: { type: String, required: true }, score: { type: Number, required: true }, pickupDistanceKm: { type: Number, required: true }, pickupEtaMinutes: { type: Number, required: true }, customerEtaMinutes: { type: Number, required: true }, totalEtaMinutes: { type: Number, required: true }, reasons: { type: [String], default: [] }, outcome: { type: String, enum: ["preview", "offered", "accepted", "rejected", "expired", "race_lost"], required: true }, actorRole: { type: String, default: "system" } }, { timestamps: true, collection: "dispatch_decisions" });
 const riderIncidentSchema = new Schema({ riderId: { type: Schema.Types.ObjectId, ref: "Rider", required: true, index: true }, reason: { type: String, required: true, enum: ["late_acceptance", "late_delivery", "no_show", "unsafe_driving", "fraud_signal", "customer_complaint", "document_expired", "other"] }, evidence: { type: [String], default: [] }, acknowledged: { type: Boolean, default: false }, resolved: { type: Boolean, default: false }, occurredAt: { type: Date, default: Date.now }, createdByRole: { type: String, required: true } }, { timestamps: true, collection: "rider_incidents" });
 riderIncidentSchema.index({ riderId: 1, occurredAt: -1 });
@@ -51,5 +70,7 @@ export const RiderApplication = mongoose.models.RiderApplication || mongoose.mod
 export const CustomerAccount = mongoose.models.CustomerAccount || mongoose.model("CustomerAccount", customerAccountSchema);
 export const EmployeeAccount = mongoose.models.EmployeeAccount || mongoose.model("EmployeeAccount", employeeAccountSchema);
 export const RiderSlot = mongoose.models.RiderSlot || mongoose.model("RiderSlot", riderSlotSchema);
+export const PasskeyCredential = mongoose.models.PasskeyCredential || mongoose.model("PasskeyCredential", passkeyCredentialSchema);
+export const RiderAssignmentReservation = mongoose.models.RiderAssignmentReservation || mongoose.model("RiderAssignmentReservation", riderAssignmentReservationSchema);
 
-export async function ensureIndexes() { await Promise.all([Restaurant.init(), Rider.init(), Fleet.init(), Order.init(), Zone.init(), StripeEvent.init(), DispatchDecision.init(), RiderIncident.init(), RiderApplication.init(), CustomerAccount.init(), EmployeeAccount.init(), RiderSlot.init()]); }
+export async function ensureIndexes() { await Promise.all([Restaurant.init(), Rider.init(), Fleet.init(), Order.init(), Zone.init(), StripeEvent.init(), DispatchDecision.init(), RiderIncident.init(), RiderApplication.init(), CustomerAccount.init(), EmployeeAccount.init(), RiderSlot.init(), PasskeyCredential.init(), RiderAssignmentReservation.init()]); }
