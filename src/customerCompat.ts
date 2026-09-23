@@ -13,7 +13,7 @@ const checkPassword = (value: string, encoded: string) => {
   const expected = Buffer.from(digest, "hex");
   return actual.length === expected.length && timingSafeEqual(actual, expected);
 };
-const publicUser = (user: any) => ({ id: String(user._id), name: user.name, email: user.email, role: "user", createdAt: user.createdAt, lastSignedIn: user.lastSignedIn });
+const publicUser = (user: any) => user ? ({ id: String(user._id), name: user.name, email: user.email, role: "user", createdAt: user.createdAt, lastSignedIn: user.lastSignedIn }) : null;
 
 function inputOf(req: Request): any {
   const body = req.body ?? {};
@@ -81,7 +81,11 @@ export async function handleCustomerTrpc(req: Request, res: Response) {
       try {
         const session = await createCheckoutSession({ orderId: String(order._id), publicCode: code, origin: req.header("origin") || "https://app.pikidelivery.com", customerEmail: user?.email, items: normalized, deliveryFeeCents: deliveryCents, serviceFeeCents: serviceCents });
         await Order.updateOne({ _id: order._id }, { $set: { stripeCheckoutSessionId: session.id } }).exec(); return reply(res, { orderId: code, checkoutUrl: session.url, totalCents });
-      } catch { await Order.updateOne({ _id: order._id }, { $set: { paymentState: "failed" } }).exec(); return fail(res, "El pago no está disponible todavía", "PRECONDITION_FAILED"); }
+      } catch (error) {
+        console.error(`[customerCompat] Stripe checkout failed for ${code}`, error instanceof Error ? error.message : error);
+        await Order.updateOne({ _id: order._id }, { $set: { paymentState: "failed" } }).exec();
+        return fail(res, "Stripe no está disponible en este momento. Comprueba la configuración de la cuenta de pruebas.", "STRIPE_UNAVAILABLE");
+      }
     }
     return fail(res, `Procedimiento no soportado: ${procedure}`, "NOT_FOUND");
   } catch (error) { console.error(`[customerCompat] ${procedure}`, error); return fail(res, "Error interno de la plataforma", "INTERNAL_SERVER_ERROR"); }
