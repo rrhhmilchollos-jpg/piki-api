@@ -88,6 +88,23 @@ app.post("/api/v1/partners/onboarding", async (req, res) => {
   res.status(201).json({ message: "Solicitud recibida para revisión.", partner: { id: partner.id, name: partner.name, email: partner.email, phone: partner.phone, onboarding_status: partner.onboardingStatus } });
 });
 
+app.get("/api/v1/admin/restaurants", requireRole("admin"), async (req, res) => {
+  const status = typeof req.query.status === "string" ? req.query.status : undefined;
+  const filter = status ? { onboardingStatus: status } : {};
+  const restaurants = await Restaurant.find(filter).sort({ createdAt: -1 }).limit(200).lean().exec();
+  return res.json({ restaurants });
+});
+
+app.patch("/api/v1/admin/restaurants/:id/status", requireRole("admin"), async (req, res) => {
+  const idParam = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+  const id = objectId(idParam); if (!id) return res.status(400).json({ error: "INVALID_RESTAURANT_ID" });
+  const parsed = z.object({ status: z.enum(["pending_review", "approved", "rejected", "suspended"]) }).safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "INVALID_RESTAURANT_STATUS", details: parsed.error.flatten() });
+  const restaurant = await Restaurant.findByIdAndUpdate(id, { $set: { onboardingStatus: parsed.data.status, isActive: parsed.data.status === "approved" } }, { new: true }).lean().exec();
+  if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
+  return res.json({ restaurant });
+});
+
 app.post("/api/v1/riders/applications", async (req, res) => {
   const ip = req.ip || req.socket.remoteAddress || "unknown";
   if (!allowRiderApplication(ip)) return res.status(429).json({ error: "APPLICATION_RATE_LIMITED", retryAfterSeconds: 900 });
@@ -294,6 +311,11 @@ app.post("/api/v1/zones", requireRole("admin", "fleet"), async (req, res) => {
   const parsed = zoneSchema.safeParse(req.body); if (!parsed.success) return res.status(400).json({ error: "INVALID_ZONE", details: parsed.error.flatten() });
   const zone = await Zone.findOneAndUpdate({ slug: parsed.data.slug }, { $set: { ...parsed.data, polygon: { type: "Polygon", coordinates: parsed.data.polygon.coordinates } } }, { upsert: true, new: true }).lean().exec();
   return res.status(201).json({ zone });
+});
+
+app.get("/api/v1/zones", requireRole("admin", "fleet"), async (_req, res) => {
+  const zones = await Zone.find({}).sort({ name: 1 }).lean().exec();
+  return res.json({ zones });
 });
 
 app.get("/api/v1/admin/overview", requireRole("admin"), async (_req, res) => {
