@@ -266,11 +266,34 @@ app.get("/api/v1/rider-applications", requireRole("admin", "fleet"), async (req,
   return res.json({ applications });
 });
 
+app.get("/api/v1/rider-applications/:id/documents", requireRole("admin", "fleet"), async (req, res) => {
+  const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
+  if (!id) return res.status(400).json({ error: "INVALID_APPLICATION_ID" });
+  const application = await RiderApplication.findById(id).select("name email documents").lean().exec() as any;
+  if (!application) return res.status(404).json({ error: "APPLICATION_NOT_FOUND" });
+  return res.json({ applicationId: application._id, name: application.name, email: application.email, documents: (application.documents || []).map(({ contentBase64, ...metadata }: any) => metadata) });
+});
+app.patch("/api/v1/rider-applications/:id/documents/:documentId/status", requireRole("admin", "fleet"), async (req, res) => {
+  const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
+  if (!id) return res.status(400).json({ error: "INVALID_APPLICATION_ID" });
+  const parsed = z.object({ status: z.enum(["approved", "rejected"]), reviewNotes: z.string().max(1000).default("") }).safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "INVALID_DOCUMENT_STATUS", details: parsed.error.flatten() });
+  const application = await RiderApplication.findOneAndUpdate({ _id: id, "documents._id": req.params.documentId }, { $set: { "documents.$.status": parsed.data.status, "documents.$.reviewNotes": parsed.data.reviewNotes, "documents.$.reviewedAt": new Date() } }, { new: true }).select("name email documents").lean().exec() as any;
+  if (!application) return res.status(404).json({ error: "DOCUMENT_NOT_FOUND" });
+  return res.json({ applicationId: application._id, documents: (application.documents || []).map(({ contentBase64, ...metadata }: any) => metadata) });
+});
 app.patch("/api/v1/rider-applications/:id/status", requireRole("admin", "fleet"), async (req, res) => {
   const idParam = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
   const id = objectId(idParam); if (!id) return res.status(400).json({ error: "INVALID_APPLICATION_ID" });
   const parsed = z.object({ status: z.enum(["pending", "contacted", "approved", "rejected"]), notes: z.string().max(1000).optional(), assignedFleetId: z.string().regex(/^[a-f\d]{24}$/).nullable().optional() }).safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_APPLICATION_STATUS", details: parsed.error.flatten() });
+  const existing = await RiderApplication.findById(id).select("documents status").lean().exec() as any;
+  if (!existing) return res.status(404).json({ error: "APPLICATION_NOT_FOUND" });
+  if (["approved", "rejected"].includes(parsed.data.status)) {
+    const documents = existing.documents || [];
+    if (!documents.length || documents.some((document: any) => document.status === "received")) return res.status(409).json({ error: "DOCUMENT_REVIEW_REQUIRED", message: "Debes revisar todos los documentos antes de aprobar o rechazar la solicitud." });
+    if (parsed.data.status === "approved" && documents.some((document: any) => document.status !== "approved")) return res.status(409).json({ error: "DOCUMENTS_NOT_APPROVED", message: "No se puede aprobar: existe documentación rechazada." });
+  }
   const update: Record<string, unknown> = { status: parsed.data.status, notes: parsed.data.notes };
   if (parsed.data.assignedFleetId !== undefined) update.assignedFleetId = parsed.data.assignedFleetId ? objectId(parsed.data.assignedFleetId) : null;
   const application = await RiderApplication.findByIdAndUpdate(id, { $set: update }, { new: true }).lean().exec() as any;
