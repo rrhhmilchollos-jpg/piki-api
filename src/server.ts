@@ -222,6 +222,13 @@ app.patch("/api/v1/admin/restaurants/:id/status", requireRole("admin"), async (r
   const id = objectId(idParam); if (!id) return res.status(400).json({ error: "INVALID_RESTAURANT_ID" });
   const parsed = z.object({ status: z.enum(["pending_review", "approved", "rejected", "suspended"]) }).safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_RESTAURANT_STATUS", details: parsed.error.flatten() });
+  const existing = await Restaurant.findById(id).select("partnerProfile onboardingStatus").lean().exec() as any;
+  if (!existing) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
+  if (["approved", "rejected"].includes(parsed.data.status)) {
+    const documents = existing.partnerProfile?.documents || [];
+    if (!documents.length || documents.some((document: any) => document.status === "received")) return res.status(409).json({ error: "PARTNER_DOCUMENT_REVIEW_REQUIRED", message: "Debes revisar todos los documentos del partner antes de aprobar o rechazar la solicitud." });
+    if (parsed.data.status === "approved" && documents.some((document: any) => document.status !== "approved")) return res.status(409).json({ error: "PARTNER_DOCUMENTS_NOT_APPROVED", message: "No se puede aprobar: existe documentación del partner rechazada." });
+  }
   const restaurant = await Restaurant.findByIdAndUpdate(id, { $set: { onboardingStatus: parsed.data.status, isActive: parsed.data.status === "approved" } }, { new: true }).lean().exec();
   if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
   return res.json({ restaurant });
