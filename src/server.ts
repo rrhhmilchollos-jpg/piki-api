@@ -4,7 +4,7 @@ import cors from "cors";
 import express from "express";
 import mongoose from "mongoose";
 import { z } from "zod";
-import { DispatchDecision, EmployeeAccount, Fleet, Order, Restaurant, Rider, RiderApplication, RiderIncident, RiderSlot, Zone, ensureIndexes } from "./models.js";
+import { DispatchDecision, EmployeeAccount, Fleet, Order, Restaurant, PartnerAsset, PartnerLocalityGroup, Rider, RiderApplication, RiderIncident, RiderSlot, Zone, ensureIndexes } from "./models.js";
 import { seedCatalog } from "./seed.js";
 import { assertTransition, calculateEtaRange, transitionSchema, validateCoordinates } from "./workflow.js";
 import { configuredAuthRoles, requireRole } from "./auth.js";
@@ -49,6 +49,11 @@ const riderDocumentInputSchema = z.object({ type: z.enum(["identity", "driving_l
 const riderApplicationSchema = z.object({ name: z.string().min(2).max(160), email: z.string().email(), phone: z.string().min(6).max(40), city: z.string().min(2).max(120), vehicle: z.enum(["bike", "electric_bike", "electric_scooter", "motorcycle", "scooter", "car"]), availability: z.string().min(2).max(160), documents: z.array(riderDocumentInputSchema).min(3).max(10), website: z.string().max(0).optional() });
 const riderApplicationAttempts = new Map<string, { count: number; resetAt: number }>();
 const ownerEmail = "rrhh.milchollos@gmail.com";
+const MAX_MENU_IMAGE_BYTES = 200 * 1024;
+const MENU_IMAGE_MIME_TYPES = ["image/webp", "image/jpeg", "image/png"] as const;
+function localityKey(value: string) { return value.trim().toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "") || "sin-localidad"; }
+function organizationFolder(locality: string, restaurantId: string) { return `partners/${localityKey(locality)}/${restaurantId}/menu`; }
+function publicAssetUrl(assetId: string) { return `${process.env.PUBLIC_API_URL || "https://api.pikidelivery.com"}/api/v1/catalog/assets/${assetId}`; }
 
 function allowRiderApplication(ip: string) {
   const now = Date.now(); const current = riderApplicationAttempts.get(ip);
@@ -177,8 +182,11 @@ app.post("/api/v1/partners/onboarding", async (req, res) => {
   if (existingTaxId) return res.status(409).json({ error: "PARTNER_TAX_ID_ALREADY_EXISTS" });
   const slug = `${parsed.data.name.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "")}-${Date.now().toString(36)}`;
   const { legalName, taxId, legalForm, representativeName, representativeRole, representativeDocument, fiscalAddress, operatingAddress, postalCode, city, province, iban, bankAccountHolder, cuisine, vatRate, commissionAccepted, termsAcceptedAt, openingHours, documents, ...contact } = parsed.data;
-  const partner = await Restaurant.create({ slug, name: contact.name, cuisine, category: cuisine, address: operatingAddress, tagline: "Solicitud recibida por PIKI", onboardingStatus: "pending_review", isActive: false, email: contact.email, phone: contact.phone, partnerProfile: { legalName, taxId: taxId.toUpperCase(), legalForm, representativeName, representativeRole, representativeDocument, fiscalAddress, operatingAddress, postalCode, city, province, iban: iban.toUpperCase(), bankAccountHolder, cuisine, vatRate, commissionAccepted, termsAcceptedAt, openingHours, documents: documents.map(({ contentBase64, ...metadata }) => ({ ...metadata, contentBase64, status: "received" })) } });
-  res.status(201).json({ message: "Solicitud recibida para revisión.", partner: { id: partner.id, name: partner.name, email: partner.email, phone: partner.phone, onboarding_status: partner.onboardingStatus } });
+  const locality = city.trim();
+  const groupKey = localityKey(locality);
+  const partner = await Restaurant.create({ slug, name: contact.name, cuisine, category: cuisine, locality, partnerGroupKey: groupKey, address: operatingAddress, tagline: "Solicitud recibida por PIKI", onboardingStatus: "pending_review", isActive: false, email: contact.email, phone: contact.phone, partnerProfile: { legalName, taxId: taxId.toUpperCase(), legalForm, representativeName, representativeRole, representativeDocument, fiscalAddress, operatingAddress, postalCode, city, province, iban: iban.toUpperCase(), bankAccountHolder, cuisine, vatRate, commissionAccepted, termsAcceptedAt, openingHours, documents: documents.map(({ contentBase64, ...metadata }) => ({ ...metadata, contentBase64, status: "received" })) } });
+  await PartnerLocalityGroup.findOneAndUpdate({ localityKey: groupKey }, { $set: { localityName: locality, province, isActive: true }, $addToSet: { restaurantIds: partner._id } }, { upsert: true, new: true });
+  res.status(201).json({ message: "Solicitud recibida para revisión.", partner: { id: partner.id, name: partner.name, email: partner.email, phone: partner.phone, locality, partnerGroupKey: groupKey, onboarding_status: partner.onboardingStatus } });
 });
 
 async function employeeRestaurant(req: express.Request) {
@@ -187,7 +195,36 @@ async function employeeRestaurant(req: express.Request) {
   return employee?.restaurantId ? String(employee.restaurantId) : null;
 }
 const menuModifierSchema = z.object({ id: z.string().min(1).max(80), name: z.string().min(1).max(120), price: z.number().min(0).max(1000), required: z.boolean().default(false), options: z.array(z.string().max(120)).max(30).default([]) });
-const partnerMenuItemSchema = z.object({ id: z.string().min(1).max(80), name: z.string().min(1).max(160), description: z.string().max(500).default(""), price: z.number().min(0).max(1000), category: z.string().max(100).default("General"), image: z.string().url().or(z.literal("")).default(""), allergens: z.array(z.string().max(80)).max(30).default([]), modifiers: z.array(menuModifierSchema).max(20).default([]), available: z.boolean().default(true), vegetarian: z.boolean().default(false), popular: z.boolean().default(false) });
+const partnerMenuItemSchema = z.object({ id: z.string().min(1).max(80), name: z.string().min(1).max(160), description: z.string().max(500).default(""), price: z.number().min(0).max(1000), category: z.string().max(100).default("General"), image: z.string().max(1200).refine((value) => value === "" || value.startsWith("https://api.pikidelivery.com/api/v1/catalog/assets/"), "La imagen debe proceder del almacenamiento de PIKI").default(""), allergens: z.array(z.string().max(80)).max(30).default([]), modifiers: z.array(menuModifierSchema).max(20).default([]), available: z.boolean().default(true), vegetarian: z.boolean().default(false), popular: z.boolean().default(false) });
+app.get("/api/v1/catalog/assets/:id", async (req, res) => {
+  const assetId = objectId(String(req.params.id));
+  if (!assetId) return res.status(400).json({ error: "INVALID_ASSET_ID" });
+  const asset = await PartnerAsset.findOne({ _id: assetId, kind: { $in: ["menu_image", "restaurant_image"] } }).select("+contentBase64 mimeType fileName sizeBytes").lean().exec() as any;
+  if (!asset) return res.status(404).json({ error: "ASSET_NOT_FOUND" });
+  res.setHeader("Content-Type", asset.mimeType);
+  res.setHeader("Content-Length", String(asset.sizeBytes));
+  res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
+  return res.send(Buffer.from(asset.contentBase64, "base64"));
+});
+app.post("/api/v1/partners/menu/assets", requireRole("partner"), async (req, res) => {
+  const restaurantId = await employeeRestaurant(req);
+  if (!restaurantId) return res.status(403).json({ error: "PARTNER_RESTAURANT_NOT_ASSIGNED" });
+  const parsed = z.object({ fileName: z.string().min(1).max(180), mimeType: z.enum(MENU_IMAGE_MIME_TYPES), sizeBytes: z.number().int().positive().max(MAX_MENU_IMAGE_BYTES), sha256: z.string().regex(/^[a-f0-9]{64}$/i), contentBase64: z.string().min(1).max(300000), kind: z.literal("menu_image").default("menu_image") }).safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "INVALID_MENU_IMAGE", maxBytes: MAX_MENU_IMAGE_BYTES, allowedTypes: MENU_IMAGE_MIME_TYPES, details: parsed.error.flatten() });
+  const rawBase64 = parsed.data.contentBase64.replace(/^data:[^;]+;base64,/, "");
+  const bytes = Buffer.from(rawBase64, "base64");
+  if (bytes.length !== parsed.data.sizeBytes || bytes.length > MAX_MENU_IMAGE_BYTES) return res.status(413).json({ error: "MENU_IMAGE_TOO_LARGE", maxBytes: MAX_MENU_IMAGE_BYTES });
+  const digest = createHash("sha256").update(bytes).digest("hex");
+  if (digest !== parsed.data.sha256.toLowerCase()) return res.status(400).json({ error: "MENU_IMAGE_CHECKSUM_MISMATCH" });
+  const restaurant = await Restaurant.findById(restaurantId).select("locality partnerGroupKey").lean().exec() as any;
+  if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
+  const locality = restaurant.locality || "Sin localidad";
+  const asset = await PartnerAsset.create({ restaurantId: objectId(restaurantId), organizationKey: restaurantId, folderKey: organizationFolder(locality, restaurantId), locality, kind: parsed.data.kind, fileName: parsed.data.fileName.replace(/[^a-zA-Z0-9._-]/g, "_"), mimeType: parsed.data.mimeType, sizeBytes: bytes.length, sha256: digest, contentBase64: rawBase64 });
+  const groupKey = localityKey(locality);
+  await PartnerLocalityGroup.findOneAndUpdate({ localityKey: groupKey }, { $set: { localityName: locality, province: "Valencia", isActive: true }, $addToSet: { restaurantIds: objectId(restaurantId) } }, { upsert: true, new: true });
+  return res.status(201).json({ asset: { id: asset.id, fileName: asset.fileName, mimeType: asset.mimeType, sizeBytes: asset.sizeBytes, sha256: asset.sha256, folderKey: asset.folderKey, locality: asset.locality, url: publicAssetUrl(asset.id) } });
+});
+app.get("/api/v1/admin/partner-groups/locality", requireRole("admin"), async (_req, res) => res.json({ groups: await PartnerLocalityGroup.find({ isActive: true }).sort({ localityName: 1 }).lean().exec() }));
 app.get("/api/v1/partners/menu", requireRole("partner"), async (req, res) => { const restaurantId = await employeeRestaurant(req); if (!restaurantId) return res.status(403).json({ error: "PARTNER_RESTAURANT_NOT_ASSIGNED" }); const restaurant = await Restaurant.findById(restaurantId).select("name menu").lean().exec() as any; if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" }); return res.json({ restaurant, menu: restaurant.menu || [] }); });
 app.put("/api/v1/partners/menu", requireRole("partner"), async (req, res) => { const restaurantId = await employeeRestaurant(req); if (!restaurantId) return res.status(403).json({ error: "PARTNER_RESTAURANT_NOT_ASSIGNED" }); const parsed = z.object({ items: z.array(partnerMenuItemSchema).max(500) }).safeParse(req.body); if (!parsed.success) return res.status(400).json({ error: "INVALID_MENU", details: parsed.error.flatten() }); const restaurant = await Restaurant.findByIdAndUpdate(restaurantId, { $set: { menu: parsed.data.items } }, { new: true }).select("name menu").lean().exec() as any; if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" }); return res.json({ restaurant, menu: restaurant.menu || [] }); });
 app.get("/api/v1/partners/kitchen/orders", requireRole("partner"), async (req, res) => { const restaurantId = await employeeRestaurant(req); if (!restaurantId) return res.status(403).json({ error: "PARTNER_RESTAURANT_NOT_ASSIGNED" }); const orders = await Order.find({ restaurantId, status: { $in: ["pending", "accepted", "preparing", "ready_for_pickup"] } }).sort({ createdAt: 1 }).lean().exec(); return res.json({ orders }); });
