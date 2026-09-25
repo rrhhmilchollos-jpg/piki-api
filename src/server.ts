@@ -626,6 +626,18 @@ app.post("/api/v1/dispatch/orders/:id/offer-response", requireRole("rider", "adm
   return res.json({ assignment: { state: "rejected", orderId } });
 });
 
+app.get("/api/v1/riders/:id/offers", requireRole("rider"), async (req, res) => {
+  const riderId = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
+  if (!riderId || !req.auth?.employeeId) return res.status(400).json({ error: "INVALID_RIDER_SESSION" });
+  const employee = await EmployeeAccount.findById(req.auth.employeeId).select("email").lean().exec() as any;
+  const rider = employee ? await Rider.findOne({ _id: riderId, email: employee.email }).select("_id").lean().exec() : null;
+  if (!rider) return res.status(403).json({ error: "RIDER_ACCESS_DENIED" });
+  const offers = await Order.find({ riderId, assignmentState: { $in: ["offered", "assigned"] }, status: { $nin: ["delivered", "cancelled"] } })
+    .select("_id publicCode displayCode displayCodeDate restaurantId status paymentState assignmentState assignmentExpiresAt deliveryAddress items createdAt")
+    .sort({ createdAt: -1 }).limit(10).lean().exec();
+  return res.json({ offers, refreshedAt: new Date().toISOString() });
+});
+
 app.get("/api/v1/riders/operational-map", requireRole("rider"), async (req, res) => {
   const employee = req.auth?.employeeId ? await EmployeeAccount.findById(req.auth.employeeId).select("zoneSlugs fleetId").lean().exec() as any : null;
   const zoneSlugs = Array.isArray(employee?.zoneSlugs) ? employee.zoneSlugs.filter((value: unknown): value is string => typeof value === "string") : [];
