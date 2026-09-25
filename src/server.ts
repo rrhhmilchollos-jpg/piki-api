@@ -130,7 +130,7 @@ app.post("/api/v1/admin/owner/bootstrap", requireRole("admin"), async (req, res)
   return res.json({ owner: { id: owner?._id, email: owner?.email, name: owner?.name, role: owner?.jobRole }, protected: true, hiddenFromAdmin: true });
 });
 app.get("/api/v1/payments/status", (_req, res) => res.json({ provider: "stripe", secretKeyConfigured: Boolean(process.env.STRIPE_SECRET_KEY), webhookConfigured: stripeConfigured(), mode: process.env.STRIPE_SECRET_KEY?.startsWith("sk_live_") ? "live" : "test_or_unknown" }));
-app.get("/api/v1/signatures/status", (_req, res) => res.json({ provider: "signaturit", configured: signaturitConfigured(), mode: signaturitMode(), apiBaseUrl: signaturitBaseUrl(), eventsUrl: signatureWebhookUrl() }));
+app.get("/api/v1/signatures/status", (_req, res) => res.json({ provider: "signaturit", configured: signaturitConfigured(), mode: signaturitMode(), apiBaseUrl: signaturitBaseUrl(), eventsUrlConfigured: Boolean(process.env.SIGNATURIT_EVENTS_URL), webhookProtected: Boolean(process.env.SIGNATURIT_WEBHOOK_TOKEN) }));
 app.post("/api/v1/admin/signatures", requireRole("admin"), async (req, res) => {
   const parsed = z.object({ entityType: z.enum(["partner", "rider", "employee"]), entityId: z.string().regex(/^[a-f\d]{24}$/), signerName: z.string().min(2).max(160), signerEmail: z.string().email(), subject: z.string().min(2).max(200), documentName: z.string().min(1).max(180), documentBase64: z.string().min(20).max(8_000_000) }).safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_SIGNATURE_REQUEST", details: parsed.error.flatten() });
