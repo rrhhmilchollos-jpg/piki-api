@@ -315,7 +315,8 @@ app.patch("/api/v1/rider-applications/:id/status", requireRole("admin", "fleet")
   if (!existing) return res.status(404).json({ error: "APPLICATION_NOT_FOUND" });
   if (["approved", "rejected"].includes(parsed.data.status)) {
     const documents = existing.documents || [];
-    if (!documents.length || documents.some((document: any) => document.status === "received")) return res.status(409).json({ error: "DOCUMENT_REVIEW_REQUIRED", message: "Debes revisar todos los documentos antes de aprobar o rechazar la solicitud." });
+    if (parsed.data.status === "approved" && (!documents.length || documents.some((document: any) => document.status === "received"))) return res.status(409).json({ error: "DOCUMENT_REVIEW_REQUIRED", message: "Debes revisar y validar todos los documentos antes de aprobar la solicitud." });
+    if (parsed.data.status === "rejected" && documents.some((document: any) => document.status === "received")) return res.status(409).json({ error: "DOCUMENT_REVIEW_REQUIRED", message: "Revisa los documentos pendientes antes de rechazar la solicitud." });
     if (parsed.data.status === "approved" && documents.some((document: any) => document.status !== "approved")) return res.status(409).json({ error: "DOCUMENTS_NOT_APPROVED", message: "No se puede aprobar: existe documentación rechazada." });
   }
   const update: Record<string, unknown> = { status: parsed.data.status, notes: parsed.data.notes };
