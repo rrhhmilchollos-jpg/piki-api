@@ -627,6 +627,14 @@ app.post("/api/v1/dispatch/orders/:id/offer-response", requireRole("rider", "adm
   return res.json({ assignment: { state: "rejected", orderId } });
 });
 
+app.get("/api/v1/riders/operational-map", requireRole("rider"), async (req, res) => {
+  const employee = req.auth?.employeeId ? await EmployeeAccount.findById(req.auth.employeeId).select("zoneSlugs fleetId").lean().exec() as any : null;
+  const zoneSlugs = Array.isArray(employee?.zoneSlugs) ? employee.zoneSlugs.filter((value: unknown): value is string => typeof value === "string") : [];
+  const filter: Record<string, unknown> = { isActive: true };
+  if (zoneSlugs.length) filter.slug = { $in: zoneSlugs };
+  const zones = await Zone.find(filter).select("slug name isActive polygon").sort({ name: 1 }).lean().exec();
+  return res.json({ zones, source: "piki-api", refreshedAt: new Date().toISOString() });
+});
 app.post("/api/v1/zones", requireRole("admin", "fleet"), async (req, res) => {
   const parsed = zoneSchema.safeParse(req.body); if (!parsed.success) return res.status(400).json({ error: "INVALID_ZONE", details: parsed.error.flatten() });
   const zone = await Zone.findOneAndUpdate({ slug: parsed.data.slug }, { $set: { ...parsed.data, polygon: { type: "Polygon", coordinates: parsed.data.polygon.coordinates } } }, { upsert: true, new: true }).lean().exec();
