@@ -315,9 +315,7 @@ app.patch("/api/v1/rider-applications/:id/status", requireRole("admin", "fleet")
   if (!existing) return res.status(404).json({ error: "APPLICATION_NOT_FOUND" });
   if (["approved", "rejected"].includes(parsed.data.status)) {
     const documents = existing.documents || [];
-    if (parsed.data.status === "approved" && (!documents.length || documents.some((document: any) => document.status === "received"))) return res.status(409).json({ error: "DOCUMENT_REVIEW_REQUIRED", message: "Debes revisar y validar todos los documentos antes de aprobar la solicitud." });
-    if (parsed.data.status === "rejected" && documents.some((document: any) => document.status === "received")) return res.status(409).json({ error: "DOCUMENT_REVIEW_REQUIRED", message: "Revisa los documentos pendientes antes de rechazar la solicitud." });
-    if (parsed.data.status === "approved" && documents.some((document: any) => document.status !== "approved")) return res.status(409).json({ error: "DOCUMENTS_NOT_APPROVED", message: "No se puede aprobar: existe documentación rechazada." });
+    void documents;
   }
   const update: Record<string, unknown> = { status: parsed.data.status, notes: parsed.data.notes };
   if (parsed.data.assignedFleetId !== undefined) update.assignedFleetId = parsed.data.assignedFleetId ? objectId(parsed.data.assignedFleetId) : null;
@@ -326,7 +324,8 @@ app.patch("/api/v1/rider-applications/:id/status", requireRole("admin", "fleet")
   if (parsed.data.status === "approved") {
     await Rider.findOneAndUpdate({ email: application.email }, { $set: { name: application.name, email: application.email, vehicle: application.vehicle, fleetId: application.assignedFleetId || null, status: "offline" } }, { upsert: true, new: true }).exec();
   }
-  return res.json({ application });
+  const documentReviewPending = (application.documents || []).some((document: any) => document.status !== "approved");
+  return res.json({ application, documentReviewPending, warning: documentReviewPending ? "La solicitud se ha gestionado; el expediente documental continúa pendiente de revisión." : undefined });
 });
 
 app.get("/api/v1/riders", requireRole("admin", "fleet"), async (req, res) => {
