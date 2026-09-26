@@ -516,6 +516,9 @@ app.post("/api/v1/orders/:id/transitions", requireRole("admin", "partner", "ride
   if (actorRole === "rider") {
     const rider = await riderAccessForRequest(order.riderId, req);
     if (!rider) return res.status(403).json({ error: "RIDER_ORDER_ACCESS_DENIED" });
+    if (parsed.data.status === "cancelled") {
+      return res.status(403).json({ error: "RIDER_CANCELLATION_NOT_ALLOWED", message: "Los Riders no pueden cancelar pedidos. Deben abrir una incidencia en Soporte PIKI para que Operaciones agote las vías de contacto con el Customer antes de cancelar." });
+    }
   }
   try { assertTransition(order.status, parsed.data.status, actorRole); } catch (error) { return res.status(409).json({ error: "INVALID_ORDER_TRANSITION", message: error instanceof Error ? error.message : "Transition not allowed" }); }
   const update: Record<string, unknown> = { $set: { status: parsed.data.status }, $inc: { version: 1 }, $push: { statusHistory: { status: parsed.data.status, actorRole, reason: parsed.data.reason || "" } } };
