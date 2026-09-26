@@ -18,6 +18,9 @@ const defaultOrigins = ["http://localhost:3000", "http://localhost:5173", "https
 const allowedOrigins = (process.env.CORS_ORIGINS || defaultOrigins).split(",").map((origin) => origin.trim()).filter(Boolean);
 const databaseName = process.env.MONGODB_DB || "piki";
 let databaseReady = false;
+mongoose.connection.on("connected", () => { databaseReady = true; });
+mongoose.connection.on("disconnected", () => { databaseReady = false; console.warn("MongoDB disconnected; API entering not-ready state"); });
+mongoose.connection.on("error", (error) => { databaseReady = false; console.error("MongoDB connection error", error instanceof Error ? error.message : error); });
 
 app.disable("x-powered-by");
 app.use((_req, res, next) => {
@@ -164,6 +167,17 @@ app.post("/api/v1/admin/employees", requireOwner(), async (req, res) => {
 });
 app.get("/api/v1/admin/employees", requireRole("admin"), async (_req, res) => res.json({ employees: await EmployeeAccount.find({ email: { $ne: ownerEmail }, hiddenFromAdmin: { $ne: true } }).select("name email jobRole apiRole portfolioId fleetId zoneSlugs active mustChangePassword lastLoginAt createdAt").sort({ createdAt: -1 }).lean().exec() }));
 app.get("/api/v1/admin/customers", requireRole("admin"), async (_req, res) => res.json({ customers: await CustomerAccount.find({}).select("name email lastSignedIn createdAt updatedAt").sort({ createdAt: -1 }).limit(1000).lean().exec() }));
+app.post("/api/v1/admin/employees/:id/reset-password", requireOwner(), async (req, res) => {
+  const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
+  if (!id) return res.status(400).json({ error: "INVALID_EMPLOYEE_ID" });
+  const parsed = z.object({ newPassword: z.string().min(12).max(200).regex(/[A-Z]/).regex(/[a-z]/).regex(/[0-9]/) }).safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "INVALID_RESET_PASSWORD", message: "La contraseña debe tener 12 caracteres, mayúscula, minúscula y número." });
+  const target = await EmployeeAccount.findById(id).select("email ownerProtected").lean().exec() as any;
+  if (!target) return res.status(404).json({ error: "EMPLOYEE_NOT_FOUND" });
+  if (target.ownerProtected || target.email === ownerEmail) return res.status(403).json({ error: "OWNER_ACCOUNT_PROTECTED" });
+  const employee = await EmployeeAccount.findByIdAndUpdate(id, { $set: { passwordHash: hashPassword(parsed.data.newPassword), mustChangePassword: false, passwordChangedAt: new Date(), sessionHash: null, active: true } }, { new: true }).select("name email jobRole apiRole active mustChangePassword").lean().exec();
+  return res.json({ employee, reset: true });
+});
 app.patch("/api/v1/admin/employees/:id/active", requireOwner(), async (req, res) => { const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id); if (!id) return res.status(400).json({ error: "INVALID_EMPLOYEE_ID" }); const parsed = z.object({ active: z.boolean() }).safeParse(req.body); if (!parsed.success) return res.status(400).json({ error: "INVALID_ACTIVE_STATE" }); const target = await EmployeeAccount.findById(id).select("email ownerProtected").lean().exec() as any; if (!target) return res.status(404).json({ error: "EMPLOYEE_NOT_FOUND" }); if (target.ownerProtected || target.email === ownerEmail) return res.status(403).json({ error: "OWNER_ACCOUNT_PROTECTED" }); const employee = await EmployeeAccount.findByIdAndUpdate(id, { $set: { active: parsed.data.active, ...(parsed.data.active ? {} : { sessionHash: null }) } }, { new: true }).select("name email jobRole apiRole active mustChangePassword").lean().exec(); return res.json({ employee }); });
 app.post("/api/v1/admin/owner/bootstrap", requireOwner(), async (req, res) => {
   const parsed = z.object({ email: z.literal(ownerEmail), password: z.string().min(8).max(200), name: z.string().min(2).max(160).default("Propietario y CEO de PIKI") }).safeParse(req.body);
@@ -923,6 +937,7 @@ app.post("/api/v1/riders/:id/test-orders", requireRole("rider"), async (req, res
 });
 
 app.get("/api/v1/riders/:id/offers", requireRole("rider"), async (req, res) => {
+  if (!databaseReady || mongoose.connection.readyState !== 1) return res.status(503).json({ error: "DATABASE_UNAVAILABLE", message: "La API está reconectando la base de datos; vuelve a intentar en unos segundos." });
   const riderId = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
   if (!riderId) return res.status(400).json({ error: "INVALID_RIDER_SESSION" });
   const rider = await riderAccessForRequest(riderId, req);
