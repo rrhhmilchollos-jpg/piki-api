@@ -10,7 +10,10 @@ import { seedCatalog } from "./seed.js";
 import { assertTransition, calculateEtaRange, transitionSchema, validateCoordinates } from "./algorithms/index.js";
 import { configuredAuthRoles, requireOwner, requireRole, resolveRole } from "./auth.js";
 import { EmployeeSession, issueEmployeeSession, revokeEmployeeSessions, sessionRole } from "./employeeSessions.js";
-import { createCheckoutSession, processStripeWebhook, stripeConfigured, createSignaturitSignature, signaturitBaseUrl, signaturitConfigured, signaturitMode, signatureWebhookUrl, webhookDigest, handleCustomerTrpc } from "./integrations/index.js";
+import { createCheckoutSession, processStripeWebhook, stripeConfigured, createSignaturitSignature, signaturitBaseUrl, signaturitConfigured, signaturitMode, signatureWebhookUrl, webhookDigest, handleCustomerTrpc, currentCustomer } from "./integrations/index.js";
+import { getVersionPolicy, isPikiSurface, requiresUpdate, setVersionPolicy, syncVersionPolicy, versionPolicySchema, type PikiSurface } from "./appVersion.js";
+import { publicPushConfig, revokePushSubscription, savePushSubscription, sendPushToOwner } from "./push.js";
+import { publishOrderStatusEvents, publishRiderOfferEvent, serveRealtimeEvents, startRealtimeRelay } from "./realtime.js";
 import { rankDispatchCandidates, computeMobilityAdvice, calculateSanctionDecision, defaultSanctionPolicy } from "./algorithms/index.js";
 import { createSessionToken, generateTemporaryPassword, hashPassword, hashSessionToken, verifyPassword } from "./employeeAuth.js";
 
@@ -51,7 +54,8 @@ app.use("/api/v1/auth", rateLimit(20, 60_000, "auth"));
 app.use("/api/v1/partners/onboarding", rateLimit(10, 60_000, "partner-onboarding"));
 app.use("/api/v1/riders/applications", rateLimit(10, 60_000, "rider-onboarding"));
 app.use("/api/v1/payments/webhook", rateLimit(100, 60_000, "stripe-webhook"));
-app.post("/api/v1/payments/webhook", express.raw({ type: "application/json" }), async (req, res) => {
+app.use("/api/webhooks/stripe", rateLimit(100, 60_000, "stripe-webhook"));
+const stripeWebhookHandler = async (req: express.Request, res: express.Response) => {
   const signature = req.header("stripe-signature");
   if (!signature || !stripeConfigured()) return res.status(503).json({ error: "STRIPE_WEBHOOK_NOT_CONFIGURED" });
   try {
@@ -60,9 +64,9 @@ app.post("/api/v1/payments/webhook", express.raw({ type: "application/json" }), 
   } catch (error) {
     return res.status(400).json({ error: "INVALID_STRIPE_WEBHOOK", message: error instanceof Error ? error.message : "Webhook rejected" });
   }
-});
+};
+app.post(["/api/v1/payments/webhook", "/api/webhooks/stripe"], express.raw({ type: "application/json" }), stripeWebhookHandler);
 app.use(express.json({ limit: "12mb" }));
-app.all("/api/trpc/:procedure", handleCustomerTrpc);
 
 const objectId = (value: string) => mongoose.isValidObjectId(value) ? new mongoose.Types.ObjectId(value) : null;
 const locationSchema = z.object({ latitude: z.number().min(-90).max(90), longitude: z.number().min(-180).max(180) });
@@ -128,12 +132,103 @@ app.get("/ready", (_req, res) => {
   return res.json({ service: "piki-api", status: "ready", database: "connected" });
 });
 app.get("/api/v1", (_req, res) => res.json({ name: "PIKI API", version: "v1", status: databaseReady ? "ready" : "initializing" }));
-const PIKI_APP_VERSION = process.env.PIKI_APP_VERSION || "0.2.1";
-app.get("/api/v1/app-version", (req, res) => {
-  const surface = String(req.query.surface || "unknown").toLowerCase();
-  res.setHeader("Cache-Control", "no-store");
-  return res.json({ surface, minimumVersion: PIKI_APP_VERSION, apiVersion: "0.2.0", updateRequired: false });
+const releasePolicyToken = process.env.PIKI_RELEASE_POLICY_TOKEN || "";
+const pushSubscriptionSchema = z.object({
+  subscription: z.object({
+    endpoint: z.string().url().refine((value) => value.startsWith("https://")),
+    expirationTime: z.number().nullable().optional(),
+    keys: z.object({ p256dh: z.string().min(16).max(1000), auth: z.string().min(8).max(1000) }).strict(),
+  }).strict(),
+}).strict();
+const employeeSurfaceRoles: Record<Exclude<PikiSurface, "customer">, string[]> = {
+  partner: ["partner"], fleet: ["fleet", "commercial"], admin: ["admin"], rider: ["rider"],
+};
+function requestedSurface(req: express.Request): PikiSurface | null {
+  const value = String(req.header("x-piki-surface") || req.query.surface || "").toLowerCase();
+  return isPikiSurface(value) ? value : null;
+}
+function scheduleCustomerOrderPush(order: any, status: string) {
+  void publishOrderStatusEvents(order, status).catch((error) => console.warn("Realtime order status event failed", error instanceof Error ? error.message : error));
+  if (!order?.customerId) return;
+  const titleByStatus: Record<string, string> = { accepted: "Tu pedido ha sido aceptado", preparing: "Tu pedido se está preparando", ready_for_pickup: "Tu pedido está listo", picked_up: "Tu pedido va en camino", on_the_way: "Tu pedido va en camino", delivered: "Pedido entregado", cancelled: "Pedido cancelado" };
+  const title = titleByStatus[status] || "Actualización de tu pedido";
+  void sendPushToOwner({ surface: "customer", ownerType: "customer", ownerId: String(order.customerId), payload: { title, body: "Abre PIKI para consultar el estado de tu pedido.", url: `/?order=${encodeURIComponent(String(order.publicCode || ""))}`, tag: `order-${String(order._id)}`, renotify: true } }).catch((error) => console.warn("Customer push scheduling failed", error instanceof Error ? error.message : error));
+}
+
+app.get("/api/v1/app-version", async (req, res) => {
+  const surface = requestedSurface(req);
+  if (!surface) return res.status(400).json({ error: "INVALID_SURFACE" });
+  const policy = await syncVersionPolicy(surface);
+  const clientVersion = typeof req.query.clientVersion === "string" ? req.query.clientVersion : undefined;
+  const clientBuildId = typeof req.query.clientBuildId === "string" ? req.query.clientBuildId : undefined;
+  res.setHeader("Cache-Control", "no-store, max-age=0");
+  return res.json({ surface, ...policy, updateRequired: requiresUpdate(policy, clientVersion, clientBuildId) });
 });
+app.post("/api/v1/app-version/policy", rateLimit(20, 60_000, "release-policy"), (req, res) => {
+  const expected = releasePolicyToken;
+  if (!expected || req.header("authorization") !== `Bearer ${expected}`) return res.status(401).json({ error: "AUTHENTICATION_REQUIRED" });
+  const surface = typeof req.body?.surface === "string" ? req.body.surface.toLowerCase() : "";
+  if (!isPikiSurface(surface)) return res.status(400).json({ error: "INVALID_SURFACE" });
+  const { surface: _surface, ...policyInput } = req.body || {};
+  const parsed = versionPolicySchema.safeParse(policyInput);
+  if (!parsed.success) return res.status(400).json({ error: "INVALID_RELEASE_POLICY" });
+  const policy = setVersionPolicy(surface, parsed.data);
+  res.setHeader("Cache-Control", "no-store, max-age=0");
+  return res.json({ surface, ...policy });
+});
+app.use("/api/v1", async (req, res, next) => {
+  if (req.path === "/app-version" || req.path === "/app-version/policy" || req.path === "/push/config") return next();
+  const surface = requestedSurface(req);
+  const clientVersion = req.header("x-piki-client-version") || undefined;
+  const clientBuildId = req.header("x-piki-client-build") || undefined;
+  if (surface && clientVersion) {
+    const policy = await syncVersionPolicy(surface);
+    if (requiresUpdate(policy, clientVersion, clientBuildId)) {
+      res.setHeader("Cache-Control", "no-store, max-age=0");
+      return res.status(426).json({ error: "CLIENT_UPDATE_REQUIRED", surface, ...policy });
+    }
+  }
+  return next();
+});
+app.get("/api/v1/push/config", (_req, res) => {
+  res.setHeader("Cache-Control", "no-store, max-age=0");
+  return res.json(publicPushConfig());
+});
+app.post("/api/v1/push/subscriptions", rateLimit(20, 60_000, "push-subscribe"), async (req, res) => {
+  const surface = requestedSurface(req);
+  const parsed = pushSubscriptionSchema.safeParse(req.body);
+  if (!surface) return res.status(400).json({ error: "INVALID_SURFACE" });
+  if (!parsed.success) return res.status(400).json({ error: "INVALID_PUSH_SUBSCRIPTION" });
+  try {
+    if (surface === "customer") {
+      const customer = await currentCustomer(req) as any;
+      if (!customer) return res.status(401).json({ error: "AUTHENTICATION_REQUIRED" });
+      return res.status(201).json(await savePushSubscription({ surface, ownerType: "customer", ownerId: String(customer._id), subscription: parsed.data.subscription }));
+    }
+    const auth = await resolveRole(req);
+    if (!auth?.employeeId || !employeeSurfaceRoles[surface].includes(auth.role)) return res.status(403).json({ error: "FORBIDDEN" });
+    return res.status(201).json(await savePushSubscription({ surface, ownerType: "employee", ownerId: auth.employeeId, subscription: parsed.data.subscription }));
+  } catch (error) {
+    return res.status(503).json({ error: error instanceof Error && error.message === "PUSH_NOT_CONFIGURED" ? "PUSH_NOT_CONFIGURED" : "PUSH_SUBSCRIPTION_FAILED" });
+  }
+});
+app.delete("/api/v1/push/subscriptions", rateLimit(20, 60_000, "push-unsubscribe"), async (req, res) => {
+  const surface = requestedSurface(req);
+  const endpoint = typeof req.body?.endpoint === "string" ? req.body.endpoint : undefined;
+  if (!surface) return res.status(400).json({ error: "INVALID_SURFACE" });
+  if (surface === "customer") {
+    const customer = await currentCustomer(req) as any;
+    if (!customer) return res.status(401).json({ error: "AUTHENTICATION_REQUIRED" });
+    await revokePushSubscription({ surface, ownerType: "customer", ownerId: String(customer._id), endpoint });
+  } else {
+    const auth = await resolveRole(req);
+    if (!auth?.employeeId || !employeeSurfaceRoles[surface].includes(auth.role)) return res.status(403).json({ error: "FORBIDDEN" });
+    await revokePushSubscription({ surface, ownerType: "employee", ownerId: auth.employeeId, endpoint });
+  }
+  return res.status(204).end();
+});
+app.get("/api/v1/realtime/events", serveRealtimeEvents);
+app.all("/api/trpc/:procedure", handleCustomerTrpc);
 
 app.get("/api/v1/auth/status", (_req, res) => res.json({ authentication: "bearer", configured_roles: configuredAuthRoles() }));
 const employeeLoginSchema = z.object({ email: z.string().email(), password: z.string().min(8).max(200) });
@@ -335,7 +430,7 @@ app.get("/api/v1/admin/partner-groups/locality", requireRole("admin"), async (_r
 app.get("/api/v1/partners/menu", requireRole("partner"), async (req, res) => { const restaurantId = await employeeRestaurant(req); if (!restaurantId) return res.status(403).json({ error: "PARTNER_RESTAURANT_NOT_ASSIGNED" }); const restaurant = await Restaurant.findById(restaurantId).select("name menu").lean().exec() as any; if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" }); return res.json({ restaurant, menu: restaurant.menu || [] }); });
 app.put("/api/v1/partners/menu", requireRole("partner"), async (req, res) => { const restaurantId = await employeeRestaurant(req); if (!restaurantId) return res.status(403).json({ error: "PARTNER_RESTAURANT_NOT_ASSIGNED" }); const parsed = z.object({ items: z.array(partnerMenuItemSchema).max(500) }).safeParse(req.body); if (!parsed.success) return res.status(400).json({ error: "INVALID_MENU", details: parsed.error.flatten() }); const restaurant = await Restaurant.findByIdAndUpdate(restaurantId, { $set: { menu: parsed.data.items } }, { new: true }).select("name menu").lean().exec() as any; if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" }); return res.json({ restaurant, menu: restaurant.menu || [] }); });
 app.get("/api/v1/partners/kitchen/orders", requireRole("partner"), async (req, res) => { const restaurantId = await employeeRestaurant(req); if (!restaurantId) return res.status(403).json({ error: "PARTNER_RESTAURANT_NOT_ASSIGNED" }); const orders = await Order.find({ restaurantId, status: { $in: ["pending", "accepted", "preparing", "ready_for_pickup"] } }).sort({ createdAt: 1 }).lean().exec(); return res.json({ orders }); });
-app.patch("/api/v1/partners/kitchen/orders/:id/status", requireRole("partner"), async (req, res) => { const restaurantId = await employeeRestaurant(req); if (!restaurantId) return res.status(403).json({ error: "PARTNER_RESTAURANT_NOT_ASSIGNED" }); const parsed = z.object({ status: z.enum(["accepted", "preparing", "ready_for_pickup", "cancelled"]) }).safeParse(req.body); if (!parsed.success) return res.status(400).json({ error: "INVALID_KITCHEN_STATUS" }); const orderId = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id); if (!orderId) return res.status(400).json({ error: "INVALID_ORDER_ID" }); const order = await Order.findOne({ _id: orderId, restaurantId }); if (!order) return res.status(404).json({ error: "ORDER_NOT_FOUND" }); const current = order.status as any; const target = parsed.data.status; const allowed: Record<string, string[]> = { pending: ["accepted", "cancelled"], accepted: ["preparing", "cancelled"], preparing: ["ready_for_pickup", "cancelled"] }; if (!allowed[current]?.includes(target)) return res.status(409).json({ error: "INVALID_ORDER_TRANSITION", from: current, to: target }); if (target === "accepted" && order.paymentState !== "paid") return res.status(409).json({ error: "PAYMENT_NOT_CONFIRMED" }); order.status = target as any; order.statusHistory.push({ status: target, actorRole: "partner", reason: "Actualización desde pantalla de cocina" } as any); await order.save(); return res.json({ order }); });
+app.patch("/api/v1/partners/kitchen/orders/:id/status", requireRole("partner"), async (req, res) => { const restaurantId = await employeeRestaurant(req); if (!restaurantId) return res.status(403).json({ error: "PARTNER_RESTAURANT_NOT_ASSIGNED" }); const parsed = z.object({ status: z.enum(["accepted", "preparing", "ready_for_pickup", "cancelled"]) }).safeParse(req.body); if (!parsed.success) return res.status(400).json({ error: "INVALID_KITCHEN_STATUS" }); const orderId = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id); if (!orderId) return res.status(400).json({ error: "INVALID_ORDER_ID" }); const order = await Order.findOne({ _id: orderId, restaurantId }); if (!order) return res.status(404).json({ error: "ORDER_NOT_FOUND" }); const current = order.status as any; const target = parsed.data.status; const allowed: Record<string, string[]> = { pending: ["accepted", "cancelled"], accepted: ["preparing", "cancelled"], preparing: ["ready_for_pickup", "cancelled"] }; if (!allowed[current]?.includes(target)) return res.status(409).json({ error: "INVALID_ORDER_TRANSITION", from: current, to: target }); if (target === "accepted" && order.paymentState !== "paid") return res.status(409).json({ error: "PAYMENT_NOT_CONFIRMED" }); order.status = target as any; order.statusHistory.push({ status: target, actorRole: "partner", reason: "Actualización desde pantalla de cocina" } as any); await order.save(); scheduleCustomerOrderPush(order, target); return res.json({ order }); });
 
 app.get("/api/v1/commercial/portfolio", requireRole("commercial"), async (req, res) => {
   const employeeId = req.auth?.employeeId;
@@ -607,6 +702,7 @@ app.post("/api/v1/orders/:id/transitions", requireRole("admin", "partner", "ride
   const updated = await Order.findOneAndUpdate({ _id: id, version: order.version, status: order.status }, update, { new: true }).lean().exec();
   if (!updated) return res.status(409).json({ error: "ORDER_CHANGED_RETRY" });
   if (["delivered", "cancelled"].includes(parsed.data.status)) await RiderOrderMessage.deleteMany({ orderId: order._id }).exec();
+  scheduleCustomerOrderPush(updated, parsed.data.status);
   if (["delivered", "cancelled"].includes(parsed.data.status) && order.riderId) {
     const remainingOrder = await Order.findOne({ riderId: order.riderId, _id: { $ne: order._id }, status: { $nin: ["delivered", "cancelled"] }, assignmentState: { $in: ["offered", "assigned"] } }).select("_id").lean().exec() as any;
     await Rider.findByIdAndUpdate(order.riderId, { $set: { status: remainingOrder ? "busy" : "available", activeOrderId: remainingOrder?._id || null } }).exec();
@@ -663,6 +759,7 @@ app.post("/api/v1/riders/:riderId/orders/:orderId/confirm-delivery", requireRole
   const deliveredOrder = updated as any;
   await RiderOrderMessage.deleteMany({ orderId, riderId }).exec();
   await Rider.findOneAndUpdate({ _id: riderId, activeOrderId: orderId }, { $set: { status: "available", activeOrderId: null } }).exec();
+  scheduleCustomerOrderPush(deliveredOrder, "delivered");
   return res.json({ message: "Entrega confirmada.", chatPurged: true, order: { id: deliveredOrder._id, status: deliveredOrder.status, deliveredAt: deliveredOrder.deliveredAt } });
 });
 
@@ -835,6 +932,7 @@ async function assignOrderAutomatically(orderId: mongoose.Types.ObjectId, prefer
       const assigned = await Order.findOneAndUpdate({ _id: order._id, riderId: null, assignmentState: { $in: ["unassigned", "expired", "rejected"] } }, { $set: { riderId: rider._id, assignmentState: "offered", assignmentExpiresAt: expiresAt, dispatchScore: decision.score }, $inc: { dispatchAttempts: 1, version: 1 } }, { new: true }).lean().exec() as any;
       if (!assigned) { await Rider.updateOne({ _id: rider._id, activeOrderId: order._id }, { $set: { status: "available", activeOrderId: null } }).exec(); continue; }
       await DispatchDecision.create({ orderId: assigned._id, ...decision, riderId: rider._id, outcome: "offered", actorRole: "system" });
+      void publishRiderOfferEvent(assigned, String(rider._id)).catch((error) => console.warn("Rider offer event failed", error));
       return { state: "offered" as const, orderId: assigned._id, riderId: rider._id, expiresAt, decision, policy };
     }
     return { state: "reservation_race" as const };
@@ -914,6 +1012,7 @@ app.post("/api/v1/dispatch/orders/:id/assign", requireRole("admin", "fleet"), as
     const assigned = await Order.findOneAndUpdate({ _id: order._id, riderId: null, assignmentState: { $in: ["unassigned", "expired", "rejected"] } }, { $set: { riderId: rider._id, assignmentState: "offered", assignmentExpiresAt: expiresAt, dispatchScore: decision.score }, $inc: { dispatchAttempts: 1, version: 1 } }, { new: true }).lean().exec() as any;
     if (!assigned) { await Rider.updateOne({ _id: rider._id, activeOrderId: order._id }, { $set: { status: "available", activeOrderId: null } }).exec(); continue; }
     await DispatchDecision.create({ orderId: assigned._id, ...decision, riderId: rider._id, outcome: "offered", actorRole: req.auth?.role || "system" });
+    void publishRiderOfferEvent(assigned, String(rider._id)).catch((error) => console.warn("Rider offer event failed", error));
     return res.status(201).json({ assignment: { orderId: assigned._id, riderId: rider._id, state: assigned.assignmentState, expiresAt, score: decision.score, pickupDistanceKm: decision.pickupDistanceKm, pickupEtaMinutes: decision.pickupEtaMinutes, customerEtaMinutes: decision.customerEtaMinutes, totalEtaMinutes: decision.totalEtaMinutes, algorithmVersion: decision.algorithmVersion, maxConcurrentOrders: policy.maxConcurrentOrders, saturated: policy.saturated, reasons: decision.reasons } });
   }
   return res.status(409).json({ error: "RIDER_RESERVATION_RACE", message: "Los candidatos cambiaron mientras se asignaba el pedido; reintenta." });
@@ -935,7 +1034,9 @@ app.post("/api/v1/dispatch/orders/:id/offer-response", requireRole("rider", "adm
   if (new Date(order.assignmentExpiresAt || 0).getTime() < Date.now()) parsed.data.accept = false;
   if (parsed.data.accept) {
     const updated = await Order.findOneAndUpdate({ _id: orderId, assignmentState: "offered", riderId: order.riderId }, { $set: { assignmentState: "assigned" }, $inc: { version: 1 } }, { new: true }).lean().exec() as any;
-    return updated ? res.json({ assignment: { state: "assigned", orderId: updated._id, riderId: updated.riderId } }) : res.status(409).json({ error: "OFFER_CHANGED_RETRY" });
+    if (!updated) return res.status(409).json({ error: "OFFER_CHANGED_RETRY" });
+    void publishOrderStatusEvents(updated, updated.status).catch((error) => console.warn("Realtime accepted offer event failed", error));
+    return res.json({ assignment: { state: "assigned", orderId: updated._id, riderId: updated.riderId } });
   }
   await Order.findOneAndUpdate({ _id: orderId, assignmentState: "offered", riderId: order.riderId }, { $set: { assignmentState: "rejected", riderId: null, assignmentExpiresAt: null }, $inc: { version: 1 } }).exec();
   await Rider.updateOne({ _id: order.riderId, activeOrderId: orderId }, { $set: { status: "available", activeOrderId: null } }).exec();
@@ -1071,10 +1172,23 @@ app.patch("/api/v1/rider-applications/:id/assign-fleet", requireRole("admin", "f
   return res.json({ application, fleet });
 });
 
+app.get("/api/v1/fleets/pending-partner-orders", requireRole("admin", "fleet", "commercial"), async (_req, res) => {
+  const orders = await Order.find({ paymentState: "paid", status: "pending", assignmentState: "unassigned" }).select("publicCode restaurantId totalCents createdAt status paymentState assignmentState").sort({ createdAt: 1 }).limit(100).lean().exec() as any[];
+  const restaurants = await Restaurant.find({ _id: { $in: orders.map((order) => order.restaurantId) } }).select("name").lean().exec() as any[];
+  const names = new Map(restaurants.map((restaurant) => [String(restaurant._id), restaurant.name]));
+  return res.json({ orders: orders.map((order) => ({ id: String(order._id), publicCode: order.publicCode, restaurant: names.get(String(order.restaurantId)) || "Restaurante", totalCents: order.totalCents, createdAt: order.createdAt, status: order.status, paymentState: order.paymentState, assignmentState: order.assignmentState })) });
+});
 app.get("/api/v1/admin/overview", requireRole("admin"), async (_req, res) => {
   const startOfDay = new Date(); startOfDay.setHours(0, 0, 0, 0);
-  const [activeRestaurants, pendingRestaurants, riders, openOrders, deliveredToday] = await Promise.all([Restaurant.countDocuments({ isActive: true, onboardingStatus: "approved" }), Restaurant.countDocuments({ onboardingStatus: "pending_review" }), Rider.countDocuments(), Order.countDocuments({ status: { $in: ["pending", "accepted", "preparing", "ready_for_pickup", "picked_up", "on_the_way"] } }), Order.countDocuments({ status: "delivered", deliveredAt: { $gte: startOfDay } })]);
-  res.json({ service: "piki-api", overview: { active_restaurants: activeRestaurants, pending_restaurants: pendingRestaurants, riders, open_orders: openOrders, delivered_today: deliveredToday } });
+  const [activeRestaurants, pendingRestaurants, riders, openOrders, deliveredToday, gmv] = await Promise.all([
+    Restaurant.countDocuments({ isActive: true, onboardingStatus: "approved" }),
+    Restaurant.countDocuments({ onboardingStatus: "pending_review" }),
+    Rider.countDocuments(),
+    Order.countDocuments({ status: { $in: ["pending", "accepted", "preparing", "ready_for_pickup", "picked_up", "on_the_way"] } }),
+    Order.countDocuments({ status: "delivered", deliveredAt: { $gte: startOfDay } }),
+    Order.aggregate([{ $match: { paymentState: "paid", createdAt: { $gte: startOfDay } } }, { $group: { _id: null, totalCents: { $sum: "$totalCents" }, orders: { $sum: 1 } } }]),
+  ]);
+  res.json({ service: "piki-api", overview: { active_restaurants: activeRestaurants, pending_restaurants: pendingRestaurants, riders, open_orders: openOrders, delivered_today: deliveredToday, gmv_today_cents: Number(gmv[0]?.totalCents || 0), paid_orders_today: Number(gmv[0]?.orders || 0) } });
 });
 
 app.get("/api/v1/admin/operations/live", requireRole("admin"), async (_req, res) => {
@@ -1128,7 +1242,7 @@ app.use((error: any, req: express.Request, res: express.Response, next: express.
 
 async function start() {
   const uri = process.env.MONGODB_URI;
-  if (uri) { await mongoose.connect(uri, { dbName: databaseName, serverSelectionTimeoutMS: 10_000 }); await ensureIndexes(); if (process.env.SEED_DEMO_DATA === "true") await seedCatalog(); databaseReady = true; } else console.warn("MONGODB_URI is not configured; /ready will remain unavailable.");
+  if (uri) { await mongoose.connect(uri, { dbName: databaseName, serverSelectionTimeoutMS: 10_000 }); await ensureIndexes(); startRealtimeRelay(); if (process.env.SEED_DEMO_DATA === "true") await seedCatalog(); databaseReady = true; } else console.warn("MONGODB_URI is not configured; /ready will remain unavailable.");
   await EmployeeSession.init();
   const server = app.listen(port, "0.0.0.0", () => console.log(`PIKI API listening on port ${port}`));
   const sweepTimer = setInterval(() => { void runAutomaticDispatchSweep().catch((error) => console.error("Automatic dispatch sweep crashed", error)); }, 5_000).unref();

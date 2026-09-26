@@ -35,7 +35,10 @@ npm run seed
 | `GET` | `/api/v1/fleets/overview` | Resume flotas y pedidos operativos. |
 | `POST` | `/api/v1/orders` | Valida catálogo, recalcula importes y crea un pedido pendiente de pago. |
 | `POST` | `/api/v1/payments/checkout` | Crea una Checkout Session de Stripe usando los importes guardados en MongoDB. |
-| `POST` | `/api/v1/payments/webhook` | Verifica `Stripe-Signature`, deduplica eventos y actualiza el estado de pago. |
+| `POST` | `/api/webhooks/stripe` | Endpoint canónico Stripe: verifica `Stripe-Signature`, deduplica y activa el pedido pagado. |
+| `POST` | `/api/v1/payments/webhook` | Alias compatible del endpoint canónico Stripe. |
+| `GET` | `/api/v1/realtime/events` | Stream SSE autenticado y reanudable de eventos operativos por superficie. |
+| `GET` | `/api/v1/fleets/pending-partner-orders` | Cola Fleet de pedidos pagados que esperan aceptación del Partner. |
 
 ## Configuración Stripe en modo test
 
@@ -46,7 +49,18 @@ STRIPE_SECRET_KEY=sk_test_...
 STRIPE_WEBHOOK_SECRET=whsec_...
 ```
 
-El endpoint público del webhook es `https://api.pikidelivery.com/api/v1/payments/webhook`. Stripe requiere el cuerpo crudo para verificar la firma; por eso la ruta se registra antes de `express.json()`. Los eventos se deduplican en la colección `stripe_events` usando `event.id`. El cliente no debe marcar un pedido como pagado a partir de `success_url`: la confirmación válida es el webhook verificado.
+Configura en Stripe el endpoint público **`https://api.pikidelivery.com/api/webhooks/stripe`** y suscríbelo, como mínimo, a `checkout.session.completed`, `checkout.session.async_payment_succeeded` y `payment_intent.succeeded`. La ruta histórica `/api/v1/payments/webhook` sigue disponible para no romper configuraciones anteriores.
+
+Stripe requiere el cuerpo crudo para verificar la firma; por eso la ruta se registra antes de `express.json()`. Los eventos se deduplican en la colección `stripe_events` usando `event.id`. El cliente no debe marcar un pedido como pagado a partir de `success_url`: la confirmación válida es el webhook firmado.
+
+## Flujo de pedido pagado en tiempo real
+
+1. El webhook válido mueve de forma idempotente el pedido a `paymentState=paid`, `status=pending` y `assignmentState=unassigned`.
+2. La API escribe eventos persistentes en `realtime_events` (retención de 24 h) y los entrega por SSE; MongoDB Change Streams los replica cuando Render usa más de una instancia.
+3. Partner recibe `order.awaiting_partner_acceptance` y mantiene la alarma hasta pulsar **Aceptar pedido**. Fleet lo muestra en **Pedidos por asignar** y no reserva rider todavía. Admin recalcula GMV y pedidos abiertos.
+4. Customer recibe el texto de estado en directo. Rider solo recibe una oferta después de la aceptación del Partner y de la reserva segura de asignación.
+
+Los clientes deben enviar `X-PIKI-Surface`, credenciales válidas y conservar `Last-Event-ID`; así pueden recuperar eventos tras una pérdida temporal de red sin solicitar un refresco manual.
 
 ## Seguridad de configuración
 

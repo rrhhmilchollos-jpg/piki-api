@@ -33,7 +33,7 @@ function getSession(req: Request) {
   const cookie = req.header("cookie")?.split(";").map((part) => part.trim()).find((part) => part.startsWith(`${COOKIE}=`));
   return cookie ? cookie.slice(COOKIE.length + 1) : null;
 }
-async function currentUser(req: Request) { const raw = getSession(req); return raw ? CustomerAccount.findOne({ sessionHash: hashToken(raw) }).lean().exec() : null; }
+export async function currentCustomer(req: Request) { const raw = getSession(req); return raw ? CustomerAccount.findOne({ sessionHash: hashToken(raw) }).lean().exec() : null; }
 function setSession(res: Response, userId: string) { const raw = randomBytes(32).toString("base64url"); void CustomerAccount.updateOne({ _id: userId }, { $set: { sessionHash: hashToken(raw), lastSignedIn: new Date() } }).exec(); res.setHeader("Set-Cookie", `${COOKIE}=${raw}; Max-Age=31536000; Path=/; HttpOnly; Secure; SameSite=None`); }
 function restaurantView(row: any) {
   return { id: String(row._id), name: row.name, cuisine: row.cuisine, category: row.category, tagline: row.tagline || "Descubre este establecimiento en PIKI.", eta: `${row.etaMinutes?.[0] || 20}–${row.etaMinutes?.[1] || 35} min`, fee: (row.deliveryFeeCents || 0) / 100, rating: row.rating || 0, reviews: row.reviews || 0, promoted: row.promoted, image: row.image || "", accent: row.accent || "#FFD72E", menu: (row.menu || []).map((item: any) => ({ id: item.id, name: item.name, description: item.description || "", price: item.price, vegetarian: Boolean(item.vegetarian), popular: Boolean(item.popular) })) };
@@ -54,7 +54,7 @@ export async function handleCustomerTrpc(req: Request, res: Response) {
       const row = await Restaurant.findById(input?.id).lean().exec();
       return reply(res, row ? restaurantView(row) : null);
     }
-    if (procedure === "auth.me") return reply(res, await currentUser(req).then((user) => publicUser(user)));
+    if (procedure === "auth.me") return reply(res, await currentCustomer(req).then((user) => publicUser(user)));
     if (procedure === "auth.register") {
       const name = String(input?.name || "").trim(); const email = String(input?.email || "").trim().toLowerCase(); const password = String(input?.password || "");
       if (name.length < 2 || !email.includes("@") || password.length < 8) return fail(res, "Datos de cuenta no válidos");
@@ -68,7 +68,7 @@ export async function handleCustomerTrpc(req: Request, res: Response) {
     }
     if (procedure === "auth.logout") { res.clearCookie(COOKIE); return reply(res, { success: true }); }
     if (procedure === "order.messages" || procedure === "order.sendMessage") {
-      const user = await currentUser(req) as any;
+      const user = await currentCustomer(req) as any;
       if (!user) return fail(res, "Debes iniciar sesión para consultar el chat", "AUTH_REQUIRED");
       const publicCode = String(input?.id || "").trim();
       if (!publicCode) return fail(res, "Pedido no válido", "BAD_REQUEST");
@@ -87,7 +87,7 @@ export async function handleCustomerTrpc(req: Request, res: Response) {
       return reply(res, { id: String(message._id), senderRole: message.senderRole, body: message.body, createdAt: message.createdAt });
     }
     if (procedure === "order.create" || procedure === "order.checkout") {
-      const user = await currentUser(req) as any;
+      const user = await currentCustomer(req) as any;
       if (!user) return fail(res, "Debes iniciar sesión para realizar pedidos", "AUTH_REQUIRED");
       const restaurant = await Restaurant.findById(input?.restaurantId).lean().exec() as any;
       if (!restaurant) return fail(res, "Restaurante no encontrado", "NOT_FOUND");

@@ -39,6 +39,34 @@ const passkeyCredentialSchema = new Schema({
   deviceName: { type: String, default: "" },
 }, { timestamps: true, collection: "passkey_credentials" });
 passkeyCredentialSchema.index({ ownerType: 1, ownerId: 1 });
+const realtimeEventSchema = new Schema({
+  channel: { type: String, enum: ["partner", "fleet", "admin", "rider", "customer"], required: true, index: true },
+  audienceKey: { type: String, required: true, index: true },
+  type: { type: String, required: true, index: true },
+  payload: { type: Schema.Types.Mixed, required: true },
+  dedupeKey: { type: String },
+}, { timestamps: true, collection: "realtime_events" });
+realtimeEventSchema.index({ channel: 1, audienceKey: 1, _id: 1 });
+realtimeEventSchema.index({ dedupeKey: 1 }, { unique: true, sparse: true });
+realtimeEventSchema.index({ createdAt: 1 }, { expireAfterSeconds: 86_400 });
+const pushSubscriptionSchema = new Schema({
+  surface: { type: String, enum: ["customer", "partner", "fleet", "admin", "rider"], required: true, index: true },
+  ownerType: { type: String, enum: ["customer", "employee"], required: true, index: true },
+  ownerId: { type: Schema.Types.ObjectId, required: true, index: true },
+  endpoint: { type: String, required: true, select: false },
+  endpointHash: { type: String, required: true, index: true },
+  keys: {
+    p256dh: { type: String, required: true, select: false },
+    auth: { type: String, required: true, select: false },
+  },
+  expirationTime: { type: Number, default: null },
+  status: { type: String, enum: ["active", "revoked", "expired", "failed"], default: "active", index: true },
+  failureCount: { type: Number, default: 0 },
+  lastSuccessAt: { type: Date, default: null },
+  lastFailureAt: { type: Date, default: null },
+}, { timestamps: true, collection: "push_subscriptions" });
+pushSubscriptionSchema.index({ ownerType: 1, ownerId: 1, surface: 1, endpointHash: 1 }, { unique: true });
+pushSubscriptionSchema.index({ surface: 1, status: 1, updatedAt: -1 });
 const riderAssignmentReservationSchema = new Schema({
   riderId: { type: Schema.Types.ObjectId, ref: "Rider", required: true, index: true },
   orderId: { type: Schema.Types.ObjectId, ref: "Order", required: true, unique: true, index: true },
@@ -105,6 +133,8 @@ export const EmployeeAccount = mongoose.models.EmployeeAccount || mongoose.model
 export const RiderSlot = mongoose.models.RiderSlot || mongoose.model("RiderSlot", riderSlotSchema);
 export const SignatureRequest = mongoose.models.SignatureRequest || mongoose.model("SignatureRequest", signatureRequestSchema);
 export const PasskeyCredential = mongoose.models.PasskeyCredential || mongoose.model("PasskeyCredential", passkeyCredentialSchema);
+export const PushSubscription = mongoose.models.PushSubscription || mongoose.model("PushSubscription", pushSubscriptionSchema);
+export const RealtimeEvent = mongoose.models.RealtimeEvent || mongoose.model("RealtimeEvent", realtimeEventSchema);
 export const RiderAssignmentReservation = mongoose.models.RiderAssignmentReservation || mongoose.model("RiderAssignmentReservation", riderAssignmentReservationSchema);
 
 export async function ensureIndexes() {
@@ -114,7 +144,7 @@ export async function ensureIndexes() {
       if (error?.codeName !== "IndexNotFound" && error?.code !== 27) throw error;
     }
   }
-  await Promise.all([Restaurant.init(), PartnerAsset.init(), PartnerLocalityGroup.init(), Fleet.init(), Order.init(), Zone.init(), StripeEvent.init(), DispatchDecision.init(), RiderIncident.init(), RiderOrderMessage.init(), RiderApplication.init(), CustomerAccount.init(), RiderSlot.init(), SignatureRequest.init(), PasskeyCredential.init(), RiderAssignmentReservation.init()]);
+  await Promise.all([Restaurant.init(), PartnerAsset.init(), PartnerLocalityGroup.init(), Fleet.init(), Order.init(), Zone.init(), StripeEvent.init(), DispatchDecision.init(), RiderIncident.init(), RiderOrderMessage.init(), RiderApplication.init(), CustomerAccount.init(), RiderSlot.init(), SignatureRequest.init(), PasskeyCredential.init(), PushSubscription.init(), RealtimeEvent.init(), RiderAssignmentReservation.init()]);
   const ridersWithoutCode = await Rider.find({ $or: [{ riderCode: { $exists: false } }, { riderCode: null }, { riderCode: "" }] }).select("_id").lean().exec();
   for (const rider of ridersWithoutCode) {
     const base = `PIKI-R-${String(rider._id).slice(-6).toUpperCase()}`;
