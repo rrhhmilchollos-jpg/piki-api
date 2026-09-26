@@ -77,8 +77,9 @@ export async function syncVersionPolicy(surface: PikiSurface): Promise<VersionPo
     const response = await fetch(releaseUrls[surface], { cache: "no-store", signal: controller.signal });
     if (!response.ok) throw new Error(`release metadata HTTP ${response.status}`);
     const body = await response.json() as Record<string, unknown>;
-    if (body.surface !== surface) throw new Error("release metadata surface mismatch");
-    const parsed = versionPolicySchema.safeParse(body);
+    const { surface: releaseSurface, ...releasePolicy } = body;
+    if (releaseSurface !== surface) throw new Error("release metadata surface mismatch");
+    const parsed = versionPolicySchema.safeParse(releasePolicy);
     if (!parsed.success) throw new Error("release metadata is invalid");
     policies = { ...policies, [surface]: parsed.data };
   } catch (error) {
