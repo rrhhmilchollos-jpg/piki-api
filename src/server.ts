@@ -101,7 +101,10 @@ app.post("/api/v1/auth/employee/login", async (req, res) => {
   const token = createSessionToken(); employee.sessionHash = hashSessionToken(token); employee.lastLoginAt = new Date(); await employee.save();
   return res.json({ accessToken: token, requiresPasswordChange: Boolean(employee.mustChangePassword), employee: { id: employee.id, name: employee.name, email: employee.email, jobRole: employee.jobRole, apiRole: employee.apiRole, portfolioId: employee.portfolioId, fleetId: employee.fleetId, zoneSlugs: employee.zoneSlugs } });
 });
-app.get("/api/v1/auth/employee/me", requireRole("admin", "partner", "rider", "fleet", "commercial"), async (req, res) => res.json({ employee: { id: req.auth?.employeeId, role: req.auth?.role, mustChangePassword: Boolean(req.auth?.mustChangePassword) } }));
+app.get("/api/v1/auth/employee/me", requireRole("admin", "partner", "rider", "fleet", "commercial"), async (req, res) => {
+  const employee = req.auth?.employeeId ? await EmployeeAccount.findById(req.auth.employeeId).select("email ownerProtected").lean().exec() as any : null;
+  return res.json({ employee: { id: req.auth?.employeeId, email: employee?.email || null, role: req.auth?.role, ownerProtected: Boolean(employee?.ownerProtected), mustChangePassword: Boolean(req.auth?.mustChangePassword) } });
+});
 app.post("/api/v1/auth/employee/change-password", requireRole("admin", "partner", "rider", "fleet", "commercial"), async (req, res) => {
   const parsed = z.object({ currentPassword: z.string().min(8), newPassword: z.string().min(12).max(200).regex(/[A-Z]/).regex(/[a-z]/).regex(/[0-9]/) }).safeParse(req.body);
   if (!parsed.success || !req.auth?.employeeId) return res.status(400).json({ error: "INVALID_PASSWORD_CHANGE", message: "La contraseña debe tener 12 caracteres, mayúscula, minúscula y número." });
