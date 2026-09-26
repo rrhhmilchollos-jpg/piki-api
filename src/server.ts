@@ -372,11 +372,21 @@ app.get("/api/v1/coverage", async (req, res) => {
   const latitude = Number(req.query.latitude); const longitude = Number(req.query.longitude);
   if (!validateCoordinates(latitude, longitude)) return res.status(400).json({ error: "INVALID_COORDINATES" });
   const coverage = evaluateXativaCoverage([longitude, latitude]);
-  const restaurants = coverage.covered
-    ? await Restaurant.find({ isActive: true, onboardingStatus: "approved" }).select("-partnerProfile -commercialEmployeeId -email").sort({ promoted: -1, rating: -1, reviews: -1 }).lean().exec()
-    : [];
+  let restaurants: unknown[] = [];
+  let catalogAvailable = true;
+  if (coverage.covered) {
+    try {
+      restaurants = await Restaurant.find({ isActive: true, onboardingStatus: "approved" }).select("-partnerProfile -commercialEmployeeId -email").sort({ promoted: -1, rating: -1, reviews: -1 }).lean().exec();
+    } catch (error) {
+      // The price decision is deterministic and must never disappear because a
+      // catalogue/index query is temporarily unavailable. The storefront has
+      // its own catalogue endpoints and can retry them independently.
+      catalogAvailable = false;
+      console.warn("Coverage catalogue query failed", error instanceof Error ? error.message : error);
+    }
+  }
   res.setHeader("Cache-Control", "no-store, max-age=0");
-  res.json({ ...coverage, restaurants });
+  res.json({ ...coverage, catalogAvailable, restaurants });
 });
 
 const partnerDocumentSchema = z.object({ type: z.enum(["tax_id", "bank_certificate", "insurance", "activity_license", "food_sanitary_authorization", "identity", "other"]), fileName: z.string().min(1).max(180), mimeType: z.enum(["application/pdf", "image/jpeg", "image/png"]), sizeBytes: z.number().int().positive().max(2_500_000), sha256: z.string().regex(/^[a-f0-9]{64}$/), contentBase64: z.string().min(20).max(3_500_000) });
