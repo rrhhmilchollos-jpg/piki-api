@@ -539,8 +539,8 @@ app.post("/api/v1/riders/:riderId/orders/:orderId/confirm-delivery", requireRole
   const orderId = objectId(Array.isArray(req.params.orderId) ? req.params.orderId[0] : req.params.orderId);
   if (!riderId || !orderId || !req.auth?.employeeId) return res.status(400).json({ error: "INVALID_DELIVERY_CONFIRMATION" });
   const employee = await EmployeeAccount.findById(req.auth.employeeId).select("email").lean().exec() as any;
-  const rider = employee ? await Rider.findOne({ _id: riderId, email: employee.email }).select("_id").lean().exec() : null;
-  if (!rider) return res.status(403).json({ error: "RIDER_ACCESS_DENIED" });
+  const riderAccess = employee ? await Rider.findOne({ _id: riderId, email: employee.email }).select("_id").lean().exec() : null;
+  if (!riderAccess) return res.status(403).json({ error: "RIDER_ACCESS_DENIED" });
   const order = await Order.findOne({ _id: orderId, riderId, assignmentState: "assigned" }).lean().exec() as any;
   if (!order) return res.status(404).json({ error: "ASSIGNED_ORDER_NOT_FOUND" });
   if (order.status !== "on_the_way") return res.status(409).json({ error: "ORDER_NOT_ON_THE_WAY", message: "Primero confirma que has recogido el pedido e iniciado la ruta." });
@@ -766,9 +766,13 @@ app.get("/api/v1/riders/:id/offers", requireRole("rider"), async (req, res) => {
   const rider = employee ? await Rider.findOne({ _id: riderId, email: employee.email }).select("_id").lean().exec() : null;
   if (!rider) return res.status(403).json({ error: "RIDER_ACCESS_DENIED" });
   const offers = await Order.find({ riderId, assignmentState: { $in: ["offered", "assigned"] }, status: { $nin: ["delivered", "cancelled"] } })
-    .select("_id publicCode displayCode displayCodeDate restaurantId status paymentState assignmentState assignmentExpiresAt deliveryAddress items createdAt")
-    .sort({ createdAt: -1 }).limit(10).lean().exec();
-  return res.json({ offers, refreshedAt: new Date().toISOString() });
+    .select("_id publicCode displayCode displayCodeDate restaurantId riderId status paymentState assignmentState assignmentExpiresAt deliveryAddress deliveryLocation items createdAt")
+    .sort({ createdAt: -1 }).limit(10).lean().exec() as any[];
+  const riderProfile = await Rider.findById(riderId).select("vehicle").lean().exec() as any;
+  const phase: Record<string, string> = { ready_for_pickup: "going_to_restaurant", picked_up: "waiting_for_food", on_the_way: "going_to_customer" };
+  const now = Date.now();
+  const enrichedOffers = offers.map((offer) => ({ ...offer, vehicle: riderProfile?.vehicle || "unknown", phase: phase[offer.status] || "assigned", etaMinutes: offer.assignmentExpiresAt ? Math.max(0, Math.ceil((new Date(offer.assignmentExpiresAt).getTime() - now) / 60000)) : null, displayCode: offer.displayCode || null }));
+  return res.json({ offers: enrichedOffers, refreshedAt: new Date().toISOString() });
 });
 
 app.get("/api/v1/riders/operational-map", requireRole("rider"), async (req, res) => {
