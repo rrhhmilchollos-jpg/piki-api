@@ -53,6 +53,14 @@ function localityKey(value: string) { return value.trim().toLowerCase().normaliz
 function organizationFolder(locality: string, restaurantId: string) { return `partners/${localityKey(locality)}/${restaurantId}/menu`; }
 function publicAssetUrl(assetId: string) { return `${process.env.PUBLIC_API_URL || "https://api.pikidelivery.com"}/api/v1/catalog/assets/${assetId}`; }
 
+async function nextRiderCode() {
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    const riderCode = `PIKI-R-${randomInt(100000, 1000000)}`;
+    if (!(await Rider.exists({ riderCode }))) return riderCode;
+  }
+  throw new Error("RIDER_CODE_CAPACITY_REACHED");
+}
+
 function allowRiderApplication(ip: string) {
   const now = Date.now(); const current = riderApplicationAttempts.get(ip);
   if (!current || current.resetAt <= now) { riderApplicationAttempts.set(ip, { count: 1, resetAt: now + 15 * 60_000 }); return true; }
@@ -398,7 +406,8 @@ app.patch("/api/v1/rider-applications/:id/status", requireRole("admin", "fleet")
   const application = await RiderApplication.findByIdAndUpdate(id, { $set: update }, { new: true }).lean().exec() as any;
   if (!application) return res.status(404).json({ error: "APPLICATION_NOT_FOUND" });
   if (parsed.data.status === "approved") {
-    await Rider.findOneAndUpdate({ email: application.email }, { $set: { name: application.name, email: application.email, vehicle: application.vehicle, fleetId: application.assignedFleetId || null, status: "offline" } }, { upsert: true, new: true }).exec();
+    const existingRider = await Rider.findOne({ email: application.email }).select("_id riderCode").lean().exec() as any;
+    await Rider.findOneAndUpdate({ email: application.email }, { $set: { name: application.name, email: application.email, vehicle: application.vehicle, fleetId: application.assignedFleetId || null, status: "offline" }, $setOnInsert: { riderCode: existingRider?.riderCode || await nextRiderCode() } }, { upsert: true, new: true }).exec();
   }
   const documentReviewPending = (application.documents || []).some((document: any) => document.status !== "approved");
   return res.json({ application, documentReviewPending, warning: documentReviewPending ? "La solicitud se ha gestionado; el expediente documental continúa pendiente de revisión." : undefined });
@@ -592,7 +601,7 @@ app.post("/api/v1/riders/:id/location", requireRole("admin", "rider", "fleet"), 
   const id = objectId(parsed.data.riderId); if (!id) return res.status(400).json({ error: "INVALID_RIDER_ID" });
   const rider = await Rider.findByIdAndUpdate(id, { $set: { location: { type: "Point", coordinates: [parsed.data.longitude, parsed.data.latitude] }, lastLocationAt: new Date() } }, { new: true }).lean().exec() as any;
   if (!rider) return res.status(404).json({ error: "RIDER_NOT_FOUND" });
-  return res.json({ rider: { id: rider._id, status: rider.status, location: rider.location, lastLocationAt: rider.lastLocationAt } });
+  return res.json({ rider: { id: rider._id, riderCode: rider.riderCode, status: rider.status, location: rider.location, lastLocationAt: rider.lastLocationAt } });
 });
 app.patch("/api/v1/riders/:id/status", requireRole("admin", "rider", "fleet"), async (req, res) => {
   const idParam = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
@@ -605,7 +614,7 @@ app.patch("/api/v1/riders/:id/status", requireRole("admin", "rider", "fleet"), a
   }
   const rider = await Rider.findByIdAndUpdate(id, { $set: { status: parsed.data.status } }, { new: true }).lean().exec() as any;
   if (!rider) return res.status(404).json({ error: "RIDER_NOT_FOUND" });
-  return res.json({ rider: { id: rider._id, name: rider.name, status: rider.status, fleetId: rider.fleetId, lastLocationAt: rider.lastLocationAt } });
+  return res.json({ rider: { id: rider._id, riderCode: rider.riderCode, name: rider.name, status: rider.status, fleetId: rider.fleetId, lastLocationAt: rider.lastLocationAt } });
 });
 
 app.get("/api/v1/riders/:id/slots", requireRole("admin", "rider", "fleet"), async (req, res) => {
@@ -633,7 +642,7 @@ app.get("/api/v1/riders/session", requireRole("rider"), async (req, res) => {
   const employee = await EmployeeAccount.findById(employeeId).lean().exec() as any;
   const rider = employee ? await Rider.findOne({ email: employee.email }).lean().exec() as any : null;
   if (!rider) return res.status(404).json({ error: "RIDER_ACCOUNT_NOT_LINKED" });
-  return res.json({ rider: { id: rider._id, name: rider.name, email: rider.email, status: rider.status, fleetId: rider.fleetId } });
+  return res.json({ rider: { id: rider._id, riderCode: rider.riderCode, name: rider.name, email: rider.email, status: rider.status, fleetId: rider.fleetId } });
 });
 
 app.get("/api/v1/riders/:id/shift", requireRole("admin", "rider", "fleet"), async (req, res) => {
@@ -642,7 +651,7 @@ app.get("/api/v1/riders/:id/shift", requireRole("admin", "rider", "fleet"), asyn
   const rider = await Rider.findById(riderId).lean().exec() as any;
   if (!rider) return res.status(404).json({ error: "RIDER_NOT_FOUND" });
   const { now, slot } = await findCurrentRiderSlot(riderId);
-  return res.json({ rider: { id: rider._id, status: rider.status }, now, eligible: Boolean(slot), shift: slot });
+  return res.json({ rider: { id: rider._id, riderCode: rider.riderCode, status: rider.status }, now, eligible: Boolean(slot), shift: slot });
 });
 
 app.post("/api/v1/riders/:id/shift/start", requireRole("admin", "rider", "fleet"), async (req, res) => {
@@ -655,7 +664,7 @@ app.post("/api/v1/riders/:id/shift/start", requireRole("admin", "rider", "fleet"
   const currentSlot = slot as any;
   const updatedSlot = await RiderSlot.findOneAndUpdate({ _id: currentSlot._id, status: "planned" }, { $set: { status: "active" } }, { new: true }).lean().exec();
   await Rider.findByIdAndUpdate(riderId, { $set: { status: "available" } }).exec();
-  return res.json({ message: "Jornada iniciada", warningSound: "start_shift", rider: { id: riderId, status: "available" }, shift: updatedSlot });
+  return res.json({ message: "Jornada iniciada", warningSound: "start_shift", rider: { id: riderId, riderCode: rider.riderCode, status: "available" }, shift: updatedSlot });
 });
 
 app.post("/api/v1/riders/:id/shift/stop", requireRole("admin", "rider", "fleet"), async (req, res) => {
@@ -665,7 +674,7 @@ app.post("/api/v1/riders/:id/shift/stop", requireRole("admin", "rider", "fleet")
   if (slot) await RiderSlot.updateOne({ _id: (slot as any)._id }, { $set: { status: "completed" } }).exec();
   const rider = await Rider.findByIdAndUpdate(riderId, { $set: { status: "offline", activeOrderId: null } }, { new: true }).lean().exec() as any;
   if (!rider) return res.status(404).json({ error: "RIDER_NOT_FOUND" });
-  return res.json({ message: "Jornada finalizada", rider: { id: rider._id, status: rider.status } });
+  return res.json({ message: "Jornada finalizada", rider: { id: rider._id, riderCode: rider.riderCode, status: rider.status } });
 });
 
 app.post("/api/v1/riders/:id/slots", requireRole("admin", "fleet"), async (req, res) => {
@@ -928,13 +937,13 @@ app.get("/api/v1/admin/overview", requireRole("admin"), async (_req, res) => {
 });
 
 app.get("/api/v1/admin/operations/live", requireRole("admin"), async (_req, res) => {
-  const riders = await Rider.find({ location: { $exists: true } }).select("name email status vehicle location lastLocationAt activeOrderId fleetId").lean().exec() as any[];
+  const riders = await Rider.find({ location: { $exists: true } }).select("riderCode name email status vehicle location lastLocationAt activeOrderId fleetId").lean().exec() as any[];
   const activeOrderIds = riders.map((rider) => rider.activeOrderId).filter(Boolean);
   const orders = await Order.find({ _id: { $in: activeOrderIds } }).select("publicCode displayCode status assignmentState deliveryAddress restaurantId customerId riderId").select("+customerPhone").lean().exec() as any[];
   const restaurants = await Restaurant.find({ _id: { $in: orders.map((order) => order.restaurantId) } }).select("name address").lean().exec() as any[];
   const restaurantMap = new Map(restaurants.map((restaurant) => [String(restaurant._id), restaurant]));
   const orderMap = new Map(orders.map((order) => [String(order._id), { ...order, customerPhone: order.customerPhone || null, restaurant: restaurantMap.get(String(order.restaurantId)) || null }]));
-  return res.json({ refreshedAt: new Date().toISOString(), riders: riders.map((rider) => ({ id: rider._id, name: rider.name, status: rider.status, vehicle: rider.vehicle, location: rider.location, lastLocationAt: rider.lastLocationAt, activeOrder: rider.activeOrderId ? orderMap.get(String(rider.activeOrderId)) || null : null })) });
+  return res.json({ refreshedAt: new Date().toISOString(), riders: riders.map((rider) => ({ id: rider._id, riderCode: rider.riderCode, name: rider.name, status: rider.status, vehicle: rider.vehicle, location: rider.location, lastLocationAt: rider.lastLocationAt, activeOrder: rider.activeOrderId ? orderMap.get(String(rider.activeOrderId)) || null : null })) });
 });
 
 app.get("/api/v1/riders/overview", requireRole("admin", "rider", "fleet"), async (_req, res) => {

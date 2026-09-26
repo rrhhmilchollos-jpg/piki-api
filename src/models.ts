@@ -70,7 +70,7 @@ const restaurantSchema = new Schema({
 restaurantSchema.index({ location: "2dsphere" }, { sparse: true });
 restaurantSchema.index({ isActive: 1, category: 1, rating: -1 });
 
-const riderSchema = new Schema({ name: { type: String, required: true }, email: { type: String, required: true, unique: true }, fleetId: { type: Schema.Types.ObjectId, ref: "Fleet", default: null }, status: { type: String, enum: ["offline", "available", "busy", "paused"], default: "offline", index: true }, vehicle: { type: String, enum: ["bike", "electric_bike", "electric_scooter", "motorcycle", "scooter", "car"], default: "electric_scooter" }, location: { type: geoPoint, default: undefined }, lastLocationAt: { type: Date, default: null }, activeOrderId: { type: Schema.Types.ObjectId, ref: "Order", default: null }, reliabilityScore: { type: Number, min: 0, max: 1, default: 0.75 } }, { timestamps: true, collection: "riders" });
+const riderSchema = new Schema({ riderCode: { type: String, required: true, unique: true, index: true, immutable: true }, name: { type: String, required: true }, email: { type: String, required: true, unique: true }, fleetId: { type: Schema.Types.ObjectId, ref: "Fleet", default: null }, status: { type: String, enum: ["offline", "available", "busy", "paused"], default: "offline", index: true }, vehicle: { type: String, enum: ["bike", "electric_bike", "electric_scooter", "motorcycle", "scooter", "car"], default: "electric_scooter" }, location: { type: geoPoint, default: undefined }, lastLocationAt: { type: Date, default: null }, activeOrderId: { type: Schema.Types.ObjectId, ref: "Order", default: null }, reliabilityScore: { type: Number, min: 0, max: 1, default: 0.75 } }, { timestamps: true, collection: "riders" });
 riderSchema.index({ location: "2dsphere" }, { sparse: true });
 const riderSlotSchema = new Schema({ riderId: { type: Schema.Types.ObjectId, ref: "Rider", required: true, index: true }, zoneSlug: { type: String, required: true }, date: { type: String, required: true }, startTime: { type: String, required: true }, endTime: { type: String, required: true }, status: { type: String, enum: ["planned", "active", "completed", "cancelled"], default: "planned" }, notes: { type: String, default: "" } }, { timestamps: true, collection: "rider_slots" });
 riderSlotSchema.index({ riderId: 1, date: 1, startTime: 1 }, { unique: true });
@@ -107,4 +107,14 @@ export const SignatureRequest = mongoose.models.SignatureRequest || mongoose.mod
 export const PasskeyCredential = mongoose.models.PasskeyCredential || mongoose.model("PasskeyCredential", passkeyCredentialSchema);
 export const RiderAssignmentReservation = mongoose.models.RiderAssignmentReservation || mongoose.model("RiderAssignmentReservation", riderAssignmentReservationSchema);
 
-export async function ensureIndexes() { await Promise.all([Restaurant.init(), PartnerAsset.init(), PartnerLocalityGroup.init(), Rider.init(), Fleet.init(), Order.init(), Zone.init(), StripeEvent.init(), DispatchDecision.init(), RiderIncident.init(), RiderOrderMessage.init(), RiderApplication.init(), CustomerAccount.init(), EmployeeAccount.init(), RiderSlot.init(), SignatureRequest.init(), PasskeyCredential.init(), RiderAssignmentReservation.init()]); }
+export async function ensureIndexes() {
+  await Promise.all([Restaurant.init(), PartnerAsset.init(), PartnerLocalityGroup.init(), Rider.init(), Fleet.init(), Order.init(), Zone.init(), StripeEvent.init(), DispatchDecision.init(), RiderIncident.init(), RiderOrderMessage.init(), RiderApplication.init(), CustomerAccount.init(), EmployeeAccount.init(), RiderSlot.init(), SignatureRequest.init(), PasskeyCredential.init(), RiderAssignmentReservation.init()]);
+  const ridersWithoutCode = await Rider.find({ $or: [{ riderCode: { $exists: false } }, { riderCode: null }, { riderCode: "" }] }).select("_id").lean().exec();
+  for (const rider of ridersWithoutCode) {
+    const base = `PIKI-R-${String(rider._id).slice(-6).toUpperCase()}`;
+    let riderCode = base;
+    let suffix = 1;
+    while (await Rider.exists({ riderCode })) riderCode = `${base}-${suffix++}`;
+    await Rider.updateOne({ _id: rider._id, $or: [{ riderCode: { $exists: false } }, { riderCode: null }, { riderCode: "" }] }, { $set: { riderCode } }).exec();
+  }
+}
