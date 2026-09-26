@@ -82,6 +82,7 @@ async function activeOrderCounts(riderIds: mongoose.Types.ObjectId[]) {
   return new Map(rows.map((row: any) => [String(row._id), Number(row.count)]));
 }
 
+app.get("/", (_req, res) => res.json({ service: "piki-api", name: "PIKI Delivery API", version: "0.2.0", status: databaseReady ? "ready" : "initializing", health: "/health", readiness: "/ready" }));
 app.get("/health", (_req, res) => res.json({ service: "piki-api", status: "ok", version: "0.2.0", environment: process.env.NODE_ENV || "development" }));
 app.get("/ready", (_req, res) => {
   if (!databaseReady || mongoose.connection.readyState !== 1) return res.status(503).json({ service: "piki-api", status: "not_ready", database: "unavailable" });
@@ -513,8 +514,7 @@ app.post("/api/v1/orders/:id/transitions", requireRole("admin", "partner", "ride
   const actorRole = req.auth?.role === "admin" ? parsed.data.actorRole : req.auth?.role;
   if (!actorRole) return res.status(401).json({ error: "AUTHENTICATION_REQUIRED" });
   if (actorRole === "rider") {
-    const employee = req.auth?.employeeId ? await EmployeeAccount.findById(req.auth.employeeId).select("email").lean().exec() as any : null;
-    const rider = employee ? await Rider.findOne({ _id: order.riderId, email: employee.email }).select("_id").lean().exec() : null;
+    const rider = await riderAccessForRequest(order.riderId, req);
     if (!rider) return res.status(403).json({ error: "RIDER_ORDER_ACCESS_DENIED" });
   }
   try { assertTransition(order.status, parsed.data.status, actorRole); } catch (error) { return res.status(409).json({ error: "INVALID_ORDER_TRANSITION", message: error instanceof Error ? error.message : "Transition not allowed" }); }
@@ -531,12 +531,24 @@ app.post("/api/v1/orders/:id/transitions", requireRole("admin", "partner", "ride
   return res.json({ order: updated });
 });
 
+async function riderAccessForRequest(riderId: any, req: express.Request) {
+  if (!riderId || req.auth?.role !== "rider") return null;
+  if (req.auth.employeeId) {
+    const employee = await EmployeeAccount.findById(req.auth.employeeId).select("email").lean().exec() as any;
+    return employee ? await Rider.findOne({ _id: riderId, email: employee.email }).select("_id vehicle email").lean().exec() : null;
+  }
+  // El token técnico nunca sirve para todos los riders: queda limitado por configuración a uno.
+  const scopedRiderId = String(process.env.RIDER_API_RIDER_ID || "").trim();
+  return scopedRiderId && String(riderId) === scopedRiderId
+    ? await Rider.findById(riderId).select("_id vehicle email").lean().exec()
+    : null;
+}
+
 const riderMessageSchema = z.object({ body: z.string().trim().min(1).max(500) });
 async function riderOrderAccess(riderIdParam: string, orderIdParam: string, req: express.Request) {
   const riderId = objectId(riderIdParam); const orderId = objectId(orderIdParam);
-  if (!riderId || !orderId || !req.auth?.employeeId) return null;
-  const employee = await EmployeeAccount.findById(req.auth.employeeId).select("email").lean().exec() as any;
-  const rider = employee ? await Rider.findOne({ _id: riderId, email: employee.email }).select("_id").lean().exec() : null;
+  if (!riderId || !orderId) return null;
+  const rider = await riderAccessForRequest(riderId, req);
   if (!rider) return null;
   return await Order.findOne({ _id: orderId, riderId, assignmentState: "assigned", status: { $nin: ["delivered", "cancelled"] } }).select("_id riderId status").lean().exec() as any;
 }
@@ -548,7 +560,7 @@ app.get("/api/v1/riders/:riderId/orders/:orderId/messages", requireRole("rider")
 });
 app.post("/api/v1/riders/:riderId/orders/:orderId/messages", requireRole("rider"), async (req, res) => {
   const order = await riderOrderAccess(String(req.params.riderId), String(req.params.orderId), req);
-  if (!order || !req.auth?.employeeId) return res.status(403).json({ error: "RIDER_ORDER_ACCESS_DENIED" });
+  if (!order) return res.status(403).json({ error: "RIDER_ORDER_ACCESS_DENIED" });
   const parsed = riderMessageSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_MESSAGE", details: parsed.error.flatten() });
   const message = await RiderOrderMessage.create({ orderId: order._id, riderId: order.riderId, senderRole: "rider", body: parsed.data.body });
@@ -557,9 +569,8 @@ app.post("/api/v1/riders/:riderId/orders/:orderId/messages", requireRole("rider"
 app.post("/api/v1/riders/:riderId/orders/:orderId/confirm-delivery", requireRole("rider"), async (req, res) => {
   const riderId = objectId(Array.isArray(req.params.riderId) ? req.params.riderId[0] : req.params.riderId);
   const orderId = objectId(Array.isArray(req.params.orderId) ? req.params.orderId[0] : req.params.orderId);
-  if (!riderId || !orderId || !req.auth?.employeeId) return res.status(400).json({ error: "INVALID_DELIVERY_CONFIRMATION" });
-  const employee = await EmployeeAccount.findById(req.auth.employeeId).select("email").lean().exec() as any;
-  const riderAccess = employee ? await Rider.findOne({ _id: riderId, email: employee.email }).select("_id").lean().exec() : null;
+  if (!riderId || !orderId) return res.status(400).json({ error: "INVALID_DELIVERY_CONFIRMATION" });
+  const riderAccess = await riderAccessForRequest(riderId, req);
   if (!riderAccess) return res.status(403).json({ error: "RIDER_ACCESS_DENIED" });
   const order = await Order.findOne({ _id: orderId, riderId, assignmentState: "assigned" }).lean().exec() as any;
   if (!order) return res.status(404).json({ error: "ASSIGNED_ORDER_NOT_FOUND" });
@@ -782,9 +793,8 @@ app.post("/api/v1/dispatch/orders/:id/offer-response", requireRole("rider", "adm
 
 app.post("/api/v1/riders/:id/test-orders", requireRole("rider"), async (req, res) => {
   const riderId = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
-  if (!riderId || !req.auth?.employeeId) return res.status(400).json({ error: "INVALID_RIDER_SESSION" });
-  const employee = await EmployeeAccount.findById(req.auth.employeeId).select("email").lean().exec() as any;
-  const rider = employee ? await Rider.findOne({ _id: riderId, email: employee.email }).lean().exec() as any : null;
+  if (!riderId) return res.status(400).json({ error: "INVALID_RIDER_SESSION" });
+  const rider = await riderAccessForRequest(riderId, req) as any;
   if (!rider) return res.status(403).json({ error: "RIDER_ACCESS_DENIED" });
   const existing = await Order.findOne({ riderId, isTestOrder: true, status: { $nin: ["delivered", "cancelled"] } }).select("_id publicCode").lean().exec();
   if (existing) return res.status(409).json({ error: "TEST_ORDER_ALREADY_ACTIVE", order: existing });
@@ -800,9 +810,8 @@ app.post("/api/v1/riders/:id/test-orders", requireRole("rider"), async (req, res
 
 app.get("/api/v1/riders/:id/offers", requireRole("rider"), async (req, res) => {
   const riderId = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
-  if (!riderId || !req.auth?.employeeId) return res.status(400).json({ error: "INVALID_RIDER_SESSION" });
-  const employee = await EmployeeAccount.findById(req.auth.employeeId).select("email").lean().exec() as any;
-  const rider = employee ? await Rider.findOne({ _id: riderId, email: employee.email }).select("_id").lean().exec() : null;
+  if (!riderId) return res.status(400).json({ error: "INVALID_RIDER_SESSION" });
+  const rider = await riderAccessForRequest(riderId, req);
   if (!rider) return res.status(403).json({ error: "RIDER_ACCESS_DENIED" });
   const offers = await Order.find({ riderId, assignmentState: { $in: ["offered", "assigned"] }, status: { $nin: ["delivered", "cancelled"] } })
     .select("_id publicCode displayCode displayCodeDate restaurantId customerId riderId status paymentState assignmentState assignmentExpiresAt deliveryAddress deliveryLocation items createdAt")
