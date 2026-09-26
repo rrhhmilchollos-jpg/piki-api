@@ -49,6 +49,13 @@ const riderAssignmentReservationSchema = new Schema({
 }, { timestamps: true, collection: "rider_assignment_reservations" });
 riderAssignmentReservationSchema.index({ riderId: 1, status: 1, slot: 1 }, { unique: true, partialFilterExpression: { status: "reserved" } });
 const dispatchDecisionSchema = new Schema({ orderId: { type: Schema.Types.ObjectId, ref: "Order", required: true, index: true }, riderId: { type: Schema.Types.ObjectId, ref: "Rider", default: null, index: true }, algorithmVersion: { type: String, required: true }, score: { type: Number, required: true }, pickupDistanceKm: { type: Number, required: true }, pickupEtaMinutes: { type: Number, required: true }, customerEtaMinutes: { type: Number, required: true }, totalEtaMinutes: { type: Number, required: true }, reasons: { type: [String], default: [] }, outcome: { type: String, enum: ["preview", "offered", "accepted", "rejected", "expired", "race_lost"], required: true }, actorRole: { type: String, default: "system" } }, { timestamps: true, collection: "dispatch_decisions" });
+const riderOrderMessageSchema = new Schema({
+  orderId: { type: Schema.Types.ObjectId, ref: "Order", required: true, index: true },
+  riderId: { type: Schema.Types.ObjectId, ref: "Rider", required: true, index: true },
+  senderRole: { type: String, enum: ["rider", "customer", "admin"], required: true },
+  body: { type: String, required: true, trim: true, maxlength: 500 },
+}, { timestamps: true, collection: "rider_order_messages" });
+riderOrderMessageSchema.index({ orderId: 1, createdAt: 1 });
 const riderIncidentSchema = new Schema({ riderId: { type: Schema.Types.ObjectId, ref: "Rider", required: true, index: true }, reason: { type: String, required: true, enum: ["late_acceptance", "late_delivery", "no_show", "unsafe_driving", "fraud_signal", "customer_complaint", "document_expired", "other"] }, evidence: { type: [String], default: [] }, acknowledged: { type: Boolean, default: false }, resolved: { type: Boolean, default: false }, occurredAt: { type: Date, default: Date.now }, createdByRole: { type: String, required: true } }, { timestamps: true, collection: "rider_incidents" });
 riderIncidentSchema.index({ riderId: 1, occurredAt: -1 });
 const riderDocumentSchema = new Schema({ type: { type: String, enum: ["identity", "residence_permit", "social_security_number", "bank_certificate", "driving_license", "insurance", "vehicle_registration", "vehicle_technical_sheet", "scooter_responsible_declaration", "dgt_mvp_homologation", "other"], required: true }, fileName: { type: String, required: true, trim: true }, mimeType: { type: String, required: true, trim: true }, sizeBytes: { type: Number, required: true, min: 1, max: 2_500_000 }, sha256: { type: String, required: true, match: /^[a-f0-9]{64}$/i }, contentBase64: { type: String, required: true, select: false }, status: { type: String, enum: ["received", "approved", "rejected"], default: "received" }, reviewNotes: { type: String, default: "" }, reviewedAt: { type: Date, default: null } }, { _id: true });
@@ -91,6 +98,7 @@ export const Zone = mongoose.models.Zone || mongoose.model("Zone", zoneSchema);
 export const StripeEvent = mongoose.models.StripeEvent || mongoose.model("StripeEvent", stripeEventSchema);
 export const DispatchDecision = mongoose.models.DispatchDecision || mongoose.model("DispatchDecision", dispatchDecisionSchema);
 export const RiderIncident = mongoose.models.RiderIncident || mongoose.model("RiderIncident", riderIncidentSchema);
+export const RiderOrderMessage = mongoose.models.RiderOrderMessage || mongoose.model("RiderOrderMessage", riderOrderMessageSchema);
 export const RiderApplication = mongoose.models.RiderApplication || mongoose.model("RiderApplication", riderApplicationSchema);
 export const CustomerAccount = mongoose.models.CustomerAccount || mongoose.model("CustomerAccount", customerAccountSchema);
 export const EmployeeAccount = mongoose.models.EmployeeAccount || mongoose.model("EmployeeAccount", employeeAccountSchema);
@@ -99,4 +107,4 @@ export const SignatureRequest = mongoose.models.SignatureRequest || mongoose.mod
 export const PasskeyCredential = mongoose.models.PasskeyCredential || mongoose.model("PasskeyCredential", passkeyCredentialSchema);
 export const RiderAssignmentReservation = mongoose.models.RiderAssignmentReservation || mongoose.model("RiderAssignmentReservation", riderAssignmentReservationSchema);
 
-export async function ensureIndexes() { await Promise.all([Restaurant.init(), PartnerAsset.init(), PartnerLocalityGroup.init(), Rider.init(), Fleet.init(), Order.init(), Zone.init(), StripeEvent.init(), DispatchDecision.init(), RiderIncident.init(), RiderApplication.init(), CustomerAccount.init(), EmployeeAccount.init(), RiderSlot.init(), SignatureRequest.init(), PasskeyCredential.init(), RiderAssignmentReservation.init()]); }
+export async function ensureIndexes() { await Promise.all([Restaurant.init(), PartnerAsset.init(), PartnerLocalityGroup.init(), Rider.init(), Fleet.init(), Order.init(), Zone.init(), StripeEvent.init(), DispatchDecision.init(), RiderIncident.init(), RiderOrderMessage.init(), RiderApplication.init(), CustomerAccount.init(), EmployeeAccount.init(), RiderSlot.init(), SignatureRequest.init(), PasskeyCredential.init(), RiderAssignmentReservation.init()]); }

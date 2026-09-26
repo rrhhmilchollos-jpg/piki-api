@@ -4,7 +4,7 @@ import cors from "cors";
 import express from "express";
 import mongoose from "mongoose";
 import { z } from "zod";
-import { CustomerAccount, DispatchDecision, EmployeeAccount, Fleet, Order, Restaurant, PartnerAsset, PartnerLocalityGroup, Rider, RiderApplication, RiderIncident, RiderSlot, SignatureRequest, Zone, ensureIndexes } from "./models.js";
+import { CustomerAccount, DispatchDecision, EmployeeAccount, Fleet, Order, Restaurant, PartnerAsset, PartnerLocalityGroup, Rider, RiderApplication, RiderIncident, RiderOrderMessage, RiderSlot, SignatureRequest, Zone, ensureIndexes } from "./models.js";
 import { seedCatalog } from "./seed.js";
 import { assertTransition, calculateEtaRange, transitionSchema, validateCoordinates } from "./workflow.js";
 import { configuredAuthRoles, requireOwner, requireRole } from "./auth.js";
@@ -534,6 +534,29 @@ app.post("/api/v1/orders/:id/transitions", requireRole("admin", "partner", "ride
   return res.json({ order: updated });
 });
 
+const riderMessageSchema = z.object({ body: z.string().trim().min(1).max(500) });
+async function riderOrderAccess(riderIdParam: string, orderIdParam: string, req: express.Request) {
+  const riderId = objectId(riderIdParam); const orderId = objectId(orderIdParam);
+  if (!riderId || !orderId || !req.auth?.employeeId) return null;
+  const employee = await EmployeeAccount.findById(req.auth.employeeId).select("email").lean().exec() as any;
+  const rider = employee ? await Rider.findOne({ _id: riderId, email: employee.email }).select("_id").lean().exec() : null;
+  if (!rider) return null;
+  return await Order.findOne({ _id: orderId, riderId, assignmentState: "assigned", status: { $nin: ["delivered", "cancelled"] } }).select("_id riderId status").lean().exec() as any;
+}
+app.get("/api/v1/riders/:riderId/orders/:orderId/messages", requireRole("rider"), async (req, res) => {
+  const order = await riderOrderAccess(String(req.params.riderId), String(req.params.orderId), req);
+  if (!order) return res.status(403).json({ error: "RIDER_ORDER_ACCESS_DENIED" });
+  const messages = await RiderOrderMessage.find({ orderId: order._id }).sort({ createdAt: 1 }).limit(100).lean().exec();
+  return res.json({ messages });
+});
+app.post("/api/v1/riders/:riderId/orders/:orderId/messages", requireRole("rider"), async (req, res) => {
+  const order = await riderOrderAccess(String(req.params.riderId), String(req.params.orderId), req);
+  if (!order || !req.auth?.employeeId) return res.status(403).json({ error: "RIDER_ORDER_ACCESS_DENIED" });
+  const parsed = riderMessageSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "INVALID_MESSAGE", details: parsed.error.flatten() });
+  const message = await RiderOrderMessage.create({ orderId: order._id, riderId: order.riderId, senderRole: "rider", body: parsed.data.body });
+  return res.status(201).json({ message });
+});
 app.post("/api/v1/riders/:riderId/orders/:orderId/confirm-delivery", requireRole("rider"), async (req, res) => {
   const riderId = objectId(Array.isArray(req.params.riderId) ? req.params.riderId[0] : req.params.riderId);
   const orderId = objectId(Array.isArray(req.params.orderId) ? req.params.orderId[0] : req.params.orderId);
@@ -547,8 +570,9 @@ app.post("/api/v1/riders/:riderId/orders/:orderId/confirm-delivery", requireRole
   const updated = await Order.findOneAndUpdate({ _id: orderId, riderId, status: "on_the_way", version: order.version }, { $set: { status: "delivered", deliveredAt: new Date() }, $inc: { version: 1 }, $push: { statusHistory: { status: "delivered", actorRole: "rider", reason: "Entrega confirmada por el Rider" } } }, { new: true }).lean().exec();
   if (!updated) return res.status(409).json({ error: "ORDER_CHANGED_RETRY" });
   const deliveredOrder = updated as any;
+  await RiderOrderMessage.deleteMany({ orderId, riderId }).exec();
   await Rider.findOneAndUpdate({ _id: riderId, activeOrderId: orderId }, { $set: { status: "available", activeOrderId: null } }).exec();
-  return res.json({ message: "Entrega confirmada.", order: { id: deliveredOrder._id, status: deliveredOrder.status, deliveredAt: deliveredOrder.deliveredAt } });
+  return res.json({ message: "Entrega confirmada.", chatPurged: true, order: { id: deliveredOrder._id, status: deliveredOrder.status, deliveredAt: deliveredOrder.deliveredAt } });
 });
 
 app.post("/api/v1/riders/:id/location", requireRole("admin", "rider", "fleet"), async (req, res) => {
