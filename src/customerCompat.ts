@@ -69,6 +69,25 @@ export async function handleCustomerTrpc(req: Request, res: Response) {
       return reply(res, row ? restaurantView(row) : null);
     }
     if (procedure === "auth.me") return reply(res, await currentCustomer(req).then((user) => publicUser(user)));
+    if (procedure === "customer.deliveryAddress.get") {
+      const user = await currentCustomer(req) as any;
+      if (!user) return fail(res, "Inicia sesión para consultar tu dirección guardada.", "AUTH_REQUIRED");
+      const coordinates = user.deliveryLocation?.coordinates;
+      const hasSavedAddress = typeof user.deliveryAddress === "string" && user.deliveryAddress.length >= 5 && Array.isArray(coordinates) && coordinates.length >= 2;
+      return reply(res, hasSavedAddress ? { saved: true, address: user.deliveryAddress, deliveryLocation: { latitude: Number(coordinates[1]), longitude: Number(coordinates[0]) }, updatedAt: user.deliveryAddressUpdatedAt || null } : { saved: false, address: null, deliveryLocation: null, updatedAt: null });
+    }
+    if (procedure === "customer.deliveryAddress.save") {
+      const user = await currentCustomer(req) as any;
+      if (!user) return fail(res, "Inicia sesión para guardar tu dirección.", "AUTH_REQUIRED");
+      const address = String(input?.address || "").trim();
+      const latitude = Number(input?.deliveryLocation?.latitude); const longitude = Number(input?.deliveryLocation?.longitude);
+      if (address.length < 5 || address.length > 280 || !Number.isFinite(latitude) || latitude < -90 || latitude > 90 || !Number.isFinite(longitude) || longitude < -180 || longitude > 180) return fail(res, "Selecciona una dirección válida de la lista antes de guardarla.", "DELIVERY_LOCATION_REQUIRED");
+      const coverage = evaluateXativaCoverage([longitude, latitude]);
+      if (!coverage.covered) return fail(res, "Todavía no repartimos en esa dirección.", "DELIVERY_OUTSIDE_COVERAGE");
+      const updatedAt = new Date();
+      await CustomerAccount.updateOne({ _id: user._id }, { $set: { deliveryAddress: address, deliveryLocation: { type: "Point", coordinates: [longitude, latitude] }, deliveryAddressUpdatedAt: updatedAt } }).exec();
+      return reply(res, { saved: true, address, deliveryLocation: { latitude, longitude }, updatedAt, coverage });
+    }
     if (procedure === "auth.register") {
       const name = String(input?.name || "").trim(); const email = String(input?.email || "").trim().toLowerCase(); const password = String(input?.password || "");
       if (name.length < 2 || !email.includes("@") || password.length < 8) return fail(res, "Datos de cuenta no válidos");
