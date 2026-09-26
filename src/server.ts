@@ -376,7 +376,11 @@ app.get("/api/v1/coverage", async (req, res) => {
   let catalogAvailable = true;
   if (coverage.covered) {
     try {
-      restaurants = await Restaurant.find({ isActive: true, onboardingStatus: "approved" }).select("-partnerProfile -commercialEmployeeId -email").sort({ promoted: -1, rating: -1, reviews: -1 }).lean().exec();
+      restaurants = await Restaurant.find({ isActive: true, onboardingStatus: "approved" })
+        // Inclusive projection avoids a MongoDB path collision with the
+        // select:false document payload nested under partnerProfile.
+        .select("slug name cuisine category locality tagline etaMinutes deliveryFeeCents rating reviews promoted image accent phone address location menu")
+        .sort({ promoted: -1, rating: -1, reviews: -1 }).lean().exec();
     } catch (error) {
       // The price decision is deterministic and must never disappear because a
       // catalogue/index query is temporarily unavailable. The storefront has
