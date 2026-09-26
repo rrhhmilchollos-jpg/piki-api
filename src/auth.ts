@@ -1,6 +1,7 @@
 import type { NextFunction, Request, Response } from "express";
-import { EmployeeAccount } from "./models.js";
+import { EmployeeAccount, Rider } from "./models.js";
 import { hashSessionToken } from "./employeeAuth.js";
+import { resolveEmployeeSession } from "./employeeSessions.js";
 
 export const apiRoles = ["admin", "partner", "rider", "fleet", "commercial"] as const;
 export type ApiRole = (typeof apiRoles)[number];
@@ -22,12 +23,14 @@ const tokenEntries: Array<[ApiRole, string | undefined]> = [
   ["commercial", process.env.COMMERCIAL_API_TOKEN],
 ];
 
-async function resolveRole(request: Request): Promise<{ role: ApiRole; employeeId?: string; mustChangePassword?: boolean } | null> {
+export async function resolveRole(request: Request): Promise<{ role: ApiRole; employeeId?: string; mustChangePassword?: boolean } | null> {
   const header = request.header("authorization") || "";
   const [scheme, token] = header.split(" ");
   if (scheme?.toLowerCase() !== "bearer" || !token) return null;
   const match = tokenEntries.find(([, configured]) => configured && configured === token);
   if (match?.[0]) return { role: match[0] };
+  const scoped = await resolveEmployeeSession(token);
+  if (scoped) return { ...scoped, role: scoped.role as ApiRole };
   const employee = await EmployeeAccount.findOne({ sessionHash: hashSessionToken(token), active: true }).lean().exec() as any;
   return employee ? { role: employee.apiRole as ApiRole, employeeId: String(employee._id), mustChangePassword: employee.mustChangePassword } : null;
 }
@@ -42,6 +45,12 @@ export function requireRole(...allowedRoles: ApiRole[]) {
     if (!allowedRoles.includes(auth.role)) return response.status(403).json({ error: "FORBIDDEN", role: auth.role });
     if (auth.mustChangePassword && !request.path.endsWith("/employee/change-password") && !request.path.endsWith("/employee/me")) return response.status(428).json({ error: "PASSWORD_CHANGE_REQUIRED" });
     request.auth = auth;
+    const riderResource = request.path.match(/^\/api\/v1\/riders\/([a-f\d]{24})(?:\/|$)/i);
+    if (auth.role === "rider" && riderResource) {
+      const employee = auth.employeeId ? await EmployeeAccount.findById(auth.employeeId).select("email").lean().exec() as any : null;
+      const allowed = employee ? await Rider.exists({ _id: riderResource[1], email: employee.email }) : process.env.RIDER_API_RIDER_ID === riderResource[1];
+      if (!allowed) return response.status(403).json({ error: "RIDER_ACCESS_DENIED" });
+    }
     return next();
   };
 }

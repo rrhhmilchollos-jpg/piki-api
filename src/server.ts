@@ -1,4 +1,5 @@
 import "dotenv/config";
+import "express-async-errors";
 import { createHash, randomInt } from "node:crypto";
 import cors from "cors";
 import express from "express";
@@ -7,12 +8,13 @@ import { z } from "zod";
 import { CustomerAccount, DispatchDecision, EmployeeAccount, Fleet, Order, Restaurant, PartnerAsset, PartnerLocalityGroup, Rider, RiderApplication, RiderIncident, RiderOrderMessage, RiderSlot, SignatureRequest, Zone, ensureIndexes } from "./models.js";
 import { seedCatalog } from "./seed.js";
 import { assertTransition, calculateEtaRange, transitionSchema, validateCoordinates } from "./algorithms/index.js";
-import { configuredAuthRoles, requireOwner, requireRole } from "./auth.js";
+import { configuredAuthRoles, requireOwner, requireRole, resolveRole } from "./auth.js";
+import { EmployeeSession, issueEmployeeSession, revokeEmployeeSessions, sessionRole } from "./employeeSessions.js";
 import { createCheckoutSession, processStripeWebhook, stripeConfigured, createSignaturitSignature, signaturitBaseUrl, signaturitConfigured, signaturitMode, signatureWebhookUrl, webhookDigest, handleCustomerTrpc } from "./integrations/index.js";
 import { rankDispatchCandidates, computeMobilityAdvice, calculateSanctionDecision, defaultSanctionPolicy } from "./algorithms/index.js";
 import { createSessionToken, generateTemporaryPassword, hashPassword, hashSessionToken, verifyPassword } from "./employeeAuth.js";
 
-const app = express();
+export const app = express();
 const port = Number(process.env.PORT || 3000);
 const defaultOrigins = ["http://localhost:3000", "http://localhost:5173", "https://pikidelivery.com", "https://www.pikidelivery.com", "https://app.pikidelivery.com", "https://partners.pikidelivery.com", "https://admin.pikidelivery.com", "https://riders.pikidelivery.com", "https://fleet.pikidelivery.com"].join(",");
 const allowedOrigins = (process.env.CORS_ORIGINS || defaultOrigins).split(",").map((origin) => origin.trim()).filter(Boolean);
@@ -70,7 +72,7 @@ const riderLocationSchema = locationSchema.extend({ riderId: z.string().min(1) }
 const zoneSchema = z.object({ name: z.string().min(2).max(120), slug: z.string().regex(/^[a-z0-9-]+$/), serviceFeeCents: z.number().int().min(0).max(10000).default(0), maxEtaMinutes: z.number().int().min(1).max(240).default(60), polygon: z.object({ coordinates: z.array(z.array(z.array(z.number()))).min(1) }) });
 const dispatchSchema = z.object({ preparationMinutes: z.coerce.number().int().min(1).max(180).default(15), offerSeconds: z.coerce.number().int().min(15).max(180).default(60), maxCustomerEtaMinutes: z.coerce.number().int().min(10).max(240).optional() });
 const riderIncidentSchema = z.object({ reason: z.enum(["late_acceptance", "late_delivery", "no_show", "unsafe_driving", "fraud_signal", "customer_complaint", "document_expired", "other"]), evidence: z.array(z.string().url()).max(10).default([]), occurredAt: z.coerce.date().optional() });
-const riderSlotSchema = z.object({ zoneSlug: z.string().regex(/^[a-z0-9-]+$/), date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/), startTime: z.string().regex(/^\d{2}:\d{2}$/), endTime: z.string().regex(/^\d{2}:\d{2}$/), status: z.enum(["planned", "active", "completed", "cancelled"]).default("planned"), notes: z.string().max(500).default("") });
+const riderSlotSchema = z.object({ zoneSlug: z.string().regex(/^[a-z0-9-]+$/), date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/), startTime: z.string().regex(/^(?:[01]\d|2[0-3]):[0-5]\d$/), endTime: z.string().regex(/^(?:[01]\d|2[0-3]):[0-5]\d$/), status: z.enum(["planned", "active", "completed", "cancelled"]).default("planned"), notes: z.string().max(500).default("") });
 const riderSlotCreateSchema = riderSlotSchema.extend({ riderId: z.string().regex(/^[a-f\d]{24}$/) });
 const riderDocumentInputSchema = z.object({ type: z.enum(["identity", "residence_permit", "social_security_number", "bank_certificate", "driving_license", "insurance", "vehicle_registration", "vehicle_technical_sheet", "scooter_responsible_declaration", "dgt_mvp_homologation", "other"]), fileName: z.string().min(1).max(180), mimeType: z.string().min(1).max(120), sizeBytes: z.number().int().min(1).max(2_500_000), sha256: z.string().regex(/^[a-f0-9]{64}$/i), contentBase64: z.string().min(1).max(3_500_000) });
 const riderApplicationSchema = z.object({ name: z.string().min(2).max(160), email: z.string().email(), phone: z.string().min(6).max(40), city: z.string().min(2).max(120), vehicle: z.enum(["bike", "electric_bike", "electric_scooter", "motorcycle", "scooter", "car"]), availability: z.string().min(2).max(160), socialSecurityNumber: z.string().min(4).max(40), identityVerificationMethod: z.literal("online_scan"), safetyDeclarationAccepted: z.literal(true), documents: z.array(riderDocumentInputSchema).min(3).max(12), website: z.string().max(0).optional() });
@@ -140,8 +142,19 @@ app.post("/api/v1/auth/employee/login", async (req, res) => {
   if (String(req.headers["x-piki-surface"] || "").toLowerCase() === "admin" && parsed.data.email.toLowerCase() !== ownerEmail) return res.status(403).json({ error: "ADMIN_OWNER_ONLY", message: "El panel Admin está reservado al propietario de PIKI." });
   const employee = await EmployeeAccount.findOne({ email: parsed.data.email.toLowerCase(), active: true }).select("+passwordHash").exec() as any;
   if (!employee || !verifyPassword(parsed.data.password, employee.passwordHash)) return res.status(401).json({ error: "INVALID_CREDENTIALS" });
-  const token = createSessionToken(); employee.sessionHash = hashSessionToken(token); employee.lastLoginAt = new Date(); await employee.save();
-  return res.json({ accessToken: token, requiresPasswordChange: Boolean(employee.mustChangePassword), employee: { id: employee.id, name: employee.name, email: employee.email, jobRole: employee.jobRole, apiRole: employee.apiRole, portfolioId: employee.portfolioId, fleetId: employee.fleetId, zoneSlugs: employee.zoneSlugs } });
+  const surface = String(req.headers["x-piki-surface"] || "").toLowerCase();
+  const role = sessionRole(employee, surface);
+  if (!role) return res.status(403).json({ error: "SURFACE_ROLE_MISMATCH", message: "Esta cuenta no tiene acceso a esta aplicación." });
+  // The authenticated owner explicitly uses an independent test Rider profile.
+  // No password or admin role is changed, and no shift starts automatically.
+  if (role === "rider" && employee.email === ownerEmail && employee.ownerProtected) {
+    if (!(await Rider.exists({ email: employee.email }))) {
+      await Rider.findOneAndUpdate({ email: employee.email }, { $setOnInsert: { name: "PIKI · Rider propietario (QA)", email: employee.email, riderCode: await nextRiderCode(), status: "offline", isTestRider: true } }, { upsert: true, new: true, setDefaultsOnInsert: true });
+    }
+  }
+  const issued = await issueEmployeeSession(employee, surface);
+  if (!issued) return res.status(403).json({ error: "SURFACE_ROLE_MISMATCH" });
+  return res.json({ accessToken: issued.token, requiresPasswordChange: Boolean(employee.mustChangePassword), employee: { id: employee.id, name: employee.name, email: employee.email, jobRole: role === "rider" ? "rider" : employee.jobRole, apiRole: issued.role, portfolioId: employee.portfolioId, fleetId: employee.fleetId, zoneSlugs: employee.zoneSlugs } });
 });
 app.get("/api/v1/auth/employee/me", requireRole("admin", "partner", "rider", "fleet", "commercial"), async (req, res) => {
   const employee = req.auth?.employeeId ? await EmployeeAccount.findById(req.auth.employeeId).select("email ownerProtected").lean().exec() as any : null;
@@ -152,7 +165,11 @@ app.post("/api/v1/auth/employee/change-password", requireRole("admin", "partner"
   if (!parsed.success || !req.auth?.employeeId) return res.status(400).json({ error: "INVALID_PASSWORD_CHANGE", message: "La contraseña debe tener 12 caracteres, mayúscula, minúscula y número." });
   const employee = await EmployeeAccount.findById(req.auth.employeeId).select("+passwordHash").exec() as any;
   if (!employee || !verifyPassword(parsed.data.currentPassword, employee.passwordHash)) return res.status(401).json({ error: "INVALID_CURRENT_PASSWORD" });
-  employee.passwordHash = hashPassword(parsed.data.newPassword); employee.mustChangePassword = false; employee.passwordChangedAt = new Date(); await employee.save();
+  employee.passwordHash = hashPassword(parsed.data.newPassword); employee.mustChangePassword = false; employee.passwordChangedAt = new Date(); employee.sessionHash = null; await employee.save();
+  // Keep the current session for the completed mandatory-password gate; revoke others.
+  const tokenHash = hashSessionToken(String(req.headers.authorization || "").replace(/^Bearer /i, ""));
+  await EmployeeSession.deleteMany({ employeeId: employee._id, tokenHash: { $ne: tokenHash } }).exec();
+  await EmployeeSession.updateOne({ tokenHash }, { $set: { issuedAt: employee.passwordChangedAt } }).exec();
   return res.json({ changed: true });
 });
 const employeeCreateSchema = z.object({ name: z.string().min(2).max(160), email: z.string().email(), jobRole: z.enum(["admin", "partner", "rider", "fleet", "zone_manager", "commercial"]), apiRole: z.enum(["admin", "partner", "rider", "fleet", "commercial"]).optional(), restaurantId: z.string().regex(/^[a-f\d]{24}$/).nullable().optional(), fleetId: z.string().regex(/^[a-f\d]{24}$/).nullable().optional(), zoneSlugs: z.array(z.string().regex(/^[a-z0-9-]+$/)).max(100).default([]) });
@@ -175,7 +192,8 @@ app.post("/api/v1/admin/employees/:id/reset-password", requireOwner(), async (re
   const target = await EmployeeAccount.findById(id).select("email ownerProtected").lean().exec() as any;
   if (!target) return res.status(404).json({ error: "EMPLOYEE_NOT_FOUND" });
   if (target.ownerProtected || target.email === ownerEmail) return res.status(403).json({ error: "OWNER_ACCOUNT_PROTECTED" });
-  const employee = await EmployeeAccount.findByIdAndUpdate(id, { $set: { passwordHash: hashPassword(parsed.data.newPassword), mustChangePassword: false, passwordChangedAt: new Date(), sessionHash: null, active: true } }, { new: true }).select("name email jobRole apiRole active mustChangePassword").lean().exec();
+  const employee = await EmployeeAccount.findByIdAndUpdate(id, { $set: { passwordHash: hashPassword(parsed.data.newPassword), mustChangePassword: true, passwordChangedAt: new Date(), sessionHash: null, active: true } }, { new: true }).select("name email jobRole apiRole active mustChangePassword").lean().exec();
+  await revokeEmployeeSessions(id);
   return res.json({ employee, reset: true });
 });
 app.patch("/api/v1/admin/employees/:id/active", requireOwner(), async (req, res) => { const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id); if (!id) return res.status(400).json({ error: "INVALID_EMPLOYEE_ID" }); const parsed = z.object({ active: z.boolean() }).safeParse(req.body); if (!parsed.success) return res.status(400).json({ error: "INVALID_ACTIVE_STATE" }); const target = await EmployeeAccount.findById(id).select("email ownerProtected").lean().exec() as any; if (!target) return res.status(404).json({ error: "EMPLOYEE_NOT_FOUND" }); if (target.ownerProtected || target.email === ownerEmail) return res.status(403).json({ error: "OWNER_ACCOUNT_PROTECTED" }); const employee = await EmployeeAccount.findByIdAndUpdate(id, { $set: { active: parsed.data.active, ...(parsed.data.active ? {} : { sessionHash: null }) } }, { new: true }).select("name email jobRole apiRole active mustChangePassword").lean().exec(); return res.json({ employee }); });
@@ -205,7 +223,7 @@ app.post("/api/v1/admin/signatures", requireRole("admin"), async (req, res) => {
 });
 app.post("/api/v1/signatures/signaturit/events", async (req, res) => {
   const webhookToken = process.env.SIGNATURIT_WEBHOOK_TOKEN;
-  if (webhookToken && req.query.token !== webhookToken) return res.status(401).json({ error: "INVALID_SIGNATURE_WEBHOOK_TOKEN" });
+  if (!webhookToken || req.query.token !== webhookToken) return res.status(401).json({ error: "INVALID_SIGNATURE_WEBHOOK_TOKEN" });
   const raw = JSON.stringify(req.body || {});
   const payload = req.body as any;
   const externalId = String(payload?.id || payload?.signature?.id || payload?.document?.signature_id || "");
@@ -216,12 +234,12 @@ app.post("/api/v1/signatures/signaturit/events", async (req, res) => {
 });
 
 app.get("/api/v1/catalog/restaurants", async (req, res) => {
-  const query = typeof req.query.q === "string" ? req.query.q.trim() : "";
+  const query = typeof req.query.q === "string" ? req.query.q.trim().slice(0, 120).replace(/[.*+?^${}()|[\]\\]/g, "\\$&") : "";
   const category = typeof req.query.category === "string" ? req.query.category.trim() : "";
   const filter: Record<string, unknown> = { isActive: true, onboardingStatus: "approved" };
   if (category && category !== "Todos") filter.category = category;
   if (query) filter.$or = [{ name: { $regex: query, $options: "i" } }, { cuisine: { $regex: query, $options: "i" } }, { category: { $regex: query, $options: "i" } }];
-  const restaurants = await Restaurant.find(filter).sort({ promoted: -1, rating: -1, reviews: -1 }).lean().exec();
+  const restaurants = await Restaurant.find(filter).select("-partnerProfile -commercialEmployeeId -email").sort({ promoted: -1, rating: -1, reviews: -1 }).lean().exec();
   res.json({ restaurants });
 });
 
@@ -663,7 +681,7 @@ app.patch("/api/v1/riders/:id/status", requireRole("admin", "rider", "fleet"), a
   if (!parsed.success) return res.status(400).json({ error: "INVALID_RIDER_STATUS" });
   if (parsed.data.status === "available") {
     const { now, slot } = await findCurrentRiderSlot(id);
-    if (!slot) return res.status(409).json({ error: "SHIFT_RESERVATION_REQUIRED", message: "El rider necesita un slot reservado activo para ponerse disponible.", now });
+    if (!slot || (slot as any).status !== "active") return res.status(409).json({ error: "SHIFT_RESERVATION_REQUIRED", message: "Debes iniciar tu jornada dentro del turno reservado antes de ponerte disponible.", now });
   }
   const rider = await Rider.findByIdAndUpdate(id, { $set: { status: parsed.data.status } }, { new: true }).lean().exec() as any;
   if (!rider) return res.status(404).json({ error: "RIDER_NOT_FOUND" });
@@ -715,14 +733,17 @@ app.post("/api/v1/riders/:id/shift/start", requireRole("admin", "rider", "fleet"
   const { now, slot } = await findCurrentRiderSlot(riderId);
   if (!slot) return res.status(409).json({ error: "SHIFT_RESERVATION_REQUIRED", message: "No puedes iniciar la jornada fuera de tu horario reservado.", now });
   const currentSlot = slot as any;
-  const updatedSlot = await RiderSlot.findOneAndUpdate({ _id: currentSlot._id, status: "planned" }, { $set: { status: "active" } }, { new: true }).lean().exec();
-  await Rider.findByIdAndUpdate(riderId, { $set: { status: "available" } }).exec();
-  return res.json({ message: "Jornada iniciada", warningSound: "start_shift", rider: { id: riderId, riderCode: rider.riderCode, status: "available" }, shift: updatedSlot });
+  const updatedSlot = await RiderSlot.findOneAndUpdate({ _id: currentSlot._id, status: { $in: ["planned", "active"] } }, { $set: { status: "active" } }, { new: true }).lean().exec();
+  const hasOrders = await Order.exists({ riderId, status: { $nin: ["delivered", "cancelled"] }, assignmentState: { $in: ["offered", "assigned"] } });
+  const status = hasOrders ? "busy" : "available";
+  await Rider.findByIdAndUpdate(riderId, { $set: { status } }).exec();
+  return res.json({ message: "Jornada iniciada", warningSound: "start_shift", rider: { id: riderId, riderCode: rider.riderCode, status }, shift: updatedSlot });
 });
 
 app.post("/api/v1/riders/:id/shift/stop", requireRole("admin", "rider", "fleet"), async (req, res) => {
   const riderId = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
   if (!riderId) return res.status(400).json({ error: "INVALID_RIDER_ID" });
+  if (await Order.exists({ riderId, status: { $nin: ["delivered", "cancelled"] }, assignmentState: { $in: ["offered", "assigned"] } })) return res.status(409).json({ error: "ACTIVE_DELIVERY_REQUIRES_SUPPORT", message: "Completa el reparto o contacta con Soporte antes de finalizar la jornada." });
   const { slot } = await findCurrentRiderSlot(riderId);
   if (slot) await RiderSlot.updateOne({ _id: (slot as any)._id }, { $set: { status: "completed" } }).exec();
   const rider = await Rider.findByIdAndUpdate(riderId, { $set: { status: "offline", activeOrderId: null } }, { new: true }).lean().exec() as any;
@@ -734,6 +755,7 @@ app.post("/api/v1/riders/:id/slots", requireRole("admin", "fleet"), async (req, 
   const riderIdParam = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
   const riderId = objectId(riderIdParam); if (!riderId) return res.status(400).json({ error: "INVALID_RIDER_ID" });
   const parsed = riderSlotSchema.safeParse(req.body); if (!parsed.success) return res.status(400).json({ error: "INVALID_RIDER_SLOT", details: parsed.error.flatten() });
+  if (parsed.data.endTime <= parsed.data.startTime) return res.status(400).json({ error: "INVALID_SLOT_TIME_RANGE" });
   const rider = await Rider.findById(riderId).lean().exec(); if (!rider) return res.status(404).json({ error: "RIDER_NOT_FOUND" });
   const overlap = await RiderSlot.findOne({ riderId, date: parsed.data.date, status: { $nin: ["cancelled", "completed"] }, $or: [{ startTime: { $lt: parsed.data.endTime }, endTime: { $gt: parsed.data.startTime } }] }).lean().exec();
   if (overlap) return res.status(409).json({ error: "RIDER_SLOT_OVERLAP", slot: overlap });
@@ -1065,7 +1087,7 @@ app.get("/api/v1/admin/operations/live", requireRole("admin"), async (_req, res)
   return res.json({ refreshedAt: new Date().toISOString(), riders: riders.map((rider) => ({ id: rider._id, riderCode: rider.riderCode, name: rider.name, status: rider.status, vehicle: rider.vehicle, location: rider.location, lastLocationAt: rider.lastLocationAt, activeOrder: rider.activeOrderId ? orderMap.get(String(rider.activeOrderId)) || null : null })) });
 });
 
-app.get("/api/v1/riders/overview", requireRole("admin", "rider", "fleet"), async (_req, res) => {
+app.get("/api/v1/riders/overview", requireRole("admin", "fleet"), async (_req, res) => {
   const startOfDay = new Date(); startOfDay.setHours(0, 0, 0, 0);
   const [registered, unassigned, active, completed] = await Promise.all([Rider.countDocuments(), Order.countDocuments({ riderId: null, status: "ready_for_pickup" }), Order.countDocuments({ riderId: { $ne: null }, status: { $in: ["picked_up", "on_the_way"] } }), Order.countDocuments({ riderId: { $ne: null }, status: "delivered", deliveredAt: { $gte: startOfDay } })]);
   res.json({ service: "piki-api", overview: { registered_riders: registered, unassigned_orders: unassigned, active_deliveries: active, completed_today: completed } });
@@ -1093,14 +1115,29 @@ app.get("/api/v1/fleets/overview", requireRole("admin", "fleet"), async (_req, r
 });
 
 app.use((_req, res) => res.status(404).json({ error: "NOT_FOUND" }));
+app.use((error: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
+  if (res.headersSent) return next(error);
+  // Never return stack traces, credentials, documents, or invalid values to clients/logs.
+  const name = String(error?.name || "Error");
+  const invalid = ["CastError", "ValidationError", "SyntaxError"].includes(name);
+  const unavailable = /Mongo.*(Network|NotConnected|ServerSelection)|MongooseServerSelection/.test(name);
+  const status = invalid ? 400 : unavailable ? 503 : 500;
+  console.error(JSON.stringify({ event: "request_failed", method: req.method, path: req.path, errorType: name, status }));
+  res.status(status).json({ error: invalid ? "INVALID_REQUEST" : unavailable ? "DATABASE_UNAVAILABLE" : "INTERNAL_SERVER_ERROR" });
+});
 
 async function start() {
   const uri = process.env.MONGODB_URI;
   if (uri) { await mongoose.connect(uri, { dbName: databaseName, serverSelectionTimeoutMS: 10_000 }); await ensureIndexes(); if (process.env.SEED_DEMO_DATA === "true") await seedCatalog(); databaseReady = true; } else console.warn("MONGODB_URI is not configured; /ready will remain unavailable.");
-  app.listen(port, "0.0.0.0", () => console.log(`PIKI API listening on port ${port}`));
-  setInterval(() => { void runAutomaticDispatchSweep().catch((error) => console.error("Automatic dispatch sweep crashed", error)); }, 5_000).unref();
+  await EmployeeSession.init();
+  const server = app.listen(port, "0.0.0.0", () => console.log(`PIKI API listening on port ${port}`));
+  const sweepTimer = setInterval(() => { void runAutomaticDispatchSweep().catch((error) => console.error("Automatic dispatch sweep crashed", error)); }, 5_000).unref();
   void runAutomaticDispatchSweep().catch((error) => console.error("Initial automatic dispatch sweep failed", error));
+  process.once("SIGTERM", () => {
+    clearInterval(sweepTimer); databaseReady = false;
+    server.close(() => { void mongoose.disconnect().finally(() => process.exit(0)); });
+    setTimeout(() => process.exit(0), 25_000).unref();
+  });
 }
 
-start().catch((error) => { console.error("Unable to start PIKI API", error); process.exit(1); });
-process.on("SIGTERM", () => { mongoose.disconnect().catch(() => undefined); });
+if (process.env.PIKI_NO_LISTEN !== "true") start().catch((error) => { console.error("Unable to start PIKI API", error); process.exit(1); });
