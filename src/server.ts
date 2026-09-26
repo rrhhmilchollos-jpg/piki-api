@@ -469,26 +469,26 @@ app.post("/api/v1/payments/checkout", async (req, res) => {
 });
 
 const testDispatchOrderSchema = z.object({ restaurantId: z.string().optional(), count: z.coerce.number().int().min(1).max(10).default(1), deliveryAddress: z.string().min(5).max(280).default("Plaza de la Seu, 1, Xàtiva") });
-app.post("/api/v1/admin/dispatch/test-orders", requireRole("admin"), async (req, res) => {
+app.post("/api/v1/admin/dispatch/test-orders", requireRole("admin", "fleet"), async (req, res) => {
   const parsed = testDispatchOrderSchema.safeParse(req.body || {});
   if (!parsed.success) return res.status(400).json({ error: "INVALID_TEST_ORDER_REQUEST", details: parsed.error.flatten() });
-  const restaurantFilter: Record<string, unknown> = { isActive: true, onboardingStatus: "approved", "menu.0": { $exists: true } };
+  const restaurantFilter: Record<string, unknown> = { isActive: true, onboardingStatus: "approved" };
   if (parsed.data.restaurantId) {
     const id = objectId(parsed.data.restaurantId);
     if (!id) return res.status(400).json({ error: "INVALID_RESTAURANT_ID" });
     restaurantFilter._id = id;
   }
   const restaurants = await Restaurant.find(restaurantFilter).limit(parsed.data.count).lean().exec() as any[];
-  if (!restaurants.length) return res.status(409).json({ error: "NO_RESTAURANT_WITH_MENU", message: "No hay establecimientos aprobados con carta para generar el pedido de prueba." });
+  if (!restaurants.length) return res.status(409).json({ error: "NO_APPROVED_RESTAURANT", message: "No hay establecimientos aprobados para generar el pedido de prueba." });
   const created = [];
   for (let index = 0; index < parsed.data.count; index += 1) {
     const restaurant = restaurants[index % restaurants.length];
-    const item = (restaurant.menu || []).find((candidate: any) => candidate.available !== false) || restaurant.menu[0];
+    const item = (restaurant.menu || []).find((candidate: any) => candidate.available !== false) || { id: "test-item", name: "Pedido de prueba PIKI", price: 1 };
     const dailyCode = await createDailyDisplayCode();
     const subtotalCents = Math.round(Number(item.price || 0) * 100);
     const deliveryFeeCents = Number(restaurant.deliveryFeeCents || 0);
     const totalCents = subtotalCents + deliveryFeeCents + 79;
-    const order = await Order.create({ publicCode: `PIKI-TEST-${Date.now().toString(36).toUpperCase()}-${index + 1}`, ...dailyCode, restaurantId: restaurant._id, customerId: "test-customer@pikidelivery.com", customerPhone: "+34960000111", isTestOrder: true, items: [{ itemId: item.id, name: item.name, quantity: 1, unitPriceCents: subtotalCents }], deliveryAddress: parsed.data.deliveryAddress, deliveryLocation: { type: "Point", coordinates: restaurant.location?.coordinates || [-0.52, 38.99] }, subtotalCents, deliveryFeeCents, totalCents, paymentState: "paid", status: "ready_for_pickup", statusHistory: [{ status: "ready_for_pickup", actorRole: "admin", reason: "Pedido de prueba creado desde Supervisión de dispatch" }] });
+    const order = await Order.create({ publicCode: `PIKI-TEST-${Date.now().toString(36).toUpperCase()}-${index + 1}`, ...dailyCode, restaurantId: restaurant._id, customerId: "test-customer@pikidelivery.com", customerPhone: "+34960000111", isTestOrder: true, items: [{ itemId: item.id, name: item.name, quantity: 1, unitPriceCents: subtotalCents }], deliveryAddress: parsed.data.deliveryAddress, deliveryLocation: { type: "Point", coordinates: restaurant.location?.coordinates || [-0.52, 38.99] }, subtotalCents, deliveryFeeCents, totalCents, paymentState: "paid", status: "ready_for_pickup", assignmentState: "unassigned", statusHistory: [{ status: "ready_for_pickup", actorRole: "admin", reason: "Pedido de prueba creado desde Supervisión de dispatch" }] });
     created.push({ id: order.id, publicCode: order.publicCode, displayCode: order.displayCode, restaurantId: restaurant._id, restaurantName: restaurant.name, status: order.status, paymentState: order.paymentState, isTestOrder: true });
   }
   return res.status(201).json({ orders: created, message: `${created.length} pedido(s) de prueba listo(s) para dispatch.` });
@@ -527,6 +527,7 @@ app.post("/api/v1/orders/:id/transitions", requireRole("admin", "partner", "ride
   if (parsed.data.status === "cancelled") update.$set = { status: "cancelled", cancelledAt: new Date() };
   const updated = await Order.findOneAndUpdate({ _id: id, version: order.version, status: order.status }, update, { new: true }).lean().exec();
   if (!updated) return res.status(409).json({ error: "ORDER_CHANGED_RETRY" });
+  if (["delivered", "cancelled"].includes(parsed.data.status)) await RiderOrderMessage.deleteMany({ orderId: order._id }).exec();
   if (["delivered", "cancelled"].includes(parsed.data.status) && order.riderId) {
     const remainingOrder = await Order.findOne({ riderId: order.riderId, _id: { $ne: order._id }, status: { $nin: ["delivered", "cancelled"] }, assignmentState: { $in: ["offered", "assigned"] } }).select("_id").lean().exec() as any;
     await Rider.findByIdAndUpdate(order.riderId, { $set: { status: remainingOrder ? "busy" : "available", activeOrderId: remainingOrder?._id || null } }).exec();
