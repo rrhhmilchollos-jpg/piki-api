@@ -19,7 +19,33 @@ const allowedOrigins = (process.env.CORS_ORIGINS || defaultOrigins).split(",").m
 const databaseName = process.env.MONGODB_DB || "piki";
 let databaseReady = false;
 
-app.use(cors({ origin: allowedOrigins.length ? allowedOrigins : true, credentials: true }));
+app.disable("x-powered-by");
+app.use((_req, res, next) => {
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-Frame-Options", "DENY");
+  res.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
+  res.setHeader("Permissions-Policy", "camera=(), microphone=(), payment=(self), usb=()");
+  res.setHeader("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'; base-uri 'none'");
+  next();
+});
+app.use(cors({ origin: (origin, callback) => callback(null, !origin || allowedOrigins.includes(origin)), credentials: true }));
+
+const requestBuckets = new Map<string, { startedAt: number; count: number }>();
+const rateLimit = (limit: number, windowMs: number, keyPrefix: string) => (req: express.Request, res: express.Response, next: express.NextFunction) => {
+  const now = Date.now();
+  const key = `${keyPrefix}:${req.ip}:${req.path}`;
+  const current = requestBuckets.get(key);
+  const bucket = !current || now - current.startedAt >= windowMs ? { startedAt: now, count: 0 } : current;
+  bucket.count += 1; requestBuckets.set(key, bucket);
+  if (bucket.count > limit) return res.status(429).json({ error: "RATE_LIMITED", retryAfterSeconds: Math.ceil((windowMs - (now - bucket.startedAt)) / 1000) });
+  res.setHeader("X-RateLimit-Limit", String(limit));
+  return next();
+};
+setInterval(() => { const cutoff = Date.now() - 15 * 60_000; for (const [key, bucket] of requestBuckets) if (bucket.startedAt < cutoff) requestBuckets.delete(key); }, 15 * 60_000).unref();
+app.use("/api/v1/auth", rateLimit(20, 60_000, "auth"));
+app.use("/api/v1/partners/onboarding", rateLimit(10, 60_000, "partner-onboarding"));
+app.use("/api/v1/riders/applications", rateLimit(10, 60_000, "rider-onboarding"));
+app.use("/api/v1/payments/webhook", rateLimit(100, 60_000, "stripe-webhook"));
 app.post("/api/v1/payments/webhook", express.raw({ type: "application/json" }), async (req, res) => {
   const signature = req.header("stripe-signature");
   if (!signature || !stripeConfigured()) return res.status(503).json({ error: "STRIPE_WEBHOOK_NOT_CONFIGURED" });
