@@ -256,7 +256,10 @@ app.post("/api/v1/partners/onboarding", async (req, res) => {
 });
 
 async function employeeRestaurant(req: express.Request) {
-  if (!req.auth?.employeeId) return null;
+  if (!req.auth?.employeeId) {
+    const scopedRestaurantId = String(process.env.PARTNER_API_RESTAURANT_ID || "").trim();
+    return req.auth?.role === "partner" && objectId(scopedRestaurantId) ? scopedRestaurantId : null;
+  }
   const employee = await EmployeeAccount.findById(req.auth.employeeId).select("restaurantId jobRole").lean().exec() as any;
   return employee?.restaurantId ? String(employee.restaurantId) : null;
 }
