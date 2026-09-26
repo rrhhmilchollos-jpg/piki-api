@@ -783,6 +783,24 @@ app.post("/api/v1/dispatch/orders/:id/offer-response", requireRole("rider", "adm
   return res.json({ assignment: { state: "rejected", orderId } });
 });
 
+app.post("/api/v1/riders/:id/test-orders", requireRole("rider"), async (req, res) => {
+  const riderId = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
+  if (!riderId || !req.auth?.employeeId) return res.status(400).json({ error: "INVALID_RIDER_SESSION" });
+  const employee = await EmployeeAccount.findById(req.auth.employeeId).select("email").lean().exec() as any;
+  const rider = employee ? await Rider.findOne({ _id: riderId, email: employee.email }).lean().exec() as any : null;
+  if (!rider) return res.status(403).json({ error: "RIDER_ACCESS_DENIED" });
+  const existing = await Order.findOne({ riderId, isTestOrder: true, status: { $nin: ["delivered", "cancelled"] } }).select("_id publicCode").lean().exec();
+  if (existing) return res.status(409).json({ error: "TEST_ORDER_ALREADY_ACTIVE", order: existing });
+  const restaurant = await Restaurant.findOne({ isActive: true, onboardingStatus: "approved" }).sort({ promoted: -1, rating: -1 }).lean().exec() as any;
+  if (!restaurant) return res.status(409).json({ error: "NO_TEST_RESTAURANT" });
+  const display = await createDailyDisplayCode();
+  const restaurantPoint = restaurant.location?.coordinates;
+  const deliveryCoordinates = Array.isArray(restaurantPoint) && restaurantPoint.length >= 2 ? [Number(restaurantPoint[0]) + 0.003, Number(restaurantPoint[1]) + 0.002] : undefined;
+  const testOrder = await Order.create({ publicCode: `PIKI-TEST-${randomInt(100000, 999999)}`, ...display, restaurantId: restaurant._id, customerId: null, riderId, isTestOrder: true, status: "ready_for_pickup", paymentState: "paid", assignmentState: "assigned", deliveryAddress: "Dirección de cliente de prueba, Xàtiva", deliveryLocation: deliveryCoordinates ? { type: "Point", coordinates: deliveryCoordinates } : undefined, items: [{ itemId: "test-item", name: "Pedido de prueba PIKI", quantity: 1, unitPriceCents: 100 }], subtotalCents: 100, totalCents: 100, statusHistory: [{ status: "ready_for_pickup", actorRole: "rider", reason: "Pedido de prueba generado desde Riders" }] });
+  await Rider.updateOne({ _id: riderId }, { $set: { status: "busy", activeOrderId: testOrder._id } }).exec();
+  return res.status(201).json({ order: { _id: testOrder._id, publicCode: testOrder.publicCode, displayCode: testOrder.displayCode, status: testOrder.status, paymentState: testOrder.paymentState, assignmentState: testOrder.assignmentState, assignmentExpiresAt: null, items: testOrder.items, vehicle: rider.vehicle, phase: "going_to_restaurant", etaMinutes: null, restaurant: { name: restaurant.name, address: restaurant.address || "", phone: restaurant.phone || "", cuisine: restaurant.cuisine || "", etaMinutes: restaurant.etaMinutes || [] }, customerName: null, deliveryAddress: null, deliveryLocation: null }, message: "Pedido de prueba creado. No genera ningún cobro real." });
+});
+
 app.get("/api/v1/riders/:id/offers", requireRole("rider"), async (req, res) => {
   const riderId = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
   if (!riderId || !req.auth?.employeeId) return res.status(400).json({ error: "INVALID_RIDER_SESSION" });
@@ -790,12 +808,43 @@ app.get("/api/v1/riders/:id/offers", requireRole("rider"), async (req, res) => {
   const rider = employee ? await Rider.findOne({ _id: riderId, email: employee.email }).select("_id").lean().exec() : null;
   if (!rider) return res.status(403).json({ error: "RIDER_ACCESS_DENIED" });
   const offers = await Order.find({ riderId, assignmentState: { $in: ["offered", "assigned"] }, status: { $nin: ["delivered", "cancelled"] } })
-    .select("_id publicCode displayCode displayCodeDate restaurantId riderId status paymentState assignmentState assignmentExpiresAt deliveryAddress deliveryLocation items createdAt")
+    .select("_id publicCode displayCode displayCodeDate restaurantId customerId riderId status paymentState assignmentState assignmentExpiresAt deliveryAddress deliveryLocation items createdAt")
     .sort({ createdAt: -1 }).limit(10).lean().exec() as any[];
   const riderProfile = await Rider.findById(riderId).select("vehicle").lean().exec() as any;
-  const phase: Record<string, string> = { ready_for_pickup: "going_to_restaurant", picked_up: "waiting_for_food", on_the_way: "going_to_customer" };
+  const restaurantIds = offers.map((offer) => offer.restaurantId).filter(Boolean);
+  const customerIds = offers.map((offer) => offer.customerId).filter(Boolean);
+  const [restaurants, customers] = await Promise.all([
+    Restaurant.find({ _id: { $in: restaurantIds } }).select("name address phone cuisine etaMinutes deliveryFeeCents").lean().exec(),
+    CustomerAccount.find({ _id: { $in: customerIds } }).select("name").lean().exec(),
+  ]);
+  const restaurantById = new Map(restaurants.map((restaurant: any) => [String(restaurant._id), restaurant]));
+  const customerById = new Map(customers.map((customer: any) => [String(customer._id), customer]));
+  const phase: Record<string, string> = { accepted: "going_to_restaurant", preparing: "waiting_for_food", ready_for_pickup: "going_to_restaurant", picked_up: "going_to_customer", on_the_way: "going_to_customer" };
   const now = Date.now();
-  const enrichedOffers = offers.map((offer) => ({ ...offer, vehicle: riderProfile?.vehicle || "unknown", phase: phase[offer.status] || "assigned", etaMinutes: offer.assignmentExpiresAt ? Math.max(0, Math.ceil((new Date(offer.assignmentExpiresAt).getTime() - now) / 60000)) : null, displayCode: offer.displayCode || null }));
+  const enrichedOffers = offers.map((offer) => {
+    const restaurant = restaurantById.get(String(offer.restaurantId)) as any;
+    const customer = customerById.get(String(offer.customerId)) as any;
+    const customerPhase = ["picked_up", "on_the_way"].includes(offer.status);
+    return {
+      _id: offer._id,
+      publicCode: offer.publicCode,
+      displayCode: offer.displayCode || null,
+      displayCodeDate: offer.displayCodeDate || null,
+      status: offer.status,
+      paymentState: offer.paymentState,
+      assignmentState: offer.assignmentState,
+      assignmentExpiresAt: offer.assignmentExpiresAt,
+      items: offer.items,
+      createdAt: offer.createdAt,
+      vehicle: riderProfile?.vehicle || "unknown",
+      phase: phase[offer.status] || "assigned",
+      etaMinutes: offer.assignmentExpiresAt ? Math.max(0, Math.ceil((new Date(offer.assignmentExpiresAt).getTime() - now) / 60000)) : null,
+      restaurant: restaurant ? { name: restaurant.name, address: restaurant.address || "", phone: restaurant.phone || "", cuisine: restaurant.cuisine || "", etaMinutes: restaurant.etaMinutes || [] } : null,
+      customerName: customerPhase ? customer?.name || "Cliente" : null,
+      deliveryAddress: customerPhase ? offer.deliveryAddress || "" : null,
+      deliveryLocation: customerPhase ? offer.deliveryLocation || null : null,
+    };
+  });
   return res.json({ offers: enrichedOffers, refreshedAt: new Date().toISOString() });
 });
 
