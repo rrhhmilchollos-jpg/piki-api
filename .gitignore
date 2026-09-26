@@ -4,4 +4,6 @@ dist/
 .env.*
 !.env.example
 coverage/
+!src/coverage/
+!src/coverage/**
 .DS_Store

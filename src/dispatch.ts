@@ -18,6 +18,8 @@ export type DispatchInput = {
   restaurantLocation: [number, number];
   customerLocation: [number, number];
   preparationMinutes: number;
+  routeDistanceKm?: number | null;
+  requiredVehicleClasses?: DispatchCandidate["vehicle"][];
   now?: Date;
   maxGpsAgeSeconds?: number;
   maxCustomerEtaMinutes?: number;
@@ -40,6 +42,8 @@ export type DispatchDecision = {
   algorithmVersion: string;
   score: number;
   pickupDistanceKm: number;
+  routeDistanceKm: number | null;
+  requiredVehicleClasses: DispatchCandidate["vehicle"][];
   pickupEtaMinutes: number;
   customerEtaMinutes: number;
   totalEtaMinutes: number;
@@ -84,10 +88,14 @@ export function scoreDispatchCandidate(candidate: DispatchCandidate, input: Disp
   if (candidate.status !== "available" && candidate.status !== "busy") return null;
   if (!candidate.location?.coordinates || candidate.location.coordinates.length < 2) return null;
   if (freshnessSeconds(candidate, now) > (input.maxGpsAgeSeconds ?? 90)) return null;
+  const requiredVehicleClasses = input.requiredVehicleClasses || [];
+  if (requiredVehicleClasses.length && !requiredVehicleClasses.includes(candidate.vehicle)) return null;
 
   const riderLocation: [number, number] = [candidate.location.coordinates[0], candidate.location.coordinates[1]];
   const pickupDistanceKm = distanceKm(riderLocation, input.restaurantLocation);
-  const customerDistanceKm = distanceKm(input.restaurantLocation, input.customerLocation);
+  // Route distance is persisted at order creation and controls vehicle eligibility.
+  // Haversine remains only as an ETA fallback when the provider was unavailable.
+  const customerDistanceKm = input.routeDistanceKm ?? distanceKm(input.restaurantLocation, input.customerLocation);
   const pickupEtaMinutes = travelMinutes(pickupDistanceKm, candidate.vehicle);
   const customerEtaMinutes = travelMinutes(customerDistanceKm, candidate.vehicle);
   const totalEtaMinutes = input.preparationMinutes + Math.max(input.preparationMinutes, pickupEtaMinutes) + customerEtaMinutes;
@@ -120,6 +128,8 @@ export function scoreDispatchCandidate(candidate: DispatchCandidate, input: Disp
     algorithmVersion: DISPATCH_ALGORITHM_VERSION,
     score: Math.round(score * 100) / 100,
     pickupDistanceKm: Math.round(pickupDistanceKm * 100) / 100,
+    routeDistanceKm: input.routeDistanceKm ?? null,
+    requiredVehicleClasses,
     pickupEtaMinutes,
     customerEtaMinutes,
     totalEtaMinutes,
@@ -127,6 +137,8 @@ export function scoreDispatchCandidate(candidate: DispatchCandidate, input: Disp
       `recogida en ${pickupEtaMinutes} min`,
       `entrega estimada en ${totalEtaMinutes} min`,
       `distancia de recogida ${pickupDistanceKm.toFixed(2)} km`,
+      input.routeDistanceKm == null ? "ruta sin proveedor: restricción conservadora aplicada" : `ruta al cliente ${input.routeDistanceKm.toFixed(2)} km`,
+      ...(requiredVehicleClasses.length ? [`vehículo requerido: ${requiredVehicleClasses.join(" o ")}`] : []),
       `espera de preparación ${preparationWait} min`,
       `carga activa ${activeOrderCount}/${maxConcurrentOrders}`,
       `fiabilidad ${(reliability * 100).toFixed(0)}%`,
