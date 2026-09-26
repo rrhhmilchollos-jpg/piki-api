@@ -10,7 +10,7 @@ export const PIKI_OWNER_EMAIL = "rrhh.milchollos@gmail.com";
 declare global {
   namespace Express {
     interface Request {
-      auth?: { role: ApiRole; employeeId?: string; mustChangePassword?: boolean };
+      auth?: { role: ApiRole; employeeId?: string; mustChangePassword?: boolean; accessLevel?: "superadmin" | "subadmin" };
     }
   }
 }
@@ -23,7 +23,7 @@ const tokenEntries: Array<[ApiRole, string | undefined]> = [
   ["commercial", process.env.COMMERCIAL_API_TOKEN],
 ];
 
-export async function resolveRole(request: Request): Promise<{ role: ApiRole; employeeId?: string; mustChangePassword?: boolean } | null> {
+export async function resolveRole(request: Request): Promise<{ role: ApiRole; employeeId?: string; mustChangePassword?: boolean; accessLevel?: "superadmin" | "subadmin" } | null> {
   const header = request.header("authorization") || "";
   const [scheme, token] = header.split(" ");
   if (scheme?.toLowerCase() !== "bearer" || !token) return null;
@@ -32,7 +32,7 @@ export async function resolveRole(request: Request): Promise<{ role: ApiRole; em
   const scoped = await resolveEmployeeSession(token);
   if (scoped) return { ...scoped, role: scoped.role as ApiRole };
   const employee = await EmployeeAccount.findOne({ sessionHash: hashSessionToken(token), active: true }).lean().exec() as any;
-  return employee ? { role: employee.apiRole as ApiRole, employeeId: String(employee._id), mustChangePassword: employee.mustChangePassword } : null;
+  return employee ? { role: employee.apiRole as ApiRole, employeeId: String(employee._id), mustChangePassword: employee.mustChangePassword, accessLevel: employee.accessLevel } : null;
 }
 
 export function requireRole(...allowedRoles: ApiRole[]) {
@@ -63,9 +63,9 @@ export function requireOwner() {
       response.setHeader("WWW-Authenticate", "Bearer");
       return response.status(401).json({ error: "AUTHENTICATION_REQUIRED" });
     }
-    if (auth.role !== "admin" || !auth.employeeId) return response.status(403).json({ error: "OWNER_ONLY" });
-    const owner = await EmployeeAccount.findOne({ _id: auth.employeeId, email: PIKI_OWNER_EMAIL, active: true }).select("_id").lean().exec();
-    if (!owner) return response.status(403).json({ error: "OWNER_ONLY" });
+    if (auth.role !== "admin" || !auth.employeeId) return response.status(403).json({ error: "SUPERADMIN_ONLY" });
+    const owner = await EmployeeAccount.findOne({ _id: auth.employeeId, email: PIKI_OWNER_EMAIL, active: true, authorizationStatus: "approved", accessLevel: "superadmin" }).select("_id").lean().exec();
+    if (!owner) return response.status(403).json({ error: "SUPERADMIN_ONLY", message: "Solo RRHH superadmin puede realizar esta operación." });
     if (auth.mustChangePassword) return response.status(428).json({ error: "PASSWORD_CHANGE_REQUIRED" });
     request.auth = auth;
     return next();

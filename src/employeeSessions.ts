@@ -16,8 +16,8 @@ schema.index({ expiresAt: 1 }, { expireAfterSeconds: 0 });
 export const EmployeeSession = mongoose.models.EmployeeSession || mongoose.model("EmployeeSession", schema);
 
 /** A surface can narrow a role, never grant privileges from a request header. */
-export function sessionRole(employee: { email: string; apiRole: string; ownerProtected?: boolean }, surface: string): string | null {
-  if (surface === "admin" && employee.email !== OWNER_EMAIL) return null;
+export function sessionRole(employee: { email: string; apiRole: string; ownerProtected?: boolean; authorizationStatus?: string }, surface: string): string | null {
+  if (employee.authorizationStatus && employee.authorizationStatus !== "approved") return null;
   // The protected owner account may operate internal surfaces. The session
   // role remains scoped to the requested app; ordinary employees are still
   // restricted by the surface map below.

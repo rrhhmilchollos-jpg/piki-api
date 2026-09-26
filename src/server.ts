@@ -5,7 +5,7 @@ import cors from "cors";
 import express from "express";
 import mongoose from "mongoose";
 import { z } from "zod";
-import { CashLedgerEntry, CustomerAccount, DispatchDecision, EmployeeAccount, Fleet, Order, Restaurant, PartnerAsset, PartnerLocalityGroup, Rider, RiderApplication, RiderIncident, RiderOrderMessage, RiderSlot, SignatureRequest, Zone, ensureIndexes } from "./models.js";
+import { CashLedgerEntry, CustomerAccount, DispatchDecision, EmployeeAccount, AccessAuthorization, Fleet, Order, Restaurant, PartnerAsset, PartnerLocalityGroup, Rider, RiderApplication, RiderIncident, RiderOrderMessage, RiderSlot, SignatureRequest, Zone, PushSubscription, RealtimeEvent, ensureIndexes } from "./models.js";
 import { seedCatalog } from "./seed.js";
 import { assertTransition, calculateEtaRange, transitionSchema, validateCoordinates } from "./algorithms/index.js";
 import { configuredAuthRoles, requireOwner, requireRole, resolveRole } from "./auth.js";
@@ -254,8 +254,8 @@ app.get("/api/v1/auth/status", (_req, res) => res.json({ authentication: "bearer
 const employeeLoginSchema = z.object({ email: z.string().email(), password: z.string().min(8).max(200) });
 app.post("/api/v1/auth/employee/login", async (req, res) => {
   const parsed = employeeLoginSchema.safeParse(req.body); if (!parsed.success) return res.status(400).json({ error: "INVALID_LOGIN" });
-  if (String(req.headers["x-piki-surface"] || "").toLowerCase() === "admin" && parsed.data.email.toLowerCase() !== ownerEmail) return res.status(403).json({ error: "ADMIN_OWNER_ONLY", message: "El panel Admin está reservado al propietario de PIKI." });
-  const employee = await EmployeeAccount.findOne({ email: parsed.data.email.toLowerCase(), active: true }).select("+passwordHash").exec() as any;
+  if (String(req.headers["x-piki-surface"] || "").toLowerCase() === "admin" && parsed.data.email.toLowerCase() !== ownerEmail) { /* subadmins are allowed; destructive operations remain superadmin-only */ }
+  const employee = await EmployeeAccount.findOne({ email: parsed.data.email.toLowerCase(), active: true, $or: [{ authorizationStatus: "approved" }, { authorizationStatus: { $exists: false } }] }).select("+passwordHash").exec() as any;
   if (!employee || !verifyPassword(parsed.data.password, employee.passwordHash)) return res.status(401).json({ error: "INVALID_CREDENTIALS" });
   const surface = String(req.headers["x-piki-surface"] || "").toLowerCase();
   const role = sessionRole(employee, surface);
@@ -269,11 +269,11 @@ app.post("/api/v1/auth/employee/login", async (req, res) => {
   }
   const issued = await issueEmployeeSession(employee, surface);
   if (!issued) return res.status(403).json({ error: "SURFACE_ROLE_MISMATCH" });
-  return res.json({ accessToken: issued.token, requiresPasswordChange: Boolean(employee.mustChangePassword), employee: { id: employee.id, name: employee.name, email: employee.email, jobRole: role === "rider" ? "rider" : employee.jobRole, apiRole: issued.role, portfolioId: employee.portfolioId, fleetId: employee.fleetId, zoneSlugs: employee.zoneSlugs } });
+  return res.json({ accessToken: issued.token, requiresPasswordChange: Boolean(employee.mustChangePassword), employee: { id: employee.id, name: employee.name, email: employee.email, jobRole: role === "rider" ? "rider" : employee.jobRole, apiRole: issued.role, accessLevel: employee.accessLevel || (employee.email === ownerEmail ? "superadmin" : "subadmin"), authorizationStatus: employee.authorizationStatus || "approved", portfolioId: employee.portfolioId, fleetId: employee.fleetId, zoneSlugs: employee.zoneSlugs } });
 });
 app.get("/api/v1/auth/employee/me", requireRole("admin", "partner", "rider", "fleet", "commercial"), async (req, res) => {
-  const employee = req.auth?.employeeId ? await EmployeeAccount.findById(req.auth.employeeId).select("email ownerProtected").lean().exec() as any : null;
-  return res.json({ employee: { id: req.auth?.employeeId, email: employee?.email || null, role: req.auth?.role, ownerProtected: Boolean(employee?.ownerProtected), mustChangePassword: Boolean(req.auth?.mustChangePassword) } });
+  const employee = req.auth?.employeeId ? await EmployeeAccount.findById(req.auth.employeeId).select("email ownerProtected accessLevel authorizationStatus").lean().exec() as any : null;
+  return res.json({ employee: { id: req.auth?.employeeId, email: employee?.email || null, role: req.auth?.role, accessLevel: employee?.accessLevel || "subadmin", authorizationStatus: employee?.authorizationStatus || "approved", ownerProtected: Boolean(employee?.ownerProtected), mustChangePassword: Boolean(req.auth?.mustChangePassword) } });
 });
 app.post("/api/v1/auth/employee/change-password", requireRole("admin", "partner", "rider", "fleet", "commercial"), async (req, res) => {
   const parsed = z.object({ currentPassword: z.string().min(8), newPassword: z.string().min(12).max(200).regex(/[A-Z]/).regex(/[a-z]/).regex(/[0-9]/) }).safeParse(req.body);
@@ -293,11 +293,12 @@ app.post("/api/v1/admin/employees", requireOwner(), async (req, res) => {
   const apiRole = parsed.data.apiRole || (parsed.data.jobRole === "commercial" ? "commercial" : parsed.data.jobRole === "zone_manager" ? "fleet" : parsed.data.jobRole);
   const temporaryPassword = generateTemporaryPassword();
   try {
-    const employee = await EmployeeAccount.create({ ...parsed.data, restaurantId: parsed.data.restaurantId ? objectId(parsed.data.restaurantId) : null, fleetId: parsed.data.fleetId ? objectId(parsed.data.fleetId) : null, apiRole, passwordHash: hashPassword(temporaryPassword), mustChangePassword: true, active: true });
+    const employee = await EmployeeAccount.create({ ...parsed.data, accessLevel: "subadmin", authorizationStatus: "approved", authorizedAt: new Date(), authorizedBy: req.auth?.employeeId ? objectId(req.auth.employeeId) : null, restaurantId: parsed.data.restaurantId ? objectId(parsed.data.restaurantId) : null, fleetId: parsed.data.fleetId ? objectId(parsed.data.fleetId) : null, apiRole, passwordHash: hashPassword(temporaryPassword), mustChangePassword: true, active: true });
+    await AccessAuthorization.create({ employeeId: employee._id, action: "created", previousStatus: null, nextStatus: "approved", previousRole: null, nextRole: apiRole, accessLevel: "subadmin", actorEmployeeId: objectId(req.auth!.employeeId!), reason: "Cuenta creada y autorizada por RRHH superadmin." });
     return res.status(201).json({ employee: { id: employee.id, name: employee.name, email: employee.email, jobRole: employee.jobRole, apiRole: employee.apiRole, portfolioId: employee.portfolioId, fleetId: employee.fleetId, zoneSlugs: employee.zoneSlugs, active: employee.active }, temporaryPassword, warning: "Mostrar esta contraseña una sola vez y entregarla por un canal seguro." });
   } catch (error) { if ((error as any)?.code === 11000) return res.status(409).json({ error: "EMPLOYEE_EMAIL_ALREADY_EXISTS" }); throw error; }
 });
-app.get("/api/v1/admin/employees", requireRole("admin"), async (_req, res) => res.json({ employees: await EmployeeAccount.find({ email: { $ne: ownerEmail }, hiddenFromAdmin: { $ne: true } }).select("name email jobRole apiRole portfolioId fleetId zoneSlugs active mustChangePassword lastLoginAt createdAt").sort({ createdAt: -1 }).lean().exec() }));
+app.get("/api/v1/admin/employees", requireRole("admin"), async (_req, res) => res.json({ employees: await EmployeeAccount.find({ email: { $ne: ownerEmail }, hiddenFromAdmin: { $ne: true } }).select("name email jobRole apiRole accessLevel authorizationStatus authorizedAt authorizedBy authorizationReason portfolioId fleetId zoneSlugs active mustChangePassword lastLoginAt createdAt").sort({ createdAt: -1 }).lean().exec() }));
 app.get("/api/v1/admin/customers", requireRole("admin"), async (_req, res) => res.json({ customers: await CustomerAccount.find({}).select("name email lastSignedIn createdAt updatedAt").sort({ createdAt: -1 }).limit(1000).lean().exec() }));
 app.post("/api/v1/admin/employees/:id/reset-password", requireOwner(), async (req, res) => {
   const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
@@ -311,11 +312,41 @@ app.post("/api/v1/admin/employees/:id/reset-password", requireOwner(), async (re
   await revokeEmployeeSessions(id);
   return res.json({ employee, reset: true });
 });
-app.patch("/api/v1/admin/employees/:id/active", requireOwner(), async (req, res) => { const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id); if (!id) return res.status(400).json({ error: "INVALID_EMPLOYEE_ID" }); const parsed = z.object({ active: z.boolean() }).safeParse(req.body); if (!parsed.success) return res.status(400).json({ error: "INVALID_ACTIVE_STATE" }); const target = await EmployeeAccount.findById(id).select("email ownerProtected").lean().exec() as any; if (!target) return res.status(404).json({ error: "EMPLOYEE_NOT_FOUND" }); if (target.ownerProtected || target.email === ownerEmail) return res.status(403).json({ error: "OWNER_ACCOUNT_PROTECTED" }); const employee = await EmployeeAccount.findByIdAndUpdate(id, { $set: { active: parsed.data.active, ...(parsed.data.active ? {} : { sessionHash: null }) } }, { new: true }).select("name email jobRole apiRole active mustChangePassword").lean().exec(); return res.json({ employee }); });
+app.patch("/api/v1/admin/employees/:id/authorization", requireOwner(), async (req, res) => {
+  const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id); if (!id) return res.status(400).json({ error: "INVALID_EMPLOYEE_ID" });
+  const parsed = z.object({ status: z.enum(["approved", "suspended", "revoked"]), apiRole: z.enum(["admin", "partner", "rider", "fleet", "commercial"]).optional(), jobRole: z.enum(["admin", "partner", "rider", "fleet", "zone_manager", "commercial"]).optional(), fleetId: z.string().regex(/^[a-f\d]{24}$/).nullable().optional(), zoneSlugs: z.array(z.string().regex(/^[a-z0-9-]+$/)).max(100).optional(), reason: z.string().max(500).default("") }).safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "INVALID_AUTHORIZATION", details: parsed.error.flatten() });
+  const target = await EmployeeAccount.findById(id).select("email ownerProtected jobRole apiRole accessLevel authorizationStatus").lean().exec() as any;
+  if (!target) return res.status(404).json({ error: "EMPLOYEE_NOT_FOUND" });
+  if (target.ownerProtected || target.email === ownerEmail) return res.status(403).json({ error: "OWNER_ACCOUNT_PROTECTED" });
+  const update: Record<string, unknown> = { authorizationStatus: parsed.data.status, active: parsed.data.status === "approved", authorizedAt: parsed.data.status === "approved" ? new Date() : null, authorizedBy: objectId(req.auth!.employeeId!), authorizationReason: parsed.data.reason };
+  if (parsed.data.apiRole) update.apiRole = parsed.data.apiRole;
+  if (parsed.data.jobRole) update.jobRole = parsed.data.jobRole;
+  if (parsed.data.fleetId !== undefined) update.fleetId = parsed.data.fleetId ? objectId(parsed.data.fleetId) : null;
+  if (parsed.data.zoneSlugs) update.zoneSlugs = parsed.data.zoneSlugs;
+  if (parsed.data.status !== "approved") update.sessionHash = null;
+  const employee = await EmployeeAccount.findByIdAndUpdate(id, { $set: update }, { new: true }).select("name email jobRole apiRole accessLevel authorizationStatus authorizedAt authorizedBy authorizationReason fleetId zoneSlugs active mustChangePassword").lean().exec() as any;
+  await AccessAuthorization.create({ employeeId: id, action: parsed.data.apiRole || parsed.data.jobRole ? "role_changed" : parsed.data.status, previousStatus: target.authorizationStatus || null, nextStatus: parsed.data.status, previousRole: target.apiRole, nextRole: employee.apiRole, accessLevel: employee.accessLevel || "subadmin", actorEmployeeId: objectId(req.auth!.employeeId!), reason: parsed.data.reason });
+  if (parsed.data.status !== "approved") await revokeEmployeeSessions(id);
+  return res.json({ employee, authorization: { status: parsed.data.status, persisted: true } });
+});
+
+app.patch("/api/v1/admin/employees/:id/active", requireOwner(), async (req, res) => {
+  const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id); if (!id) return res.status(400).json({ error: "INVALID_EMPLOYEE_ID" });
+  const parsed = z.object({ active: z.boolean(), reason: z.string().max(500).default("") }).safeParse(req.body); if (!parsed.success) return res.status(400).json({ error: "INVALID_ACTIVE_STATE" });
+  const target = await EmployeeAccount.findById(id).select("email ownerProtected jobRole apiRole accessLevel authorizationStatus").lean().exec() as any;
+  if (!target) return res.status(404).json({ error: "EMPLOYEE_NOT_FOUND" });
+  if (target.ownerProtected || target.email === ownerEmail) return res.status(403).json({ error: "OWNER_ACCOUNT_PROTECTED" });
+  const nextStatus = parsed.data.active ? "approved" : "suspended";
+  const employee = await EmployeeAccount.findByIdAndUpdate(id, { $set: { active: parsed.data.active, authorizationStatus: nextStatus, authorizedAt: parsed.data.active ? new Date() : null, authorizedBy: req.auth?.employeeId ? objectId(req.auth.employeeId) : null, authorizationReason: parsed.data.reason, ...(parsed.data.active ? {} : { sessionHash: null }) } }, { new: true }).select("name email jobRole apiRole accessLevel authorizationStatus active mustChangePassword").lean().exec() as any;
+  await AccessAuthorization.create({ employeeId: id, action: nextStatus, previousStatus: target.authorizationStatus || null, nextStatus, previousRole: target.apiRole, nextRole: employee?.apiRole || target.apiRole, accessLevel: employee?.accessLevel || target.accessLevel || "subadmin", actorEmployeeId: objectId(req.auth!.employeeId!), reason: parsed.data.reason });
+  if (!parsed.data.active) await revokeEmployeeSessions(id);
+  return res.json({ employee });
+});
 app.post("/api/v1/admin/owner/bootstrap", requireOwner(), async (req, res) => {
   const parsed = z.object({ email: z.literal(ownerEmail), password: z.string().min(8).max(200), name: z.string().min(2).max(160).default("Propietario y CEO de PIKI") }).safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_OWNER_BOOTSTRAP" });
-  const owner = await EmployeeAccount.findOneAndUpdate({ email: parsed.data.email }, { $set: { name: parsed.data.name, jobRole: "admin", apiRole: "admin", passwordHash: hashPassword(parsed.data.password), active: true, ownerProtected: true, hiddenFromAdmin: true, mustChangePassword: false, passwordChangedAt: new Date() }, $setOnInsert: { portfolioId: "owner_piki_ceo" } }, { upsert: true, new: true, setDefaultsOnInsert: true }).select("_id email name jobRole apiRole ownerProtected hiddenFromAdmin").lean().exec() as any;
+  const owner = await EmployeeAccount.findOneAndUpdate({ email: parsed.data.email }, { $set: { name: parsed.data.name, jobRole: "admin", apiRole: "admin", accessLevel: "superadmin", authorizationStatus: "approved", authorizedAt: new Date(), passwordHash: hashPassword(parsed.data.password), active: true, ownerProtected: true, hiddenFromAdmin: true, mustChangePassword: false, passwordChangedAt: new Date() }, $setOnInsert: { portfolioId: "owner_piki_ceo" } }, { upsert: true, new: true, setDefaultsOnInsert: true }).select("_id email name jobRole apiRole ownerProtected hiddenFromAdmin").lean().exec() as any;
   return res.json({ owner: { id: owner?._id, email: owner?.email, name: owner?.name, role: owner?.jobRole }, protected: true, hiddenFromAdmin: true });
 });
 app.get("/api/v1/payments/status", (_req, res) => res.json({ provider: "stripe", secretKeyConfigured: Boolean(process.env.STRIPE_SECRET_KEY), webhookConfigured: stripeConfigured(), mode: process.env.STRIPE_SECRET_KEY?.startsWith("sk_live_") ? "live" : "test_or_unknown" }));
@@ -489,7 +520,7 @@ app.get("/api/v1/commercial/portfolio", requireRole("commercial"), async (req, r
   return res.json({ portfolioId: employee?.portfolioId || null, restaurants });
 });
 
-app.patch("/api/v1/admin/restaurants/:id/assign-commercial", requireRole("admin"), async (req, res) => {
+app.patch("/api/v1/admin/restaurants/:id/assign-commercial", requireOwner(), async (req, res) => {
   const restaurantId = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
   const commercialId = objectId(String(req.body?.employeeId || ""));
   if (!restaurantId || !commercialId) return res.status(400).json({ error: "INVALID_ASSIGNMENT" });
@@ -507,7 +538,7 @@ app.get("/api/v1/admin/restaurants", requireRole("admin"), async (req, res) => {
   return res.json({ restaurants });
 });
 
-app.patch("/api/v1/admin/restaurants/:id/status", requireRole("admin"), async (req, res) => {
+app.patch("/api/v1/admin/restaurants/:id/status", requireOwner(), async (req, res) => {
   const idParam = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
   const id = objectId(idParam); if (!id) return res.status(400).json({ error: "INVALID_RESTAURANT_ID" });
   const parsed = z.object({ status: z.enum(["pending_review", "approved", "rejected", "suspended"]) }).safeParse(req.body);
@@ -541,7 +572,7 @@ app.get("/api/v1/admin/restaurants/:id/documents/:documentId/content", requireRo
   return res.json({ fileName: document.fileName, mimeType: document.mimeType, sizeBytes: document.sizeBytes, sha256: document.sha256, contentBase64: document.contentBase64 });
 });
 
-app.patch("/api/v1/admin/restaurants/:id/documents/:documentId/status", requireRole("admin"), async (req, res) => {
+app.patch("/api/v1/admin/restaurants/:id/documents/:documentId/status", requireOwner(), async (req, res) => {
   const restaurantId = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
   if (!restaurantId) return res.status(400).json({ error: "INVALID_RESTAURANT_ID" });
   const parsed = z.object({ status: z.enum(["received", "approved", "rejected"]), reviewNotes: z.string().max(1000).default("") }).safeParse(req.body);
@@ -593,7 +624,7 @@ app.get("/api/v1/rider-applications/:id/documents/:documentId/content", requireR
   if (!document) return res.status(404).json({ error: "DOCUMENT_NOT_FOUND" });
   return res.json({ fileName: document.fileName, mimeType: document.mimeType, sizeBytes: document.sizeBytes, sha256: document.sha256, contentBase64: document.contentBase64 });
 });
-app.patch("/api/v1/rider-applications/:id/documents/:documentId/status", requireRole("admin", "fleet"), async (req, res) => {
+app.patch("/api/v1/rider-applications/:id/documents/:documentId/status", requireOwner(), async (req, res) => {
   const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
   if (!id) return res.status(400).json({ error: "INVALID_APPLICATION_ID" });
   const parsed = z.object({ status: z.enum(["approved", "rejected"]), reviewNotes: z.string().max(1000).default("") }).safeParse(req.body);
@@ -602,7 +633,7 @@ app.patch("/api/v1/rider-applications/:id/documents/:documentId/status", require
   if (!application) return res.status(404).json({ error: "DOCUMENT_NOT_FOUND" });
   return res.json({ applicationId: application._id, documents: (application.documents || []).map(({ contentBase64, ...metadata }: any) => metadata) });
 });
-app.patch("/api/v1/rider-applications/:id/status", requireRole("admin", "fleet"), async (req, res) => {
+app.patch("/api/v1/rider-applications/:id/status", requireOwner(), async (req, res) => {
   const idParam = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
   const id = objectId(idParam); if (!id) return res.status(400).json({ error: "INVALID_APPLICATION_ID" });
   const parsed = z.object({ status: z.enum(["pending", "contacted", "approved", "rejected"]), notes: z.string().max(1000).optional(), assignedFleetId: z.string().regex(/^[a-f\d]{24}$/).nullable().optional() }).safeParse(req.body);
@@ -1427,7 +1458,7 @@ app.use((error: any, req: express.Request, res: express.Response, next: express.
 
 async function start() {
   const uri = process.env.MONGODB_URI;
-  if (uri) { await mongoose.connect(uri, { dbName: databaseName, serverSelectionTimeoutMS: 10_000 }); await ensureIndexes(); startRealtimeRelay(); if (process.env.SEED_DEMO_DATA === "true") await seedCatalog(); databaseReady = true; } else console.warn("MONGODB_URI is not configured; /ready will remain unavailable.");
+  if (uri) { await mongoose.connect(uri, { dbName: databaseName, serverSelectionTimeoutMS: 10_000 }); await EmployeeAccount.updateMany({ authorizationStatus: { $exists: false } }, { $set: { authorizationStatus: "approved", accessLevel: "subadmin" } }).exec(); await EmployeeAccount.updateOne({ email: ownerEmail }, { $set: { accessLevel: "superadmin", authorizationStatus: "approved", ownerProtected: true, active: true } }).exec(); await ensureIndexes(); startRealtimeRelay(); if (process.env.SEED_DEMO_DATA === "true") await seedCatalog(); databaseReady = true; } else console.warn("MONGODB_URI is not configured; /ready will remain unavailable.");
   await EmployeeSession.init();
   const server = app.listen(port, "0.0.0.0", () => console.log(`PIKI API listening on port ${port}`));
   const sweepTimer = setInterval(() => { void runAutomaticDispatchSweep().catch((error) => console.error("Automatic dispatch sweep crashed", error)); }, 5_000).unref();
