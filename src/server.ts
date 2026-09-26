@@ -6,15 +6,11 @@ import mongoose from "mongoose";
 import { z } from "zod";
 import { CustomerAccount, DispatchDecision, EmployeeAccount, Fleet, Order, Restaurant, PartnerAsset, PartnerLocalityGroup, Rider, RiderApplication, RiderIncident, RiderOrderMessage, RiderSlot, SignatureRequest, Zone, ensureIndexes } from "./models.js";
 import { seedCatalog } from "./seed.js";
-import { assertTransition, calculateEtaRange, transitionSchema, validateCoordinates } from "./workflow.js";
+import { assertTransition, calculateEtaRange, transitionSchema, validateCoordinates } from "./algorithms/index.js";
 import { configuredAuthRoles, requireOwner, requireRole } from "./auth.js";
-import { createCheckoutSession, processStripeWebhook, stripeConfigured } from "./stripe.js";
-import { rankDispatchCandidates } from "./dispatch.js";
-import { computeMobilityAdvice } from "./low-activity.js";
-import { calculateSanctionDecision, defaultSanctionPolicy } from "./sanctions.js";
-import { handleCustomerTrpc } from "./customerCompat.js";
+import { createCheckoutSession, processStripeWebhook, stripeConfigured, createSignaturitSignature, signaturitBaseUrl, signaturitConfigured, signaturitMode, signatureWebhookUrl, webhookDigest, handleCustomerTrpc } from "./integrations/index.js";
+import { rankDispatchCandidates, computeMobilityAdvice, calculateSanctionDecision, defaultSanctionPolicy } from "./algorithms/index.js";
 import { createSessionToken, generateTemporaryPassword, hashPassword, hashSessionToken, verifyPassword } from "./employeeAuth.js";
-import { createSignaturitSignature, signaturitBaseUrl, signaturitConfigured, signaturitMode, signatureWebhookUrl, webhookDigest } from "./signaturit.js";
 
 const app = express();
 const port = Number(process.env.PORT || 3000);
