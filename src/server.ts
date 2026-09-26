@@ -500,7 +500,7 @@ app.post("/api/v1/payments/checkout", async (req, res) => {
   }
 });
 
-const testDispatchOrderSchema = z.object({ restaurantId: z.string().optional(), customerId: z.string().regex(/^[a-f\d]{24}$/i).optional(), count: z.coerce.number().int().min(1).max(10).default(1), deliveryAddress: z.string().min(5).max(280).default("Plaza de la Seu, 1, Xàtiva") });
+const testDispatchOrderSchema = z.object({ restaurantId: z.string().optional(), customerId: z.string().regex(/^[a-f\d]{24}$/i).optional(), count: z.coerce.number().int().min(1).max(10).default(1), deliveryAddress: z.string().min(5).max(280).default("Plaza de la Seu, 1, Xàtiva"), status: z.enum(["accepted", "preparing", "ready_for_pickup"]).default("preparing") });
 app.post("/api/v1/admin/dispatch/test-orders", requireRole("admin", "fleet"), async (req, res) => {
   const parsed = testDispatchOrderSchema.safeParse(req.body || {});
   if (!parsed.success) return res.status(400).json({ error: "INVALID_TEST_ORDER_REQUEST", details: parsed.error.flatten() });
@@ -520,16 +520,17 @@ app.post("/api/v1/admin/dispatch/test-orders", requireRole("admin", "fleet"), as
     const subtotalCents = Math.round(Number(item.price || 0) * 100);
     const deliveryFeeCents = Number(restaurant.deliveryFeeCents || 0);
     const totalCents = subtotalCents + deliveryFeeCents + 79;
-    const order = await Order.create({ publicCode: `PIKI-TEST-${Date.now().toString(36).toUpperCase()}-${index + 1}`, ...dailyCode, restaurantId: restaurant._id, customerId: parsed.data.customerId || "test-customer@pikidelivery.com", customerPhone: "+34960000111", isTestOrder: true, items: [{ itemId: item.id, name: item.name, quantity: 1, unitPriceCents: subtotalCents }], deliveryAddress: parsed.data.deliveryAddress, deliveryLocation: { type: "Point", coordinates: restaurant.location?.coordinates || [-0.52, 38.99] }, subtotalCents, deliveryFeeCents, totalCents, paymentState: "paid", status: "ready_for_pickup", assignmentState: "unassigned", statusHistory: [{ status: "ready_for_pickup", actorRole: "admin", reason: "Pedido de prueba creado desde Supervisión de dispatch" }] });
+    const order = await Order.create({ publicCode: `PIKI-TEST-${Date.now().toString(36).toUpperCase()}-${index + 1}`, ...dailyCode, restaurantId: restaurant._id, customerId: parsed.data.customerId || "test-customer@pikidelivery.com", customerPhone: "+34960000111", isTestOrder: true, items: [{ itemId: item.id, name: item.name, quantity: 1, unitPriceCents: subtotalCents }], deliveryAddress: parsed.data.deliveryAddress, deliveryLocation: { type: "Point", coordinates: restaurant.location?.coordinates || [-0.52, 38.99] }, subtotalCents, deliveryFeeCents, totalCents, paymentState: "paid", status: parsed.data.status, assignmentState: "unassigned", statusHistory: [{ status: parsed.data.status, actorRole: "admin", reason: "Pedido de prueba creado desde Supervisión de dispatch" }] });
     created.push({ id: order.id, publicCode: order.publicCode, displayCode: order.displayCode, restaurantId: restaurant._id, restaurantName: restaurant.name, status: order.status, paymentState: order.paymentState, isTestOrder: true });
   }
-  return res.status(201).json({ orders: created, message: `${created.length} pedido(s) de prueba listo(s) para dispatch.` });
+  return res.status(201).json({ orders: created, message: `${created.length} pedido(s) de prueba creado(s) y visible(s) en Cocina, Fleet y Dispatch.` });
 });
 
 app.get("/api/v1/orders", requireRole("admin", "partner", "rider", "fleet"), async (req, res) => {
   const filter: Record<string, unknown> = {};
   if (typeof req.query.customerId === "string") filter.customerId = req.query.customerId;
   if (typeof req.query.status === "string") filter.status = req.query.status;
+  if (req.query.dispatchable === "true") filter.status = { $in: ["accepted", "preparing", "ready_for_pickup"] };
   const orders = await Order.find(filter).sort({ createdAt: -1 }).limit(100).lean().exec();
   res.json({ orders });
 });
@@ -546,7 +547,7 @@ app.post("/api/v1/orders/:id/transitions", requireRole("admin", "partner", "ride
   const orderId = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
   const id = objectId(orderId); if (!id) return res.status(400).json({ error: "INVALID_ORDER_ID" });
   const order = await Order.findById(id); if (!order) return res.status(404).json({ error: "ORDER_NOT_FOUND" });
-  const actorRole = req.auth?.role === "admin" ? parsed.data.actorRole : req.auth?.role;
+  const actorRole = req.auth?.role === "admin" ? (parsed.data.actorRole || req.auth.role) : req.auth?.role;
   if (!actorRole) return res.status(401).json({ error: "AUTHENTICATION_REQUIRED" });
   if (actorRole === "rider") {
     const rider = await riderAccessForRequest(order.riderId, req);
