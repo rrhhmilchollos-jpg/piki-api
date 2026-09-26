@@ -259,8 +259,12 @@ const employeeLoginSchema = z.object({ email: z.string().email(), password: z.st
 app.post("/api/v1/auth/employee/login", async (req, res) => {
   const parsed = employeeLoginSchema.safeParse(req.body); if (!parsed.success) return res.status(400).json({ error: "INVALID_LOGIN" });
   if (String(req.headers["x-piki-surface"] || "").toLowerCase() === "admin" && parsed.data.email.toLowerCase() !== ownerEmail) { /* subadmins are allowed; destructive operations remain superadmin-only */ }
-  const employee = await EmployeeAccount.findOne({ email: parsed.data.email.toLowerCase(), active: true, $or: [{ authorizationStatus: "approved" }, { authorizationStatus: { $exists: false } }] }).select("+passwordHash").exec() as any;
+  const employee = await EmployeeAccount.findOne({ email: parsed.data.email.toLowerCase() }).select("+passwordHash").exec() as any;
   if (!employee || !verifyPassword(parsed.data.password, employee.passwordHash)) return res.status(401).json({ error: "INVALID_CREDENTIALS" });
+  if (!employee.active || (employee.authorizationStatus && employee.authorizationStatus !== "approved")) {
+    const isPartner = employee.apiRole === "partner";
+    return res.status(403).json({ error: isPartner ? "PARTNER_PENDING_APPROVAL" : "ACCOUNT_NOT_ACTIVE", message: isPartner ? "Tu solicitud está pendiente de revisión por Administración. Podrás iniciar sesión cuando se aprueben el comercio y la documentación." : "Esta cuenta no está activa." });
+  }
   const surface = String(req.headers["x-piki-surface"] || "").toLowerCase();
   const role = sessionRole(employee, surface);
   if (!role) return res.status(403).json({ error: "SURFACE_ROLE_MISMATCH", message: "Esta cuenta no tiene acceso a esta aplicación." });
@@ -464,7 +468,7 @@ app.get("/api/v1/coverage", async (req, res) => {
 
 const partnerDocumentSchema = z.object({ type: z.enum(["tax_id", "bank_certificate", "insurance", "activity_license", "food_sanitary_authorization", "identity", "other"]), fileName: z.string().min(1).max(180), mimeType: z.enum(["application/pdf", "image/jpeg", "image/png"]), sizeBytes: z.number().int().positive().max(2_500_000), sha256: z.string().regex(/^[a-f0-9]{64}$/), contentBase64: z.string().min(20).max(3_500_000) });
 const openingHoursSchema = z.record(z.string().min(2).max(15), z.object({ open: z.string().regex(/^\d{2}:\d{2}$/), close: z.string().regex(/^\d{2}:\d{2}$/), closed: z.boolean() }));
-const partnerSchema = z.object({ name: z.string().min(2).max(160), email: z.string().email(), phone: z.string().min(6).max(40), address: z.string().min(5).max(280), legalName: z.string().min(2).max(180), taxId: z.string().regex(/^[A-Za-z0-9-]{5,20}$/), legalForm: z.enum(["autonomo", "sl", "sa", "cooperativa", "otra"]), representativeName: z.string().min(2).max(160), representativeRole: z.string().min(2).max(100), representativeDocument: z.string().min(5).max(30), fiscalAddress: z.string().min(5).max(280), operatingAddress: z.string().min(5).max(280), postalCode: z.string().regex(/^\d{5}$/), city: z.string().min(2).max(100), province: z.string().min(2).max(100), iban: z.string().regex(/^[A-Z]{2}\d{2}[A-Z0-9]{10,30}$/), bankAccountHolder: z.string().min(2).max(180), cuisine: z.string().min(2).max(100), vatRate: z.union([z.literal(4), z.literal(10), z.literal(21)]), commissionAccepted: z.literal(true), termsAcceptedAt: z.coerce.date(), contractAccepted: z.literal(true), privacyAccepted: z.literal(true), dataProcessingAccepted: z.literal(true), pdaUnits: z.number().int().min(1).max(50), pdaUnitCostCents: z.literal(30000), pdaCostAccepted: z.literal(true), pdaCostAcceptedAt: z.coerce.date(), privacyAcceptedAt: z.coerce.date(), dataProcessingAcceptedAt: z.coerce.date(), openingHours: openingHoursSchema, documents: z.array(partnerDocumentSchema).length(5) });
+const partnerSchema = z.object({ name: z.string().min(2).max(160), email: z.string().email(), password: z.string().min(12).max(200).regex(/[A-Z]/).regex(/[a-z]/).regex(/[0-9]/), phone: z.string().min(6).max(40), address: z.string().min(5).max(280), legalName: z.string().min(2).max(180), taxId: z.string().regex(/^[A-Za-z0-9-]{5,20}$/), legalForm: z.enum(["autonomo", "sl", "sa", "cooperativa", "otra"]), representativeName: z.string().min(2).max(160), representativeRole: z.string().min(2).max(100), representativeDocument: z.string().min(5).max(30), fiscalAddress: z.string().min(5).max(280), operatingAddress: z.string().min(5).max(280), postalCode: z.string().regex(/^\d{5}$/), city: z.string().min(2).max(100), province: z.string().min(2).max(100), iban: z.string().regex(/^[A-Z]{2}\d{2}[A-Z0-9]{10,30}$/), bankAccountHolder: z.string().min(2).max(180), cuisine: z.string().min(2).max(100), vatRate: z.union([z.literal(4), z.literal(10), z.literal(21)]), commissionAccepted: z.literal(true), termsAcceptedAt: z.coerce.date(), contractAccepted: z.literal(true), privacyAccepted: z.literal(true), dataProcessingAccepted: z.literal(true), pdaUnits: z.number().int().min(1).max(50), pdaUnitCostCents: z.literal(30000), pdaCostAccepted: z.literal(true), pdaCostAcceptedAt: z.coerce.date(), privacyAcceptedAt: z.coerce.date(), dataProcessingAcceptedAt: z.coerce.date(), openingHours: openingHoursSchema, documents: z.array(partnerDocumentSchema).length(5) });
 app.post("/api/v1/partners/onboarding", async (req, res) => {
   const parsed = partnerSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_PARTNER", details: parsed.error.flatten() });
@@ -476,11 +480,20 @@ app.post("/api/v1/partners/onboarding", async (req, res) => {
   }
   const existingTaxId = await Restaurant.findOne({ "partnerProfile.taxId": parsed.data.taxId.toUpperCase() }).select("_id").lean().exec();
   if (existingTaxId) return res.status(409).json({ error: "PARTNER_TAX_ID_ALREADY_EXISTS" });
+  const normalizedEmail = parsed.data.email.toLowerCase();
+  if (await EmployeeAccount.exists({ email: normalizedEmail })) return res.status(409).json({ error: "PARTNER_EMAIL_ALREADY_EXISTS", message: "Ya existe una solicitud o cuenta con este correo." });
   const slug = `${parsed.data.name.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "")}-${Date.now().toString(36)}`;
-  const { legalName, taxId, legalForm, representativeName, representativeRole, representativeDocument, fiscalAddress, operatingAddress, postalCode, city, province, iban, bankAccountHolder, cuisine, vatRate, commissionAccepted, termsAcceptedAt, contractAccepted, privacyAccepted, dataProcessingAccepted, pdaUnits, pdaUnitCostCents, pdaCostAccepted, pdaCostAcceptedAt, privacyAcceptedAt, dataProcessingAcceptedAt, openingHours, documents, ...contact } = parsed.data;
+  const { legalName, taxId, legalForm, representativeName, representativeRole, representativeDocument, fiscalAddress, operatingAddress, postalCode, city, province, iban, bankAccountHolder, cuisine, vatRate, commissionAccepted, termsAcceptedAt, contractAccepted, privacyAccepted, dataProcessingAccepted, pdaUnits, pdaUnitCostCents, pdaCostAccepted, pdaCostAcceptedAt, privacyAcceptedAt, dataProcessingAcceptedAt, openingHours, documents, password: _password, ...contact } = parsed.data;
   const locality = city.trim();
   const groupKey = localityKey(locality);
   const partner = await Restaurant.create({ slug, name: contact.name, cuisine, category: cuisine, locality, partnerGroupKey: groupKey, address: operatingAddress, tagline: "Solicitud recibida por PIKI", onboardingStatus: "pending_review", isActive: false, email: contact.email, phone: contact.phone, partnerProfile: { legalName, taxId: taxId.toUpperCase(), legalForm, representativeName, representativeRole, representativeDocument, fiscalAddress, operatingAddress, postalCode, city, province, iban: iban.toUpperCase(), bankAccountHolder, cuisine, vatRate, commissionAccepted, termsAcceptedAt, contractAcceptedAt: contractAccepted ? termsAcceptedAt : null, privacyAcceptedAt, dataProcessingAcceptedAt, pdaUnits, pdaUnitCostCents, pdaCostAcceptedAt: pdaCostAccepted ? pdaCostAcceptedAt : null, openingHours, documents: documents.map(({ contentBase64, ...metadata }) => ({ ...metadata, contentBase64, status: "received" })) } });
+  try {
+    await EmployeeAccount.create({ name: contact.name, email: normalizedEmail, jobRole: "partner", apiRole: "partner", accessLevel: "subadmin", authorizationStatus: "pending", restaurantId: partner._id, passwordHash: hashPassword(parsed.data.password), mustChangePassword: false, active: false });
+  } catch (error) {
+    await Restaurant.findByIdAndDelete(partner._id).exec();
+    if ((error as any)?.code === 11000) return res.status(409).json({ error: "PARTNER_EMAIL_ALREADY_EXISTS", message: "Ya existe una solicitud o cuenta con este correo." });
+    throw error;
+  }
   await PartnerLocalityGroup.findOneAndUpdate({ localityKey: groupKey }, { $set: { localityName: locality, province, isActive: true }, $addToSet: { restaurantIds: partner._id } }, { upsert: true, new: true });
   res.status(201).json({ message: "Solicitud recibida para revisión.", partner: { id: partner.id, name: partner.name, email: partner.email, phone: partner.phone, locality, partnerGroupKey: groupKey, onboarding_status: partner.onboardingStatus } });
 });
@@ -566,9 +579,21 @@ app.patch("/api/v1/admin/restaurants/:id/status", requireOwner(), async (req, re
     if (!documents.length || documents.some((document: any) => document.status === "received")) return res.status(409).json({ error: "PARTNER_DOCUMENT_REVIEW_REQUIRED", message: "Debes revisar todos los documentos del partner antes de aprobar o rechazar la solicitud." });
     if (parsed.data.status === "approved" && documents.some((document: any) => document.status !== "approved")) return res.status(409).json({ error: "PARTNER_DOCUMENTS_NOT_APPROVED", message: "No se puede aprobar: existe documentación del partner rechazada." });
   }
-  const restaurant = await Restaurant.findByIdAndUpdate(id, { $set: { onboardingStatus: parsed.data.status, isActive: parsed.data.status === "approved" } }, { new: true }).lean().exec();
+  const restaurant = await Restaurant.findByIdAndUpdate(id, { $set: { onboardingStatus: parsed.data.status, isActive: parsed.data.status === "approved" } }, { new: true }).lean().exec() as any;
   if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
-  return res.json({ restaurant });
+  const partnerAccount = await EmployeeAccount.findOne({ restaurantId: restaurant._id, apiRole: "partner" }).select("_id authorizationStatus").exec() as any;
+  if (parsed.data.status === "approved" && !partnerAccount) {
+    await Restaurant.findByIdAndUpdate(id, { $set: { onboardingStatus: "pending_review", isActive: false } }).exec();
+    return res.status(409).json({ error: "PARTNER_ACCOUNT_MISSING", message: "La solicitud no tiene una cuenta Partner asociada." });
+  }
+  if (partnerAccount) {
+    const approved = parsed.data.status === "approved";
+    const nextStatus = approved ? "approved" : parsed.data.status === "rejected" ? "revoked" : "suspended";
+    await EmployeeAccount.findByIdAndUpdate(partnerAccount._id, { $set: { authorizationStatus: nextStatus, active: approved, authorizedAt: approved ? new Date() : null, authorizedBy: approved ? objectId(req.auth!.employeeId!) : null, authorizationReason: `Estado del comercio: ${parsed.data.status}`, ...(approved ? {} : { sessionHash: null }) } }).exec();
+    if (!approved) await revokeEmployeeSessions(String(partnerAccount._id));
+    await AccessAuthorization.create({ employeeId: partnerAccount._id, action: parsed.data.status, previousStatus: partnerAccount.authorizationStatus || "pending", nextStatus, previousRole: "partner", nextRole: "partner", accessLevel: "subadmin", actorEmployeeId: objectId(req.auth!.employeeId!), reason: `Estado del comercio: ${parsed.data.status}` });
+  }
+  return res.json({ restaurant, partnerAccount: partnerAccount ? { id: String(partnerAccount._id), access: parsed.data.status === "approved" ? "enabled" : "disabled" } : null });
 });
 
 app.get("/api/v1/admin/restaurants/:id/documents", requireRole("admin"), async (req, res) => {
