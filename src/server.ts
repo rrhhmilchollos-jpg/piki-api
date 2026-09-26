@@ -530,7 +530,9 @@ app.post("/api/v1/admin/dispatch/test-orders", requireRole("admin", "fleet"), as
     const deliveryFeeCents = Number(restaurant.deliveryFeeCents || 0);
     const totalCents = subtotalCents + deliveryFeeCents + 79;
     const order = await Order.create({ publicCode: `PIKI-TEST-${Date.now().toString(36).toUpperCase()}-${index + 1}`, ...dailyCode, restaurantId: restaurant._id, customerId: parsed.data.customerId || "test-customer@pikidelivery.com", customerPhone: "+34960000111", isTestOrder: true, items: [{ itemId: item.id, name: item.name, quantity: 1, unitPriceCents: subtotalCents }], deliveryAddress: parsed.data.deliveryAddress, deliveryLocation: { type: "Point", coordinates: restaurant.location?.coordinates || [-0.52, 38.99] }, subtotalCents, deliveryFeeCents, totalCents, paymentState: "paid", status: parsed.data.status, assignmentState: "unassigned", statusHistory: [{ status: parsed.data.status, actorRole: "admin", reason: "Pedido de prueba creado desde Supervisión de dispatch" }] });
-    created.push({ id: order.id, publicCode: order.publicCode, displayCode: order.displayCode, restaurantId: restaurant._id, restaurantName: restaurant.name, status: order.status, paymentState: order.paymentState, isTestOrder: true });
+    const preferredQaRider = process.env.QA_RIDER_EMAIL && parsed.data.customerId === "qa-kfc-e2e" ? await Rider.findOne({ email: process.env.QA_RIDER_EMAIL.toLowerCase() }).select("_id").lean().exec() as any : null;
+    void queueAutomaticDispatch(order._id, preferredQaRider?._id).catch((error) => console.error("Automatic dispatch failed", error));
+    created.push({ id: order.id, publicCode: order.publicCode, displayCode: order.displayCode, restaurantId: restaurant._id, restaurantName: restaurant.name, status: order.status, paymentState: order.paymentState, isTestOrder: true, dispatchQueued: true });
   }
   return res.status(201).json({ orders: created, message: `${created.length} pedido(s) de prueba creado(s) y visible(s) en Cocina, Fleet y Dispatch.` });
 });
@@ -759,6 +761,59 @@ app.get("/api/v1/riders/:id/sanction-status", requireRole("admin", "fleet", "rid
   const decision = calculateSanctionDecision(incidents.map((item: any) => ({ id: String(item._id), riderId: String(item.riderId), reason: item.reason, occurredAt: item.occurredAt, evidence: item.evidence, acknowledged: item.acknowledged, resolved: item.resolved })), new Date(), defaultSanctionPolicy);
   return res.json({ riderId, policy: defaultSanctionPolicy, incidents, sanction: decision });
 });
+
+const automaticDispatchInFlight = new Set<string>();
+
+/**
+ * Asignación automática idempotente. El algoritmo solo acepta riders con sesión
+ * operativa, GPS reciente y capacidad disponible. preferredRiderId se reserva
+ * para pedidos QA internos y nunca se expone a Customer/Partner.
+ */
+async function assignOrderAutomatically(orderId: mongoose.Types.ObjectId, preferredRiderId?: mongoose.Types.ObjectId) {
+  const key = String(orderId);
+  if (automaticDispatchInFlight.has(key)) return { state: "in_progress" as const };
+  automaticDispatchInFlight.add(key);
+  try {
+    const order = await Order.findById(orderId).lean().exec() as any;
+    if (!order) return { state: "not_found" as const };
+    if (order.paymentState !== "paid" || !["accepted", "preparing", "ready_for_pickup"].includes(order.status)) return { state: "not_dispatchable" as const };
+    if (order.riderId || order.assignmentState === "assigned" || order.assignmentState === "offered") return { state: "already_assigned" as const, riderId: order.riderId };
+    const restaurant = await Restaurant.findById(order.restaurantId).lean().exec() as any;
+    if (!restaurant?.location?.coordinates || !order.deliveryLocation?.coordinates) return { state: "missing_geolocation" as const };
+    const policy = await dispatchLoadPolicy();
+    const freshness = new Date(Date.now() - 90_000);
+    const riderFilter: Record<string, unknown> = { status: { $in: ["available", "busy"] }, lastLocationAt: { $gte: freshness }, location: { $exists: true } };
+    if (preferredRiderId) riderFilter._id = preferredRiderId;
+    const riders = await Rider.find(riderFilter).limit(100).lean().exec() as any[];
+    const counts = await activeOrderCounts(riders.map((rider) => rider._id));
+    const ranked = rankDispatchCandidates(riders.map((rider) => ({ id: String(rider._id), status: rider.status, vehicle: rider.vehicle, location: rider.location, lastLocationAt: rider.lastLocationAt, reliabilityScore: rider.reliabilityScore, activeOrderCount: counts.get(String(rider._id)) || 0, zoneFit: 1, servicePriority: preferredRiderId && String(rider._id) === String(preferredRiderId) ? 1 : 0.5 })), { restaurantLocation: [restaurant.location.coordinates[0], restaurant.location.coordinates[1]], customerLocation: [order.deliveryLocation.coordinates[0], order.deliveryLocation.coordinates[1]], preparationMinutes: 15, maxConcurrentOrders: policy.maxConcurrentOrders });
+    if (!ranked.length) return { state: "no_eligible_rider" as const, candidatesConsidered: riders.length };
+    for (const decision of ranked) {
+      const currentLoad = counts.get(decision.riderId) || 0;
+      const riderFilterForReservation = currentLoad === 0 ? { _id: objectId(decision.riderId), status: { $in: ["available", "busy"] }, activeOrderId: null } : { _id: objectId(decision.riderId), status: { $in: ["available", "busy"] }, activeOrderId: { $ne: null } };
+      const rider = await Rider.findOneAndUpdate(riderFilterForReservation, currentLoad === 0 ? { $set: { status: "busy", activeOrderId: order._id } } : { $set: { status: "busy" } }, { new: true }).lean().exec() as any;
+      if (!rider) continue;
+      const expiresAt = new Date(Date.now() + 180_000);
+      const assigned = await Order.findOneAndUpdate({ _id: order._id, riderId: null, assignmentState: { $in: ["unassigned", "expired", "rejected"] } }, { $set: { riderId: rider._id, assignmentState: "offered", assignmentExpiresAt: expiresAt, dispatchScore: decision.score }, $inc: { dispatchAttempts: 1, version: 1 } }, { new: true }).lean().exec() as any;
+      if (!assigned) { await Rider.updateOne({ _id: rider._id, activeOrderId: order._id }, { $set: { status: "available", activeOrderId: null } }).exec(); continue; }
+      await DispatchDecision.create({ orderId: assigned._id, ...decision, riderId: rider._id, outcome: "offered", actorRole: "system" });
+      return { state: "offered" as const, orderId: assigned._id, riderId: rider._id, expiresAt, decision, policy };
+    }
+    return { state: "reservation_race" as const };
+  } finally {
+    automaticDispatchInFlight.delete(key);
+  }
+}
+
+async function queueAutomaticDispatch(orderId: mongoose.Types.ObjectId, preferredRiderId?: mongoose.Types.ObjectId) {
+  // No se bloquea la respuesta al Customer/Partner; el worker se reintenta.
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const result = await assignOrderAutomatically(orderId, preferredRiderId);
+    if (!["no_eligible_rider", "reservation_race"].includes(result.state)) return result;
+    await new Promise((resolve) => setTimeout(resolve, 750 * (attempt + 1)));
+  }
+  return assignOrderAutomatically(orderId, preferredRiderId);
+}
 
 app.get("/api/v1/dispatch/orders/:id/preview", requireRole("admin", "fleet"), async (req, res) => {
   const parsed = dispatchSchema.safeParse(req.query);
