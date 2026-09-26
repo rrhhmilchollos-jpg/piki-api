@@ -18,6 +18,10 @@ export const EmployeeSession = mongoose.models.EmployeeSession || mongoose.model
 /** A surface can narrow a role, never grant privileges from a request header. */
 export function sessionRole(employee: { email: string; apiRole: string; ownerProtected?: boolean }, surface: string): string | null {
   if (surface === "admin" && employee.email !== OWNER_EMAIL) return null;
+  // The protected owner account may operate internal surfaces. The session
+  // role remains scoped to the requested app; ordinary employees are still
+  // restricted by the surface map below.
+  if (employee.email === OWNER_EMAIL && employee.ownerProtected && employee.apiRole === "admin" && ["partner", "fleet"].includes(surface)) return surface;
   if (surface === "rider" && employee.email === OWNER_EMAIL && employee.ownerProtected && employee.apiRole === "admin") return "rider";
   const permitted: Record<string, string[]> = { rider: ["rider"], partner: ["partner"], partners: ["partner"], fleet: ["fleet", "commercial"], admin: ["admin"] };
   return permitted[surface] && !permitted[surface].includes(employee.apiRole) ? null : employee.apiRole;
