@@ -543,7 +543,8 @@ app.post("/api/v1/admin/dispatch/test-orders", requireRole("admin", "fleet"), as
     const subtotalCents = Math.round(Number(item.price || 0) * 100);
     const deliveryFeeCents = Number(restaurant.deliveryFeeCents || 0);
     const totalCents = subtotalCents + deliveryFeeCents + 79;
-    const order = await Order.create({ publicCode: `PIKI-TEST-${Date.now().toString(36).toUpperCase()}-${index + 1}`, ...dailyCode, restaurantId: restaurant._id, customerId: parsed.data.customerId || "test-customer@pikidelivery.com", customerPhone: "+34960000111", isTestOrder: true, items: [{ itemId: item.id, name: item.name, quantity: 1, unitPriceCents: subtotalCents }], deliveryAddress: parsed.data.deliveryAddress, deliveryLocation: { type: "Point", coordinates: restaurant.location?.coordinates || [-0.52, 38.99] }, subtotalCents, deliveryFeeCents, totalCents, paymentState: "paid", status: parsed.data.status, assignmentState: "unassigned", statusHistory: [{ status: parsed.data.status, actorRole: "admin", reason: "Pedido de prueba creado desde Supervisión de dispatch" }] });
+    const qaCustomerId = parsed.data.customerId && objectId(parsed.data.customerId) ? objectId(parsed.data.customerId) : null;
+    const order = await Order.create({ publicCode: `PIKI-TEST-${Date.now().toString(36).toUpperCase()}-${index + 1}`, ...dailyCode, restaurantId: restaurant._id, customerId: qaCustomerId, customerPhone: "+34960000111", isTestOrder: true, items: [{ itemId: item.id, name: item.name, quantity: 1, unitPriceCents: subtotalCents }], deliveryAddress: parsed.data.deliveryAddress, deliveryLocation: { type: "Point", coordinates: restaurant.location?.coordinates || [-0.52, 38.99] }, subtotalCents, deliveryFeeCents, totalCents, paymentState: "paid", status: parsed.data.status, assignmentState: "unassigned", statusHistory: [{ status: parsed.data.status, actorRole: "admin", reason: "Pedido de prueba creado desde Supervisión de dispatch" }] });
     const preferredQaRider = process.env.QA_RIDER_EMAIL && parsed.data.customerId === "qa-kfc-e2e" ? await Rider.findOne({ email: process.env.QA_RIDER_EMAIL.toLowerCase() }).select("_id").lean().exec() as any : null;
     void queueAutomaticDispatch(order._id, preferredQaRider?._id).catch((error) => console.error("Automatic dispatch failed", error));
     created.push({ id: order.id, publicCode: order.publicCode, displayCode: order.displayCode, restaurantId: restaurant._id, restaurantName: restaurant.name, status: order.status, paymentState: order.paymentState, isTestOrder: true, dispatchQueued: true });
@@ -947,7 +948,7 @@ app.get("/api/v1/riders/:id/offers", requireRole("rider"), async (req, res) => {
     .sort({ createdAt: -1 }).limit(10).lean().exec() as any[];
   const riderProfile = await Rider.findById(riderId).select("vehicle").lean().exec() as any;
   const restaurantIds = offers.map((offer) => offer.restaurantId).filter(Boolean);
-  const customerIds = offers.map((offer) => offer.customerId).filter(Boolean);
+  const customerIds = offers.map((offer) => offer.customerId).filter((value): value is mongoose.Types.ObjectId => Boolean(value) && mongoose.isValidObjectId(value));
   const [restaurants, customers] = await Promise.all([
     Restaurant.find({ _id: { $in: restaurantIds } }).select("name address phone cuisine etaMinutes deliveryFeeCents").lean().exec(),
     CustomerAccount.find({ _id: { $in: customerIds } }).select("name").lean().exec(),
