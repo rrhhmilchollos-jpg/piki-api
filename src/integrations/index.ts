@@ -9,6 +9,7 @@ export {
 } from "../stripe.js";
 export {
   createSignaturitSignature,
+  signaturitBaseUrl,
   signaturitConfigured,
   signaturitMode,
   signatureWebhookUrl,
