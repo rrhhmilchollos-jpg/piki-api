@@ -18,7 +18,7 @@ export type VersionPolicy = z.infer<typeof versionPolicySchema>;
 export type VersionPolicyMap = Record<PikiSurface, VersionPolicy>;
 
 const fallbackPolicy: VersionPolicy = {
-  version: "0.2.3",
+  version: "0.2.4",
   minimumVersion: "0.0.0",
   buildId: "initial-safe-policy",
   forceUpdate: false,
@@ -102,8 +102,12 @@ export function setAllVersionPolicies(next: VersionPolicyMap): void {
   policies = next;
 }
 
-export function requiresUpdate(policy: VersionPolicy, clientVersion?: string, clientBuildId?: string): boolean {
+/**
+ * `buildId` identifies the deployed artefact for telemetry and cache names,
+ * not an incompatible API contract. Required access is tied to semver so a
+ * same-version Vercel rebuild cannot trap a valid client in a reload loop.
+ */
+export function requiresUpdate(policy: VersionPolicy, clientVersion?: string, _clientBuildId?: string): boolean {
   if (!policy.forceUpdate || !clientVersion) return false;
-  if (compareSemver(clientVersion, policy.minimumVersion) < 0) return true;
-  return clientVersion === policy.version && Boolean(clientBuildId) && clientBuildId !== policy.buildId;
+  return compareSemver(clientVersion, policy.minimumVersion) < 0;
 }
