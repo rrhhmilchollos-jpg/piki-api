@@ -5,7 +5,7 @@ import cors from "cors";
 import express from "express";
 import mongoose from "mongoose";
 import { z } from "zod";
-import { CustomerAccount, DispatchDecision, EmployeeAccount, Fleet, Order, Restaurant, PartnerAsset, PartnerLocalityGroup, Rider, RiderApplication, RiderIncident, RiderOrderMessage, RiderSlot, SignatureRequest, Zone, ensureIndexes } from "./models.js";
+import { CashLedgerEntry, CustomerAccount, DispatchDecision, EmployeeAccount, Fleet, Order, Restaurant, PartnerAsset, PartnerLocalityGroup, Rider, RiderApplication, RiderIncident, RiderOrderMessage, RiderSlot, SignatureRequest, Zone, ensureIndexes } from "./models.js";
 import { seedCatalog } from "./seed.js";
 import { assertTransition, calculateEtaRange, transitionSchema, validateCoordinates } from "./algorithms/index.js";
 import { configuredAuthRoles, requireOwner, requireRole, resolveRole } from "./auth.js";
@@ -73,7 +73,7 @@ app.use(express.json({ limit: "12mb" }));
 const objectId = (value: string) => mongoose.isValidObjectId(value) ? new mongoose.Types.ObjectId(value) : null;
 const locationSchema = z.object({ latitude: z.number().min(-90).max(90), longitude: z.number().min(-180).max(180) });
 const orderItemSchema = z.object({ itemId: z.string().min(1), quantity: z.number().int().min(1).max(20) });
-const createOrderSchema = z.object({ restaurantId: z.string().min(1), customerId: z.string().max(160).optional(), deliveryAddress: z.string().min(5).max(280), deliveryLocation: locationSchema, items: z.array(orderItemSchema).min(1).max(50) });
+const createOrderSchema = z.object({ restaurantId: z.string().min(1), customerId: z.string().max(160).optional(), deliveryAddress: z.string().min(5).max(280), deliveryLocation: locationSchema, items: z.array(orderItemSchema).min(1).max(50), paymentMethod: z.enum(["stripe", "cash"]).default("stripe") });
 const riderLocationSchema = locationSchema.extend({ riderId: z.string().min(1) });
 const zoneSchema = z.object({ name: z.string().min(2).max(120), slug: z.string().regex(/^[a-z0-9-]+$/), serviceFeeCents: z.number().int().min(0).max(10000).default(0), maxEtaMinutes: z.number().int().min(1).max(240).default(60), polygon: z.object({ coordinates: z.array(z.array(z.array(z.number()))).min(1) }) });
 const dispatchSchema = z.object({ preparationMinutes: z.coerce.number().int().min(1).max(180).default(15), offerSeconds: z.coerce.number().int().min(15).max(180).default(60), maxCustomerEtaMinutes: z.coerce.number().int().min(10).max(240).optional() });
@@ -651,7 +651,7 @@ app.post("/api/v1/orders", async (req, res) => {
   const totalCents = subtotalCents + deliveryFeeCents + serviceFeeCents;
   const publicCode = `PIKI-${Date.now().toString(36).toUpperCase()}`;
   const dailyCode = await createDailyDisplayCode();
-  const order = await Order.create({ publicCode, ...dailyCode, restaurantId: restaurant._id, customerId: parsed.data.customerId || null, items: normalizedItems, deliveryAddress: parsed.data.deliveryAddress, deliveryLocation: { type: "Point", coordinates: deliveryPoint }, coveragePolicySlug: coverage.policySlug, coveragePolicyVersion: coverage.policyVersion, coverageDecision: coverage.reason, straightLineDistanceKm: coverage.straightLineDistanceKm, withinMunicipality: coverage.withinMunicipality, deliveryBaseFeeCents: coverage.deliveryBaseFeeCents, outsideMunicipalitySurchargeCents: coverage.outsideMunicipalitySurchargeCents, routeDistanceKm: route.routeDistanceKm, routeDurationMinutes: route.routeDurationMinutes, routeProvider: route.routeProvider, routingDegraded: route.routingDegraded, requiredVehicleClasses: route.requiredVehicleClasses, subtotalCents, deliveryFeeCents, serviceFeeCents, totalCents, paymentState: "pending", statusHistory: [{ status: "pending", actorRole: "customer", reason: "Pedido creado con política de cobertura Xàtiva" }] });
+  const order = await Order.create({ publicCode, ...dailyCode, restaurantId: restaurant._id, customerId: parsed.data.customerId || null, items: normalizedItems, deliveryAddress: parsed.data.deliveryAddress, deliveryLocation: { type: "Point", coordinates: deliveryPoint }, coveragePolicySlug: coverage.policySlug, coveragePolicyVersion: coverage.policyVersion, coverageDecision: coverage.reason, straightLineDistanceKm: coverage.straightLineDistanceKm, withinMunicipality: coverage.withinMunicipality, deliveryBaseFeeCents: coverage.deliveryBaseFeeCents, outsideMunicipalitySurchargeCents: coverage.outsideMunicipalitySurchargeCents, routeDistanceKm: route.routeDistanceKm, routeDurationMinutes: route.routeDurationMinutes, routeProvider: route.routeProvider, routingDegraded: route.routingDegraded, requiredVehicleClasses: route.requiredVehicleClasses, subtotalCents, deliveryFeeCents, serviceFeeCents, totalCents, paymentMethod: parsed.data.paymentMethod, paymentState: parsed.data.paymentMethod === "cash" ? "paid" : "pending", statusHistory: [{ status: "pending", actorRole: "customer", reason: "Pedido creado con política de cobertura Xàtiva" }] });
   res.status(201).json({ order: { id: order.id, publicCode, displayCode: order.displayCode, displayCodeDate: order.displayCodeDate, status: order.status, paymentState: order.paymentState, subtotalCents, deliveryFeeCents, serviceFeeCents, totalCents, coverage, route, etaMinutes: calculateEtaRange([restaurant.etaMinutes[0] || 20, restaurant.etaMinutes[1] || 35], [5, 20]) } });
 });
 
@@ -715,6 +715,22 @@ app.get("/api/v1/orders/:id", async (req, res) => {
   if (!order) return res.status(404).json({ error: "ORDER_NOT_FOUND" });
   return res.json({ order });
 });
+
+async function recordCashCollection(order: any, riderId: mongoose.Types.ObjectId, actorRole: "rider" | "admin" | "fleet") {
+  if (order.paymentMethod !== "cash") return null;
+  const idempotencyKey = `cash-collection:${String(order._id)}`;
+  const existing = await CashLedgerEntry.findOne({ idempotencyKey }).lean().exec() as any;
+  if (existing) return existing;
+  const entry = await CashLedgerEntry.create({ orderId: order._id, riderId, actorRole, direction: "in", amountCents: Number(order.totalCents || 0), reason: "customer_cash_collection", idempotencyKey, note: "Cobro en efectivo confirmado en la entrega" });
+  await Order.updateOne({ _id: order._id, cashCollectedAt: null }, { $set: { cashCollectedAt: new Date(), cashCollectedByRiderId: riderId, paymentState: "paid" } }).exec();
+  return entry.toObject();
+}
+
+async function cashWallet(riderId: mongoose.Types.ObjectId) {
+  const rows = await CashLedgerEntry.aggregate([{ $match: { riderId } }, { $group: { _id: "$direction", totalCents: { $sum: "$amountCents" }, entries: { $sum: 1 } } }]);
+  const inRow = rows.find((row: any) => row._id === "in"); const outRow = rows.find((row: any) => row._id === "out");
+  return { riderId: String(riderId), collectedCents: Number(inRow?.totalCents || 0), handedOverCents: Number(outRow?.totalCents || 0), availableCents: Number(inRow?.totalCents || 0) - Number(outRow?.totalCents || 0), collectedEntries: Number(inRow?.entries || 0), updatedAt: new Date().toISOString() };
+}
 
 app.post("/api/v1/orders/:id/transitions", requireRole("admin", "partner", "rider", "fleet"), async (req, res) => {
   const parsed = transitionSchema.safeParse(req.body);
@@ -790,13 +806,27 @@ app.post("/api/v1/riders/:riderId/orders/:orderId/confirm-delivery", requireRole
   const order = await Order.findOne({ _id: orderId, riderId, assignmentState: "assigned" }).lean().exec() as any;
   if (!order) return res.status(404).json({ error: "ASSIGNED_ORDER_NOT_FOUND" });
   if (order.status !== "on_the_way") return res.status(409).json({ error: "ORDER_NOT_ON_THE_WAY", message: "Primero confirma que has recogido el pedido e iniciado la ruta." });
-  const updated = await Order.findOneAndUpdate({ _id: orderId, riderId, status: "on_the_way", version: order.version }, { $set: { status: "delivered", deliveredAt: new Date() }, $inc: { version: 1 }, $push: { statusHistory: { status: "delivered", actorRole: "rider", reason: "Entrega confirmada por el Rider" } } }, { new: true }).lean().exec();
+  if (order.paymentMethod === "cash") await recordCashCollection(order, riderId, "rider");
+  const updated = await Order.findOneAndUpdate({ _id: orderId, riderId, status: "on_the_way", version: order.version }, { $set: { status: "delivered", deliveredAt: new Date() }, $inc: { version: 1 }, $push: { statusHistory: { status: "delivered", actorRole: "rider", reason: order.paymentMethod === "cash" ? "Entrega confirmada y cobro en efectivo registrado" : "Entrega confirmada por el Rider" } } }, { new: true }).lean().exec();
   if (!updated) return res.status(409).json({ error: "ORDER_CHANGED_RETRY" });
   const deliveredOrder = updated as any;
   await RiderOrderMessage.deleteMany({ orderId, riderId }).exec();
   await Rider.findOneAndUpdate({ _id: riderId, activeOrderId: orderId }, { $set: { status: "available", activeOrderId: null } }).exec();
   scheduleCustomerOrderPush(deliveredOrder, "delivered");
   return res.json({ message: "Entrega confirmada.", chatPurged: true, order: { id: deliveredOrder._id, status: deliveredOrder.status, deliveredAt: deliveredOrder.deliveredAt } });
+});
+
+app.get("/api/v1/riders/:id/cash-wallet", requireRole("admin", "rider", "fleet"), async (req, res) => {
+  const riderId = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
+  if (!riderId) return res.status(400).json({ error: "INVALID_RIDER_ID" });
+  if (req.auth?.role === "rider" && !(await riderAccessForRequest(riderId, req))) return res.status(403).json({ error: "RIDER_ACCESS_DENIED" });
+  return res.json({ wallet: await cashWallet(riderId) });
+});
+
+app.get("/api/v1/ops/cash-wallets", requireRole("admin", "fleet"), async (_req, res) => {
+  const rows = await CashLedgerEntry.aggregate([{ $group: { _id: "$riderId", collectedCents: { $sum: { $cond: [{ $eq: ["$direction", "in"] }, "$amountCents", 0] } }, handedOverCents: { $sum: { $cond: [{ $eq: ["$direction", "out"] }, "$amountCents", 0] } }, entries: { $sum: 1 } } }]);
+  const riderIds = rows.map((row: any) => row._id).filter(Boolean); const riders = await Rider.find({ _id: { $in: riderIds } }).select("name email fleetId").lean().exec(); const names = new Map(riders.map((rider: any) => [String(rider._id), rider]));
+  return res.json({ wallets: rows.map((row: any) => ({ riderId: String(row._id), rider: names.get(String(row._id)) || null, collectedCents: Number(row.collectedCents || 0), handedOverCents: Number(row.handedOverCents || 0), availableCents: Number(row.collectedCents || 0) - Number(row.handedOverCents || 0), entries: Number(row.entries || 0) })) });
 });
 
 app.post("/api/v1/riders/:id/location", requireRole("admin", "rider", "fleet"), async (req, res) => {
