@@ -1,6 +1,6 @@
 import "dotenv/config";
 import "express-async-errors";
-import { createHash, randomInt } from "node:crypto";
+import { createHash, createHmac, randomInt } from "node:crypto";
 import cors from "cors";
 import express from "express";
 import mongoose from "mongoose";
@@ -13,7 +13,7 @@ import { EmployeeSession, issueEmployeeSession, revokeEmployeeSessions, sessionR
 import { createCheckoutSession, processStripeWebhook, stripeConfigured, createSignaturitSignature, signaturitBaseUrl, signaturitConfigured, signaturitMode, signatureWebhookUrl, webhookDigest, handleCustomerTrpc, currentCustomer } from "./integrations/index.js";
 import { getVersionPolicy, isPikiSurface, requiresUpdate, setVersionPolicy, syncVersionPolicy, versionPolicySchema, type PikiSurface } from "./appVersion.js";
 import { publicPushConfig, revokePushSubscription, savePushSubscription, sendPushToOwner } from "./push.js";
-import { publishOrderStatusEvents, publishRiderOfferEvent, serveRealtimeEvents, startRealtimeRelay } from "./realtime.js";
+import { publishOrderStatusEvents, publishPaidOrderEvents, publishRiderOfferEvent, serveRealtimeEvents, startRealtimeRelay } from "./realtime.js";
 import { rankDispatchCandidates, computeMobilityAdvice, calculateSanctionDecision, defaultSanctionPolicy } from "./algorithms/index.js";
 import { createSessionToken, generateTemporaryPassword, hashPassword, hashSessionToken, verifyPassword } from "./employeeAuth.js";
 import { evaluateXativaCoverage } from "./coverage/xativaPolicy.js";
@@ -73,7 +73,13 @@ app.use(express.json({ limit: "12mb" }));
 const objectId = (value: string) => mongoose.isValidObjectId(value) ? new mongoose.Types.ObjectId(value) : null;
 const locationSchema = z.object({ latitude: z.number().min(-90).max(90), longitude: z.number().min(-180).max(180) });
 const orderItemSchema = z.object({ itemId: z.string().min(1), quantity: z.number().int().min(1).max(20) });
-const createOrderSchema = z.object({ restaurantId: z.string().min(1), customerId: z.string().max(160).optional(), deliveryAddress: z.string().min(5).max(280), deliveryLocation: locationSchema, items: z.array(orderItemSchema).min(1).max(50), paymentMethod: z.enum(["stripe", "cash"]).default("stripe") });
+const createOrderSchema = z.object({ restaurantId: z.string().min(1), customerId: z.string().max(160).optional(), deliveryAddress: z.string().min(5).max(280), deliveryLocation: locationSchema, items: z.array(orderItemSchema).min(1).max(50), paymentMethod: z.enum(["stripe", "bizum", "cash"]).default("stripe") });
+const dispatchablePaymentFilter = { $or: [{ paymentState: "paid" }, { paymentMethod: "cash", paymentState: "pending" }] };
+const deliveryQrSignature = (orderCode: string) => createHmac("sha256", process.env.DELIVERY_QR_SECRET || "development-only-delivery-qr-secret").update(`delivery:${orderCode}`).digest("hex").slice(0, 24);
+const deliveryQrUrl = (orderCode: string) => `${(process.env.CUSTOMER_APP_URL || "https://pikidelivery.com").replace(/\/$/, "")}/?order_id=${encodeURIComponent(orderCode)}&delivery_token=${deliveryQrSignature(orderCode)}`;
+const deliveryQrIsValid = (orderCode: string, raw: unknown) => {
+  try { const url = new URL(String(raw)); return url.searchParams.get("order_id") === orderCode && url.searchParams.get("delivery_token") === deliveryQrSignature(orderCode); } catch { return false; }
+};
 const riderLocationSchema = locationSchema.extend({ riderId: z.string().min(1) });
 const zoneSchema = z.object({ name: z.string().min(2).max(120), slug: z.string().regex(/^[a-z0-9-]+$/), serviceFeeCents: z.number().int().min(0).max(10000).default(0), maxEtaMinutes: z.number().int().min(1).max(240).default(60), polygon: z.object({ coordinates: z.array(z.array(z.array(z.number()))).min(1) }) });
 const dispatchSchema = z.object({ preparationMinutes: z.coerce.number().int().min(1).max(180).default(15), offerSeconds: z.coerce.number().int().min(15).max(180).default(60), maxCustomerEtaMinutes: z.coerce.number().int().min(10).max(240).optional() });
@@ -115,7 +121,7 @@ async function createDailyDisplayCode() {
 
 async function dispatchLoadPolicy() {
   const [queuedOrders, activeRiders] = await Promise.all([
-    Order.countDocuments({ riderId: null, paymentState: "paid", status: { $in: ["accepted", "preparing", "ready_for_pickup"] } }),
+    Order.countDocuments({ riderId: null, ...dispatchablePaymentFilter, status: { $in: ["accepted", "preparing", "ready_for_pickup"] } }),
     Rider.countDocuments({ status: { $in: ["available", "busy"] } }),
   ]);
   const saturated = queuedOrders >= Math.max(3, Math.ceil(Math.max(activeRiders, 1) * 1.5));
@@ -458,7 +464,7 @@ app.get("/api/v1/admin/partner-groups/locality", requireRole("admin"), async (_r
 app.get("/api/v1/partners/menu", requireRole("partner"), async (req, res) => { const restaurantId = await employeeRestaurant(req); if (!restaurantId) return res.status(403).json({ error: "PARTNER_RESTAURANT_NOT_ASSIGNED" }); const restaurant = await Restaurant.findById(restaurantId).select("name menu").lean().exec() as any; if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" }); return res.json({ restaurant, menu: restaurant.menu || [] }); });
 app.put("/api/v1/partners/menu", requireRole("partner"), async (req, res) => { const restaurantId = await employeeRestaurant(req); if (!restaurantId) return res.status(403).json({ error: "PARTNER_RESTAURANT_NOT_ASSIGNED" }); const parsed = z.object({ items: z.array(partnerMenuItemSchema).max(500) }).safeParse(req.body); if (!parsed.success) return res.status(400).json({ error: "INVALID_MENU", details: parsed.error.flatten() }); const restaurant = await Restaurant.findByIdAndUpdate(restaurantId, { $set: { menu: parsed.data.items } }, { new: true }).select("name menu").lean().exec() as any; if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" }); return res.json({ restaurant, menu: restaurant.menu || [] }); });
 app.get("/api/v1/partners/kitchen/orders", requireRole("partner"), async (req, res) => { const restaurantId = await employeeRestaurant(req); if (!restaurantId) return res.status(403).json({ error: "PARTNER_RESTAURANT_NOT_ASSIGNED" }); const orders = await Order.find({ restaurantId, status: { $in: ["pending", "accepted", "preparing", "ready_for_pickup"] } }).sort({ createdAt: 1 }).lean().exec(); return res.json({ orders }); });
-app.patch("/api/v1/partners/kitchen/orders/:id/status", requireRole("partner"), async (req, res) => { const restaurantId = await employeeRestaurant(req); if (!restaurantId) return res.status(403).json({ error: "PARTNER_RESTAURANT_NOT_ASSIGNED" }); const parsed = z.object({ status: z.enum(["accepted", "preparing", "ready_for_pickup", "cancelled"]) }).safeParse(req.body); if (!parsed.success) return res.status(400).json({ error: "INVALID_KITCHEN_STATUS" }); const orderId = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id); if (!orderId) return res.status(400).json({ error: "INVALID_ORDER_ID" }); const order = await Order.findOne({ _id: orderId, restaurantId }); if (!order) return res.status(404).json({ error: "ORDER_NOT_FOUND" }); const current = order.status as any; const target = parsed.data.status; const allowed: Record<string, string[]> = { pending: ["accepted", "cancelled"], accepted: ["preparing", "cancelled"], preparing: ["ready_for_pickup", "cancelled"] }; if (!allowed[current]?.includes(target)) return res.status(409).json({ error: "INVALID_ORDER_TRANSITION", from: current, to: target }); if (target === "accepted" && order.paymentState !== "paid") return res.status(409).json({ error: "PAYMENT_NOT_CONFIRMED" }); order.status = target as any; order.statusHistory.push({ status: target, actorRole: "partner", reason: "Actualización desde pantalla de cocina" } as any); await order.save(); scheduleCustomerOrderPush(order, target); return res.json({ order }); });
+app.patch("/api/v1/partners/kitchen/orders/:id/status", requireRole("partner"), async (req, res) => { const restaurantId = await employeeRestaurant(req); if (!restaurantId) return res.status(403).json({ error: "PARTNER_RESTAURANT_NOT_ASSIGNED" }); const parsed = z.object({ status: z.enum(["accepted", "preparing", "ready_for_pickup", "cancelled"]) }).safeParse(req.body); if (!parsed.success) return res.status(400).json({ error: "INVALID_KITCHEN_STATUS" }); const orderId = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id); if (!orderId) return res.status(400).json({ error: "INVALID_ORDER_ID" }); const order = await Order.findOne({ _id: orderId, restaurantId }); if (!order) return res.status(404).json({ error: "ORDER_NOT_FOUND" }); const current = order.status as any; const target = parsed.data.status; const allowed: Record<string, string[]> = { pending: ["accepted", "cancelled"], accepted: ["preparing", "cancelled"], preparing: ["ready_for_pickup", "cancelled"] }; if (!allowed[current]?.includes(target)) return res.status(409).json({ error: "INVALID_ORDER_TRANSITION", from: current, to: target }); if (target === "accepted" && order.paymentState !== "paid" && order.paymentMethod !== "cash") return res.status(409).json({ error: "PAYMENT_NOT_CONFIRMED" }); order.status = target as any; order.statusHistory.push({ status: target, actorRole: "partner", reason: "Actualización desde pantalla de cocina" } as any); await order.save(); scheduleCustomerOrderPush(order, target); return res.json({ order }); });
 
 app.get("/api/v1/commercial/portfolio", requireRole("commercial"), async (req, res) => {
   const employeeId = req.auth?.employeeId;
@@ -651,8 +657,9 @@ app.post("/api/v1/orders", async (req, res) => {
   const totalCents = subtotalCents + deliveryFeeCents + serviceFeeCents;
   const publicCode = `PIKI-${Date.now().toString(36).toUpperCase()}`;
   const dailyCode = await createDailyDisplayCode();
-  const order = await Order.create({ publicCode, ...dailyCode, restaurantId: restaurant._id, customerId: parsed.data.customerId || null, items: normalizedItems, deliveryAddress: parsed.data.deliveryAddress, deliveryLocation: { type: "Point", coordinates: deliveryPoint }, coveragePolicySlug: coverage.policySlug, coveragePolicyVersion: coverage.policyVersion, coverageDecision: coverage.reason, straightLineDistanceKm: coverage.straightLineDistanceKm, withinMunicipality: coverage.withinMunicipality, deliveryBaseFeeCents: coverage.deliveryBaseFeeCents, outsideMunicipalitySurchargeCents: coverage.outsideMunicipalitySurchargeCents, routeDistanceKm: route.routeDistanceKm, routeDurationMinutes: route.routeDurationMinutes, routeProvider: route.routeProvider, routingDegraded: route.routingDegraded, requiredVehicleClasses: route.requiredVehicleClasses, subtotalCents, deliveryFeeCents, serviceFeeCents, totalCents, paymentMethod: parsed.data.paymentMethod, paymentState: parsed.data.paymentMethod === "cash" ? "paid" : "pending", statusHistory: [{ status: "pending", actorRole: "customer", reason: "Pedido creado con política de cobertura Xàtiva" }] });
-  res.status(201).json({ order: { id: order.id, publicCode, displayCode: order.displayCode, displayCodeDate: order.displayCodeDate, status: order.status, paymentState: order.paymentState, subtotalCents, deliveryFeeCents, serviceFeeCents, totalCents, coverage, route, etaMinutes: calculateEtaRange([restaurant.etaMinutes[0] || 20, restaurant.etaMinutes[1] || 35], [5, 20]) } });
+  const order = await Order.create({ publicCode, ...dailyCode, restaurantId: restaurant._id, customerId: parsed.data.customerId || null, items: normalizedItems, deliveryAddress: parsed.data.deliveryAddress, deliveryLocation: { type: "Point", coordinates: deliveryPoint }, coveragePolicySlug: coverage.policySlug, coveragePolicyVersion: coverage.policyVersion, coverageDecision: coverage.reason, straightLineDistanceKm: coverage.straightLineDistanceKm, withinMunicipality: coverage.withinMunicipality, deliveryBaseFeeCents: coverage.deliveryBaseFeeCents, outsideMunicipalitySurchargeCents: coverage.outsideMunicipalitySurchargeCents, routeDistanceKm: route.routeDistanceKm, routeDurationMinutes: route.routeDurationMinutes, routeProvider: route.routeProvider, routingDegraded: route.routingDegraded, requiredVehicleClasses: route.requiredVehicleClasses, subtotalCents, deliveryFeeCents, serviceFeeCents, totalCents, paymentMethod: parsed.data.paymentMethod, paymentState: "pending", statusHistory: [{ status: "pending", actorRole: "customer", reason: parsed.data.paymentMethod === "cash" ? "Pedido en efectivo: cobro pendiente de entrega" : "Pedido creado con política de cobertura Xàtiva" }] });
+  if (parsed.data.paymentMethod === "cash") await publishPaidOrderEvents(order, { settlement: "cash_due", message: "Pedido en efectivo: cobro pendiente de entrega." });
+  res.status(201).json({ order: { id: order.id, publicCode, displayCode: order.displayCode, displayCodeDate: order.displayCodeDate, status: order.status, paymentState: parsed.data.paymentMethod === "cash" ? "pending_cash_collection" : order.paymentState, paymentMethod: parsed.data.paymentMethod, cashDueAtDelivery: parsed.data.paymentMethod === "cash", deliveryQrUrl: deliveryQrUrl(publicCode), subtotalCents, deliveryFeeCents, serviceFeeCents, totalCents, coverage, route, etaMinutes: calculateEtaRange([restaurant.etaMinutes[0] || 20, restaurant.etaMinutes[1] || 35], [5, 20]) } });
 });
 
 const checkoutSchema = z.object({ orderId: z.string().min(1), origin: z.string().url(), customerEmail: z.string().email().optional() });
@@ -806,6 +813,8 @@ app.post("/api/v1/riders/:riderId/orders/:orderId/confirm-delivery", requireRole
   const order = await Order.findOne({ _id: orderId, riderId, assignmentState: "assigned" }).lean().exec() as any;
   if (!order) return res.status(404).json({ error: "ASSIGNED_ORDER_NOT_FOUND" });
   if (order.status !== "on_the_way") return res.status(409).json({ error: "ORDER_NOT_ON_THE_WAY", message: "Primero confirma que has recogido el pedido e iniciado la ruta." });
+  const qrRequired = Boolean(process.env.DELIVERY_QR_SECRET) || process.env.NODE_ENV === "production";
+  if (qrRequired && !deliveryQrIsValid(order.publicCode, req.body?.deliveryQr)) return res.status(422).json({ error: "DELIVERY_QR_INVALID", message: "Escanea el QR de entrega del Customer antes de confirmar." });
   if (order.paymentMethod === "cash") await recordCashCollection(order, riderId, "rider");
   const updated = await Order.findOneAndUpdate({ _id: orderId, riderId, status: "on_the_way", version: order.version }, { $set: { status: "delivered", deliveredAt: new Date() }, $inc: { version: 1 }, $push: { statusHistory: { status: "delivered", actorRole: "rider", reason: order.paymentMethod === "cash" ? "Entrega confirmada y cobro en efectivo registrado" : "Entrega confirmada por el Rider" } } }, { new: true }).lean().exec();
   if (!updated) return res.status(409).json({ error: "ORDER_CHANGED_RETRY" });
@@ -813,7 +822,7 @@ app.post("/api/v1/riders/:riderId/orders/:orderId/confirm-delivery", requireRole
   await RiderOrderMessage.deleteMany({ orderId, riderId }).exec();
   await Rider.findOneAndUpdate({ _id: riderId, activeOrderId: orderId }, { $set: { status: "available", activeOrderId: null } }).exec();
   scheduleCustomerOrderPush(deliveredOrder, "delivered");
-  return res.json({ message: "Entrega confirmada.", chatPurged: true, order: { id: deliveredOrder._id, status: deliveredOrder.status, deliveredAt: deliveredOrder.deliveredAt } });
+  return res.json({ message: order.paymentMethod === "cash" ? "Entrega confirmada y efectivo registrado en cartera." : "Entrega confirmada.", chatPurged: true, order: { id: deliveredOrder._id, publicCode: deliveredOrder.publicCode, status: deliveredOrder.status, deliveredAt: deliveredOrder.deliveredAt, paymentMethod: deliveredOrder.paymentMethod, cashCollected: Boolean(deliveredOrder.cashCollectedAt) } });
 });
 
 app.get("/api/v1/riders/:id/cash-wallet", requireRole("admin", "rider", "fleet"), async (req, res) => {
@@ -977,7 +986,7 @@ async function assignOrderAutomatically(orderId: mongoose.Types.ObjectId, prefer
   try {
     const order = await Order.findById(orderId).lean().exec() as any;
     if (!order) return { state: "not_found" as const };
-    if (order.paymentState !== "paid" || !["accepted", "preparing", "ready_for_pickup"].includes(order.status)) return { state: "not_dispatchable" as const };
+    if (!(order.paymentState === "paid" || order.paymentMethod === "cash") || !["accepted", "preparing", "ready_for_pickup"].includes(order.status)) return { state: "not_dispatchable" as const };
     if (order.riderId || order.assignmentState === "assigned" || order.assignmentState === "offered") return { state: "already_assigned" as const, riderId: order.riderId };
     const restaurant = await Restaurant.findById(order.restaurantId).lean().exec() as any;
     if (!restaurant?.location?.coordinates || !order.deliveryLocation?.coordinates) return { state: "missing_geolocation" as const };
@@ -1019,7 +1028,7 @@ async function queueAutomaticDispatch(orderId: mongoose.Types.ObjectId, preferre
 
 async function runAutomaticDispatchSweep() {
   if (!databaseReady || mongoose.connection.readyState !== 1) return;
-  const candidates = await Order.find({ riderId: null, assignmentState: { $in: ["unassigned", "expired", "rejected"] }, paymentState: "paid", status: { $in: ["accepted", "preparing", "ready_for_pickup"] } }).select("_id").sort({ createdAt: 1 }).limit(25).lean().exec();
+  const candidates = await Order.find({ riderId: null, assignmentState: { $in: ["unassigned", "expired", "rejected"] }, ...dispatchablePaymentFilter, status: { $in: ["accepted", "preparing", "ready_for_pickup"] } }).select("_id").sort({ createdAt: 1 }).limit(25).lean().exec();
   for (const order of candidates) void queueAutomaticDispatch(order._id as mongoose.Types.ObjectId).catch((error) => console.error("Automatic dispatch sweep failed", error));
 }
 
@@ -1057,7 +1066,7 @@ app.post("/api/v1/dispatch/orders/:id/assign", requireRole("admin", "fleet"), as
   if (!orderId) return res.status(400).json({ error: "INVALID_ORDER_ID" });
   const order = await Order.findById(orderId).lean().exec() as any;
   if (!order) return res.status(404).json({ error: "ORDER_NOT_FOUND" });
-  if (order.paymentState !== "paid") return res.status(409).json({ error: "ORDER_NOT_PAID" });
+  if (order.paymentState !== "paid" && order.paymentMethod !== "cash") return res.status(409).json({ error: "ORDER_NOT_PAID" });
   if (!["accepted", "preparing", "ready_for_pickup"].includes(order.status)) return res.status(409).json({ error: "ORDER_NOT_DISPATCHABLE", status: order.status });
   if (order.riderId || order.assignmentState === "assigned") return res.status(409).json({ error: "ORDER_ALREADY_ASSIGNED" });
   const restaurant = await Restaurant.findById(order.restaurantId).lean().exec() as any;
@@ -1133,7 +1142,7 @@ app.get("/api/v1/riders/:id/offers", requireRole("rider"), async (req, res) => {
   const rider = await riderAccessForRequest(riderId, req);
   if (!rider) return res.status(403).json({ error: "RIDER_ACCESS_DENIED" });
   const offers = await Order.find({ riderId, assignmentState: { $in: ["offered", "assigned"] }, status: { $nin: ["delivered", "cancelled"] } })
-    .select("_id publicCode displayCode displayCodeDate restaurantId customerId riderId status paymentState assignmentState assignmentExpiresAt deliveryAddress deliveryLocation items createdAt")
+    .select("_id publicCode displayCode displayCodeDate restaurantId customerId riderId status paymentState paymentMethod totalCents assignmentState assignmentExpiresAt deliveryAddress deliveryLocation items createdAt")
     .sort({ createdAt: -1 }).limit(10).lean().exec() as any[];
   const riderProfile = await Rider.findById(riderId).select("vehicle").lean().exec() as any;
   const restaurantIds = offers.map((offer) => offer.restaurantId).filter(Boolean);
@@ -1157,6 +1166,8 @@ app.get("/api/v1/riders/:id/offers", requireRole("rider"), async (req, res) => {
       displayCodeDate: offer.displayCodeDate || null,
       status: offer.status,
       paymentState: offer.paymentState,
+      paymentMethod: offer.paymentMethod || "stripe",
+      totalCents: Number(offer.totalCents || 0),
       assignmentState: offer.assignmentState,
       assignmentExpiresAt: offer.assignmentExpiresAt,
       items: offer.items,
@@ -1239,10 +1250,10 @@ app.patch("/api/v1/rider-applications/:id/assign-fleet", requireRole("admin", "f
 });
 
 app.get("/api/v1/fleets/pending-partner-orders", requireRole("admin", "fleet", "commercial"), async (_req, res) => {
-  const orders = await Order.find({ paymentState: "paid", status: "pending", assignmentState: "unassigned" }).select("publicCode restaurantId totalCents createdAt status paymentState assignmentState").sort({ createdAt: 1 }).limit(100).lean().exec() as any[];
+  const orders = await Order.find({ ...dispatchablePaymentFilter, status: "pending", assignmentState: "unassigned" }).select("publicCode restaurantId totalCents createdAt status paymentState paymentMethod assignmentState").sort({ createdAt: 1 }).limit(100).lean().exec() as any[];
   const restaurants = await Restaurant.find({ _id: { $in: orders.map((order) => order.restaurantId) } }).select("name").lean().exec() as any[];
   const names = new Map(restaurants.map((restaurant) => [String(restaurant._id), restaurant.name]));
-  return res.json({ orders: orders.map((order) => ({ id: String(order._id), publicCode: order.publicCode, restaurant: names.get(String(order.restaurantId)) || "Restaurante", totalCents: order.totalCents, createdAt: order.createdAt, status: order.status, paymentState: order.paymentState, assignmentState: order.assignmentState })) });
+  return res.json({ orders: orders.map((order) => ({ id: String(order._id), publicCode: order.publicCode, restaurant: names.get(String(order.restaurantId)) || "Restaurante", totalCents: order.totalCents, createdAt: order.createdAt, status: order.status, paymentState: order.paymentState, paymentMethod: order.paymentMethod || "stripe", cashDueAtDelivery: order.paymentMethod === "cash", assignmentState: order.assignmentState })) });
 });
 app.get("/api/v1/admin/overview", requireRole("admin"), async (_req, res) => {
   const startOfDay = new Date(); startOfDay.setHours(0, 0, 0, 0);

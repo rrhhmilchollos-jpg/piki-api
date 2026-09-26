@@ -1,7 +1,8 @@
-import { createHash, randomBytes, scryptSync, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, randomBytes, scryptSync, timingSafeEqual } from "node:crypto";
 import type { Request, Response } from "express";
 import { Order, Restaurant, CustomerAccount, RiderOrderMessage } from "./models.js";
 import { createCheckoutSession } from "./stripe.js";
+import { publishPaidOrderEvents } from "./realtime.js";
 
 const COOKIE = "piki_customer_session";
 const hashToken = (value: string) => createHash("sha256").update(value).digest("hex");
@@ -35,6 +36,16 @@ function getSession(req: Request) {
 }
 export async function currentCustomer(req: Request) { const raw = getSession(req); return raw ? CustomerAccount.findOne({ sessionHash: hashToken(raw) }).lean().exec() : null; }
 function setSession(res: Response, userId: string) { const raw = randomBytes(32).toString("base64url"); void CustomerAccount.updateOne({ _id: userId }, { $set: { sessionHash: hashToken(raw), lastSignedIn: new Date() } }).exec(); res.setHeader("Set-Cookie", `${COOKIE}=${raw}; Max-Age=31536000; Path=/; HttpOnly; Secure; SameSite=None`); }
+const customerPaymentMethod = (value: unknown) => {
+  const method = String(value || "stripe");
+  return (["stripe", "bizum", "cash"] as const).includes(method as any) ? method as "stripe" | "bizum" | "cash" : null;
+};
+
+const deliveryQrUrl = (orderCode: string) => {
+  const signature = createHmac("sha256", process.env.DELIVERY_QR_SECRET || "development-only-delivery-qr-secret").update(`delivery:${orderCode}`).digest("hex").slice(0, 24);
+  return `${(process.env.CUSTOMER_APP_URL || "https://pikidelivery.com").replace(/\/$/, "")}/?order_id=${encodeURIComponent(orderCode)}&delivery_token=${signature}`;
+};
+
 function restaurantView(row: any) {
   return { id: String(row._id), name: row.name, cuisine: row.cuisine, category: row.category, tagline: row.tagline || "Descubre este establecimiento en PIKI.", eta: `${row.etaMinutes?.[0] || 20}–${row.etaMinutes?.[1] || 35} min`, fee: (row.deliveryFeeCents || 0) / 100, rating: row.rating || 0, reviews: row.reviews || 0, promoted: row.promoted, image: row.image || "", accent: row.accent || "#FFD72E", menu: (row.menu || []).map((item: any) => ({ id: item.id, name: item.name, description: item.description || "", price: item.price, vegetarian: Boolean(item.vegetarian), popular: Boolean(item.popular) })) };
 }
@@ -67,6 +78,15 @@ export async function handleCustomerTrpc(req: Request, res: Response) {
       setSession(res, String(user._id)); return reply(res, { user: publicUser(user) });
     }
     if (procedure === "auth.logout") { res.clearCookie(COOKIE); return reply(res, { success: true }); }
+    if (procedure === "order.deliveryCredentials") {
+      const user = await currentCustomer(req) as any;
+      if (!user) return fail(res, "Debes iniciar sesión para ver el QR de entrega", "AUTH_REQUIRED");
+      const publicCode = String(input?.id || "").trim();
+      const order = await Order.findOne({ publicCode, customerId: String(user._id) }).select("publicCode status").lean().exec() as any;
+      if (!order) return fail(res, "Pedido no encontrado", "NOT_FOUND");
+      const available = order.status === "on_the_way";
+      return reply(res, { available, pin: null, qrToken: available ? deliveryQrUrl(order.publicCode) : null, state: available ? "pending" : "unavailable" });
+    }
     if (procedure === "order.messages" || procedure === "order.sendMessage") {
       const user = await currentCustomer(req) as any;
       if (!user) return fail(res, "Debes iniciar sesión para consultar el chat", "AUTH_REQUIRED");
@@ -95,17 +115,23 @@ export async function handleCustomerTrpc(req: Request, res: Response) {
       const items = requested.map((line: any) => { const item = restaurant.menu.find((candidate: any) => candidate.id === line.id); return item ? { itemId: item.id, name: item.name, quantity: Number(line.quantity), unitPriceCents: Math.round(item.price * 100) } : null; });
       if (!items.length || items.some((item: any) => !item || !Number.isInteger(item.quantity) || item.quantity < 1)) return fail(res, "La cesta no es válida");
       const normalized = items as Array<{itemId: string; name: string; quantity: number; unitPriceCents: number}>;
+      const paymentMethod = customerPaymentMethod(input?.paymentMethod);
+      if (!paymentMethod) return fail(res, "El método de pago seleccionado no es válido");
       const subtotalCents = normalized.reduce((sum, item) => sum + item.unitPriceCents * item.quantity, 0); const deliveryCents = restaurant.deliveryFeeCents || 0; const serviceCents = 79; const totalCents = subtotalCents + deliveryCents + serviceCents;
       const code = `PIKI-${Date.now().toString(36).toUpperCase()}`;
-      const order = await Order.create({ publicCode: code, restaurantId: restaurant._id, customerId: user ? String(user._id) : null, items: normalized, deliveryAddress: input.address, subtotalCents, deliveryFeeCents: deliveryCents, totalCents, paymentState: "pending", statusHistory: [{ status: "pending", actorRole: "customer", reason: "Pedido creado" }] });
-      if (procedure === "order.create") return reply(res, { id: code, restaurant: restaurant.name, eta: `${restaurant.etaMinutes?.[0] || 20}–${restaurant.etaMinutes?.[1] || 35} min`, createdAt: Date.now(), status: order.status, totalCents });
+      const order = await Order.create({ publicCode: code, restaurantId: restaurant._id, customerId: String(user._id), items: normalized, deliveryAddress: input.address, subtotalCents, deliveryFeeCents: deliveryCents, serviceFeeCents: serviceCents, totalCents, paymentMethod, paymentState: "pending", statusHistory: [{ status: "pending", actorRole: "customer", reason: paymentMethod === "cash" ? "Pedido confirmado: cobro en efectivo pendiente de entrega" : `Pedido creado: pago ${paymentMethod === "bizum" ? "Bizum" : "online"} pendiente` }] });
+      if (paymentMethod === "cash") {
+        await publishPaidOrderEvents(order, { settlement: "cash_due", message: "Pedido confirmado: el Rider cobrará el efectivo al entregar." });
+        return reply(res, { orderId: code, checkoutUrl: null, totalCents, paymentMethod, paymentState: "pending_cash_collection", cashDueAtDelivery: true });
+      }
+      if (procedure === "order.create") return reply(res, { id: code, restaurant: restaurant.name, eta: `${restaurant.etaMinutes?.[0] || 20}–${restaurant.etaMinutes?.[1] || 35} min`, createdAt: Date.now(), status: order.status, totalCents, paymentMethod });
       try {
-        const session = await createCheckoutSession({ orderId: String(order._id), publicCode: code, origin: req.header("origin") || "https://app.pikidelivery.com", customerEmail: user?.email, items: normalized, deliveryFeeCents: deliveryCents, serviceFeeCents: serviceCents });
-        await Order.updateOne({ _id: order._id }, { $set: { stripeCheckoutSessionId: session.id } }).exec(); return reply(res, { orderId: code, checkoutUrl: session.url, totalCents });
+        const session = await createCheckoutSession({ orderId: String(order._id), publicCode: code, origin: req.header("origin") || "https://app.pikidelivery.com", customerEmail: user?.email, items: normalized, deliveryFeeCents: deliveryCents, serviceFeeCents: serviceCents, preferredPaymentMethod: paymentMethod });
+        await Order.updateOne({ _id: order._id }, { $set: { stripeCheckoutSessionId: session.id } }).exec(); return reply(res, { orderId: code, checkoutUrl: session.url, totalCents, paymentMethod });
       } catch (error) {
         console.error(`[customerCompat] Stripe checkout failed for ${code}`, error instanceof Error ? error.message : error);
         await Order.updateOne({ _id: order._id }, { $set: { paymentState: "failed" } }).exec();
-        return fail(res, "Stripe no está disponible en este momento. Comprueba la configuración de la cuenta de pruebas.", "STRIPE_UNAVAILABLE");
+        return fail(res, "El pago online no está disponible todavía. Puedes seleccionar efectivo o pedir a PIKI que complete la configuración de Stripe.", "STRIPE_UNAVAILABLE");
       }
     }
     return fail(res, `Procedimiento no soportado: ${procedure}`, "NOT_FOUND");

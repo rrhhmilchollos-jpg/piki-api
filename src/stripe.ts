@@ -17,9 +17,11 @@ export async function createCheckoutSession(input: {
   items: Array<{ name: string; quantity: number; unitPriceCents: number }>;
   deliveryFeeCents: number;
   serviceFeeCents: number;
+  /** Stripe dynamic methods remain managed in Dashboard; this records Customer intent. */
+  preferredPaymentMethod?: "stripe" | "bizum";
 }) {
   if (!stripe) throw new Error("STRIPE_SECRET_KEY no configurada");
-  const metadata = { order_id: input.orderId, order_code: input.publicCode };
+  const metadata = { order_id: input.orderId, order_code: input.publicCode, customer_payment_choice: input.preferredPaymentMethod || "stripe" };
   const lineItems: Stripe.Checkout.SessionCreateParams.LineItem[] = input.items.map((item) => ({
     quantity: item.quantity,
     price_data: { currency: "eur", product_data: { name: item.name }, unit_amount: item.unitPriceCents },
@@ -33,6 +35,8 @@ export async function createCheckoutSession(input: {
     customer_email: input.customerEmail,
     client_reference_id: input.publicCode,
     metadata,
+    // Do not send payment_method_types: Stripe Dynamic Payment Methods decides
+    // card, Apple Pay, Google Pay and Bizum eligibility in the Dashboard.
     payment_intent_data: { metadata },
     success_url: `${input.origin}/?checkout=success&order_id=${encodeURIComponent(input.publicCode)}`,
     cancel_url: `${input.origin}/?checkout=cancelled&order_id=${encodeURIComponent(input.publicCode)}`,
