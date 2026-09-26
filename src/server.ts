@@ -815,6 +815,12 @@ async function queueAutomaticDispatch(orderId: mongoose.Types.ObjectId, preferre
   return assignOrderAutomatically(orderId, preferredRiderId);
 }
 
+async function runAutomaticDispatchSweep() {
+  if (!databaseReady) return;
+  const candidates = await Order.find({ riderId: null, assignmentState: { $in: ["unassigned", "expired", "rejected"] }, paymentState: "paid", status: { $in: ["accepted", "preparing", "ready_for_pickup"] } }).select("_id").sort({ createdAt: 1 }).limit(25).lean().exec();
+  for (const order of candidates) void queueAutomaticDispatch(order._id as mongoose.Types.ObjectId).catch((error) => console.error("Automatic dispatch sweep failed", error));
+}
+
 app.get("/api/v1/dispatch/orders/:id/preview", requireRole("admin", "fleet"), async (req, res) => {
   const parsed = dispatchSchema.safeParse(req.query);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_DISPATCH_REQUEST", details: parsed.error.flatten() });
@@ -1075,6 +1081,8 @@ async function start() {
   const uri = process.env.MONGODB_URI;
   if (uri) { await mongoose.connect(uri, { dbName: databaseName, serverSelectionTimeoutMS: 10_000 }); await ensureIndexes(); if (process.env.SEED_DEMO_DATA === "true") await seedCatalog(); databaseReady = true; } else console.warn("MONGODB_URI is not configured; /ready will remain unavailable.");
   app.listen(port, "0.0.0.0", () => console.log(`PIKI API listening on port ${port}`));
+  setInterval(() => { void runAutomaticDispatchSweep().catch((error) => console.error("Automatic dispatch sweep crashed", error)); }, 5_000).unref();
+  void runAutomaticDispatchSweep().catch((error) => console.error("Initial automatic dispatch sweep failed", error));
 }
 
 start().catch((error) => { console.error("Unable to start PIKI API", error); process.exit(1); });
