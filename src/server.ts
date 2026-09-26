@@ -14,6 +14,7 @@ import { processStripeWebhook, stripeConfigured, createSignaturitSignature, sign
 import { getVersionPolicy, isPikiSurface, requiresUpdate, setVersionPolicy, syncVersionPolicy, versionPolicySchema, type PikiSurface } from "./appVersion.js";
 import { publicPushConfig, revokePushSubscription, savePushSubscription, sendPushToOwner } from "./push.js";
 import { publishOrderStatusEvents, publishPaidOrderEvents, publishRiderOfferEvent, publishRealtimeEvent, serveRealtimeEvents, startRealtimeRelay } from "./realtime.js";
+import { createCheckoutSession } from "./stripe.js";
 import { rankDispatchCandidates, computeMobilityAdvice, calculateSanctionDecision, defaultSanctionPolicy } from "./algorithms/index.js";
 import { createSessionToken, generateTemporaryPassword, hashPassword, hashSessionToken, verifyPassword } from "./employeeAuth.js";
 import { evaluateXativaCoverage } from "./coverage/xativaPolicy.js";
@@ -393,7 +394,11 @@ app.get("/api/v1/catalog/restaurants", async (req, res) => {
   const filter: Record<string, unknown> = { isActive: true, onboardingStatus: "approved" };
   if (category && category !== "Todos") filter.category = category;
   if (query) filter.$or = [{ name: { $regex: query, $options: "i" } }, { cuisine: { $regex: query, $options: "i" } }, { category: { $regex: query, $options: "i" } }];
-  const restaurants = await Restaurant.find(filter).select("-partnerProfile -commercialEmployeeId -email").sort({ promoted: -1, rating: -1, reviews: -1 }).lean().exec();
+  const restaurants = await Restaurant.find(filter)
+    // Explicit inclusion avoids MongoDB path-collision errors caused by
+    // partnerProfile.documents having select:false nested fields.
+    .select("slug name cuisine category locality partnerGroupKey tagline etaMinutes deliveryFeeCents rating reviews promoted image accent phone address location menu isActive onboardingStatus")
+    .sort({ promoted: -1, rating: -1, reviews: -1 }).lean().exec();
   res.json({ restaurants });
 });
 
@@ -725,7 +730,25 @@ app.post("/api/v1/payments/checkout", async (req, res) => {
   const id = objectId(parsed.data.orderId);
   const order = (id ? await Order.findById(id).lean().exec() : await Order.findOne({ publicCode: parsed.data.orderId }).lean().exec()) as any;
   if (!order) return res.status(404).json({ error: "ORDER_NOT_FOUND" });
-  return res.status(409).json({ error: "PAYMENT_METHOD_UNAVAILABLE", message: "El pago online todavía no está disponible. Este pedido debe crearse y cobrarse en efectivo al entregar." });
+  if (order.paymentMethod !== "stripe") return res.status(409).json({ error: "ORDER_USES_CASH", message: "Este pedido está configurado para pago en efectivo." });
+  if (order.paymentState === "paid") return res.status(409).json({ error: "ORDER_ALREADY_PAID" });
+  try {
+    const session = await createCheckoutSession({
+      orderId: String(order._id),
+      publicCode: order.publicCode,
+      origin: parsed.data.origin,
+      customerEmail: parsed.data.customerEmail,
+      items: (order.items || []).map((item: any) => ({ name: item.name, quantity: Number(item.quantity), unitPriceCents: Number(item.unitPriceCents) })),
+      deliveryFeeCents: Number(order.deliveryFeeCents || 0),
+      serviceFeeCents: Number(order.serviceFeeCents || 0),
+      preferredPaymentMethod: "stripe",
+    });
+    await Order.updateOne({ _id: order._id, paymentState: "pending" }, { $set: { stripeCheckoutSessionId: session.id }, $inc: { version: 1 } }).exec();
+    return res.status(201).json({ checkoutUrl: session.url, sessionId: session.id, orderId: String(order._id), publicCode: order.publicCode });
+  } catch (error) {
+    console.error(JSON.stringify({ event: "stripe_checkout_failed", orderId: String(order._id), errorType: error instanceof Error ? error.name : "UnknownError" }));
+    return res.status(503).json({ error: "STRIPE_CHECKOUT_UNAVAILABLE", message: "El pago online no está disponible temporalmente." });
+  }
 });
 
 const testDispatchOrderSchema = z.object({ restaurantId: z.string().optional(), customerId: z.union([z.string().regex(/^[a-f\d]{24}$/i), z.literal("qa-kfc-e2e")]).optional(), count: z.coerce.number().int().min(1).max(10).default(1), deliveryAddress: z.string().min(5).max(280).default("Plaza de la Seu, 1, Xàtiva"), status: z.enum(["accepted", "preparing", "ready_for_pickup"]).default("preparing") });
