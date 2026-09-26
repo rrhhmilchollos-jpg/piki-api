@@ -22,8 +22,11 @@ import { quoteDeliveryRoute } from "./coverage/routing.js";
 
 export const app = express();
 const port = Number(process.env.PORT || 3000);
-const defaultOrigins = ["http://localhost:3000", "http://localhost:5173", "https://pikidelivery.com", "https://www.pikidelivery.com", "https://app.pikidelivery.com", "https://partners.pikidelivery.com", "https://admin.pikidelivery.com", "https://riders.pikidelivery.com", "https://fleet.pikidelivery.com"].join(",");
-const allowedOrigins = (process.env.CORS_ORIGINS || defaultOrigins).split(",").map((origin) => origin.trim()).filter(Boolean);
+const defaultOrigins = ["http://localhost:3000", "http://localhost:5173", "https://pikidelivery.com", "https://www.pikidelivery.com", "https://app.pikidelivery.com", "https://partners.pikidelivery.com", "https://admin.pikidelivery.com", "https://riders.pikidelivery.com", "https://fleet.pikidelivery.com"];
+const configuredOrigins = (process.env.CORS_ORIGINS || "").split(",").map((origin) => origin.trim()).filter(Boolean);
+const allowedOrigins = new Set([...defaultOrigins, ...configuredOrigins]);
+const managedPikiVercelOrigin = /^https:\/\/piki-(?:customer|partner|admin|fleet|rider)-[a-z0-9-]+-rrhhmilchollos-jpgs-projects\.vercel\.app$/i;
+const isAllowedCorsOrigin = (origin?: string) => !origin || allowedOrigins.has(origin) || managedPikiVercelOrigin.test(origin);
 const databaseName = process.env.MONGODB_DB || "piki";
 let databaseReady = false;
 mongoose.connection.on("connected", () => { databaseReady = true; });
@@ -39,7 +42,7 @@ app.use((_req, res, next) => {
   res.setHeader("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'; base-uri 'none'");
   next();
 });
-app.use(cors({ origin: (origin, callback) => callback(null, !origin || allowedOrigins.includes(origin)), credentials: true }));
+app.use(cors({ origin: (origin, callback) => callback(null, isAllowedCorsOrigin(origin)), credentials: true }));
 
 const requestBuckets = new Map<string, { startedAt: number; count: number }>();
 const rateLimit = (limit: number, windowMs: number, keyPrefix: string) => (req: express.Request, res: express.Response, next: express.NextFunction) => {
