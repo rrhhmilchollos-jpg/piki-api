@@ -770,6 +770,7 @@ const automaticDispatchInFlight = new Set<string>();
  * para pedidos QA internos y nunca se expone a Customer/Partner.
  */
 async function assignOrderAutomatically(orderId: mongoose.Types.ObjectId, preferredRiderId?: mongoose.Types.ObjectId) {
+  if (!databaseReady || mongoose.connection.readyState !== 1) return { state: "database_unavailable" as const };
   const key = String(orderId);
   if (automaticDispatchInFlight.has(key)) return { state: "in_progress" as const };
   automaticDispatchInFlight.add(key);
@@ -816,7 +817,7 @@ async function queueAutomaticDispatch(orderId: mongoose.Types.ObjectId, preferre
 }
 
 async function runAutomaticDispatchSweep() {
-  if (!databaseReady) return;
+  if (!databaseReady || mongoose.connection.readyState !== 1) return;
   const candidates = await Order.find({ riderId: null, assignmentState: { $in: ["unassigned", "expired", "rejected"] }, paymentState: "paid", status: { $in: ["accepted", "preparing", "ready_for_pickup"] } }).select("_id").sort({ createdAt: 1 }).limit(25).lean().exec();
   for (const order of candidates) void queueAutomaticDispatch(order._id as mongoose.Types.ObjectId).catch((error) => console.error("Automatic dispatch sweep failed", error));
 }
