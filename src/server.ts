@@ -123,6 +123,12 @@ app.get("/ready", (_req, res) => {
   return res.json({ service: "piki-api", status: "ready", database: "connected" });
 });
 app.get("/api/v1", (_req, res) => res.json({ name: "PIKI API", version: "v1", status: databaseReady ? "ready" : "initializing" }));
+const PIKI_APP_VERSION = process.env.PIKI_APP_VERSION || "0.2.1";
+app.get("/api/v1/app-version", (req, res) => {
+  const surface = String(req.query.surface || "unknown").toLowerCase();
+  res.setHeader("Cache-Control", "no-store");
+  return res.json({ surface, minimumVersion: PIKI_APP_VERSION, apiVersion: "0.2.0", updateRequired: false });
+});
 
 app.get("/api/v1/auth/status", (_req, res) => res.json({ authentication: "bearer", configured_roles: configuredAuthRoles() }));
 const employeeLoginSchema = z.object({ email: z.string().email(), password: z.string().min(8).max(200) });
