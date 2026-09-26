@@ -163,11 +163,16 @@ app.get("/api/v1/app-version", async (req, res) => {
   const policy = await syncVersionPolicy(surface);
   const clientVersion = typeof req.query.clientVersion === "string" ? req.query.clientVersion : undefined;
   const clientBuildId = typeof req.query.clientBuildId === "string" ? req.query.clientBuildId : undefined;
-  // 0.2.1–0.2.2 PWAs never sent their version and rendered an irreversible
-  // blocking screen from this endpoint. Let that legacy check boot once; its
-  // worker then downloads the current shell. Versioned clients still receive
-  // and enforce the real minimum policy below.
-  const responsePolicy = clientVersion ? policy : { ...policy, minimumVersion: "0.0.0", forceUpdate: false };
+  // The 0.2.1 Customer PWA did not send clientVersion and used a faulty literal
+  // comparison: it blocked whenever minimumVersion was *not exactly* "0.2.1".
+  // Return that legacy sentinel only for its unversioned request so it can boot,
+  // register the recovery worker, and receive the current network shell. All
+  // versioned clients continue to receive the real, semver-based policy.
+  const responsePolicy = clientVersion
+    ? policy
+    : surface === "customer"
+      ? { ...policy, minimumVersion: "0.2.1", forceUpdate: false }
+      : { ...policy, minimumVersion: "0.0.0", forceUpdate: false };
   res.setHeader("Cache-Control", "no-store, max-age=0");
   return res.json({ surface, ...responsePolicy, updateRequired: requiresUpdate(responsePolicy, clientVersion, clientBuildId) });
 });
