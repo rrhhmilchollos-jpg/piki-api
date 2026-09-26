@@ -299,6 +299,14 @@ app.post("/api/v1/admin/employees", requireOwner(), async (req, res) => {
   } catch (error) { if ((error as any)?.code === 11000) return res.status(409).json({ error: "EMPLOYEE_EMAIL_ALREADY_EXISTS" }); throw error; }
 });
 app.get("/api/v1/admin/employees", requireRole("admin"), async (_req, res) => res.json({ employees: await EmployeeAccount.find({ email: { $ne: ownerEmail }, hiddenFromAdmin: { $ne: true } }).select("name email jobRole apiRole accessLevel authorizationStatus authorizedAt authorizedBy authorizationReason portfolioId fleetId zoneSlugs active mustChangePassword lastLoginAt createdAt").sort({ createdAt: -1 }).lean().exec() }));
+app.get("/api/v1/admin/authorization-audit", requireOwner(), async (req, res) => {
+  const email = typeof req.query.email === "string" ? req.query.email.toLowerCase() : undefined;
+  const employee = email ? await EmployeeAccount.findOne({ email }).select("_id name email jobRole apiRole accessLevel authorizationStatus authorizedAt authorizedBy authorizationReason active").lean().exec() as any : null;
+  if (email && !employee) return res.status(404).json({ error: "EMPLOYEE_NOT_FOUND" });
+  const filter = employee ? { employeeId: employee._id } : {};
+  const events = await AccessAuthorization.find(filter).select("employeeId action previousStatus nextStatus previousRole nextRole accessLevel actorEmployeeId reason createdAt").sort({ createdAt: -1 }).limit(200).lean().exec();
+  return res.json({ employee, events });
+});
 app.get("/api/v1/admin/customers", requireRole("admin"), async (_req, res) => res.json({ customers: await CustomerAccount.find({}).select("name email lastSignedIn createdAt updatedAt").sort({ createdAt: -1 }).limit(1000).lean().exec() }));
 app.post("/api/v1/admin/employees/:id/reset-password", requireOwner(), async (req, res) => {
   const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
@@ -1458,7 +1466,7 @@ app.use((error: any, req: express.Request, res: express.Response, next: express.
 
 async function start() {
   const uri = process.env.MONGODB_URI;
-  if (uri) { await mongoose.connect(uri, { dbName: databaseName, serverSelectionTimeoutMS: 10_000 }); await EmployeeAccount.updateMany({ authorizationStatus: { $exists: false } }, { $set: { authorizationStatus: "approved", accessLevel: "subadmin" } }).exec(); await EmployeeAccount.updateOne({ email: ownerEmail }, { $set: { accessLevel: "superadmin", authorizationStatus: "approved", ownerProtected: true, active: true } }).exec(); await ensureIndexes(); startRealtimeRelay(); if (process.env.SEED_DEMO_DATA === "true") await seedCatalog(); databaseReady = true; } else console.warn("MONGODB_URI is not configured; /ready will remain unavailable.");
+  if (uri) { await mongoose.connect(uri, { dbName: databaseName, serverSelectionTimeoutMS: 10_000 }); await EmployeeAccount.updateMany({ authorizationStatus: { $exists: false } }, { $set: { authorizationStatus: "approved", accessLevel: "subadmin" } }).exec(); await EmployeeAccount.updateOne({ email: ownerEmail }, { $set: { accessLevel: "superadmin", authorizationStatus: "approved", ownerProtected: true, active: true } }).exec(); const owner = await EmployeeAccount.findOne({ email: ownerEmail }).select("_id").lean().exec() as any; const legacyApproved = await EmployeeAccount.find({ email: { $ne: ownerEmail }, authorizationStatus: "approved", authorizedAt: null }).select("_id apiRole accessLevel createdAt").lean().exec() as any[]; for (const employee of legacyApproved) { const authorizedAt = employee.createdAt || new Date(); await EmployeeAccount.updateOne({ _id: employee._id, authorizedAt: null }, { $set: { authorizedAt, authorizedBy: owner?._id || null, authorizationReason: "Migración de autorización aprobada existente." } }).exec(); if (owner?._id && !(await AccessAuthorization.exists({ employeeId: employee._id }))) await AccessAuthorization.create({ employeeId: employee._id, action: "created", previousStatus: null, nextStatus: "approved", previousRole: null, nextRole: employee.apiRole, accessLevel: employee.accessLevel || "subadmin", actorEmployeeId: owner._id, reason: "Migración de autorización aprobada existente." }); } await ensureIndexes(); startRealtimeRelay(); if (process.env.SEED_DEMO_DATA === "true") await seedCatalog(); databaseReady = true; } else console.warn("MONGODB_URI is not configured; /ready will remain unavailable.");
   await EmployeeSession.init();
   const server = app.listen(port, "0.0.0.0", () => console.log(`PIKI API listening on port ${port}`));
   const sweepTimer = setInterval(() => { void runAutomaticDispatchSweep().catch((error) => console.error("Automatic dispatch sweep crashed", error)); }, 5_000).unref();
