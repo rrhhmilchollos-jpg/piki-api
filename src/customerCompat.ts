@@ -81,6 +81,27 @@ export async function handleCustomerTrpc(req: Request, res: Response) {
       setSession(res, String(user._id)); return reply(res, { user: publicUser(user) });
     }
     if (procedure === "auth.logout") { res.clearCookie(COOKIE); return reply(res, { success: true }); }
+    if (procedure === "order.get" || procedure === "order.customerTracking") {
+      const user = await currentCustomer(req) as any;
+      if (!user) return fail(res, "Inicia sesión con la cuenta que realizó el pedido.", "AUTH_REQUIRED");
+      const publicCode = String(input?.id || "").trim();
+      const order = await Order.findOne({ publicCode, customerId: String(user._id) }).select("_id publicCode status restaurantId riderId assignmentState routeDurationMinutes deliveryAddress paymentState").lean().exec() as any;
+      if (!order) return fail(res, "Pedido no encontrado", "NOT_FOUND");
+      const restaurant = await Restaurant.findById(order.restaurantId).select("name").lean().exec() as any;
+      if (procedure === "order.get") {
+        return reply(res, { id: order.publicCode, restaurant: restaurant?.name || "Pedido PIKI", status: order.status, eta: order.routeDurationMinutes ? `${order.routeDurationMinutes} min` : "actualizando…" });
+      }
+      // The rider location is private until Partner has prepared the order and Rider has confirmed pickup.
+      if (!order.riderId || order.assignmentState !== "assigned" || !["picked_up", "on_the_way"].includes(order.status)) {
+        return reply(res, { available: false, reason: "not_in_delivery" });
+      }
+      const rider = await (await import("./models.js")).Rider.findById(order.riderId).select("name vehicle location lastLocationAt").lean().exec() as any;
+      const coordinates = rider?.location?.coordinates;
+      const updatedAt = rider?.lastLocationAt ? new Date(rider.lastLocationAt).getTime() : 0;
+      const fresh = Array.isArray(coordinates) && coordinates.length >= 2 && updatedAt >= Date.now() - 90_000;
+      if (!fresh) return reply(res, { available: false, reason: "location_unavailable" });
+      return reply(res, { available: true, riderName: rider.name || "Tu rider", vehicle: rider.vehicle || "bike", phase: "going_to_customer", etaMinutes: order.routeDurationMinutes || null, latitude: Number(coordinates[1]), longitude: Number(coordinates[0]), accuracyMeters: null, updatedAt });
+    }
     if (procedure === "order.deliveryCredentials") {
       const user = await currentCustomer(req) as any;
       if (!user) return fail(res, "Debes iniciar sesión para ver el QR de entrega", "AUTH_REQUIRED");
@@ -96,7 +117,7 @@ export async function handleCustomerTrpc(req: Request, res: Response) {
       const publicCode = String(input?.id || "").trim();
       if (!publicCode) return fail(res, "Pedido no válido", "BAD_REQUEST");
       const order = await Order.findOne({ publicCode, customerId: String(user._id) }).select("_id riderId assignmentState status").lean().exec() as any;
-      const activeStatuses = ["accepted", "preparing", "ready_for_pickup", "picked_up", "on_the_way"];
+      const activeStatuses = ["picked_up", "on_the_way"];
       if (!order || !order.riderId || order.assignmentState !== "assigned" || !activeStatuses.includes(order.status)) {
         return fail(res, "El chat solo está disponible durante una entrega activa", "FORBIDDEN");
       }

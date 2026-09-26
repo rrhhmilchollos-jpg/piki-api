@@ -13,7 +13,7 @@ import { EmployeeSession, issueEmployeeSession, revokeEmployeeSessions, sessionR
 import { processStripeWebhook, stripeConfigured, createSignaturitSignature, signaturitBaseUrl, signaturitConfigured, signaturitMode, signatureWebhookUrl, webhookDigest, handleCustomerTrpc, currentCustomer } from "./integrations/index.js";
 import { getVersionPolicy, isPikiSurface, requiresUpdate, setVersionPolicy, syncVersionPolicy, versionPolicySchema, type PikiSurface } from "./appVersion.js";
 import { publicPushConfig, revokePushSubscription, savePushSubscription, sendPushToOwner } from "./push.js";
-import { publishOrderStatusEvents, publishPaidOrderEvents, publishRiderOfferEvent, serveRealtimeEvents, startRealtimeRelay } from "./realtime.js";
+import { publishOrderStatusEvents, publishPaidOrderEvents, publishRiderOfferEvent, publishRealtimeEvent, serveRealtimeEvents, startRealtimeRelay } from "./realtime.js";
 import { rankDispatchCandidates, computeMobilityAdvice, calculateSanctionDecision, defaultSanctionPolicy } from "./algorithms/index.js";
 import { createSessionToken, generateTemporaryPassword, hashPassword, hashSessionToken, verifyPassword } from "./employeeAuth.js";
 import { evaluateXativaCoverage } from "./coverage/xativaPolicy.js";
@@ -376,6 +376,20 @@ app.get("/api/v1/locations/search", async (req, res) => {
   }
 });
 
+app.get("/api/v1/locations/reverse", async (req, res) => {
+  const latitude = Number(req.query.latitude); const longitude = Number(req.query.longitude);
+  if (!validateCoordinates(latitude, longitude)) return res.status(400).json({ error: "INVALID_COORDINATES" });
+  const url = new URL("https://nominatim.openstreetmap.org/reverse");
+  url.searchParams.set("lat", String(latitude)); url.searchParams.set("lon", String(longitude));
+  url.searchParams.set("format", "jsonv2"); url.searchParams.set("zoom", "18");
+  try {
+    const response = await fetch(url, { headers: { "User-Agent": "PIKI-Delivery/0.2 (+https://pikidelivery.com)" } });
+    if (!response.ok) return res.status(502).json({ error: "GEOCODER_UNAVAILABLE" });
+    const row = await response.json() as { display_name?: string };
+    return res.json({ label: String(row.display_name || `Ubicación GPS ${latitude.toFixed(5)}, ${longitude.toFixed(5)}`), latitude, longitude });
+  } catch { return res.status(502).json({ error: "GEOCODER_UNAVAILABLE" }); }
+});
+
 app.get("/api/v1/coverage", async (req, res) => {
   const latitude = Number(req.query.latitude); const longitude = Number(req.query.longitude);
   if (!validateCoordinates(latitude, longitude)) return res.status(400).json({ error: "INVALID_COORDINATES" });
@@ -731,6 +745,14 @@ async function recordCashCollection(order: any, riderId: mongoose.Types.ObjectId
   return entry;
 }
 
+async function publishCashWalletEvent(input: { riderId: mongoose.Types.ObjectId; amountCents: number; type: "cash.wallet_changed" | "cash.handover_recorded"; reference?: string }) {
+  const payload = { riderId: String(input.riderId), amountCents: Number(input.amountCents || 0), reference: input.reference || null, occurredAt: new Date().toISOString() };
+  await Promise.all([
+    publishRealtimeEvent({ channel: "admin", audienceKey: "role:admin", type: input.type, payload, dedupeKey: `${input.type}:admin:${payload.riderId}:${payload.reference || payload.occurredAt}` }),
+    publishRealtimeEvent({ channel: "fleet", audienceKey: "role:fleet", type: input.type, payload, dedupeKey: `${input.type}:fleet:${payload.riderId}:${payload.reference || payload.occurredAt}` }),
+  ]);
+}
+
 async function cashWallet(riderId: mongoose.Types.ObjectId) {
   const rows = await CashLedgerEntry.aggregate([{ $match: { riderId } }, { $group: { _id: "$direction", totalCents: { $sum: "$amountCents" }, entries: { $sum: 1 } } }]);
   const inRow = rows.find((row: any) => row._id === "in"); const outRow = rows.find((row: any) => row._id === "out");
@@ -833,7 +855,10 @@ app.post("/api/v1/riders/:riderId/orders/:orderId/confirm-delivery", requireRole
   if (order.status !== "on_the_way") return res.status(409).json({ error: "ORDER_NOT_ON_THE_WAY", message: "Primero confirma que has recogido el pedido e iniciado la ruta." });
   const qrRequired = Boolean(process.env.DELIVERY_QR_SECRET) || process.env.NODE_ENV === "production";
   if (qrRequired && !deliveryQrIsValid(order.publicCode, req.body?.deliveryQr)) return res.status(422).json({ error: "DELIVERY_QR_INVALID", message: "Escanea el QR de entrega del Customer antes de confirmar." });
-  if (order.paymentMethod === "cash") await recordCashCollection(order, riderId, "rider");
+  if (order.paymentMethod === "cash") {
+    const cashEntry = await recordCashCollection(order, riderId, "rider");
+    if (cashEntry) await publishCashWalletEvent({ riderId, amountCents: Number(order.totalCents || 0), type: "cash.wallet_changed", reference: String(order.publicCode || "") });
+  }
   const updated = await Order.findOneAndUpdate({ _id: orderId, riderId, status: "on_the_way", version: order.version }, { $set: { status: "delivered", deliveredAt: new Date() }, $inc: { version: 1 }, $push: { statusHistory: { status: "delivered", actorRole: "rider", reason: order.paymentMethod === "cash" ? "Entrega confirmada y cobro en efectivo registrado" : "Entrega confirmada por el Rider" } } }, { new: true }).lean().exec();
   if (!updated) return res.status(409).json({ error: "ORDER_CHANGED_RETRY" });
   const deliveredOrder = updated as any;
@@ -856,6 +881,7 @@ app.post("/api/v1/ops/cash-handovers", requireRole("admin", "fleet"), async (req
   if (!parsed.success) return res.status(400).json({ error: "INVALID_CASH_HANDOVER", details: parsed.error.flatten() });
   try {
     const result = await recordCashHandover(parsed.data, req.auth?.role === "fleet" ? "fleet" : "admin");
+    await publishCashWalletEvent({ riderId: objectId(parsed.data.riderId)!, amountCents: parsed.data.amountCents, type: "cash.handover_recorded", reference: parsed.data.reference });
     return res.status(201).json(result);
   } catch (error) {
     if (error instanceof Error && error.message === "HANDOVER_EXCEEDS_AVAILABLE_CASH") return res.status(409).json({ error: error.message, wallet: (error as Error & { wallet?: unknown }).wallet });
