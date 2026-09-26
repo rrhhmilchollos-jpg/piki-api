@@ -1,6 +1,6 @@
 import { createHash, randomBytes, scryptSync, timingSafeEqual } from "node:crypto";
 import type { Request, Response } from "express";
-import { Order, Restaurant, CustomerAccount } from "./models.js";
+import { Order, Restaurant, CustomerAccount, RiderOrderMessage } from "./models.js";
 import { createCheckoutSession } from "./stripe.js";
 
 const COOKIE = "piki_customer_session";
@@ -26,7 +26,7 @@ function inputOf(req: Request): any {
   return body;
 }
 function reply(res: Response, value: unknown) { return res.json({ result: { data: { json: value } } }); }
-function fail(res: Response, message: string, code = "BAD_REQUEST") { const status = code === "UNAUTHORIZED" || code === "AUTH_REQUIRED" ? 401 : code === "CONFLICT" ? 409 : code === "NOT_FOUND" ? 404 : code === "STRIPE_UNAVAILABLE" ? 503 : 400; return res.status(status).json({ error: { json: { message, code: -32000, data: { code, httpStatus: status } } } }); }
+function fail(res: Response, message: string, code = "BAD_REQUEST") { const status = code === "UNAUTHORIZED" || code === "AUTH_REQUIRED" ? 401 : code === "FORBIDDEN" ? 403 : code === "CONFLICT" ? 409 : code === "NOT_FOUND" ? 404 : code === "STRIPE_UNAVAILABLE" ? 503 : 400; return res.status(status).json({ error: { json: { message, code: -32000, data: { code, httpStatus: status } } } }); }
 function getSession(req: Request) {
   const header = req.header("x-piki-session");
   if (header) return header;
@@ -67,6 +67,25 @@ export async function handleCustomerTrpc(req: Request, res: Response) {
       setSession(res, String(user._id)); return reply(res, { user: publicUser(user) });
     }
     if (procedure === "auth.logout") { res.clearCookie(COOKIE); return reply(res, { success: true }); }
+    if (procedure === "order.messages" || procedure === "order.sendMessage") {
+      const user = await currentUser(req) as any;
+      if (!user) return fail(res, "Debes iniciar sesión para consultar el chat", "AUTH_REQUIRED");
+      const publicCode = String(input?.id || "").trim();
+      if (!publicCode) return fail(res, "Pedido no válido", "BAD_REQUEST");
+      const order = await Order.findOne({ publicCode, customerId: String(user._id) }).select("_id riderId assignmentState status").lean().exec() as any;
+      const activeStatuses = ["accepted", "preparing", "ready_for_pickup", "picked_up", "on_the_way"];
+      if (!order || !order.riderId || order.assignmentState !== "assigned" || !activeStatuses.includes(order.status)) {
+        return fail(res, "El chat solo está disponible durante una entrega activa", "FORBIDDEN");
+      }
+      if (procedure === "order.messages") {
+        const messages = await RiderOrderMessage.find({ orderId: order._id }).sort({ createdAt: 1 }).limit(100).lean().exec();
+        return reply(res, messages.map((message: any) => ({ id: String(message._id), senderRole: message.senderRole, body: message.body, createdAt: message.createdAt })));
+      }
+      const body = String(input?.body || "").trim();
+      if (!body || body.length > 500) return fail(res, "El mensaje debe tener entre 1 y 500 caracteres", "BAD_REQUEST");
+      const message = await RiderOrderMessage.create({ orderId: order._id, riderId: order.riderId, senderRole: "customer", body });
+      return reply(res, { id: String(message._id), senderRole: message.senderRole, body: message.body, createdAt: message.createdAt });
+    }
     if (procedure === "order.create" || procedure === "order.checkout") {
       const user = await currentUser(req) as any;
       if (!user) return fail(res, "Debes iniciar sesión para realizar pedidos", "AUTH_REQUIRED");
