@@ -465,7 +465,7 @@ app.post("/api/v1/payments/checkout", async (req, res) => {
   }
 });
 
-const testDispatchOrderSchema = z.object({ restaurantId: z.string().optional(), count: z.coerce.number().int().min(1).max(10).default(1), deliveryAddress: z.string().min(5).max(280).default("Plaza de la Seu, 1, Xàtiva") });
+const testDispatchOrderSchema = z.object({ restaurantId: z.string().optional(), customerId: z.string().regex(/^[a-f\d]{24}$/i).optional(), count: z.coerce.number().int().min(1).max(10).default(1), deliveryAddress: z.string().min(5).max(280).default("Plaza de la Seu, 1, Xàtiva") });
 app.post("/api/v1/admin/dispatch/test-orders", requireRole("admin", "fleet"), async (req, res) => {
   const parsed = testDispatchOrderSchema.safeParse(req.body || {});
   if (!parsed.success) return res.status(400).json({ error: "INVALID_TEST_ORDER_REQUEST", details: parsed.error.flatten() });
@@ -485,7 +485,7 @@ app.post("/api/v1/admin/dispatch/test-orders", requireRole("admin", "fleet"), as
     const subtotalCents = Math.round(Number(item.price || 0) * 100);
     const deliveryFeeCents = Number(restaurant.deliveryFeeCents || 0);
     const totalCents = subtotalCents + deliveryFeeCents + 79;
-    const order = await Order.create({ publicCode: `PIKI-TEST-${Date.now().toString(36).toUpperCase()}-${index + 1}`, ...dailyCode, restaurantId: restaurant._id, customerId: "test-customer@pikidelivery.com", customerPhone: "+34960000111", isTestOrder: true, items: [{ itemId: item.id, name: item.name, quantity: 1, unitPriceCents: subtotalCents }], deliveryAddress: parsed.data.deliveryAddress, deliveryLocation: { type: "Point", coordinates: restaurant.location?.coordinates || [-0.52, 38.99] }, subtotalCents, deliveryFeeCents, totalCents, paymentState: "paid", status: "ready_for_pickup", assignmentState: "unassigned", statusHistory: [{ status: "ready_for_pickup", actorRole: "admin", reason: "Pedido de prueba creado desde Supervisión de dispatch" }] });
+    const order = await Order.create({ publicCode: `PIKI-TEST-${Date.now().toString(36).toUpperCase()}-${index + 1}`, ...dailyCode, restaurantId: restaurant._id, customerId: parsed.data.customerId || "test-customer@pikidelivery.com", customerPhone: "+34960000111", isTestOrder: true, items: [{ itemId: item.id, name: item.name, quantity: 1, unitPriceCents: subtotalCents }], deliveryAddress: parsed.data.deliveryAddress, deliveryLocation: { type: "Point", coordinates: restaurant.location?.coordinates || [-0.52, 38.99] }, subtotalCents, deliveryFeeCents, totalCents, paymentState: "paid", status: "ready_for_pickup", assignmentState: "unassigned", statusHistory: [{ status: "ready_for_pickup", actorRole: "admin", reason: "Pedido de prueba creado desde Supervisión de dispatch" }] });
     created.push({ id: order.id, publicCode: order.publicCode, displayCode: order.displayCode, restaurantId: restaurant._id, restaurantName: restaurant.name, status: order.status, paymentState: order.paymentState, isTestOrder: true });
   }
   return res.status(201).json({ orders: created, message: `${created.length} pedido(s) de prueba listo(s) para dispatch.` });
@@ -777,8 +777,7 @@ app.post("/api/v1/dispatch/orders/:id/offer-response", requireRole("rider", "adm
   const order = await Order.findById(orderId).lean().exec() as any;
   if (!order || !order.riderId || order.assignmentState !== "offered") return res.status(404).json({ error: "ACTIVE_RIDER_OFFER_NOT_FOUND" });
   if (req.auth?.role === "rider") {
-    const employee = req.auth.employeeId ? await EmployeeAccount.findById(req.auth.employeeId).select("email").lean().exec() as any : null;
-    const rider = employee ? await Rider.findOne({ _id: order.riderId, email: employee.email }).select("_id").lean().exec() : null;
+    const rider = await riderAccessForRequest(order.riderId, req);
     if (!rider) return res.status(403).json({ error: "RIDER_ACCESS_DENIED" });
   }
   if (new Date(order.assignmentExpiresAt || 0).getTime() < Date.now()) parsed.data.accept = false;
