@@ -108,7 +108,13 @@ export const PasskeyCredential = mongoose.models.PasskeyCredential || mongoose.m
 export const RiderAssignmentReservation = mongoose.models.RiderAssignmentReservation || mongoose.model("RiderAssignmentReservation", riderAssignmentReservationSchema);
 
 export async function ensureIndexes() {
-  await Promise.all([Restaurant.init(), PartnerAsset.init(), PartnerLocalityGroup.init(), Rider.init(), Fleet.init(), Order.init(), Zone.init(), StripeEvent.init(), DispatchDecision.init(), RiderIncident.init(), RiderOrderMessage.init(), RiderApplication.init(), CustomerAccount.init(), EmployeeAccount.init(), RiderSlot.init(), SignatureRequest.init(), PasskeyCredential.init(), RiderAssignmentReservation.init()]);
+  // Remove unique indexes from older schema versions before initialization.
+  for (const [model, indexName] of [[Rider, "riderCode_1"], [EmployeeAccount, "portfolioId_1"]] as const) {
+    try { await model.collection.dropIndex(indexName); } catch (error: any) {
+      if (error?.codeName !== "IndexNotFound" && error?.code !== 27) throw error;
+    }
+  }
+  await Promise.all([Restaurant.init(), PartnerAsset.init(), PartnerLocalityGroup.init(), Fleet.init(), Order.init(), Zone.init(), StripeEvent.init(), DispatchDecision.init(), RiderIncident.init(), RiderOrderMessage.init(), RiderApplication.init(), CustomerAccount.init(), RiderSlot.init(), SignatureRequest.init(), PasskeyCredential.init(), RiderAssignmentReservation.init()]);
   const ridersWithoutCode = await Rider.find({ $or: [{ riderCode: { $exists: false } }, { riderCode: null }, { riderCode: "" }] }).select("_id").lean().exec();
   for (const rider of ridersWithoutCode) {
     const base = `PIKI-R-${String(rider._id).slice(-6).toUpperCase()}`;
@@ -117,4 +123,6 @@ export async function ensureIndexes() {
     while (await Rider.exists({ riderCode })) riderCode = `${base}-${suffix++}`;
     await Rider.updateOne({ _id: rider._id, $or: [{ riderCode: { $exists: false } }, { riderCode: null }, { riderCode: "" }] }, { $set: { riderCode } }).exec();
   }
+  await Rider.syncIndexes();
+  await EmployeeAccount.syncIndexes();
 }

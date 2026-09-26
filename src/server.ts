@@ -684,8 +684,13 @@ app.post("/api/v1/riders/:id/slots", requireRole("admin", "fleet"), async (req, 
   const rider = await Rider.findById(riderId).lean().exec(); if (!rider) return res.status(404).json({ error: "RIDER_NOT_FOUND" });
   const overlap = await RiderSlot.findOne({ riderId, date: parsed.data.date, status: { $nin: ["cancelled", "completed"] }, $or: [{ startTime: { $lt: parsed.data.endTime }, endTime: { $gt: parsed.data.startTime } }] }).lean().exec();
   if (overlap) return res.status(409).json({ error: "RIDER_SLOT_OVERLAP", slot: overlap });
-  const slot = await RiderSlot.create({ ...parsed.data, riderId });
-  return res.status(201).json({ slot });
+  try {
+    const slot = await RiderSlot.create({ ...parsed.data, riderId });
+    return res.status(201).json({ slot });
+  } catch (error: any) {
+    if (error?.code === 11000) return res.status(409).json({ error: "RIDER_SLOT_ALREADY_EXISTS", message: "Ya existe un slot para ese rider, fecha y hora de inicio." });
+    throw error;
+  }
 });
 
 app.get("/api/v1/fleet/heatmap", requireRole("admin", "fleet"), async (_req, res) => {
