@@ -97,6 +97,7 @@ app.get("/api/v1/auth/status", (_req, res) => res.json({ authentication: "bearer
 const employeeLoginSchema = z.object({ email: z.string().email(), password: z.string().min(8).max(200) });
 app.post("/api/v1/auth/employee/login", async (req, res) => {
   const parsed = employeeLoginSchema.safeParse(req.body); if (!parsed.success) return res.status(400).json({ error: "INVALID_LOGIN" });
+  if (String(req.headers["x-piki-surface"] || "").toLowerCase() === "admin" && parsed.data.email.toLowerCase() !== ownerEmail) return res.status(403).json({ error: "ADMIN_OWNER_ONLY", message: "El panel Admin está reservado al propietario de PIKI." });
   const employee = await EmployeeAccount.findOne({ email: parsed.data.email.toLowerCase(), active: true }).select("+passwordHash").exec() as any;
   if (!employee || !verifyPassword(parsed.data.password, employee.passwordHash)) return res.status(401).json({ error: "INVALID_CREDENTIALS" });
   const token = createSessionToken(); employee.sessionHash = hashSessionToken(token); employee.lastLoginAt = new Date(); await employee.save();
@@ -487,7 +488,7 @@ app.post("/api/v1/admin/dispatch/test-orders", requireRole("admin"), async (req,
     const subtotalCents = Math.round(Number(item.price || 0) * 100);
     const deliveryFeeCents = Number(restaurant.deliveryFeeCents || 0);
     const totalCents = subtotalCents + deliveryFeeCents + 79;
-    const order = await Order.create({ publicCode: `PIKI-TEST-${Date.now().toString(36).toUpperCase()}-${index + 1}`, ...dailyCode, restaurantId: restaurant._id, customerId: "test-customer@pikidelivery.com", isTestOrder: true, items: [{ itemId: item.id, name: item.name, quantity: 1, unitPriceCents: subtotalCents }], deliveryAddress: parsed.data.deliveryAddress, deliveryLocation: { type: "Point", coordinates: restaurant.location?.coordinates || [-0.52, 38.99] }, subtotalCents, deliveryFeeCents, totalCents, paymentState: "paid", status: "ready_for_pickup", statusHistory: [{ status: "ready_for_pickup", actorRole: "admin", reason: "Pedido de prueba creado desde Supervisión de dispatch" }] });
+    const order = await Order.create({ publicCode: `PIKI-TEST-${Date.now().toString(36).toUpperCase()}-${index + 1}`, ...dailyCode, restaurantId: restaurant._id, customerId: "test-customer@pikidelivery.com", customerPhone: "+34960000111", isTestOrder: true, items: [{ itemId: item.id, name: item.name, quantity: 1, unitPriceCents: subtotalCents }], deliveryAddress: parsed.data.deliveryAddress, deliveryLocation: { type: "Point", coordinates: restaurant.location?.coordinates || [-0.52, 38.99] }, subtotalCents, deliveryFeeCents, totalCents, paymentState: "paid", status: "ready_for_pickup", statusHistory: [{ status: "ready_for_pickup", actorRole: "admin", reason: "Pedido de prueba creado desde Supervisión de dispatch" }] });
     created.push({ id: order.id, publicCode: order.publicCode, displayCode: order.displayCode, restaurantId: restaurant._id, restaurantName: restaurant.name, status: order.status, paymentState: order.paymentState, isTestOrder: true });
   }
   return res.status(201).json({ orders: created, message: `${created.length} pedido(s) de prueba listo(s) para dispatch.` });
@@ -515,6 +516,11 @@ app.post("/api/v1/orders/:id/transitions", requireRole("admin", "partner", "ride
   const order = await Order.findById(id); if (!order) return res.status(404).json({ error: "ORDER_NOT_FOUND" });
   const actorRole = req.auth?.role === "admin" ? parsed.data.actorRole : req.auth?.role;
   if (!actorRole) return res.status(401).json({ error: "AUTHENTICATION_REQUIRED" });
+  if (actorRole === "rider") {
+    const employee = req.auth?.employeeId ? await EmployeeAccount.findById(req.auth.employeeId).select("email").lean().exec() as any : null;
+    const rider = employee ? await Rider.findOne({ _id: order.riderId, email: employee.email }).select("_id").lean().exec() : null;
+    if (!rider) return res.status(403).json({ error: "RIDER_ORDER_ACCESS_DENIED" });
+  }
   try { assertTransition(order.status, parsed.data.status, actorRole); } catch (error) { return res.status(409).json({ error: "INVALID_ORDER_TRANSITION", message: error instanceof Error ? error.message : "Transition not allowed" }); }
   const update: Record<string, unknown> = { $set: { status: parsed.data.status }, $inc: { version: 1 }, $push: { statusHistory: { status: parsed.data.status, actorRole, reason: parsed.data.reason || "" } } };
   if (parsed.data.status === "delivered") update.$set = { status: "delivered", deliveredAt: new Date() };
@@ -526,6 +532,23 @@ app.post("/api/v1/orders/:id/transitions", requireRole("admin", "partner", "ride
     await Rider.findByIdAndUpdate(order.riderId, { $set: { status: remainingOrder ? "busy" : "available", activeOrderId: remainingOrder?._id || null } }).exec();
   }
   return res.json({ order: updated });
+});
+
+app.post("/api/v1/riders/:riderId/orders/:orderId/confirm-delivery", requireRole("rider"), async (req, res) => {
+  const riderId = objectId(Array.isArray(req.params.riderId) ? req.params.riderId[0] : req.params.riderId);
+  const orderId = objectId(Array.isArray(req.params.orderId) ? req.params.orderId[0] : req.params.orderId);
+  if (!riderId || !orderId || !req.auth?.employeeId) return res.status(400).json({ error: "INVALID_DELIVERY_CONFIRMATION" });
+  const employee = await EmployeeAccount.findById(req.auth.employeeId).select("email").lean().exec() as any;
+  const rider = employee ? await Rider.findOne({ _id: riderId, email: employee.email }).select("_id").lean().exec() : null;
+  if (!rider) return res.status(403).json({ error: "RIDER_ACCESS_DENIED" });
+  const order = await Order.findOne({ _id: orderId, riderId, assignmentState: "assigned" }).lean().exec() as any;
+  if (!order) return res.status(404).json({ error: "ASSIGNED_ORDER_NOT_FOUND" });
+  if (order.status !== "on_the_way") return res.status(409).json({ error: "ORDER_NOT_ON_THE_WAY", message: "Primero confirma que has recogido el pedido e iniciado la ruta." });
+  const updated = await Order.findOneAndUpdate({ _id: orderId, riderId, status: "on_the_way", version: order.version }, { $set: { status: "delivered", deliveredAt: new Date() }, $inc: { version: 1 }, $push: { statusHistory: { status: "delivered", actorRole: "rider", reason: "Entrega confirmada por el Rider" } } }, { new: true }).lean().exec();
+  if (!updated) return res.status(409).json({ error: "ORDER_CHANGED_RETRY" });
+  const deliveredOrder = updated as any;
+  await Rider.findOneAndUpdate({ _id: riderId, activeOrderId: orderId }, { $set: { status: "available", activeOrderId: null } }).exec();
+  return res.json({ message: "Entrega confirmada.", order: { id: deliveredOrder._id, status: deliveredOrder.status, deliveredAt: deliveredOrder.deliveredAt } });
 });
 
 app.post("/api/v1/riders/:id/location", requireRole("admin", "rider", "fleet"), async (req, res) => {
@@ -817,6 +840,16 @@ app.get("/api/v1/admin/overview", requireRole("admin"), async (_req, res) => {
   const startOfDay = new Date(); startOfDay.setHours(0, 0, 0, 0);
   const [activeRestaurants, pendingRestaurants, riders, openOrders, deliveredToday] = await Promise.all([Restaurant.countDocuments({ isActive: true, onboardingStatus: "approved" }), Restaurant.countDocuments({ onboardingStatus: "pending_review" }), Rider.countDocuments(), Order.countDocuments({ status: { $in: ["pending", "accepted", "preparing", "ready_for_pickup", "picked_up", "on_the_way"] } }), Order.countDocuments({ status: "delivered", deliveredAt: { $gte: startOfDay } })]);
   res.json({ service: "piki-api", overview: { active_restaurants: activeRestaurants, pending_restaurants: pendingRestaurants, riders, open_orders: openOrders, delivered_today: deliveredToday } });
+});
+
+app.get("/api/v1/admin/operations/live", requireRole("admin"), async (_req, res) => {
+  const riders = await Rider.find({ location: { $exists: true } }).select("name email status vehicle location lastLocationAt activeOrderId fleetId").lean().exec() as any[];
+  const activeOrderIds = riders.map((rider) => rider.activeOrderId).filter(Boolean);
+  const orders = await Order.find({ _id: { $in: activeOrderIds } }).select("publicCode displayCode status assignmentState deliveryAddress restaurantId customerId riderId").select("+customerPhone").lean().exec() as any[];
+  const restaurants = await Restaurant.find({ _id: { $in: orders.map((order) => order.restaurantId) } }).select("name address").lean().exec() as any[];
+  const restaurantMap = new Map(restaurants.map((restaurant) => [String(restaurant._id), restaurant]));
+  const orderMap = new Map(orders.map((order) => [String(order._id), { ...order, customerPhone: order.customerPhone || null, restaurant: restaurantMap.get(String(order.restaurantId)) || null }]));
+  return res.json({ refreshedAt: new Date().toISOString(), riders: riders.map((rider) => ({ id: rider._id, name: rider.name, status: rider.status, vehicle: rider.vehicle, location: rider.location, lastLocationAt: rider.lastLocationAt, activeOrder: rider.activeOrderId ? orderMap.get(String(rider.activeOrderId)) || null : null })) });
 });
 
 app.get("/api/v1/riders/overview", requireRole("admin", "rider", "fleet"), async (_req, res) => {
