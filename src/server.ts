@@ -10,6 +10,7 @@ import { assertTransition, calculateEtaRange, transitionSchema, validateCoordina
 import { configuredAuthRoles, requireOwner, requireRole } from "./auth.js";
 import { createCheckoutSession, processStripeWebhook, stripeConfigured } from "./stripe.js";
 import { rankDispatchCandidates } from "./dispatch.js";
+import { computeMobilityAdvice } from "./low-activity.js";
 import { calculateSanctionDecision, defaultSanctionPolicy } from "./sanctions.js";
 import { handleCustomerTrpc } from "./customerCompat.js";
 import { createSessionToken, generateTemporaryPassword, hashPassword, hashSessionToken, verifyPassword } from "./employeeAuth.js";
@@ -722,6 +723,28 @@ app.get("/api/v1/riders/operational-map", requireRole("rider"), async (req, res)
   if (zoneSlugs.length) filter.slug = { $in: zoneSlugs };
   const zones = await Zone.find(filter).select("slug name isActive polygon").sort({ name: 1 }).lean().exec();
   return res.json({ zones, source: "piki-api", refreshedAt: new Date().toISOString() });
+});
+app.get("/api/v1/riders/:id/mobility-advice", requireRole("rider"), async (req, res) => {
+  const riderId = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
+  if (!riderId || !req.auth?.employeeId) return res.status(400).json({ error: "INVALID_RIDER_SESSION" });
+  const employee = await EmployeeAccount.findById(req.auth.employeeId).select("email").lean().exec() as any;
+  const rider = employee ? await Rider.findOne({ _id: riderId, email: employee.email }).select("location").lean().exec() as any : null;
+  if (!rider) return res.status(403).json({ error: "RIDER_ACCESS_DENIED" });
+  const zones = await Zone.find({ isActive: true }).select("slug name polygon").lean().exec() as any[];
+  const since = new Date(Date.now() - 45 * 60 * 1000);
+  const zoneDemand = await Promise.all(zones.map(async (zone) => {
+    const coordinates = zone.polygon?.coordinates?.[0]?.[0];
+    const anchor: [number, number] = Array.isArray(coordinates) ? [Number(coordinates[0]), Number(coordinates[1])] : [0, 0];
+    const ordersLastWindow = await Order.countDocuments({ createdAt: { $gte: since }, status: { $nin: ["cancelled"] }, deliveryLocation: { $geoWithin: { $geometry: zone.polygon } } });
+    return { slug: zone.slug, name: zone.name, anchor, ordersLastWindow };
+  }));
+  const currentPoint = rider.location?.coordinates;
+  const currentZoneRaw = Array.isArray(currentPoint) && currentPoint.length >= 2
+    ? await Zone.findOne({ isActive: true, polygon: { $geoIntersects: { $geometry: { type: "Point", coordinates: currentPoint } } } }).select("slug").lean().exec() as any
+    : null;
+  const currentZone = currentZoneRaw ? zoneDemand.find((zone) => zone.slug === currentZoneRaw.slug) || null : null;
+  const advice = computeMobilityAdvice({ currentZone, zones: zoneDemand, lowActivityMinutes: Number(req.query.lowActivityMinutes || 15) });
+  return res.json({ advice, checkedAt: new Date().toISOString(), windowMinutes: 45 });
 });
 app.post("/api/v1/zones", requireRole("admin", "fleet"), async (req, res) => {
   const parsed = zoneSchema.safeParse(req.body); if (!parsed.success) return res.status(400).json({ error: "INVALID_ZONE", details: parsed.error.flatten() });
