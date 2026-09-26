@@ -1,8 +1,9 @@
 import { createHash, createHmac, randomBytes, scryptSync, timingSafeEqual } from "node:crypto";
 import type { Request, Response } from "express";
 import { Order, Restaurant, CustomerAccount, RiderOrderMessage } from "./models.js";
-import { createCheckoutSession } from "./stripe.js";
 import { publishPaidOrderEvents } from "./realtime.js";
+import { evaluateXativaCoverage } from "./coverage/xativaPolicy.js";
+import { quoteDeliveryRoute } from "./coverage/routing.js";
 
 const COOKIE = "piki_customer_session";
 const hashToken = (value: string) => createHash("sha256").update(value).digest("hex");
@@ -37,12 +38,14 @@ function getSession(req: Request) {
 export async function currentCustomer(req: Request) { const raw = getSession(req); return raw ? CustomerAccount.findOne({ sessionHash: hashToken(raw) }).lean().exec() : null; }
 function setSession(res: Response, userId: string) { const raw = randomBytes(32).toString("base64url"); void CustomerAccount.updateOne({ _id: userId }, { $set: { sessionHash: hashToken(raw), lastSignedIn: new Date() } }).exec(); res.setHeader("Set-Cookie", `${COOKIE}=${raw}; Max-Age=31536000; Path=/; HttpOnly; Secure; SameSite=None`); }
 const customerPaymentMethod = (value: unknown) => {
-  const method = String(value || "stripe");
-  return (["stripe", "bizum", "cash"] as const).includes(method as any) ? method as "stripe" | "bizum" | "cash" : null;
+  const method = String(value || "cash");
+  return method === "cash" ? "cash" : null;
 };
 
 const deliveryQrUrl = (orderCode: string) => {
-  const signature = createHmac("sha256", process.env.DELIVERY_QR_SECRET || "development-only-delivery-qr-secret").update(`delivery:${orderCode}`).digest("hex").slice(0, 24);
+  const secret = String(process.env.DELIVERY_QR_SECRET || "").trim();
+  if (process.env.NODE_ENV === "production" && !secret) throw new Error("DELIVERY_QR_SECRET is required in production");
+  const signature = createHmac("sha256", secret || "development-only-delivery-qr-secret").update(`delivery:${orderCode}`).digest("hex").slice(0, 24);
   return `${(process.env.CUSTOMER_APP_URL || "https://pikidelivery.com").replace(/\/$/, "")}/?order_id=${encodeURIComponent(orderCode)}&delivery_token=${signature}`;
 };
 
@@ -116,23 +119,21 @@ export async function handleCustomerTrpc(req: Request, res: Response) {
       if (!items.length || items.some((item: any) => !item || !Number.isInteger(item.quantity) || item.quantity < 1)) return fail(res, "La cesta no es válida");
       const normalized = items as Array<{itemId: string; name: string; quantity: number; unitPriceCents: number}>;
       const paymentMethod = customerPaymentMethod(input?.paymentMethod);
-      if (!paymentMethod) return fail(res, "El método de pago seleccionado no es válido");
-      const subtotalCents = normalized.reduce((sum, item) => sum + item.unitPriceCents * item.quantity, 0); const deliveryCents = restaurant.deliveryFeeCents || 0; const serviceCents = 79; const totalCents = subtotalCents + deliveryCents + serviceCents;
+      if (!paymentMethod) return fail(res, "Tarjeta y Bizum todavía no están disponibles. Selecciona efectivo al recibir.", "PAYMENT_METHOD_UNAVAILABLE");
+      const latitude = Number(input?.deliveryLocation?.latitude); const longitude = Number(input?.deliveryLocation?.longitude);
+      if (!Number.isFinite(latitude) || latitude < -90 || latitude > 90 || !Number.isFinite(longitude) || longitude < -180 || longitude > 180) return fail(res, "Selecciona una dirección válida de la lista antes de confirmar el pedido.", "DELIVERY_LOCATION_REQUIRED");
+      const deliveryPoint: [number, number] = [longitude, latitude];
+      const coverage = evaluateXativaCoverage(deliveryPoint);
+      if (!coverage.covered || coverage.deliveryFeeCents === null || coverage.serviceFeeCents === null) return fail(res, "Todavía no repartimos en esa dirección.", "DELIVERY_OUTSIDE_COVERAGE");
+      const restaurantPoint = restaurant.location?.coordinates;
+      if (!Array.isArray(restaurantPoint) || restaurantPoint.length < 2) return fail(res, "El restaurante no tiene ubicación operativa configurada.", "RESTAURANT_LOCATION_UNAVAILABLE");
+      const route = await quoteDeliveryRoute([Number(restaurantPoint[0]), Number(restaurantPoint[1])], deliveryPoint);
+      const subtotalCents = normalized.reduce((sum, item) => sum + item.unitPriceCents * item.quantity, 0);
+      const deliveryCents = coverage.deliveryFeeCents; const serviceCents = coverage.serviceFeeCents; const totalCents = subtotalCents + deliveryCents + serviceCents;
       const code = `PIKI-${Date.now().toString(36).toUpperCase()}`;
-      const order = await Order.create({ publicCode: code, restaurantId: restaurant._id, customerId: String(user._id), items: normalized, deliveryAddress: input.address, subtotalCents, deliveryFeeCents: deliveryCents, serviceFeeCents: serviceCents, totalCents, paymentMethod, paymentState: "pending", statusHistory: [{ status: "pending", actorRole: "customer", reason: paymentMethod === "cash" ? "Pedido confirmado: cobro en efectivo pendiente de entrega" : `Pedido creado: pago ${paymentMethod === "bizum" ? "Bizum" : "online"} pendiente` }] });
-      if (paymentMethod === "cash") {
-        await publishPaidOrderEvents(order, { settlement: "cash_due", message: "Pedido confirmado: el Rider cobrará el efectivo al entregar." });
-        return reply(res, { orderId: code, checkoutUrl: null, totalCents, paymentMethod, paymentState: "pending_cash_collection", cashDueAtDelivery: true });
-      }
-      if (procedure === "order.create") return reply(res, { id: code, restaurant: restaurant.name, eta: `${restaurant.etaMinutes?.[0] || 20}–${restaurant.etaMinutes?.[1] || 35} min`, createdAt: Date.now(), status: order.status, totalCents, paymentMethod });
-      try {
-        const session = await createCheckoutSession({ orderId: String(order._id), publicCode: code, origin: req.header("origin") || "https://app.pikidelivery.com", customerEmail: user?.email, items: normalized, deliveryFeeCents: deliveryCents, serviceFeeCents: serviceCents, preferredPaymentMethod: paymentMethod });
-        await Order.updateOne({ _id: order._id }, { $set: { stripeCheckoutSessionId: session.id } }).exec(); return reply(res, { orderId: code, checkoutUrl: session.url, totalCents, paymentMethod });
-      } catch (error) {
-        console.error(`[customerCompat] Stripe checkout failed for ${code}`, error instanceof Error ? error.message : error);
-        await Order.updateOne({ _id: order._id }, { $set: { paymentState: "failed" } }).exec();
-        return fail(res, "El pago online no está disponible todavía. Puedes seleccionar efectivo o pedir a PIKI que complete la configuración de Stripe.", "STRIPE_UNAVAILABLE");
-      }
+      const order = await Order.create({ publicCode: code, restaurantId: restaurant._id, customerId: String(user._id), items: normalized, deliveryAddress: String(input.address || "").trim(), deliveryLocation: { type: "Point", coordinates: deliveryPoint }, coveragePolicySlug: coverage.policySlug, coveragePolicyVersion: coverage.policyVersion, coverageDecision: coverage.reason, straightLineDistanceKm: coverage.straightLineDistanceKm, withinMunicipality: coverage.withinMunicipality, deliveryBaseFeeCents: coverage.deliveryBaseFeeCents, outsideMunicipalitySurchargeCents: coverage.outsideMunicipalitySurchargeCents, routeDistanceKm: route.routeDistanceKm, routeDurationMinutes: route.routeDurationMinutes, routeProvider: route.routeProvider, routingDegraded: route.routingDegraded, requiredVehicleClasses: route.requiredVehicleClasses, subtotalCents, deliveryFeeCents: deliveryCents, serviceFeeCents: serviceCents, totalCents, paymentMethod, paymentState: "pending", statusHistory: [{ status: "pending", actorRole: "customer", reason: "Pedido confirmado: cobro en efectivo pendiente de entrega" }] });
+      await publishPaidOrderEvents(order, { settlement: "cash_due", message: "Pedido confirmado: el Rider cobrará el efectivo exacto al entregar." });
+      return reply(res, { orderId: code, checkoutUrl: null, totalCents, paymentMethod, paymentState: "pending_cash_collection", cashDueAtDelivery: true, deliveryQrUrl: deliveryQrUrl(code), coverage, route });
     }
     return fail(res, `Procedimiento no soportado: ${procedure}`, "NOT_FOUND");
   } catch (error) { console.error(`[customerCompat] ${procedure}`, error); return fail(res, "Error interno de la plataforma", "INTERNAL_SERVER_ERROR"); }

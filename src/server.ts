@@ -10,7 +10,7 @@ import { seedCatalog } from "./seed.js";
 import { assertTransition, calculateEtaRange, transitionSchema, validateCoordinates } from "./algorithms/index.js";
 import { configuredAuthRoles, requireOwner, requireRole, resolveRole } from "./auth.js";
 import { EmployeeSession, issueEmployeeSession, revokeEmployeeSessions, sessionRole } from "./employeeSessions.js";
-import { createCheckoutSession, processStripeWebhook, stripeConfigured, createSignaturitSignature, signaturitBaseUrl, signaturitConfigured, signaturitMode, signatureWebhookUrl, webhookDigest, handleCustomerTrpc, currentCustomer } from "./integrations/index.js";
+import { processStripeWebhook, stripeConfigured, createSignaturitSignature, signaturitBaseUrl, signaturitConfigured, signaturitMode, signatureWebhookUrl, webhookDigest, handleCustomerTrpc, currentCustomer } from "./integrations/index.js";
 import { getVersionPolicy, isPikiSurface, requiresUpdate, setVersionPolicy, syncVersionPolicy, versionPolicySchema, type PikiSurface } from "./appVersion.js";
 import { publicPushConfig, revokePushSubscription, savePushSubscription, sendPushToOwner } from "./push.js";
 import { publishOrderStatusEvents, publishPaidOrderEvents, publishRiderOfferEvent, serveRealtimeEvents, startRealtimeRelay } from "./realtime.js";
@@ -73,9 +73,11 @@ app.use(express.json({ limit: "12mb" }));
 const objectId = (value: string) => mongoose.isValidObjectId(value) ? new mongoose.Types.ObjectId(value) : null;
 const locationSchema = z.object({ latitude: z.number().min(-90).max(90), longitude: z.number().min(-180).max(180) });
 const orderItemSchema = z.object({ itemId: z.string().min(1), quantity: z.number().int().min(1).max(20) });
-const createOrderSchema = z.object({ restaurantId: z.string().min(1), customerId: z.string().max(160).optional(), deliveryAddress: z.string().min(5).max(280), deliveryLocation: locationSchema, items: z.array(orderItemSchema).min(1).max(50), paymentMethod: z.enum(["stripe", "bizum", "cash"]).default("stripe") });
+const createOrderSchema = z.object({ restaurantId: z.string().min(1), customerId: z.string().max(160).optional(), deliveryAddress: z.string().min(5).max(280), deliveryLocation: locationSchema, items: z.array(orderItemSchema).min(1).max(50), paymentMethod: z.string().optional().default("cash") });
 const dispatchablePaymentFilter = { $or: [{ paymentState: "paid" }, { paymentMethod: "cash", paymentState: "pending" }] };
-const deliveryQrSignature = (orderCode: string) => createHmac("sha256", process.env.DELIVERY_QR_SECRET || "development-only-delivery-qr-secret").update(`delivery:${orderCode}`).digest("hex").slice(0, 24);
+const deliveryQrSecret = String(process.env.DELIVERY_QR_SECRET || "").trim();
+if (process.env.NODE_ENV === "production" && !deliveryQrSecret) throw new Error("DELIVERY_QR_SECRET is required in production");
+const deliveryQrSignature = (orderCode: string) => createHmac("sha256", deliveryQrSecret || "development-only-delivery-qr-secret").update(`delivery:${orderCode}`).digest("hex").slice(0, 24);
 const deliveryQrUrl = (orderCode: string) => `${(process.env.CUSTOMER_APP_URL || "https://pikidelivery.com").replace(/\/$/, "")}/?order_id=${encodeURIComponent(orderCode)}&delivery_token=${deliveryQrSignature(orderCode)}`;
 const deliveryQrIsValid = (orderCode: string, raw: unknown) => {
   try { const url = new URL(String(raw)); return url.searchParams.get("order_id") === orderCode && url.searchParams.get("delivery_token") === deliveryQrSignature(orderCode); } catch { return false; }
@@ -636,6 +638,7 @@ app.post("/api/v1/rider-slots", requireRole("admin", "fleet"), async (req, res) 
 app.post("/api/v1/orders", async (req, res) => {
   const parsed = createOrderSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_ORDER", details: parsed.error.flatten() });
+  if (parsed.data.paymentMethod !== "cash") return res.status(409).json({ error: "PAYMENT_METHOD_UNAVAILABLE", message: "Tarjeta y Bizum todavía no están disponibles. Selecciona efectivo al recibir." });
   const restaurantObjectId = objectId(parsed.data.restaurantId);
   if (!restaurantObjectId) return res.status(400).json({ error: "INVALID_RESTAURANT_ID" });
   const restaurant = await Restaurant.findOne({ _id: restaurantObjectId, isActive: true, onboardingStatus: "approved" }).lean().exec() as any;
@@ -669,14 +672,7 @@ app.post("/api/v1/payments/checkout", async (req, res) => {
   const id = objectId(parsed.data.orderId);
   const order = (id ? await Order.findById(id).lean().exec() : await Order.findOne({ publicCode: parsed.data.orderId }).lean().exec()) as any;
   if (!order) return res.status(404).json({ error: "ORDER_NOT_FOUND" });
-  if (order.paymentState === "paid") return res.status(409).json({ error: "ORDER_ALREADY_PAID" });
-  try {
-    const session = await createCheckoutSession({ orderId: String(order._id), publicCode: order.publicCode, origin: parsed.data.origin, customerEmail: parsed.data.customerEmail, items: order.items, deliveryFeeCents: order.deliveryFeeCents, serviceFeeCents: Number(order.serviceFeeCents || 0) });
-    await Order.updateOne({ _id: order._id }, { $set: { stripeCheckoutSessionId: session.id } }).exec();
-    return res.status(201).json({ checkout: { id: session.id, url: session.url, expiresAt: session.expires_at } });
-  } catch (error) {
-    return res.status(503).json({ error: "STRIPE_UNAVAILABLE", message: error instanceof Error ? error.message : "Stripe unavailable" });
-  }
+  return res.status(409).json({ error: "PAYMENT_METHOD_UNAVAILABLE", message: "El pago online todavía no está disponible. Este pedido debe crearse y cobrarse en efectivo al entregar." });
 });
 
 const testDispatchOrderSchema = z.object({ restaurantId: z.string().optional(), customerId: z.union([z.string().regex(/^[a-f\d]{24}$/i), z.literal("qa-kfc-e2e")]).optional(), count: z.coerce.number().int().min(1).max(10).default(1), deliveryAddress: z.string().min(5).max(280).default("Plaza de la Seu, 1, Xàtiva"), status: z.enum(["accepted", "preparing", "ready_for_pickup"]).default("preparing") });
@@ -726,11 +722,13 @@ app.get("/api/v1/orders/:id", async (req, res) => {
 async function recordCashCollection(order: any, riderId: mongoose.Types.ObjectId, actorRole: "rider" | "admin" | "fleet") {
   if (order.paymentMethod !== "cash") return null;
   const idempotencyKey = `cash-collection:${String(order._id)}`;
-  const existing = await CashLedgerEntry.findOne({ idempotencyKey }).lean().exec() as any;
-  if (existing) return existing;
-  const entry = await CashLedgerEntry.create({ orderId: order._id, riderId, actorRole, direction: "in", amountCents: Number(order.totalCents || 0), reason: "customer_cash_collection", idempotencyKey, note: "Cobro en efectivo confirmado en la entrega" });
+  const entry = await CashLedgerEntry.findOneAndUpdate(
+    { idempotencyKey },
+    { $setOnInsert: { orderId: order._id, riderId, actorRole, direction: "in", amountCents: Number(order.totalCents || 0), reason: "customer_cash_collection", idempotencyKey, note: "Cobro en efectivo confirmado en la entrega", reference: String(order.publicCode || "") } },
+    { upsert: true, new: true, setDefaultsOnInsert: true },
+  ).lean().exec() as any;
   await Order.updateOne({ _id: order._id, cashCollectedAt: null }, { $set: { cashCollectedAt: new Date(), cashCollectedByRiderId: riderId, paymentState: "paid" } }).exec();
-  return entry.toObject();
+  return entry;
 }
 
 async function cashWallet(riderId: mongoose.Types.ObjectId) {
@@ -738,6 +736,25 @@ async function cashWallet(riderId: mongoose.Types.ObjectId) {
   const inRow = rows.find((row: any) => row._id === "in"); const outRow = rows.find((row: any) => row._id === "out");
   return { riderId: String(riderId), collectedCents: Number(inRow?.totalCents || 0), handedOverCents: Number(outRow?.totalCents || 0), availableCents: Number(inRow?.totalCents || 0) - Number(outRow?.totalCents || 0), collectedEntries: Number(inRow?.entries || 0), updatedAt: new Date().toISOString() };
 }
+
+const cashHandoverSchema = z.object({ riderId: z.string().regex(/^[a-f\d]{24}$/i), amountCents: z.number().int().positive().max(1_000_000), reference: z.string().trim().min(3).max(120), note: z.string().trim().max(500).default("") });
+async function recordCashHandover(input: z.infer<typeof cashHandoverSchema>, actorRole: "admin" | "fleet") {
+  const riderId = objectId(input.riderId);
+  if (!riderId) throw new Error("INVALID_RIDER_ID");
+  const wallet = await cashWallet(riderId);
+  if (input.amountCents > wallet.availableCents) {
+    const error = new Error("HANDOVER_EXCEEDS_AVAILABLE_CASH") as Error & { wallet?: typeof wallet };
+    error.wallet = wallet; throw error;
+  }
+  const idempotencyKey = `cash-handover:${String(riderId)}:${input.reference}`;
+  const entry = await CashLedgerEntry.findOneAndUpdate(
+    { idempotencyKey },
+    { $setOnInsert: { orderId: null, riderId, actorRole, direction: "out", amountCents: input.amountCents, reason: "cash_handover", idempotencyKey, note: input.note, reference: input.reference } },
+    { upsert: true, new: true, setDefaultsOnInsert: true },
+  ).lean().exec() as any;
+  return { entry, wallet: await cashWallet(riderId) };
+}
+
 
 app.post("/api/v1/orders/:id/transitions", requireRole("admin", "partner", "rider", "fleet"), async (req, res) => {
   const parsed = transitionSchema.safeParse(req.body);
@@ -755,6 +772,7 @@ app.post("/api/v1/orders/:id/transitions", requireRole("admin", "partner", "ride
     }
   }
   try { assertTransition(order.status, parsed.data.status, actorRole); } catch (error) { return res.status(409).json({ error: "INVALID_ORDER_TRANSITION", message: error instanceof Error ? error.message : "Transition not allowed" }); }
+  if (parsed.data.status === "delivered" && order.paymentMethod === "cash") return res.status(409).json({ error: "DELIVERY_QR_REQUIRED", message: "Un pedido en efectivo debe cerrarse con el QR del Customer para registrar el cobro una sola vez." });
   const update: Record<string, unknown> = { $set: { status: parsed.data.status }, $inc: { version: 1 }, $push: { statusHistory: { status: parsed.data.status, actorRole, reason: parsed.data.reason || "" } } };
   if (parsed.data.status === "delivered") update.$set = { status: "delivered", deliveredAt: new Date() };
   if (parsed.data.status === "cancelled") update.$set = { status: "cancelled", cancelledAt: new Date() };
@@ -829,7 +847,21 @@ app.get("/api/v1/riders/:id/cash-wallet", requireRole("admin", "rider", "fleet")
   const riderId = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
   if (!riderId) return res.status(400).json({ error: "INVALID_RIDER_ID" });
   if (req.auth?.role === "rider" && !(await riderAccessForRequest(riderId, req))) return res.status(403).json({ error: "RIDER_ACCESS_DENIED" });
-  return res.json({ wallet: await cashWallet(riderId) });
+  const [wallet, entries] = await Promise.all([cashWallet(riderId), CashLedgerEntry.find({ riderId }).sort({ createdAt: -1 }).limit(50).lean().exec()]);
+  return res.json({ wallet, entries });
+});
+
+app.post("/api/v1/ops/cash-handovers", requireRole("admin", "fleet"), async (req, res) => {
+  const parsed = cashHandoverSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "INVALID_CASH_HANDOVER", details: parsed.error.flatten() });
+  try {
+    const result = await recordCashHandover(parsed.data, req.auth?.role === "fleet" ? "fleet" : "admin");
+    return res.status(201).json(result);
+  } catch (error) {
+    if (error instanceof Error && error.message === "HANDOVER_EXCEEDS_AVAILABLE_CASH") return res.status(409).json({ error: error.message, wallet: (error as Error & { wallet?: unknown }).wallet });
+    if (error instanceof Error && error.message === "INVALID_RIDER_ID") return res.status(400).json({ error: error.message });
+    throw error;
+  }
 });
 
 app.get("/api/v1/ops/cash-wallets", requireRole("admin", "fleet"), async (_req, res) => {
@@ -842,7 +874,10 @@ app.post("/api/v1/riders/:id/location", requireRole("admin", "rider", "fleet"), 
   const parsed = riderLocationSchema.safeParse({ ...req.body, riderId: req.params.id });
   if (!parsed.success) return res.status(400).json({ error: "INVALID_LOCATION", details: parsed.error.flatten() });
   const id = objectId(parsed.data.riderId); if (!id) return res.status(400).json({ error: "INVALID_RIDER_ID" });
-  const rider = await Rider.findByIdAndUpdate(id, { $set: { location: { type: "Point", coordinates: [parsed.data.longitude, parsed.data.latitude] }, lastLocationAt: new Date() } }, { new: true }).lean().exec() as any;
+  if (req.auth?.role === "rider" && !(await riderAccessForRequest(id, req))) return res.status(403).json({ error: "RIDER_ACCESS_DENIED" });
+  const activeSlot = (await findCurrentRiderSlot(id)).slot as any;
+  const statusUpdate = activeSlot?.status === "active" ? { status: "available" } : {};
+  const rider = await Rider.findByIdAndUpdate(id, { $set: { location: { type: "Point", coordinates: [parsed.data.longitude, parsed.data.latitude] }, lastLocationAt: new Date(), ...statusUpdate } }, { new: true }).lean().exec() as any;
   if (!rider) return res.status(404).json({ error: "RIDER_NOT_FOUND" });
   return res.json({ rider: { id: rider._id, riderCode: rider.riderCode, status: rider.status, location: rider.location, lastLocationAt: rider.lastLocationAt } });
 });
@@ -851,9 +886,12 @@ app.patch("/api/v1/riders/:id/status", requireRole("admin", "rider", "fleet"), a
   const id = objectId(idParam); if (!id) return res.status(400).json({ error: "INVALID_RIDER_ID" });
   const parsed = z.object({ status: z.enum(["offline", "available", "busy", "paused"]) }).safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_RIDER_STATUS" });
+  if (req.auth?.role === "rider" && !(await riderAccessForRequest(id, req))) return res.status(403).json({ error: "RIDER_ACCESS_DENIED" });
   if (parsed.data.status === "available") {
     const { now, slot } = await findCurrentRiderSlot(id);
-    if (!slot || (slot as any).status !== "active") return res.status(409).json({ error: "SHIFT_RESERVATION_REQUIRED", message: "Debes iniciar tu jornada dentro del turno reservado antes de ponerte disponible.", now });
+    const rider = await Rider.findById(id).select("lastLocationAt").lean().exec() as any;
+    if (!slot || (slot as any).status !== "active") return res.status(409).json({ error: "SHIFT_RESERVATION_REQUIRED", message: "Debes iniciar tu jornada antes de ponerte disponible.", now });
+    if (!rider?.lastLocationAt || new Date(rider.lastLocationAt).getTime() < Date.now() - 90_000) return res.status(409).json({ error: "FRESH_LOCATION_REQUIRED", message: "Activa y comparte tu ubicación para quedar disponible." });
   }
   const rider = await Rider.findByIdAndUpdate(id, { $set: { status: parsed.data.status } }, { new: true }).lean().exec() as any;
   if (!rider) return res.status(404).json({ error: "RIDER_NOT_FOUND" });
@@ -863,6 +901,7 @@ app.patch("/api/v1/riders/:id/status", requireRole("admin", "rider", "fleet"), a
 app.get("/api/v1/riders/:id/slots", requireRole("admin", "rider", "fleet"), async (req, res) => {
   const riderIdParam = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
   const riderId = objectId(riderIdParam); if (!riderId) return res.status(400).json({ error: "INVALID_RIDER_ID" });
+  if (req.auth?.role === "rider" && !(await riderAccessForRequest(riderId, req))) return res.status(403).json({ error: "RIDER_ACCESS_DENIED" });
   const slots = await RiderSlot.find({ riderId }).sort({ date: 1, startTime: 1 }).limit(100).lean().exec();
   return res.json({ riderId, slots });
 });
@@ -876,7 +915,26 @@ function madridNow() {
 async function findCurrentRiderSlot(riderId: mongoose.Types.ObjectId) {
   const now = madridNow();
   const slot = await RiderSlot.findOne({ riderId, date: now.date, status: { $in: ["planned", "active"] }, startTime: { $lte: now.time }, endTime: { $gt: now.time } }).sort({ startTime: 1 }).lean().exec();
-  return { now, slot };
+  const dayHasSlot = slot ? true : Boolean(await RiderSlot.exists({ riderId, date: now.date }));
+  return { now, slot, selfStartAllowed: !dayHasSlot };
+}
+
+async function canAccessRiderShift(riderId: mongoose.Types.ObjectId, req: express.Request) {
+  if (req.auth?.role !== "rider") return true;
+  return Boolean(await riderAccessForRequest(riderId, req));
+}
+
+async function createSelfStartedShift(riderId: mongoose.Types.ObjectId, now: { date: string; time: string }, req: express.Request) {
+  const employee = req.auth?.employeeId ? await EmployeeAccount.findById(req.auth.employeeId).select("zoneSlugs").lean().exec() as any : null;
+  const preferredZones = Array.isArray(employee?.zoneSlugs) ? employee.zoneSlugs.filter((value: unknown) => typeof value === "string") : [];
+  const zone = await Zone.findOne(preferredZones.length ? { slug: { $in: preferredZones }, isActive: true } : { slug: "xativa-centro", isActive: true }).sort({ name: 1 }).lean().exec() as any
+    ?? await Zone.findOne({ isActive: true }).sort({ name: 1 }).lean().exec() as any;
+  if (!zone) throw new Error("NO_ACTIVE_ZONE");
+  return await RiderSlot.findOneAndUpdate(
+    { riderId, date: now.date, startTime: now.time },
+    { $setOnInsert: { riderId, date: now.date, startTime: now.time, endTime: "23:59", zoneSlug: zone.slug, status: "active", notes: "Jornada iniciada por el Rider" } },
+    { upsert: true, new: true, setDefaultsOnInsert: true },
+  ).lean().exec();
 }
 
 app.get("/api/v1/riders/session", requireRole("rider"), async (req, res) => {
@@ -893,8 +951,9 @@ app.get("/api/v1/riders/:id/shift", requireRole("admin", "rider", "fleet"), asyn
   if (!riderId) return res.status(400).json({ error: "INVALID_RIDER_ID" });
   const rider = await Rider.findById(riderId).lean().exec() as any;
   if (!rider) return res.status(404).json({ error: "RIDER_NOT_FOUND" });
-  const { now, slot } = await findCurrentRiderSlot(riderId);
-  return res.json({ rider: { id: rider._id, riderCode: rider.riderCode, status: rider.status }, now, eligible: Boolean(slot), shift: slot });
+  if (!(await canAccessRiderShift(riderId, req))) return res.status(403).json({ error: "RIDER_ACCESS_DENIED" });
+  const { now, slot, selfStartAllowed } = await findCurrentRiderSlot(riderId);
+  return res.json({ rider: { id: rider._id, riderCode: rider.riderCode, status: rider.status }, now, eligible: Boolean(slot) || selfStartAllowed, selfStartAllowed, shift: slot });
 });
 
 app.post("/api/v1/riders/:id/shift/start", requireRole("admin", "rider", "fleet"), async (req, res) => {
@@ -902,19 +961,28 @@ app.post("/api/v1/riders/:id/shift/start", requireRole("admin", "rider", "fleet"
   if (!riderId) return res.status(400).json({ error: "INVALID_RIDER_ID" });
   const rider = await Rider.findById(riderId).lean().exec() as any;
   if (!rider) return res.status(404).json({ error: "RIDER_NOT_FOUND" });
-  const { now, slot } = await findCurrentRiderSlot(riderId);
-  if (!slot) return res.status(409).json({ error: "SHIFT_RESERVATION_REQUIRED", message: "No puedes iniciar la jornada fuera de tu horario reservado.", now });
-  const currentSlot = slot as any;
-  const updatedSlot = await RiderSlot.findOneAndUpdate({ _id: currentSlot._id, status: { $in: ["planned", "active"] } }, { $set: { status: "active" } }, { new: true }).lean().exec();
+  if (!(await canAccessRiderShift(riderId, req))) return res.status(403).json({ error: "RIDER_ACCESS_DENIED" });
+  const { now, slot, selfStartAllowed } = await findCurrentRiderSlot(riderId);
+  if (!slot && !selfStartAllowed) return res.status(409).json({ error: "SHIFT_RESERVATION_REQUIRED", message: "Ya existe un turno para hoy. Inicia la jornada dentro de su franja o contacta con Fleet.", now });
+  let updatedSlot: any;
+  if (slot) {
+    const currentSlot = slot as any;
+    updatedSlot = await RiderSlot.findOneAndUpdate({ _id: currentSlot._id, status: { $in: ["planned", "active"] } }, { $set: { status: "active" } }, { new: true }).lean().exec();
+  } else {
+    try { updatedSlot = await createSelfStartedShift(riderId, now, req); }
+    catch (error) { return res.status(409).json({ error: error instanceof Error ? error.message : "SHIFT_START_FAILED", message: "No se ha podido abrir una jornada en una zona activa." }); }
+  }
   const hasOrders = await Order.exists({ riderId, status: { $nin: ["delivered", "cancelled"] }, assignmentState: { $in: ["offered", "assigned"] } });
-  const status = hasOrders ? "busy" : "available";
+  const hasFreshLocation = Boolean(rider.lastLocationAt && new Date(rider.lastLocationAt).getTime() >= Date.now() - 90_000);
+  const status = hasOrders ? "busy" : hasFreshLocation ? "available" : "paused";
   await Rider.findByIdAndUpdate(riderId, { $set: { status } }).exec();
-  return res.json({ message: "Jornada iniciada", warningSound: "start_shift", rider: { id: riderId, riderCode: rider.riderCode, status }, shift: updatedSlot });
+  return res.json({ message: hasFreshLocation ? "Jornada iniciada" : "Jornada iniciada: comparte tu ubicación para quedar disponible.", warningSound: "start_shift", locationRequired: !hasFreshLocation, rider: { id: riderId, riderCode: rider.riderCode, status }, shift: updatedSlot });
 });
 
 app.post("/api/v1/riders/:id/shift/stop", requireRole("admin", "rider", "fleet"), async (req, res) => {
   const riderId = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
   if (!riderId) return res.status(400).json({ error: "INVALID_RIDER_ID" });
+  if (!(await canAccessRiderShift(riderId, req))) return res.status(403).json({ error: "RIDER_ACCESS_DENIED" });
   if (await Order.exists({ riderId, status: { $nin: ["delivered", "cancelled"] }, assignmentState: { $in: ["offered", "assigned"] } })) return res.status(409).json({ error: "ACTIVE_DELIVERY_REQUIRES_SUPPORT", message: "Completa el reparto o contacta con Soporte antes de finalizar la jornada." });
   const { slot } = await findCurrentRiderSlot(riderId);
   if (slot) await RiderSlot.updateOne({ _id: (slot as any)._id }, { $set: { status: "completed" } }).exec();
@@ -1026,8 +1094,19 @@ async function queueAutomaticDispatch(orderId: mongoose.Types.ObjectId, preferre
   return assignOrderAutomatically(orderId, preferredRiderId);
 }
 
+async function expireStaleOffers() {
+  const expired = await Order.find({ assignmentState: "offered", assignmentExpiresAt: { $lte: new Date() } }).select("_id riderId").limit(100).lean().exec() as any[];
+  for (const offer of expired) {
+    const released = await Order.findOneAndUpdate({ _id: offer._id, assignmentState: "offered", assignmentExpiresAt: { $lte: new Date() } }, { $set: { assignmentState: "expired", riderId: null, assignmentExpiresAt: null }, $inc: { version: 1 } }, { new: false }).lean().exec() as any;
+    if (!released?.riderId) continue;
+    await Rider.updateOne({ _id: released.riderId, activeOrderId: released._id }, { $set: { status: "available", activeOrderId: null } }).exec();
+    await DispatchDecision.updateMany({ orderId: released._id, riderId: released.riderId, outcome: "offered" }, { $set: { outcome: "expired" } }).exec();
+  }
+}
+
 async function runAutomaticDispatchSweep() {
   if (!databaseReady || mongoose.connection.readyState !== 1) return;
+  await expireStaleOffers();
   const candidates = await Order.find({ riderId: null, assignmentState: { $in: ["unassigned", "expired", "rejected"] }, ...dispatchablePaymentFilter, status: { $in: ["accepted", "preparing", "ready_for_pickup"] } }).select("_id").sort({ createdAt: 1 }).limit(25).lean().exec();
   for (const order of candidates) void queueAutomaticDispatch(order._id as mongoose.Types.ObjectId).catch((error) => console.error("Automatic dispatch sweep failed", error));
 }
@@ -1106,7 +1185,10 @@ app.post("/api/v1/dispatch/orders/:id/offer-response", requireRole("rider", "adm
     const rider = await riderAccessForRequest(order.riderId, req);
     if (!rider) return res.status(403).json({ error: "RIDER_ACCESS_DENIED" });
   }
-  if (new Date(order.assignmentExpiresAt || 0).getTime() < Date.now()) parsed.data.accept = false;
+  if (new Date(order.assignmentExpiresAt || 0).getTime() < Date.now()) {
+    await expireStaleOffers();
+    return res.status(409).json({ error: "OFFER_EXPIRED", message: "La oferta ha vencido y se ha devuelto a la cola de reparto." });
+  }
   if (parsed.data.accept) {
     const updated = await Order.findOneAndUpdate({ _id: orderId, assignmentState: "offered", riderId: order.riderId }, { $set: { assignmentState: "assigned" }, $inc: { version: 1 } }, { new: true }).lean().exec() as any;
     if (!updated) return res.status(409).json({ error: "OFFER_CHANGED_RETRY" });
