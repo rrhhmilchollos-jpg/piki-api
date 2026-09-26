@@ -4,6 +4,7 @@ import { hashSessionToken } from "./employeeAuth.js";
 
 export const apiRoles = ["admin", "partner", "rider", "fleet", "commercial"] as const;
 export type ApiRole = (typeof apiRoles)[number];
+export const PIKI_OWNER_EMAIL = "rrhh.milchollos@gmail.com";
 
 declare global {
   namespace Express {
@@ -40,6 +41,23 @@ export function requireRole(...allowedRoles: ApiRole[]) {
     }
     if (!allowedRoles.includes(auth.role)) return response.status(403).json({ error: "FORBIDDEN", role: auth.role });
     if (auth.mustChangePassword && !request.path.endsWith("/employee/change-password") && !request.path.endsWith("/employee/me")) return response.status(428).json({ error: "PASSWORD_CHANGE_REQUIRED" });
+    request.auth = auth;
+    return next();
+  };
+}
+
+/** Solo la cuenta protegida del propietario puede administrar accesos. */
+export function requireOwner() {
+  return async (request: Request, response: Response, next: NextFunction) => {
+    const auth = await resolveRole(request);
+    if (!auth) {
+      response.setHeader("WWW-Authenticate", "Bearer");
+      return response.status(401).json({ error: "AUTHENTICATION_REQUIRED" });
+    }
+    if (auth.role !== "admin" || !auth.employeeId) return response.status(403).json({ error: "OWNER_ONLY" });
+    const owner = await EmployeeAccount.findOne({ _id: auth.employeeId, email: PIKI_OWNER_EMAIL, active: true }).select("_id").lean().exec();
+    if (!owner) return response.status(403).json({ error: "OWNER_ONLY" });
+    if (auth.mustChangePassword) return response.status(428).json({ error: "PASSWORD_CHANGE_REQUIRED" });
     request.auth = auth;
     return next();
   };

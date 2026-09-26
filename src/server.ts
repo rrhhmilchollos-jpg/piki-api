@@ -7,7 +7,7 @@ import { z } from "zod";
 import { CustomerAccount, DispatchDecision, EmployeeAccount, Fleet, Order, Restaurant, PartnerAsset, PartnerLocalityGroup, Rider, RiderApplication, RiderIncident, RiderSlot, SignatureRequest, Zone, ensureIndexes } from "./models.js";
 import { seedCatalog } from "./seed.js";
 import { assertTransition, calculateEtaRange, transitionSchema, validateCoordinates } from "./workflow.js";
-import { configuredAuthRoles, requireRole } from "./auth.js";
+import { configuredAuthRoles, requireOwner, requireRole } from "./auth.js";
 import { createCheckoutSession, processStripeWebhook, stripeConfigured } from "./stripe.js";
 import { rankDispatchCandidates } from "./dispatch.js";
 import { calculateSanctionDecision, defaultSanctionPolicy } from "./sanctions.js";
@@ -111,7 +111,7 @@ app.post("/api/v1/auth/employee/change-password", requireRole("admin", "partner"
   return res.json({ changed: true });
 });
 const employeeCreateSchema = z.object({ name: z.string().min(2).max(160), email: z.string().email(), jobRole: z.enum(["admin", "partner", "rider", "fleet", "zone_manager", "commercial"]), apiRole: z.enum(["admin", "partner", "rider", "fleet", "commercial"]).optional(), restaurantId: z.string().regex(/^[a-f\d]{24}$/).nullable().optional(), fleetId: z.string().regex(/^[a-f\d]{24}$/).nullable().optional(), zoneSlugs: z.array(z.string().regex(/^[a-z0-9-]+$/)).max(100).default([]) });
-app.post("/api/v1/admin/employees", requireRole("admin"), async (req, res) => {
+app.post("/api/v1/admin/employees", requireOwner(), async (req, res) => {
   const parsed = employeeCreateSchema.safeParse(req.body); if (!parsed.success) return res.status(400).json({ error: "INVALID_EMPLOYEE", details: parsed.error.flatten() });
   const apiRole = parsed.data.apiRole || (parsed.data.jobRole === "commercial" ? "commercial" : parsed.data.jobRole === "zone_manager" ? "fleet" : parsed.data.jobRole);
   const temporaryPassword = generateTemporaryPassword();
@@ -122,8 +122,8 @@ app.post("/api/v1/admin/employees", requireRole("admin"), async (req, res) => {
 });
 app.get("/api/v1/admin/employees", requireRole("admin"), async (_req, res) => res.json({ employees: await EmployeeAccount.find({ email: { $ne: ownerEmail }, hiddenFromAdmin: { $ne: true } }).select("name email jobRole apiRole portfolioId fleetId zoneSlugs active mustChangePassword lastLoginAt createdAt").sort({ createdAt: -1 }).lean().exec() }));
 app.get("/api/v1/admin/customers", requireRole("admin"), async (_req, res) => res.json({ customers: await CustomerAccount.find({}).select("name email lastSignedIn createdAt updatedAt").sort({ createdAt: -1 }).limit(1000).lean().exec() }));
-app.patch("/api/v1/admin/employees/:id/active", requireRole("admin"), async (req, res) => { const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id); if (!id) return res.status(400).json({ error: "INVALID_EMPLOYEE_ID" }); const parsed = z.object({ active: z.boolean() }).safeParse(req.body); if (!parsed.success) return res.status(400).json({ error: "INVALID_ACTIVE_STATE" }); const target = await EmployeeAccount.findById(id).select("email ownerProtected").lean().exec() as any; if (!target) return res.status(404).json({ error: "EMPLOYEE_NOT_FOUND" }); if (target.ownerProtected || target.email === ownerEmail) return res.status(403).json({ error: "OWNER_ACCOUNT_PROTECTED" }); const employee = await EmployeeAccount.findByIdAndUpdate(id, { $set: { active: parsed.data.active, ...(parsed.data.active ? {} : { sessionHash: null }) } }, { new: true }).select("name email jobRole apiRole active mustChangePassword").lean().exec(); return res.json({ employee }); });
-app.post("/api/v1/admin/owner/bootstrap", requireRole("admin"), async (req, res) => {
+app.patch("/api/v1/admin/employees/:id/active", requireOwner(), async (req, res) => { const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id); if (!id) return res.status(400).json({ error: "INVALID_EMPLOYEE_ID" }); const parsed = z.object({ active: z.boolean() }).safeParse(req.body); if (!parsed.success) return res.status(400).json({ error: "INVALID_ACTIVE_STATE" }); const target = await EmployeeAccount.findById(id).select("email ownerProtected").lean().exec() as any; if (!target) return res.status(404).json({ error: "EMPLOYEE_NOT_FOUND" }); if (target.ownerProtected || target.email === ownerEmail) return res.status(403).json({ error: "OWNER_ACCOUNT_PROTECTED" }); const employee = await EmployeeAccount.findByIdAndUpdate(id, { $set: { active: parsed.data.active, ...(parsed.data.active ? {} : { sessionHash: null }) } }, { new: true }).select("name email jobRole apiRole active mustChangePassword").lean().exec(); return res.json({ employee }); });
+app.post("/api/v1/admin/owner/bootstrap", requireOwner(), async (req, res) => {
   const parsed = z.object({ email: z.literal(ownerEmail), password: z.string().min(8).max(200), name: z.string().min(2).max(160).default("Propietario y CEO de PIKI") }).safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_OWNER_BOOTSTRAP" });
   const owner = await EmployeeAccount.findOneAndUpdate({ email: parsed.data.email }, { $set: { name: parsed.data.name, jobRole: "admin", apiRole: "admin", passwordHash: hashPassword(parsed.data.password), active: true, ownerProtected: true, hiddenFromAdmin: true, mustChangePassword: false, passwordChangedAt: new Date() }, $setOnInsert: { portfolioId: "owner_piki_ceo" } }, { upsert: true, new: true, setDefaultsOnInsert: true }).select("_id email name jobRole apiRole ownerProtected hiddenFromAdmin").lean().exec() as any;
