@@ -509,7 +509,7 @@ app.post("/api/v1/payments/checkout", async (req, res) => {
   }
 });
 
-const testDispatchOrderSchema = z.object({ restaurantId: z.string().optional(), customerId: z.string().regex(/^[a-f\d]{24}$/i).optional(), count: z.coerce.number().int().min(1).max(10).default(1), deliveryAddress: z.string().min(5).max(280).default("Plaza de la Seu, 1, Xàtiva"), status: z.enum(["accepted", "preparing", "ready_for_pickup"]).default("preparing") });
+const testDispatchOrderSchema = z.object({ restaurantId: z.string().optional(), customerId: z.union([z.string().regex(/^[a-f\d]{24}$/i), z.literal("qa-kfc-e2e")]).optional(), count: z.coerce.number().int().min(1).max(10).default(1), deliveryAddress: z.string().min(5).max(280).default("Plaza de la Seu, 1, Xàtiva"), status: z.enum(["accepted", "preparing", "ready_for_pickup"]).default("preparing") });
 app.post("/api/v1/admin/dispatch/test-orders", requireRole("admin", "fleet"), async (req, res) => {
   const parsed = testDispatchOrderSchema.safeParse(req.body || {});
   if (!parsed.success) return res.status(400).json({ error: "INVALID_TEST_ORDER_REQUEST", details: parsed.error.flatten() });
