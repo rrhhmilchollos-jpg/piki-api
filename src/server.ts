@@ -75,6 +75,21 @@ app.post(["/api/v1/payments/webhook", "/api/webhooks/stripe"], express.raw({ typ
 app.use(express.json({ limit: "12mb" }));
 
 const objectId = (value: string) => mongoose.isValidObjectId(value) ? new mongoose.Types.ObjectId(value) : null;
+async function employeeScope(req: express.Request) {
+  if (!req.auth?.employeeId) return null;
+  return await EmployeeAccount.findById(req.auth.employeeId).select("email fleetId zoneSlugs restaurantId portfolioId jobRole apiRole").lean().exec() as any;
+}
+async function fleetRiderFilter(req: express.Request): Promise<Record<string, unknown>> {
+  if (req.auth?.role !== "fleet") return {};
+  const employee = await employeeScope(req);
+  return employee?.fleetId ? { fleetId: employee.fleetId } : { _id: null };
+}
+async function fleetCanAccessRider(req: express.Request, riderId: mongoose.Types.ObjectId | null) {
+  if (!riderId) return false;
+  if (req.auth?.role !== "fleet") return true;
+  const employee = await employeeScope(req);
+  return Boolean(employee?.fleetId && await Rider.exists({ _id: riderId, fleetId: employee.fleetId }));
+}
 const locationSchema = z.object({ latitude: z.number().min(-90).max(90), longitude: z.number().min(-180).max(180) });
 const orderItemSchema = z.object({ itemId: z.string().min(1), quantity: z.number().int().min(1).max(20) });
 const createOrderSchema = z.object({ restaurantId: z.string().min(1), customerId: z.string().max(160).optional(), deliveryAddress: z.string().min(5).max(280), deliveryLocation: locationSchema, items: z.array(orderItemSchema).min(1).max(50), paymentMethod: z.string().optional().default("cash") });
@@ -663,7 +678,7 @@ app.post("/api/v1/riders/applications", async (req, res) => {
 
 app.get("/api/v1/rider-applications", requireRole("admin", "fleet"), async (req, res) => {
   const status = typeof req.query.status === "string" ? req.query.status : undefined;
-  const filter = status ? { status } : {};
+  const filter = { ...(status ? { status } : {}), ...(await (async () => req.auth?.role === "fleet" ? { assignedFleetId: (await employeeScope(req))?.fleetId || null } : {})()) };
   const applications = await RiderApplication.find(filter).sort({ createdAt: -1 }).limit(200).lean().exec();
   return res.json({ applications });
 });
@@ -671,14 +686,16 @@ app.get("/api/v1/rider-applications", requireRole("admin", "fleet"), async (req,
 app.get("/api/v1/rider-applications/:id/documents", requireRole("admin", "fleet"), async (req, res) => {
   const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
   if (!id) return res.status(400).json({ error: "INVALID_APPLICATION_ID" });
-  const application = await RiderApplication.findById(id).select("name email documents").lean().exec() as any;
+  const applicationFilter = { _id: id, ...(req.auth?.role === "fleet" ? { assignedFleetId: (await employeeScope(req))?.fleetId || null } : {}) };
+  const application = await RiderApplication.findOne(applicationFilter).select("name email documents").lean().exec() as any;
   if (!application) return res.status(404).json({ error: "APPLICATION_NOT_FOUND" });
   return res.json({ applicationId: application._id, name: application.name, email: application.email, documents: (application.documents || []).map(({ contentBase64, ...metadata }: any) => metadata) });
 });
 app.get("/api/v1/rider-applications/:id/documents/:documentId/content", requireRole("admin", "fleet"), async (req, res) => {
   const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
   if (!id) return res.status(400).json({ error: "INVALID_APPLICATION_ID" });
-  const application = await RiderApplication.findOne({ _id: id, "documents._id": req.params.documentId }).select("+documents.contentBase64").lean().exec() as any;
+  const applicationFilter = { _id: id, "documents._id": req.params.documentId, ...(req.auth?.role === "fleet" ? { assignedFleetId: (await employeeScope(req))?.fleetId || null } : {}) };
+  const application = await RiderApplication.findOne(applicationFilter).select("+documents.contentBase64").lean().exec() as any;
   const document = application?.documents?.find((item: any) => String(item._id) === req.params.documentId);
   if (!document) return res.status(404).json({ error: "DOCUMENT_NOT_FOUND" });
   return res.json({ fileName: document.fileName, mimeType: document.mimeType, sizeBytes: document.sizeBytes, sha256: document.sha256, contentBase64: document.contentBase64 });
@@ -717,7 +734,7 @@ app.patch("/api/v1/rider-applications/:id/status", requireOwner(), async (req, r
 
 app.get("/api/v1/riders", requireRole("admin", "fleet"), async (req, res) => {
   const status = typeof req.query.status === "string" ? req.query.status : undefined;
-  const riders = await Rider.find(status ? { status } : {}).sort({ name: 1 }).limit(200).lean().exec();
+  const riders = await Rider.find({ ...(status ? { status } : {}), ...(await fleetRiderFilter(req)) }).sort({ name: 1 }).limit(200).lean().exec();
   return res.json({ riders });
 });
 
@@ -887,6 +904,16 @@ app.post("/api/v1/admin/orders/cleanup-test-data", requireOwner(), async (_req, 
 });
 app.get("/api/v1/orders", requireRole("admin", "partner", "rider", "fleet"), async (req, res) => {
   const filter: Record<string, unknown> = {};
+  const employee = await employeeScope(req);
+  if (req.auth?.role === "partner") filter.restaurantId = employee?.restaurantId || null;
+  if (req.auth?.role === "rider") {
+    const rider = employee?.email ? await Rider.findOne({ email: employee.email }).select("_id").lean().exec() as any : null;
+    filter.riderId = rider?._id || null;
+  }
+  if (req.auth?.role === "fleet") {
+    const riders = employee?.fleetId ? await Rider.find({ fleetId: employee.fleetId }).select("_id").lean().exec() : [];
+    filter.riderId = { $in: riders.map((rider: any) => rider._id) };
+  }
   if (typeof req.query.customerId === "string") filter.customerId = req.query.customerId;
   if (typeof req.query.status === "string") filter.status = req.query.status;
   if (req.query.operational === "true") { filter.status = { $in: ["pending", "accepted", "preparing", "ready_for_pickup"] }; filter.paymentState = { $in: ["pending", "paid"] }; }
@@ -895,9 +922,16 @@ app.get("/api/v1/orders", requireRole("admin", "partner", "rider", "fleet"), asy
   res.json({ orders });
 });
 
-app.get("/api/v1/orders/:id", async (req, res) => {
-  const id = objectId(req.params.id); const order = id ? await Order.findById(id).lean().exec() : await Order.findOne({ publicCode: req.params.id }).lean().exec();
+app.get("/api/v1/orders/:id", requireRole("admin", "partner", "rider", "fleet"), async (req, res) => {
+  const orderParam = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+  const id = objectId(orderParam); const order = (id ? await Order.findById(id).lean().exec() : await Order.findOne({ publicCode: orderParam }).lean().exec()) as any;
   if (!order) return res.status(404).json({ error: "ORDER_NOT_FOUND" });
+  const employee = await employeeScope(req);
+  const allowed = req.auth?.role === "admin"
+    || (req.auth?.role === "partner" && employee?.restaurantId && String(order.restaurantId) === String(employee.restaurantId))
+    || (req.auth?.role === "rider" && employee?.email && Boolean(await Rider.exists({ _id: order.riderId, email: employee.email })))
+    || (req.auth?.role === "fleet" && employee?.fleetId && Boolean(await Rider.exists({ _id: order.riderId, fleetId: employee.fleetId })));
+  if (!allowed) return res.status(403).json({ error: "ORDER_ACCESS_DENIED" });
   return res.json({ order });
 });
 
@@ -952,6 +986,9 @@ app.post("/api/v1/orders/:id/transitions", requireRole("admin", "partner", "ride
   const orderId = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
   const id = objectId(orderId); if (!id) return res.status(400).json({ error: "INVALID_ORDER_ID" });
   const order = await Order.findById(id); if (!order) return res.status(404).json({ error: "ORDER_NOT_FOUND" });
+  const employee = await employeeScope(req);
+  if (req.auth?.role === "partner" && (!employee?.restaurantId || String(order.restaurantId) !== String(employee.restaurantId))) return res.status(403).json({ error: "PARTNER_ORDER_ACCESS_DENIED" });
+  if (req.auth?.role === "fleet" && (!employee?.fleetId || !(await Rider.exists({ _id: order.riderId, fleetId: employee.fleetId }))) ) return res.status(403).json({ error: "FLEET_ORDER_ACCESS_DENIED" });
   const actorRole = req.auth?.role === "admin" ? (parsed.data.actorRole || req.auth.role) : req.auth?.role;
   if (!actorRole) return res.status(401).json({ error: "AUTHENTICATION_REQUIRED" });
   if (actorRole === "rider") {
@@ -1056,6 +1093,7 @@ app.get("/api/v1/riders/:id/cash-wallet", requireRole("admin", "rider", "fleet")
   const riderId = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
   if (!riderId) return res.status(400).json({ error: "INVALID_RIDER_ID" });
   if (req.auth?.role === "rider" && !(await riderAccessForRequest(riderId, req))) return res.status(403).json({ error: "RIDER_ACCESS_DENIED" });
+  if (req.auth?.role === "fleet" && !(await fleetCanAccessRider(req, riderId))) return res.status(403).json({ error: "FLEET_RIDER_ACCESS_DENIED" });
   const [wallet, entries] = await Promise.all([cashWallet(riderId), CashLedgerEntry.find({ riderId }).sort({ createdAt: -1 }).limit(50).lean().exec()]);
   return res.json({ wallet, entries });
 });
@@ -1063,6 +1101,9 @@ app.get("/api/v1/riders/:id/cash-wallet", requireRole("admin", "rider", "fleet")
 app.post("/api/v1/ops/cash-handovers", requireRole("admin", "fleet"), async (req, res) => {
   const parsed = cashHandoverSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_CASH_HANDOVER", details: parsed.error.flatten() });
+  const handoverRiderId = objectId(parsed.data.riderId);
+  if (!handoverRiderId) return res.status(400).json({ error: "INVALID_RIDER_ID" });
+  if (req.auth?.role === "fleet" && !(await fleetCanAccessRider(req, handoverRiderId))) return res.status(403).json({ error: "FLEET_RIDER_ACCESS_DENIED" });
   try {
     const result = await recordCashHandover(parsed.data, req.auth?.role === "fleet" ? "fleet" : "admin");
     await publishCashWalletEvent({ riderId: objectId(parsed.data.riderId)!, amountCents: parsed.data.amountCents, type: "cash.handover_recorded", reference: parsed.data.reference });
@@ -1076,7 +1117,7 @@ app.post("/api/v1/ops/cash-handovers", requireRole("admin", "fleet"), async (req
 
 app.get("/api/v1/ops/cash-wallets", requireRole("admin", "fleet"), async (_req, res) => {
   const rows = await CashLedgerEntry.aggregate([{ $group: { _id: "$riderId", collectedCents: { $sum: { $cond: [{ $eq: ["$direction", "in"] }, "$amountCents", 0] } }, handedOverCents: { $sum: { $cond: [{ $eq: ["$direction", "out"] }, "$amountCents", 0] } }, entries: { $sum: 1 } } }]);
-  const riderIds = rows.map((row: any) => row._id).filter(Boolean); const riders = await Rider.find({ _id: { $in: riderIds } }).select("name email fleetId").lean().exec(); const names = new Map(riders.map((rider: any) => [String(rider._id), rider]));
+  const riderIds = rows.map((row: any) => row._id).filter(Boolean); const riders = await Rider.find({ _id: { $in: riderIds }, ...(await fleetRiderFilter(_req)) }).select("name email fleetId").lean().exec(); const names = new Map(riders.map((rider: any) => [String(rider._id), rider]));
   return res.json({ wallets: rows.map((row: any) => ({ riderId: String(row._id), rider: names.get(String(row._id)) || null, collectedCents: Number(row.collectedCents || 0), handedOverCents: Number(row.handedOverCents || 0), availableCents: Number(row.collectedCents || 0) - Number(row.handedOverCents || 0), entries: Number(row.entries || 0) })) });
 });
 
@@ -1085,6 +1126,7 @@ app.post("/api/v1/riders/:id/location", requireRole("admin", "rider", "fleet"), 
   if (!parsed.success) return res.status(400).json({ error: "INVALID_LOCATION", details: parsed.error.flatten() });
   const id = objectId(parsed.data.riderId); if (!id) return res.status(400).json({ error: "INVALID_RIDER_ID" });
   if (req.auth?.role === "rider" && !(await riderAccessForRequest(id, req))) return res.status(403).json({ error: "RIDER_ACCESS_DENIED" });
+  if (req.auth?.role === "fleet" && !(await fleetCanAccessRider(req, id))) return res.status(403).json({ error: "FLEET_RIDER_ACCESS_DENIED" });
   const activeSlot = (await findCurrentRiderSlot(id)).slot as any;
   const statusUpdate = activeSlot?.status === "active" ? { status: "available" } : {};
   const rider = await Rider.findByIdAndUpdate(id, { $set: { location: { type: "Point", coordinates: [parsed.data.longitude, parsed.data.latitude] }, lastLocationAt: new Date(), ...statusUpdate } }, { new: true }).lean().exec() as any;
@@ -1097,6 +1139,7 @@ app.patch("/api/v1/riders/:id/status", requireRole("admin", "rider", "fleet"), a
   const parsed = z.object({ status: z.enum(["offline", "available", "busy", "paused"]) }).safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_RIDER_STATUS" });
   if (req.auth?.role === "rider" && !(await riderAccessForRequest(id, req))) return res.status(403).json({ error: "RIDER_ACCESS_DENIED" });
+  if (req.auth?.role === "fleet" && !(await fleetCanAccessRider(req, id))) return res.status(403).json({ error: "FLEET_RIDER_ACCESS_DENIED" });
   if (parsed.data.status === "available") {
     const { now, slot } = await findCurrentRiderSlot(id);
     const rider = await Rider.findById(id).select("lastLocationAt").lean().exec() as any;
@@ -1112,6 +1155,7 @@ app.get("/api/v1/riders/:id/slots", requireRole("admin", "rider", "fleet"), asyn
   const riderIdParam = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
   const riderId = objectId(riderIdParam); if (!riderId) return res.status(400).json({ error: "INVALID_RIDER_ID" });
   if (req.auth?.role === "rider" && !(await riderAccessForRequest(riderId, req))) return res.status(403).json({ error: "RIDER_ACCESS_DENIED" });
+  if (req.auth?.role === "fleet" && !(await fleetCanAccessRider(req, riderId))) return res.status(403).json({ error: "FLEET_RIDER_ACCESS_DENIED" });
   const slots = await RiderSlot.find({ riderId }).sort({ date: 1, startTime: 1 }).limit(100).lean().exec();
   return res.json({ riderId, slots });
 });
@@ -1504,14 +1548,15 @@ app.get("/api/v1/riders/:id/mobility-advice", requireRole("rider"), async (req, 
   const advice = computeMobilityAdvice({ currentZone, zones: zoneDemand, lowActivityMinutes: Number(req.query.lowActivityMinutes || 15) });
   return res.json({ advice, checkedAt: new Date().toISOString(), windowMinutes: 45 });
 });
-app.post("/api/v1/zones", requireRole("admin", "fleet"), async (req, res) => {
+app.post("/api/v1/zones", requireRole("admin"), async (req, res) => {
   const parsed = zoneSchema.safeParse(req.body); if (!parsed.success) return res.status(400).json({ error: "INVALID_ZONE", details: parsed.error.flatten() });
   const zone = await Zone.findOneAndUpdate({ slug: parsed.data.slug }, { $set: { ...parsed.data, polygon: { type: "Polygon", coordinates: parsed.data.polygon.coordinates } } }, { upsert: true, new: true }).lean().exec();
   return res.status(201).json({ zone });
 });
 
-app.get("/api/v1/zones", requireRole("admin", "fleet"), async (_req, res) => {
-  const zones = await Zone.find({}).sort({ name: 1 }).lean().exec();
+app.get("/api/v1/zones", requireRole("admin", "fleet"), async (req, res) => {
+  const employee = await employeeScope(req);
+  const zones = await Zone.find(req.auth?.role === "fleet" ? { slug: { $in: employee?.zoneSlugs || [] } } : {}).sort({ name: 1 }).lean().exec();
   return res.json({ zones });
 });
 
@@ -1522,7 +1567,7 @@ app.get("/api/v1/fleets", requireRole("admin", "fleet"), async (req, res) => {
   return res.json({ fleets });
 });
 
-app.post("/api/v1/fleets", requireRole("admin", "fleet"), async (req, res) => {
+app.post("/api/v1/fleets", requireRole("admin"), async (req, res) => {
   const parsed = z.object({ name: z.string().min(2).max(120), managerName: z.string().max(120).default(""), serviceZones: z.array(z.string().regex(/^[a-z0-9-]+$/)).default([]) }).safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_FLEET", details: parsed.error.flatten() });
   const fleet = await Fleet.findOneAndUpdate({ name: parsed.data.name }, { $set: parsed.data }, { upsert: true, new: true }).lean().exec();
@@ -1532,15 +1577,17 @@ app.post("/api/v1/fleets", requireRole("admin", "fleet"), async (req, res) => {
 app.patch("/api/v1/rider-applications/:id/assign-fleet", requireRole("admin", "fleet"), async (req, res) => {
   const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id); if (!id) return res.status(400).json({ error: "INVALID_APPLICATION_ID" });
   const fleetId = objectId(typeof req.body?.fleetId === "string" ? req.body.fleetId : ""); if (!fleetId) return res.status(400).json({ error: "INVALID_FLEET_ID" });
-  const fleet = await Fleet.findById(fleetId).lean().exec(); if (!fleet) return res.status(404).json({ error: "FLEET_NOT_FOUND" });
-  const application = await RiderApplication.findByIdAndUpdate(id, { $set: { assignedFleetId: fleetId } }, { new: true }).lean().exec() as any;
+  const fleet = await Fleet.findOne({ _id: fleetId, ...(req.auth?.role === "fleet" ? { _id: (await employeeScope(req))?.fleetId || null } : {}) }).lean() as any; if (!fleet) return res.status(404).json({ error: "FLEET_NOT_FOUND" });
+  const application = await RiderApplication.findOneAndUpdate({ _id: id, ...(req.auth?.role === "fleet" ? { assignedFleetId: fleet._id } : {}) }, { $set: { assignedFleetId: fleetId } }, { new: true }).lean().exec() as any;
   if (!application) return res.status(404).json({ error: "APPLICATION_NOT_FOUND" });
   if (application.status === "approved") await Rider.updateOne({ email: application.email }, { $set: { fleetId } }).exec();
   return res.json({ application, fleet });
 });
 
-app.get("/api/v1/fleets/pending-partner-orders", requireRole("admin", "fleet", "commercial"), async (_req, res) => {
-  const orders = await Order.find({ ...dispatchablePaymentFilter, status: "pending", assignmentState: "unassigned" }).select("publicCode restaurantId totalCents createdAt status paymentState paymentMethod assignmentState").sort({ createdAt: 1 }).limit(100).lean().exec() as any[];
+app.get("/api/v1/fleets/pending-partner-orders", requireRole("admin", "fleet", "commercial"), async (req, res) => {
+  const employee = await employeeScope(req);
+  const commercialRestaurants = req.auth?.role === "commercial" ? await Restaurant.find({ commercialEmployeeId: employee?._id }).select("_id").lean().exec() : [];
+  const orders = await Order.find({ ...dispatchablePaymentFilter, status: "pending", assignmentState: "unassigned", ...(req.auth?.role === "commercial" ? { restaurantId: { $in: commercialRestaurants.map((restaurant: any) => restaurant._id) } } : {}) }).select("publicCode restaurantId totalCents createdAt status paymentState paymentMethod assignmentState").sort({ createdAt: 1 }).limit(100).lean().exec() as any[];
   const restaurants = await Restaurant.find({ _id: { $in: orders.map((order) => order.restaurantId) } }).select("name").lean().exec() as any[];
   const names = new Map(restaurants.map((restaurant) => [String(restaurant._id), restaurant.name]));
   return res.json({ orders: orders.map((order) => ({ id: String(order._id), publicCode: order.publicCode, restaurant: names.get(String(order.restaurantId)) || "Restaurante", totalCents: order.totalCents, createdAt: order.createdAt, status: order.status, paymentState: order.paymentState, paymentMethod: order.paymentMethod || "stripe", cashDueAtDelivery: order.paymentMethod === "cash", assignmentState: order.assignmentState })) });
