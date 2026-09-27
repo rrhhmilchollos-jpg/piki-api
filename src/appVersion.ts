@@ -3,6 +3,16 @@ import { z } from "zod";
 export const PIKI_SURFACES = ["customer", "partner", "fleet", "admin", "rider"] as const;
 export type PikiSurface = (typeof PIKI_SURFACES)[number];
 
+// These live builds are blocked once so the old client gate can display the
+// mandatory update dialog. Newly generated build IDs are not included.
+export const LEGACY_ROLLOUT_BUILDS: Record<PikiSurface, string> = {
+  customer: "d7245ca0f5b2",
+  partner: "3b4c5a0f7b37",
+  fleet: "d8722743b8fc",
+  admin: "8492375e4f8e",
+  rider: "2750d92ccee6",
+};
+
 export const versionPolicySchema = z.object({
   version: z.string().regex(/^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/),
   minimumVersion: z.string().regex(/^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/),
@@ -108,8 +118,9 @@ export function setAllVersionPolicies(next: VersionPolicyMap): void {
  * decision so a rebuild with the same semver can still wake an installed PWA.
  * Clients that predate build headers continue to use the semver policy.
  */
-export function requiresUpdate(policy: VersionPolicy, clientVersion?: string, clientBuildId?: string): boolean {
+export function requiresUpdate(policy: VersionPolicy, clientVersion?: string, clientBuildId?: string, surface?: PikiSurface): boolean {
   if (!policy.forceUpdate || !clientVersion) return false;
   return compareSemver(clientVersion, policy.minimumVersion) < 0
-    || (clientBuildId !== undefined && clientBuildId !== policy.buildId);
+    || (clientBuildId !== undefined && clientBuildId !== policy.buildId)
+    || (surface !== undefined && clientBuildId === LEGACY_ROLLOUT_BUILDS[surface]);
 }

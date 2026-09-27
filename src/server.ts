@@ -247,7 +247,7 @@ app.get("/api/v1/app-version", async (req, res) => {
       ? { ...policy, minimumVersion: "0.2.1", forceUpdate: false }
       : { ...policy, minimumVersion: "0.0.0", forceUpdate: false };
   res.setHeader("Cache-Control", "no-store, max-age=0");
-  return res.json({ surface, ...responsePolicy, updateRequired: requiresUpdate(responsePolicy, clientVersion, clientBuildId) });
+  return res.json({ surface, ...responsePolicy, updateRequired: requiresUpdate(responsePolicy, clientVersion, clientBuildId, surface) });
 });
 app.post("/api/v1/app-version/policy", rateLimit(20, 60_000, "release-policy"), (req, res) => {
   const expected = releasePolicyToken;
@@ -268,7 +268,7 @@ app.use("/api/v1", async (req, res, next) => {
   const clientBuildId = req.header("x-piki-client-build") || undefined;
   if (surface && clientVersion) {
     const policy = await syncVersionPolicy(surface);
-    if (requiresUpdate(policy, clientVersion, clientBuildId)) {
+    if (requiresUpdate(policy, clientVersion, clientBuildId, surface)) {
       res.setHeader("Cache-Control", "no-store, max-age=0");
       return res.status(426).json({ error: "CLIENT_UPDATE_REQUIRED", surface, ...policy });
     }
