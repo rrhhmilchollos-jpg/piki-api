@@ -3,12 +3,6 @@ import { z } from "zod";
 export const PIKI_SURFACES = ["customer", "partner", "fleet", "admin", "rider"] as const;
 export type PikiSurface = (typeof PIKI_SURFACES)[number];
 
-// These live builds are blocked once so the old client gate can display the
-// mandatory update dialog. Newly generated build IDs are not included.
-export const LEGACY_ROLLOUT_BUILDS: Partial<Record<PikiSurface, string>> = {
-  customer: "d7245ca0f5b2",
-};
-
 export const versionPolicySchema = z.object({
   version: z.string().regex(/^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/),
   minimumVersion: z.string().regex(/^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/),
@@ -110,13 +104,16 @@ export function setAllVersionPolicies(next: VersionPolicyMap): void {
 }
 
 /**
- * A build ID identifies the exact deployed artefact. It is part of the update
- * decision so a rebuild with the same semver can still wake an installed PWA.
- * Clients that predate build headers continue to use the semver policy.
+ * Mandatory updates are a compatibility decision, so they must be based on
+ * ordered semantic versions. A build ID is diagnostic metadata only: hashes
+ * cannot establish whether a different client is older or newer and therefore
+ * must never lock a valid client out of login or operational API routes.
  */
-export function requiresUpdate(policy: VersionPolicy, clientVersion?: string, clientBuildId?: string, surface?: PikiSurface): boolean {
-  if (!policy.forceUpdate || !clientVersion) return false;
-  return compareSemver(clientVersion, policy.minimumVersion) < 0
-    || (clientBuildId !== undefined && clientBuildId !== policy.buildId)
-    || (surface !== undefined && clientBuildId === LEGACY_ROLLOUT_BUILDS[surface]);
+export function requiresUpdate(
+  policy: VersionPolicy,
+  clientVersion?: string,
+  _clientBuildId?: string,
+  _surface?: PikiSurface,
+): boolean {
+  return Boolean(policy.forceUpdate && clientVersion && compareSemver(clientVersion, policy.minimumVersion) < 0);
 }

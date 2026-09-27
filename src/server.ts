@@ -5,7 +5,7 @@ import cors from "cors";
 import express from "express";
 import mongoose from "mongoose";
 import { z } from "zod";
-import { CashLedgerEntry, CustomerAccount, DispatchDecision, EmployeeAccount, AccessAuthorization, Fleet, Order, Restaurant, PartnerAsset, PartnerLocalityGroup, Rider, RiderApplication, RiderIncident, RiderOrderMessage, RiderSlot, SignatureRequest, Zone, PushSubscription, RealtimeEvent, Tenant, TenantMembership, RiderAssignmentReservation, ensureIndexes } from "./models.js";
+import { CashLedgerEntry, CustomerAccount, DispatchDecision, EmployeeAccount, AccessAuthorization, Fleet, Order, Restaurant, PartnerAsset, PartnerLocalityGroup, Rider, RiderApplication, RiderIncident, RiderOrderMessage, RiderSlot, SignatureRequest, Zone, PushSubscription, RealtimeEvent, Tenant, TenantMembership, RiderAssignmentReservation, SupportTicket, ensureIndexes } from "./models.js";
 import { seedCatalog } from "./seed.js";
 import { assertTransition, calculateEtaRange, transitionSchema, validateCoordinates } from "./algorithms/index.js";
 import { configuredAuthRoles, requireOwner, requireRole, resolveRole } from "./auth.js";
@@ -23,11 +23,12 @@ import { runTenantMigration } from "./tenantMigration.js";
 
 export const app = express();
 const port = Number(process.env.PORT || 3000);
-const defaultOrigins = ["http://localhost:3000", "http://localhost:5173", "https://pikidelivery.com", "https://www.pikidelivery.com", "https://app.pikidelivery.com", "https://partners.pikidelivery.com", "https://admin.pikidelivery.com", "https://riders.pikidelivery.com", "https://fleet.pikidelivery.com"];
+const defaultOrigins = ["http://localhost:3000", "http://localhost:5173", "https://pikidelivery.com", "https://www.pikidelivery.com", "https://app.pikidelivery.com", "https://partners.pikidelivery.com", "https://admin.pikidelivery.com", "https://support.pikidelivery.com", "https://riders.pikidelivery.com", "https://fleet.pikidelivery.com", "https://edpexgfa.manus.space"];
 const configuredOrigins = (process.env.CORS_ORIGINS || "").split(",").map((origin) => origin.trim()).filter(Boolean);
 const allowedOrigins = new Set([...defaultOrigins, ...configuredOrigins]);
 const managedPikiVercelOrigin = /^https:\/\/piki-(?:customer|partner|admin|fleet|rider)-[a-z0-9-]+-rrhhmilchollos-jpgs-projects\.vercel\.app$/i;
 const isAllowedCorsOrigin = (origin?: string) => !origin || allowedOrigins.has(origin) || managedPikiVercelOrigin.test(origin);
+const corsOptions = { origin: (origin: string | undefined, callback: (error: Error | null, allowed?: boolean) => void) => callback(null, isAllowedCorsOrigin(origin)), credentials: true };
 const databaseName = process.env.MONGODB_DB || "piki";
 let databaseReady = false;
 mongoose.connection.on("connected", () => { databaseReady = true; });
@@ -43,7 +44,8 @@ app.use((_req, res, next) => {
   res.setHeader("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'; base-uri 'none'");
   next();
 });
-app.use(cors({ origin: (origin, callback) => callback(null, isAllowedCorsOrigin(origin)), credentials: true }));
+app.use(cors(corsOptions));
+app.options("*", cors(corsOptions));
 
 const requestBuckets = new Map<string, { startedAt: number; count: number }>();
 const rateLimit = (limit: number, windowMs: number, keyPrefix: string) => (req: express.Request, res: express.Response, next: express.NextFunction) => {
@@ -966,6 +968,76 @@ app.post("/api/v1/admin/orders/cleanup-test-data", requireOwner(), async (_req, 
     await Order.deleteMany({ _id: { $in: removeIds } }).exec();
   }
   return res.json({ deletedTestOrders: removeIds.length, keptTestOrder: keep ? { id: keep._id, publicCode: keep.publicCode } : null, productionOrdersPreserved: true });
+});
+const supportTicketInput = z.object({ orderRef: z.string().trim().max(120).optional(), reporterEmail: z.string().email().optional(), category: z.enum(["order", "rider", "partner", "account", "technical", "other"]).default("order"), priority: z.enum(["low", "normal", "high", "urgent"]).default("normal"), subject: z.string().trim().min(3).max(180), description: z.string().trim().min(3).max(4000) });
+const supportMessageInput = z.object({ body: z.string().trim().min(1).max(2000) });
+const supportStatusInput = z.object({ status: z.enum(["open", "in_progress", "waiting", "resolved", "closed"]) });
+const supportCancelInput = z.object({ reason: z.string().trim().min(10).max(500), ticketId: z.string().optional() });
+function supportOrderFilter(ref: string): Record<string, unknown> { const id = objectId(ref); return id ? { _id: id } : { $or: [{ publicCode: ref }, { displayCode: ref }] }; }
+app.get("/api/v1/admin/support/orders/search", requireRole("admin"), async (req, res) => {
+  const q = typeof req.query.q === "string" ? req.query.q.trim() : "";
+  if (q.length < 2) return res.json({ orders: [] });
+  const orders = await Order.find({ ...tenantScope(req), ...supportOrderFilter(q) }).sort({ createdAt: -1 }).limit(25).select("_id publicCode displayCode status paymentState paymentMethod riderId restaurantId customerId totalCents createdAt statusHistory").populate("riderId", "name riderCode email").populate("restaurantId", "name").lean().exec();
+  return res.json({ orders });
+});
+app.get("/api/v1/admin/support/tickets", requireRole("admin"), async (req, res) => {
+  const filter: Record<string, unknown> = { ...tenantScope(req) };
+  if (typeof req.query.status === "string" && req.query.status !== "all") filter.status = req.query.status;
+  if (typeof req.query.q === "string" && req.query.q.trim()) { const q = req.query.q.trim(); filter.$or = [{ ticketNumber: q }, { reporterEmail: { $regex: q, $options: "i" } }, { subject: { $regex: q, $options: "i" } }]; }
+  const tickets = await SupportTicket.find(filter).sort({ updatedAt: -1 }).limit(100).populate("orderId", "publicCode displayCode status").populate("assignedTo", "name email").lean().exec();
+  return res.json({ tickets });
+});
+app.post("/api/v1/admin/support/tickets", requireRole("admin"), async (req, res) => {
+  const parsed = supportTicketInput.safeParse(req.body); if (!parsed.success) return res.status(400).json({ error: "INVALID_SUPPORT_TICKET", details: parsed.error.flatten() });
+  const order = parsed.data.orderRef ? await Order.findOne({ ...tenantScope(req), ...supportOrderFilter(parsed.data.orderRef) }).select("_id").lean().exec() as any : null;
+  if (parsed.data.orderRef && !order) return res.status(404).json({ error: "ORDER_NOT_FOUND" });
+  const actorEmployeeId = objectId(String(req.auth?.employeeId || ""));
+  const ticket = await SupportTicket.create({ ...parsed.data, orderId: order?._id || null, ticketNumber: `SUP-${new Date().toISOString().slice(0, 10).replace(/-/g, "")}-${randomInt(1000, 9999)}`, createdBy: actorEmployeeId, actions: [{ action: "ticket_created", actorEmployeeId, metadata: { orderRef: parsed.data.orderRef || null } }] });
+  return res.status(201).json({ ticket });
+});
+app.post("/api/v1/admin/support/tickets/:id/messages", requireRole("admin"), async (req, res) => {
+  const parsed = supportMessageInput.safeParse(req.body); if (!parsed.success) return res.status(400).json({ error: "INVALID_SUPPORT_MESSAGE" });
+  const id = objectId(String(req.params.id)); if (!id) return res.status(400).json({ error: "INVALID_TICKET_ID" });
+  const ticket = await SupportTicket.findOneAndUpdate({ _id: id, ...tenantScope(req) }, { $push: { messages: { senderRole: "support", senderEmployeeId: objectId(String(req.auth?.employeeId || "")), body: parsed.data.body } }, $set: { status: "in_progress" } }, { new: true }).lean().exec();
+  if (!ticket) return res.status(404).json({ error: "TICKET_NOT_FOUND" });
+  return res.json({ ticket });
+});
+app.patch("/api/v1/admin/support/tickets/:id/status", requireRole("admin"), async (req, res) => {
+  const parsed = supportStatusInput.safeParse(req.body); if (!parsed.success) return res.status(400).json({ error: "INVALID_SUPPORT_STATUS" });
+  const id = objectId(String(req.params.id)); if (!id) return res.status(400).json({ error: "INVALID_TICKET_ID" });
+  const actorEmployeeId = objectId(String(req.auth?.employeeId || ""));
+  const ticket = await SupportTicket.findOneAndUpdate({ _id: id, ...tenantScope(req) }, { $set: { status: parsed.data.status, ...(parsed.data.status === "resolved" || parsed.data.status === "closed" ? { resolvedAt: new Date() } : {}) }, $push: { actions: { action: "status_changed", actorEmployeeId, metadata: { status: parsed.data.status } } } }, { new: true }).lean().exec();
+  if (!ticket) return res.status(404).json({ error: "TICKET_NOT_FOUND" });
+  return res.json({ ticket });
+});
+app.post("/api/v1/admin/support/orders/:id/cancel", requireRole("admin"), async (req, res) => {
+  const parsed = supportCancelInput.safeParse(req.body); if (!parsed.success) return res.status(400).json({ error: "INVALID_SUPPORT_CANCELLATION", details: parsed.error.flatten() });
+  const orderId = objectId(String(req.params.id)); if (!orderId) return res.status(400).json({ error: "INVALID_ORDER_ID" });
+  const order = await Order.findOne({ _id: orderId, ...tenantScope(req) }).lean().exec() as any;
+  if (!order) return res.status(404).json({ error: "ORDER_NOT_FOUND" });
+  if (["delivered", "cancelled"].includes(order.status)) return res.status(409).json({ error: "ORDER_ALREADY_CLOSED", status: order.status });
+  const updated = await Order.findOneAndUpdate({ _id: orderId, status: order.status, version: order.version }, { $set: { status: "cancelled", cancelledAt: new Date() }, $inc: { version: 1 }, $push: { statusHistory: { status: "cancelled", actorRole: "admin", reason: parsed.data.reason } } }, { new: true }).lean().exec();
+  if (!updated) return res.status(409).json({ error: "ORDER_CHANGED_RETRY" });
+  await releaseRiderOrderSlot(orderId, order.riderId);
+  const actorEmployeeId = objectId(String(req.auth?.employeeId || ""));
+  if (parsed.data.ticketId) await SupportTicket.updateOne({ _id: objectId(parsed.data.ticketId), ...tenantScope(req) }, { $push: { actions: { action: "order_cancelled", actorEmployeeId, reason: parsed.data.reason, metadata: { orderId: String(orderId) } } } }).exec();
+  scheduleCustomerOrderPush(updated, "cancelled");
+  return res.json({ order: updated, audit: { action: "order_cancelled", reason: parsed.data.reason } });
+});
+app.post("/api/v1/riders/:id/support/tickets", requireRole("rider"), async (req, res) => {
+  const parsed = z.object({ subject: z.string().trim().min(3).max(180), description: z.string().trim().min(3).max(4000), priority: z.enum(["low", "normal", "high", "urgent"]).default("normal"), orderId: z.string().optional() }).safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "INVALID_RIDER_SUPPORT_TICKET", details: parsed.error.flatten() });
+  const riderId = objectId(String(req.params.id)); if (!riderId) return res.status(400).json({ error: "INVALID_RIDER_ID" });
+  if (!(await canAccessRiderShift(riderId, req))) return res.status(403).json({ error: "RIDER_ACCESS_DENIED" });
+  const rider = await Rider.findOne({ _id: riderId, ...tenantScope(req) }).select("email name").lean().exec() as any;
+  if (!rider) return res.status(404).json({ error: "RIDER_NOT_FOUND" });
+  let orderId: mongoose.Types.ObjectId | null = null;
+  if (parsed.data.orderId) {
+    orderId = objectId(parsed.data.orderId);
+    if (!orderId || !(await Order.exists({ _id: orderId, riderId, ...tenantScope(req) }))) return res.status(404).json({ error: "RIDER_ORDER_NOT_FOUND" });
+  }
+  const ticket = await SupportTicket.create({ tenantId: (rider as any).tenantId || null, orderId, reporterEmail: rider.email, category: "rider", priority: parsed.data.priority, subject: parsed.data.subject, description: parsed.data.description, ticketNumber: `SUP-${new Date().toISOString().slice(0, 10).replace(/-/g, "")}-${randomInt(1000, 9999)}`, messages: [{ senderRole: "rider", body: parsed.data.description }], actions: [{ action: "rider_ticket_created", metadata: { riderId: String(riderId) } }] });
+  return res.status(201).json({ ticket: { id: ticket._id, ticketNumber: ticket.ticketNumber, status: ticket.status } });
 });
 app.get("/api/v1/orders", requireRole("admin", "partner", "rider", "fleet"), async (req, res) => {
   const filter: Record<string, unknown> = { ...tenantScope(req) };
