@@ -5,12 +5,8 @@ export type PikiSurface = (typeof PIKI_SURFACES)[number];
 
 // These live builds are blocked once so the old client gate can display the
 // mandatory update dialog. Newly generated build IDs are not included.
-export const LEGACY_ROLLOUT_BUILDS: Record<PikiSurface, string> = {
+export const LEGACY_ROLLOUT_BUILDS: Partial<Record<PikiSurface, string>> = {
   customer: "d7245ca0f5b2",
-  partner: "3b4c5a0f7b37",
-  fleet: "d8722743b8fc",
-  admin: "8492375e4f8e",
-  rider: "2750d92ccee6",
 };
 
 export const versionPolicySchema = z.object({
