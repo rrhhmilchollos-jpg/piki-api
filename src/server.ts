@@ -825,11 +825,23 @@ app.post("/api/v1/admin/dispatch/test-orders", requireRole("admin", "fleet"), as
   return res.status(201).json({ orders: created, message: `${created.length} pedido(s) de prueba creado(s) y visible(s) en Cocina, Fleet y Dispatch.` });
 });
 
+app.post("/api/v1/admin/orders/cleanup-test-data", requireOwner(), async (_req, res) => {
+  const testOrders = await Order.find({ isTestOrder: true }).sort({ createdAt: -1 }).select("_id publicCode").lean().exec() as any[];
+  const keep = testOrders[0] || null;
+  const removeIds = testOrders.slice(1).map((order) => order._id);
+  if (removeIds.length) {
+    await Rider.updateMany({ activeOrderId: { $in: removeIds } }, { $set: { activeOrderId: null, status: "available" } }).exec();
+    await DispatchDecision.deleteMany({ orderId: { $in: removeIds } }).exec();
+    await Order.deleteMany({ _id: { $in: removeIds } }).exec();
+  }
+  return res.json({ deletedTestOrders: removeIds.length, keptTestOrder: keep ? { id: keep._id, publicCode: keep.publicCode } : null, productionOrdersPreserved: true });
+});
 app.get("/api/v1/orders", requireRole("admin", "partner", "rider", "fleet"), async (req, res) => {
   const filter: Record<string, unknown> = {};
   if (typeof req.query.customerId === "string") filter.customerId = req.query.customerId;
   if (typeof req.query.status === "string") filter.status = req.query.status;
-  if (req.query.dispatchable === "true") filter.status = { $in: ["accepted", "preparing", "ready_for_pickup"] };
+  if (req.query.operational === "true") { filter.status = { $in: ["pending", "accepted", "preparing", "ready_for_pickup"] }; filter.paymentState = { $in: ["pending", "paid"] }; }
+  else if (req.query.dispatchable === "true") { filter.status = { $in: ["accepted", "preparing", "ready_for_pickup"] }; filter.paymentState = { $in: ["pending", "paid"] }; }
   const orders = await Order.find(filter).sort({ createdAt: -1 }).limit(100).lean().exec();
   res.json({ orders });
 });
