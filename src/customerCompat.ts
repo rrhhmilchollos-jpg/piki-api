@@ -48,6 +48,11 @@ const deliveryQrUrl = (orderCode: string) => {
   const signature = createHmac("sha256", secret || "development-only-delivery-qr-secret").update(`delivery:${orderCode}`).digest("hex").slice(0, 24);
   return `${(process.env.CUSTOMER_APP_URL || "https://pikidelivery.com").replace(/\/$/, "")}/?order_id=${encodeURIComponent(orderCode)}&delivery_token=${signature}`;
 };
+const deliveryPin = (orderCode: string) => {
+  const secret = String(process.env.DELIVERY_QR_SECRET || "").trim();
+  const signature = createHmac("sha256", secret || "development-only-delivery-qr-secret").update(`delivery:${orderCode}`).digest("hex").slice(0, 24);
+  return signature.slice(-6).toUpperCase();
+};
 
 function restaurantView(row: any) {
   return { id: String(row._id), name: row.name, cuisine: row.cuisine, category: row.category, tagline: row.tagline || "Descubre este establecimiento en PIKI.", eta: `${row.etaMinutes?.[0] || 20}–${row.etaMinutes?.[1] || 35} min`, fee: (row.deliveryFeeCents || 0) / 100, rating: row.rating || 0, reviews: row.reviews || 0, promoted: row.promoted, image: row.image || "", accent: row.accent || "#FFD72E", menu: (row.menu || []).map((item: any) => ({ id: item.id, name: item.name, description: item.description || "", price: item.price, vegetarian: Boolean(item.vegetarian), popular: Boolean(item.popular) })) };
@@ -128,7 +133,7 @@ export async function handleCustomerTrpc(req: Request, res: Response) {
       const order = await Order.findOne({ publicCode, customerId: String(user._id) }).select("publicCode status").lean().exec() as any;
       if (!order) return fail(res, "Pedido no encontrado", "NOT_FOUND");
       const available = order.status === "on_the_way";
-      return reply(res, { available, pin: null, qrToken: available ? deliveryQrUrl(order.publicCode) : null, state: available ? "pending" : "unavailable" });
+      return reply(res, { available, pin: available ? deliveryPin(order.publicCode) : null, qrToken: available ? deliveryQrUrl(order.publicCode) : null, state: available ? "pending" : "unavailable" });
     }
     if (procedure === "order.messages" || procedure === "order.sendMessage") {
       const user = await currentCustomer(req) as any;
