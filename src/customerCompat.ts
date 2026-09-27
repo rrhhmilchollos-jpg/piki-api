@@ -119,12 +119,12 @@ export async function handleCustomerTrpc(req: Request, res: Response) {
       if (!order.riderId || order.assignmentState !== "assigned" || !["picked_up", "on_the_way"].includes(order.status)) {
         return reply(res, { available: false, reason: "not_in_delivery" });
       }
-      const rider = await (await import("./models.js")).Rider.findById(order.riderId).select("name vehicle location lastLocationAt").lean().exec() as any;
+      const rider = await (await import("./models.js")).Rider.findById(order.riderId).select("name vehicle photoUrl location lastLocationAt").lean().exec() as any;
       const coordinates = rider?.location?.coordinates;
       const updatedAt = rider?.lastLocationAt ? new Date(rider.lastLocationAt).getTime() : 0;
       const fresh = Array.isArray(coordinates) && coordinates.length >= 2 && updatedAt >= Date.now() - 90_000;
-      if (!fresh) return reply(res, { available: false, reason: "location_unavailable" });
-      return reply(res, { available: true, riderName: rider.name || "Tu rider", vehicle: rider.vehicle || "bike", phase: "going_to_customer", etaMinutes: order.routeDurationMinutes || null, latitude: Number(coordinates[1]), longitude: Number(coordinates[0]), accuracyMeters: null, updatedAt });
+      if (!fresh) return reply(res, { available: false, riderName: rider.name || "Tu rider", riderPhotoUrl: rider.photoUrl || null, vehicle: rider.vehicle || "bike", reason: "location_unavailable" });
+      return reply(res, { available: true, riderName: rider.name || "Tu rider", riderPhotoUrl: rider.photoUrl || null, vehicle: rider.vehicle || "bike", phase: "going_to_customer", etaMinutes: order.routeDurationMinutes || null, latitude: Number(coordinates[1]), longitude: Number(coordinates[0]), accuracyMeters: null, updatedAt });
     }
     if (procedure === "order.deliveryCredentials") {
       const user = await currentCustomer(req) as any;

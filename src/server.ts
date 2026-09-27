@@ -785,6 +785,37 @@ app.post("/api/v1/internal/customer-orders/sync", async (req, res) => {
   return res.status(existing ? 200 : 201).json({ order: { id: order._id, publicCode: order.publicCode, status: order.status, paymentState: order.paymentState, assignmentState: order.assignmentState } });
 });
 
+function requireCustomerSyncSecret(req: express.Request, res: express.Response) {
+  const expected = process.env.PIKI_CUSTOMER_SYNC_SECRET;
+  if (!expected || req.header("x-piki-customer-sync-secret") !== expected) { res.status(401).json({ error: "INVALID_SYNC_AUTH" }); return false; }
+  return true;
+}
+app.get("/api/v1/internal/customer-orders/:publicCode/tracking", async (req, res) => {
+  if (!requireCustomerSyncSecret(req, res)) return;
+  const order = await Order.findOne({ publicCode: String(req.params.publicCode) }).lean().exec() as any;
+  if (!order) return res.status(404).json({ error: "ORDER_NOT_FOUND" });
+  const rider = order.riderId ? await Rider.findById(order.riderId).select("name vehicle location lastLocationAt photoUrl").lean().exec() as any : null;
+  const coordinates = rider?.location?.coordinates;
+  const updatedAt = rider?.lastLocationAt ? new Date(rider.lastLocationAt).getTime() : 0;
+  const fresh = Array.isArray(coordinates) && coordinates.length >= 2 && updatedAt >= Date.now() - 120_000;
+  const active = order.assignmentState === "assigned" && ["picked_up", "on_the_way"].includes(order.status);
+  return res.json({ publicCode: order.publicCode, status: order.status, assignmentState: order.assignmentState, riderId: rider?._id ? String(rider._id) : null, riderName: rider?.name || null, riderPhotoUrl: rider?.photoUrl || null, vehicle: rider?.vehicle || "bike", chatAvailable: active, locationAvailable: active && fresh, latitude: fresh ? Number(coordinates[1]) : null, longitude: fresh ? Number(coordinates[0]) : null, updatedAt: fresh ? updatedAt : null });
+});
+app.post("/api/v1/internal/customer-orders/:publicCode/messages", async (req, res) => {
+  if (!requireCustomerSyncSecret(req, res)) return;
+  const order = await Order.findOne({ publicCode: String(req.params.publicCode) }).lean().exec() as any;
+  const customerId = String(req.body?.customerId || "");
+  if (!order || !order.customerId || String(order.customerId) !== customerId || !order.riderId || !["picked_up", "on_the_way"].includes(order.status)) return res.status(403).json({ error: "CHAT_NOT_AVAILABLE" });
+  if (req.body?.action === "send") {
+    const body = String(req.body?.body || "").trim();
+    if (!body || body.length > 500) return res.status(400).json({ error: "INVALID_MESSAGE" });
+    const message = await RiderOrderMessage.create({ orderId: order._id, riderId: order.riderId, senderRole: "customer", body });
+    return res.status(201).json({ id: String(message._id), senderRole: message.senderRole, body: message.body, createdAt: message.createdAt });
+  }
+  const messages = await RiderOrderMessage.find({ orderId: order._id }).sort({ createdAt: 1 }).limit(100).lean().exec();
+  return res.json({ messages: messages.map((message: any) => ({ id: String(message._id), senderRole: message.senderRole, body: message.body, createdAt: message.createdAt })) });
+});
+
 const checkoutSchema = z.object({ orderId: z.string().min(1), origin: z.string().url(), customerEmail: z.string().email().optional() });
 app.post("/api/v1/payments/checkout", async (req, res) => {
   const parsed = checkoutSchema.safeParse(req.body);
