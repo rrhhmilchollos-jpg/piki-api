@@ -6,7 +6,7 @@ export const XATIVA_COVERAGE_POLICY = {
   version: 1,
   center: [-0.521111, 38.990276] as [number, number],
   maxStraightLineDistanceKm: 10,
-  deliveryBaseFeeCents: 199,
+  deliveryBaseFeeCents: 299,
   outsideMunicipalitySurchargeCents: 100,
   serviceFeeCents: 79,
   routeVehicleThresholdKm: 3,
