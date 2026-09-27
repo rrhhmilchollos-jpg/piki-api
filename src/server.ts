@@ -751,6 +751,23 @@ app.post("/api/v1/orders", async (req, res) => {
   res.status(201).json({ order: { id: order.id, publicCode, displayCode: order.displayCode, displayCodeDate: order.displayCodeDate, status: order.status, paymentState: parsed.data.paymentMethod === "cash" ? "pending_cash_collection" : order.paymentState, paymentMethod: parsed.data.paymentMethod, cashDueAtDelivery: parsed.data.paymentMethod === "cash", deliveryQrUrl: deliveryQrUrl(publicCode), subtotalCents, deliveryFeeCents, serviceFeeCents, totalCents, coverage, route, etaMinutes: calculateEtaRange([restaurant.etaMinutes[0] || 20, restaurant.etaMinutes[1] || 35], [5, 20]) } });
 });
 
+const customerOrderSyncSchema = z.object({ publicCode: z.string().trim().min(6).max(64), restaurantSlug: z.string().trim().min(1).max(120), customerId: z.string().nullable().optional(), deliveryAddress: z.string().trim().min(5).max(1000), deliveryLocation: z.object({ latitude: z.number().finite(), longitude: z.number().finite() }).nullable().optional(), items: z.array(z.object({ itemId: z.string().min(1), name: z.string().min(1), quantity: z.number().int().min(1).max(20), unitPriceCents: z.number().int().min(0) })).min(1), subtotalCents: z.number().int().min(0), deliveryFeeCents: z.number().int().min(0), serviceFeeCents: z.number().int().min(0), totalCents: z.number().int().min(0), paymentMethod: z.enum(["stripe", "cash"]).default("stripe"), paymentState: z.enum(["pending", "paid", "failed", "refunded"]).default("pending"), stripeCheckoutSessionId: z.string().nullable().optional(), stripePaymentIntentId: z.string().nullable().optional() });
+app.post("/api/v1/internal/customer-orders/sync", async (req, res) => {
+  const expected = process.env.PIKI_CUSTOMER_SYNC_SECRET;
+  if (!expected || req.header("x-piki-customer-sync-secret") !== expected) return res.status(401).json({ error: "INVALID_SYNC_AUTH" });
+  const parsed = customerOrderSyncSchema.safeParse(req.body); if (!parsed.success) return res.status(400).json({ error: "INVALID_CUSTOMER_ORDER", details: parsed.error.flatten() });
+  const input = parsed.data;
+  const restaurant = await Restaurant.findOne({ slug: input.restaurantSlug, isActive: true, onboardingStatus: "approved" }).lean().exec() as any;
+  if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_AVAILABLE" });
+  const existing = await Order.findOne({ publicCode: input.publicCode }).lean().exec() as any;
+  const location = input.deliveryLocation ? { type: "Point", coordinates: [input.deliveryLocation.longitude, input.deliveryLocation.latitude] } : restaurant.location;
+  if (!location?.coordinates?.length) return res.status(409).json({ error: "DELIVERY_LOCATION_REQUIRED" });
+  const order = await Order.findOneAndUpdate({ publicCode: input.publicCode }, { $set: { restaurantId: restaurant._id, customerId: input.customerId || null, items: input.items, deliveryAddress: input.deliveryAddress, deliveryLocation: location, subtotalCents: input.subtotalCents, deliveryFeeCents: input.deliveryFeeCents, serviceFeeCents: input.serviceFeeCents, totalCents: input.totalCents, paymentMethod: input.paymentMethod, paymentState: input.paymentState, ...(input.stripeCheckoutSessionId !== undefined ? { stripeCheckoutSessionId: input.stripeCheckoutSessionId } : {}), ...(input.stripePaymentIntentId !== undefined ? { stripePaymentIntentId: input.stripePaymentIntentId } : {}), ...(input.paymentState === "paid" && existing?.paymentState !== "paid" ? { status: "pending", assignmentState: "unassigned" } : {}) }, $setOnInsert: { publicCode: input.publicCode, status: "pending", assignmentState: "unassigned", statusHistory: [{ status: "pending", actorRole: "system", reason: "Pedido sincronizado desde PIKI Customer" }] } }, { upsert: true, new: true, setDefaultsOnInsert: true }).lean().exec() as any;
+  if (input.paymentState === "paid" && existing?.paymentState !== "paid") await publishPaidOrderEvents(order, { settlement: "paid", message: "Pago confirmado desde PIKI Customer." });
+  if (input.paymentMethod === "cash" && !existing) await publishPaidOrderEvents(order, { settlement: "cash_due", message: "Pedido en efectivo recibido desde PIKI Customer." });
+  return res.status(existing ? 200 : 201).json({ order: { id: order._id, publicCode: order.publicCode, status: order.status, paymentState: order.paymentState, assignmentState: order.assignmentState } });
+});
+
 const checkoutSchema = z.object({ orderId: z.string().min(1), origin: z.string().url(), customerEmail: z.string().email().optional() });
 app.post("/api/v1/payments/checkout", async (req, res) => {
   const parsed = checkoutSchema.safeParse(req.body);
