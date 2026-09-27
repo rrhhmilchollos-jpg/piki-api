@@ -5,7 +5,7 @@ const tenantSchema = new Schema({
   name: { type: String, required: true, trim: true },
   status: { type: String, enum: ["active", "suspended", "archived"], default: "active", index: true },
   isPlatformTenant: { type: Boolean, default: false, index: true },
-  settings: { type: Schema.Types.Mixed, default: {} },
+  settings: { type: Schema.Types.Mixed, default: { limits: { maxRiders: 100000, maxDailySlots: 100000, maxSlotsPerRiderPerDay: 3 } } },
 }, { timestamps: true, collection: "tenants" });
 tenantSchema.index({ status: 1, createdAt: -1 });
 const tenantMembershipSchema = new Schema({
@@ -35,7 +35,7 @@ const partnerAssetSchema = new Schema({
 partnerAssetSchema.index({ restaurantId: 1, kind: 1, createdAt: -1 });
 const partnerLocalityGroupSchema = new Schema({
   tenantId: { type: Schema.Types.ObjectId, ref: "Tenant", default: null, index: true },
-  localityKey: { type: String, required: true, unique: true, index: true },
+  localityKey: { type: String, required: true, index: true },
   localityName: { type: String, required: true },
   province: { type: String, default: "Valencia" },
   restaurantIds: { type: [Schema.Types.ObjectId], ref: "Restaurant", default: [] },
@@ -73,6 +73,7 @@ const passkeyCredentialSchema = new Schema({
 }, { timestamps: true, collection: "passkey_credentials" });
 passkeyCredentialSchema.index({ ownerType: 1, ownerId: 1 });
 const realtimeEventSchema = new Schema({
+  tenantId: { type: Schema.Types.ObjectId, ref: "Tenant", default: null, index: true },
   channel: { type: String, enum: ["partner", "fleet", "admin", "rider", "customer"], required: true, index: true },
   audienceKey: { type: String, required: true, index: true },
   type: { type: String, required: true, index: true },
@@ -83,6 +84,7 @@ realtimeEventSchema.index({ channel: 1, audienceKey: 1, _id: 1 });
 realtimeEventSchema.index({ dedupeKey: 1 }, { unique: true, sparse: true });
 realtimeEventSchema.index({ createdAt: 1 }, { expireAfterSeconds: 86_400 });
 const pushSubscriptionSchema = new Schema({
+  tenantId: { type: Schema.Types.ObjectId, ref: "Tenant", default: null, index: true },
   surface: { type: String, enum: ["customer", "partner", "fleet", "admin", "rider"], required: true, index: true },
   ownerType: { type: String, enum: ["customer", "employee"], required: true, index: true },
   ownerId: { type: Schema.Types.ObjectId, required: true, index: true },
@@ -101,6 +103,7 @@ const pushSubscriptionSchema = new Schema({
 pushSubscriptionSchema.index({ ownerType: 1, ownerId: 1, surface: 1, endpointHash: 1 }, { unique: true });
 pushSubscriptionSchema.index({ surface: 1, status: 1, updatedAt: -1 });
 const riderAssignmentReservationSchema = new Schema({
+  tenantId: { type: Schema.Types.ObjectId, ref: "Tenant", default: null, index: true },
   riderId: { type: Schema.Types.ObjectId, ref: "Rider", required: true, index: true },
   orderId: { type: Schema.Types.ObjectId, ref: "Order", required: true, unique: true, index: true },
   slot: { type: Number, enum: [1, 2], required: true },
@@ -119,7 +122,7 @@ const riderOrderMessageSchema = new Schema({
   body: { type: String, required: true, trim: true, maxlength: 500 },
 }, { timestamps: true, collection: "rider_order_messages" });
 riderOrderMessageSchema.index({ orderId: 1, createdAt: 1 });
-const riderIncidentSchema = new Schema({ riderId: { type: Schema.Types.ObjectId, ref: "Rider", required: true, index: true }, reason: { type: String, required: true, enum: ["late_acceptance", "late_delivery", "no_show", "unsafe_driving", "fraud_signal", "customer_complaint", "document_expired", "other"] }, evidence: { type: [String], default: [] }, acknowledged: { type: Boolean, default: false }, resolved: { type: Boolean, default: false }, occurredAt: { type: Date, default: Date.now }, createdByRole: { type: String, required: true } }, { timestamps: true, collection: "rider_incidents" });
+const riderIncidentSchema = new Schema({ tenantId: { type: Schema.Types.ObjectId, ref: "Tenant", default: null, index: true }, riderId: { type: Schema.Types.ObjectId, ref: "Rider", required: true, index: true }, reason: { type: String, required: true, enum: ["late_acceptance", "late_delivery", "no_show", "unsafe_driving", "fraud_signal", "customer_complaint", "document_expired", "other"] }, evidence: { type: [String], default: [] }, acknowledged: { type: Boolean, default: false }, resolved: { type: Boolean, default: false }, occurredAt: { type: Date, default: Date.now }, createdByRole: { type: String, required: true } }, { timestamps: true, collection: "rider_incidents" });
 riderIncidentSchema.index({ riderId: 1, occurredAt: -1 });
 const riderDocumentSchema = new Schema({ type: { type: String, enum: ["identity", "residence_permit", "social_security_number", "bank_certificate", "driving_license", "insurance", "vehicle_registration", "vehicle_technical_sheet", "scooter_responsible_declaration", "dgt_mvp_homologation", "other"], required: true }, fileName: { type: String, required: true, trim: true }, mimeType: { type: String, required: true, trim: true }, sizeBytes: { type: Number, required: true, min: 1, max: 2_500_000 }, sha256: { type: String, required: true, match: /^[a-f0-9]{64}$/i }, contentBase64: { type: String, required: true, select: false }, status: { type: String, enum: ["received", "approved", "rejected"], default: "received" }, reviewNotes: { type: String, default: "" }, reviewedAt: { type: Date, default: null } }, { _id: true });
 const riderApplicationSchema = new Schema({
@@ -155,10 +158,12 @@ const accessAuthorizationSchema = new Schema({
 accessAuthorizationSchema.index({ employeeId: 1, createdAt: -1 });
 const riderSlotSchema = new Schema({
   tenantId: { type: Schema.Types.ObjectId, ref: "Tenant", default: null, index: true }, riderId: { type: Schema.Types.ObjectId, ref: "Rider", required: true, index: true }, zoneSlug: { type: String, required: true }, date: { type: String, required: true }, startTime: { type: String, required: true }, endTime: { type: String, required: true }, status: { type: String, enum: ["planned", "active", "completed", "cancelled"], default: "planned" }, notes: { type: String, default: "" } }, { timestamps: true, collection: "rider_slots" });
-riderSlotSchema.index({ riderId: 1, date: 1, startTime: 1 }, { unique: true });
+riderSlotSchema.index({ tenantId: 1, riderId: 1, date: 1, startTime: 1 }, { unique: true });
+riderSlotSchema.index({ tenantId: 1, date: 1, status: 1 });
 
 const fleetSchema = new Schema({
-  tenantId: { type: Schema.Types.ObjectId, ref: "Tenant", default: null, index: true }, name: { type: String, required: true, unique: true }, managerName: { type: String, default: "" }, isActive: { type: Boolean, default: true }, serviceZones: { type: [String], default: [] } }, { timestamps: true, collection: "fleets" });
+  tenantId: { type: Schema.Types.ObjectId, ref: "Tenant", default: null, index: true }, name: { type: String, required: true }, managerName: { type: String, default: "" }, isActive: { type: Boolean, default: true }, serviceZones: { type: [String], default: [] } }, { timestamps: true, collection: "fleets" });
+fleetSchema.index({ tenantId: 1, name: 1 }, { unique: true });
 
 const orderSchema = new Schema({
   tenantId: { type: Schema.Types.ObjectId, ref: "Tenant", default: null, index: true },
@@ -169,7 +174,9 @@ orderSchema.index({ displayCodeDate: 1, displayCode: 1 }, { unique: true, partia
 orderSchema.index({ deliveryLocation: "2dsphere" }, { sparse: true });
 
 const zoneSchema = new Schema({
-  tenantId: { type: Schema.Types.ObjectId, ref: "Tenant", default: null, index: true }, name: { type: String, required: true, unique: true }, slug: { type: String, required: true, unique: true }, isActive: { type: Boolean, default: true, index: true }, polygon: { type: { type: String, enum: ["Polygon"], default: "Polygon" }, coordinates: { type: [[[Number]]], required: true } }, serviceFeeCents: { type: Number, default: 0, min: 0 }, maxEtaMinutes: { type: Number, default: 60, min: 1 } }, { timestamps: true, collection: "zones" });
+  tenantId: { type: Schema.Types.ObjectId, ref: "Tenant", default: null, index: true }, name: { type: String, required: true }, slug: { type: String, required: true }, isActive: { type: Boolean, default: true, index: true }, polygon: { type: { type: String, enum: ["Polygon"], default: "Polygon" }, coordinates: { type: [[[Number]]], required: true } }, serviceFeeCents: { type: Number, default: 0, min: 0 }, maxEtaMinutes: { type: Number, default: 60, min: 1 } }, { timestamps: true, collection: "zones" });
+zoneSchema.index({ tenantId: 1, slug: 1 }, { unique: true });
+zoneSchema.index({ tenantId: 1, name: 1 }, { unique: true });
 zoneSchema.index({ polygon: "2dsphere" });
 
 export type RestaurantDocument = InferSchemaType<typeof restaurantSchema>;
@@ -200,12 +207,12 @@ export const RiderAssignmentReservation = mongoose.models.RiderAssignmentReserva
 
 export async function ensureIndexes() {
   // Remove unique indexes from older schema versions before initialization.
-  for (const [model, indexName] of [[Rider, "riderCode_1"], [EmployeeAccount, "portfolioId_1"]] as const) {
+  for (const [model, indexName] of [[Rider, "riderCode_1"], [EmployeeAccount, "portfolioId_1"], [Fleet, "name_1"], [Zone, "name_1"], [Zone, "slug_1"], [PartnerLocalityGroup, "localityKey_1"], [RiderSlot, "riderId_1_date_1_startTime_1"]] as const) {
     try { await model.collection.dropIndex(indexName); } catch (error: any) {
       if (error?.codeName !== "IndexNotFound" && error?.code !== 27) throw error;
     }
   }
-  await Promise.all([Restaurant.init(), PartnerAsset.init(), PartnerLocalityGroup.init(), Fleet.init(), Order.init(), Zone.init(), StripeEvent.init(), CashLedgerEntry.init(), DispatchDecision.init(), RiderIncident.init(), RiderOrderMessage.init(), RiderApplication.init(), CustomerAccount.init(), RiderSlot.init(), SignatureRequest.init(), PasskeyCredential.init(), PushSubscription.init(), RealtimeEvent.init(), RiderAssignmentReservation.init(), EmployeeAccount.init(), AccessAuthorization.init()]);
+  await Promise.all([Tenant.init(), TenantMembership.init(), Restaurant.init(), PartnerAsset.init(), PartnerLocalityGroup.init(), Fleet.init(), Order.init(), Zone.init(), StripeEvent.init(), CashLedgerEntry.init(), DispatchDecision.init(), RiderIncident.init(), RiderOrderMessage.init(), RiderApplication.init(), CustomerAccount.init(), RiderSlot.init(), SignatureRequest.init(), PasskeyCredential.init(), PushSubscription.init(), RealtimeEvent.init(), RiderAssignmentReservation.init(), EmployeeAccount.init(), AccessAuthorization.init()]);
   const ridersWithoutCode = await Rider.find({ $or: [{ riderCode: { $exists: false } }, { riderCode: null }, { riderCode: "" }] }).select("_id").lean().exec();
   for (const rider of ridersWithoutCode) {
     const base = `PIKI-R-${String(rider._id).slice(-6).toUpperCase()}`;

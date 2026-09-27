@@ -13,6 +13,9 @@ import {
   RiderIncident,
   RiderOrderMessage,
   RiderSlot,
+  RiderAssignmentReservation,
+  PushSubscription,
+  RealtimeEvent,
   Tenant,
   TenantMembership,
   Zone,
@@ -27,7 +30,7 @@ const collections = [
   ["partner_assets", PartnerAsset], ["partner_locality_groups", PartnerLocalityGroup],
   ["cash_ledger_entries", CashLedgerEntry], ["dispatch_decisions", DispatchDecision],
   ["rider_incidents", RiderIncident], ["rider_order_messages", RiderOrderMessage],
-  ["rider_slots", RiderSlot], ["access_authorizations", AccessAuthorization],
+  ["rider_slots", RiderSlot], ["rider_assignment_reservations", RiderAssignmentReservation], ["push_subscriptions", PushSubscription], ["realtime_events", RealtimeEvent], ["access_authorizations", AccessAuthorization],
 ] as const;
 
 export async function runTenantMigration() {
