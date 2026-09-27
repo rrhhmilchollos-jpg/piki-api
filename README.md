@@ -8,6 +8,27 @@ La API implementa comprobaciones de salud, catálogo de restaurantes, alta de pa
 
 La conexión de Atlas no se guarda en el repositorio. La variable `MONGODB_URI` debe configurarse en el entorno de Render antes de desplegar. Se puede sembrar el catálogo inicial únicamente en un entorno de prueba con `SEED_DEMO_DATA=true`.
 
+## Migración formal a tenants
+
+La API incorpora `tenants`, `tenant_memberships` y `tenantId` indexado en las entidades operativas. La migración es idempotente y crea el tenant raíz `piki-platform` para los datos existentes.
+
+En Render, ejecutar primero una comprobación:
+
+```bash
+pnpm run migrate:tenants
+```
+
+Para aplicar el backfill en producción, configurar temporalmente `ALLOW_TENANT_MIGRATION=true` en el entorno protegido y ejecutar:
+
+```bash
+PIKI_ROOT_TENANT_SLUG=piki-platform \
+PIKI_ROOT_TENANT_NAME="PIKI Delivery" \
+ALLOW_TENANT_MIGRATION=true \
+pnpm run migrate:tenants -- --apply
+```
+
+El script no permite `--apply` sin `ALLOW_TENANT_MIGRATION=true`, informa los recuentos antes de escribir y termina desconectando MongoDB. Después de verificar los recuentos, retirar inmediatamente `ALLOW_TENANT_MIGRATION` del entorno.
+
 ## Desarrollo local
 
 ```bash

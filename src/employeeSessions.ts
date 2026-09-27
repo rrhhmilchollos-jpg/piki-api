@@ -44,7 +44,7 @@ export async function resolveEmployeeSession(token: string) {
   if (!employee || (employee.passwordChangedAt && new Date(employee.passwordChangedAt) > new Date(session.issuedAt))) return null;
   if (sessionRole(employee, session.surface) !== session.role) return null;
   if (session.role === "rider" && !(await Rider.exists({ email: employee.email }))) return null;
-  return { role: session.role, employeeId: String(employee._id), mustChangePassword: Boolean(employee.mustChangePassword) };
+  return { role: session.role, employeeId: String(employee._id), tenantId: employee.tenantId ? String(employee.tenantId) : undefined, mustChangePassword: Boolean(employee.mustChangePassword) };
 }
 
 export async function revokeEmployeeSessions(employeeId: unknown) {

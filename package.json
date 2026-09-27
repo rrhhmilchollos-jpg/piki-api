@@ -8,7 +8,8 @@
     "build": "esbuild src/server.ts --platform=node --packages=external --bundle --format=esm --outdir=dist",
     "start": "node dist/server.js",
     "check": "tsc --noEmit",
-    "seed": "tsx src/seed.ts"
+    "seed": "tsx src/seed.ts",
+    "migrate:tenants": "tsx scripts/migrate-tenants.ts"
   },
   "dependencies": {
     "@simplewebauthn/server": "^13.2.2",

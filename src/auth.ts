@@ -10,7 +10,7 @@ export const PIKI_OWNER_EMAIL = "rrhh.milchollos@gmail.com";
 declare global {
   namespace Express {
     interface Request {
-      auth?: { role: ApiRole; employeeId?: string; mustChangePassword?: boolean; accessLevel?: "superadmin" | "subadmin" };
+      auth?: { role: ApiRole; employeeId?: string; tenantId?: string; mustChangePassword?: boolean; accessLevel?: "superadmin" | "subadmin" };
     }
   }
 }
@@ -23,7 +23,7 @@ const tokenEntries: Array<[ApiRole, string | undefined]> = [
   ["commercial", process.env.COMMERCIAL_API_TOKEN],
 ];
 
-export async function resolveRole(request: Request): Promise<{ role: ApiRole; employeeId?: string; mustChangePassword?: boolean; accessLevel?: "superadmin" | "subadmin" } | null> {
+export async function resolveRole(request: Request): Promise<{ role: ApiRole; employeeId?: string; tenantId?: string; mustChangePassword?: boolean; accessLevel?: "superadmin" | "subadmin" } | null> {
   const header = request.header("authorization") || "";
   const [scheme, token] = header.split(" ");
   if (scheme?.toLowerCase() !== "bearer" || !token) return null;
@@ -32,7 +32,7 @@ export async function resolveRole(request: Request): Promise<{ role: ApiRole; em
   const scoped = await resolveEmployeeSession(token);
   if (scoped) return { ...scoped, role: scoped.role as ApiRole };
   const employee = await EmployeeAccount.findOne({ sessionHash: hashSessionToken(token), active: true }).lean().exec() as any;
-  return employee ? { role: employee.apiRole as ApiRole, employeeId: String(employee._id), mustChangePassword: employee.mustChangePassword, accessLevel: employee.accessLevel } : null;
+  return employee ? { role: employee.apiRole as ApiRole, employeeId: String(employee._id), tenantId: employee.tenantId ? String(employee.tenantId) : undefined, mustChangePassword: employee.mustChangePassword, accessLevel: employee.accessLevel } : null;
 }
 
 export function requireRole(...allowedRoles: ApiRole[]) {
