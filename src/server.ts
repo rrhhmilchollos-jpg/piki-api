@@ -90,7 +90,8 @@ const deliveryQrIsValid = (orderCode: string, raw: unknown) => {
 };
 const pickupQrSecret = String(process.env.PICKUP_QR_SECRET || deliveryQrSecret).trim();
 const pickupQrSignature = (orderCode: string) => createHmac("sha256", pickupQrSecret || "development-only-pickup-qr-secret").update(`pickup:${orderCode}`).digest("hex").slice(0, 24);
-const pickupQrPin = (orderCode: string) => pickupQrSignature(orderCode).slice(-6).toUpperCase();
+const pickupPinAlphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+const pickupQrPin = (orderCode: string) => { const digest = createHmac("sha256", pickupQrSecret || "development-only-pickup-qr-secret").update(`pickup-pin:${orderCode}`).digest(); return Array.from({ length: 4 }, (_, index) => pickupPinAlphabet[digest[index] % pickupPinAlphabet.length]).join(""); };
 const pickupQrUrl = (orderCode: string) => `${(process.env.PARTNER_APP_URL || "https://partners.pikidelivery.com").replace(/\/$/, "")}/?order_id=${encodeURIComponent(orderCode)}&pickup_token=${pickupQrSignature(orderCode)}`;
 const pickupQrIsValid = (orderCode: string, raw: unknown) => {
   const value = String(raw || "").trim();
