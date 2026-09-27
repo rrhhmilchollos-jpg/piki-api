@@ -841,7 +841,7 @@ app.get("/api/v1/orders", requireRole("admin", "partner", "rider", "fleet"), asy
   if (typeof req.query.customerId === "string") filter.customerId = req.query.customerId;
   if (typeof req.query.status === "string") filter.status = req.query.status;
   if (req.query.operational === "true") { filter.status = { $in: ["pending", "accepted", "preparing", "ready_for_pickup"] }; filter.paymentState = { $in: ["pending", "paid"] }; }
-  else if (req.query.dispatchable === "true") { filter.status = { $in: ["accepted", "preparing", "ready_for_pickup"] }; filter.paymentState = { $in: ["pending", "paid"] }; }
+  else if (req.query.dispatchable === "true") { filter.status = { $in: ["pending", "accepted", "preparing", "ready_for_pickup"] }; filter.paymentState = { $in: ["pending", "paid"] }; }
   const orders = await Order.find(filter).sort({ createdAt: -1 }).limit(100).lean().exec();
   res.json({ orders });
 });
