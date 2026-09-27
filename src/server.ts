@@ -279,6 +279,11 @@ app.post("/api/v1/auth/employee/login", async (req, res) => {
   if (!issued) return res.status(403).json({ error: "SURFACE_ROLE_MISMATCH" });
   return res.json({ accessToken: issued.token, requiresPasswordChange: Boolean(employee.mustChangePassword), employee: { id: employee.id, name: employee.name, email: employee.email, jobRole: role === "rider" ? "rider" : employee.jobRole, apiRole: issued.role, accessLevel: employee.accessLevel || (employee.email === ownerEmail ? "superadmin" : "subadmin"), authorizationStatus: employee.authorizationStatus || "approved", portfolioId: employee.portfolioId, fleetId: employee.fleetId, zoneSlugs: employee.zoneSlugs } });
 });
+app.post("/api/v1/auth/employee/logout", requireRole("admin", "partner", "rider", "fleet", "commercial"), async (req, res) => {
+  const token = String(req.headers.authorization || "").replace(/^Bearer /i, "").trim();
+  if (token) await EmployeeSession.deleteOne({ tokenHash: hashSessionToken(token) }).exec();
+  return res.status(204).end();
+});
 app.get("/api/v1/auth/employee/me", requireRole("admin", "partner", "rider", "fleet", "commercial"), async (req, res) => {
   const employee = req.auth?.employeeId ? await EmployeeAccount.findById(req.auth.employeeId).select("email ownerProtected accessLevel authorizationStatus").lean().exec() as any : null;
   return res.json({ employee: { id: req.auth?.employeeId, email: employee?.email || null, role: req.auth?.role, accessLevel: employee?.accessLevel || "subadmin", authorizationStatus: employee?.authorizationStatus || "approved", ownerProtected: Boolean(employee?.ownerProtected), mustChangePassword: Boolean(req.auth?.mustChangePassword) } });
