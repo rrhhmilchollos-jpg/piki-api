@@ -104,11 +104,12 @@ export function setAllVersionPolicies(next: VersionPolicyMap): void {
 }
 
 /**
- * `buildId` identifies the deployed artefact for telemetry and cache names,
- * not an incompatible API contract. Required access is tied to semver so a
- * same-version Vercel rebuild cannot trap a valid client in a reload loop.
+ * A build ID identifies the exact deployed artefact. It is part of the update
+ * decision so a rebuild with the same semver can still wake an installed PWA.
+ * Clients that predate build headers continue to use the semver policy.
  */
-export function requiresUpdate(policy: VersionPolicy, clientVersion?: string, _clientBuildId?: string): boolean {
+export function requiresUpdate(policy: VersionPolicy, clientVersion?: string, clientBuildId?: string): boolean {
   if (!policy.forceUpdate || !clientVersion) return false;
-  return compareSemver(clientVersion, policy.minimumVersion) < 0;
+  return compareSemver(clientVersion, policy.minimumVersion) < 0
+    || (clientBuildId !== undefined && clientBuildId !== policy.buildId);
 }
