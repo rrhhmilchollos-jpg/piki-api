@@ -16,19 +16,22 @@ schema.index({ expiresAt: 1 }, { expireAfterSeconds: 0 });
 export const EmployeeSession = mongoose.models.EmployeeSession || mongoose.model("EmployeeSession", schema);
 
 /** A surface can narrow a role, never grant privileges from a request header. */
-export function sessionRole(employee: { email: string; apiRole: string; ownerProtected?: boolean; authorizationStatus?: string }, surface: string): string | null {
+export function sessionRole(employee: { email: string; apiRole: string; roles?: string[]; primaryRole?: string | null; ownerProtected?: boolean; authorizationStatus?: string }, surface: string, requestedRole?: string): string | null {
   if (employee.authorizationStatus && employee.authorizationStatus !== "approved") return null;
+  const availableRoles = Array.isArray(employee.roles) && employee.roles.length ? employee.roles : [employee.apiRole];
+  const selectedRole = requestedRole || employee.primaryRole || employee.apiRole;
+  if (!availableRoles.includes(selectedRole)) return null;
   // The protected owner account may operate internal surfaces. The session
   // role remains scoped to the requested app; ordinary employees are still
   // restricted by the surface map below.
-  if (employee.email === OWNER_EMAIL && employee.ownerProtected && employee.apiRole === "admin" && ["partner", "fleet"].includes(surface)) return surface;
-  if (surface === "rider" && employee.email === OWNER_EMAIL && employee.ownerProtected && employee.apiRole === "admin") return "rider";
+  if (employee.email === OWNER_EMAIL && employee.ownerProtected && selectedRole === "admin" && ["partner", "fleet"].includes(surface)) return surface;
+  if (surface === "rider" && employee.email === OWNER_EMAIL && employee.ownerProtected && selectedRole === "admin") return "rider";
   const permitted: Record<string, string[]> = { rider: ["rider"], partner: ["partner"], partners: ["partner"], fleet: ["fleet", "commercial", "gerente_comercial_zona"], admin: ["admin", "partner", "rider", "fleet", "commercial", "gerente_comercial_zona"] };
-  return permitted[surface] && !permitted[surface].includes(employee.apiRole) ? null : employee.apiRole;
+  return permitted[surface] && !permitted[surface].includes(selectedRole) ? null : selectedRole;
 }
 
-export async function issueEmployeeSession(employee: any, surface: string) {
-  const role = sessionRole(employee, surface);
+export async function issueEmployeeSession(employee: any, surface: string, requestedRole?: string) {
+  const role = sessionRole(employee, surface, requestedRole);
   if (!role) return null;
   const token = createSessionToken();
   const now = new Date();
@@ -42,7 +45,7 @@ export async function resolveEmployeeSession(token: string) {
   if (!session) return null;
   const employee = await EmployeeAccount.findOne({ _id: session.employeeId, active: true }).lean().exec() as any;
   if (!employee || (employee.passwordChangedAt && new Date(employee.passwordChangedAt) > new Date(session.issuedAt))) return null;
-  if (sessionRole(employee, session.surface) !== session.role) return null;
+  if (sessionRole(employee, session.surface, session.role) !== session.role) return null;
   if (session.role === "rider" && !(await Rider.exists({ email: employee.email }))) return null;
   return { role: session.role, employeeId: String(employee._id), tenantId: employee.tenantId ? String(employee.tenantId) : undefined, mustChangePassword: Boolean(employee.mustChangePassword) };
 }
