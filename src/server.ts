@@ -1523,20 +1523,36 @@ async function runAutomaticDispatchSweep() {
   const candidates = await Order.find({ riderId: null, assignmentState: { $in: ["unassigned", "expired", "rejected"] }, ...dispatchablePaymentFilter, status: { $in: ["accepted", "preparing", "ready_for_pickup"] } }).select("_id").sort({ createdAt: 1 }).limit(25).lean().exec();
   for (const order of candidates) void queueAutomaticDispatch(order._id as mongoose.Types.ObjectId).catch((error) => console.error("Automatic dispatch sweep failed", error));
 }
-
+async function findDispatchOrder(orderId: mongoose.Types.ObjectId, req: express.Request) {
+  const scoped = await Order.findOne({ _id: orderId, ...tenantScope(req) }).lean().exec() as any;
+  if (scoped || req.auth?.role !== "fleet") return scoped;
+  // QA orders are intentionally created without tenant data so they can be
+  // used by the isolated Fleet test account. They remain explicitly marked
+  // as test orders and never grant access to production orders.
+  return await Order.findOne({ _id: orderId, isTestOrder: true }).lean().exec() as any;
+}
+function dispatchScope(req: express.Request, order: any) {
+  return req.auth?.role === "fleet" && order?.isTestOrder ? {} : tenantScope(req);
+}
+async function findDispatchRestaurant(order: any, req: express.Request, scope: Record<string, unknown>) {
+  const scoped = await Restaurant.findOne({ _id: order.restaurantId, ...scope }).lean().exec() as any;
+  if (scoped || !order.isTestOrder || req.auth?.role !== "fleet") return scoped;
+  return await Restaurant.findById(order.restaurantId).lean().exec() as any;
+}
 app.get("/api/v1/dispatch/orders/:id/preview", requireRole("admin", "fleet"), async (req, res) => {
   const parsed = dispatchSchema.safeParse(req.query);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_DISPATCH_REQUEST", details: parsed.error.flatten() });
   const orderIdParam = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
   const orderId = objectId(orderIdParam);
   if (!orderId) return res.status(400).json({ error: "INVALID_ORDER_ID" });
-  const order = await Order.findOne({ _id: orderId, ...tenantScope(req) }).lean().exec() as any;
+  const order = await findDispatchOrder(orderId, req);
   if (!order) return res.status(404).json({ error: "ORDER_NOT_FOUND" });
-  const restaurant = await Restaurant.findOne({ _id: order.restaurantId, ...tenantScope(req) }).lean().exec() as any;
+  const scope = dispatchScope(req, order);
+  const restaurant = await findDispatchRestaurant(order, req, scope);
   if (!restaurant?.location?.coordinates || !order.deliveryLocation?.coordinates) return res.status(409).json({ error: "MISSING_GEOLOCATION" });
   const freshness = new Date(Date.now() - 90_000);
   const policy = await dispatchLoadPolicy();
-  const riders = await Rider.find({ ...tenantScope(req), status: { $in: ["available", "busy"] }, lastLocationAt: { $gte: freshness }, location: { $exists: true } }).limit(100).lean().exec() as any[];
+  const riders = await Rider.find({ ...scope, status: { $in: ["available", "busy"] }, lastLocationAt: { $gte: freshness }, location: { $exists: true } }).limit(100).lean().exec() as any[];
   const counts = await activeOrderCounts(riders.map((rider) => rider._id));
   const ranked = rankDispatchCandidates(riders.map((rider) => ({ id: String(rider._id), status: rider.status, vehicle: rider.vehicle, location: rider.location, lastLocationAt: rider.lastLocationAt, reliabilityScore: rider.reliabilityScore, activeOrderCount: counts.get(String(rider._id)) || 0, zoneFit: 1, servicePriority: 0.5 })), { restaurantLocation: [restaurant.location.coordinates[0], restaurant.location.coordinates[1]], customerLocation: [order.deliveryLocation.coordinates[0], order.deliveryLocation.coordinates[1]], routeDistanceKm: typeof order.routeDistanceKm === "number" ? order.routeDistanceKm : null, requiredVehicleClasses: Array.isArray(order.requiredVehicleClasses) ? order.requiredVehicleClasses : [], preparationMinutes: parsed.data.preparationMinutes, maxCustomerEtaMinutes: parsed.data.maxCustomerEtaMinutes, maxConcurrentOrders: policy.maxConcurrentOrders });
   await DispatchDecision.insertMany(ranked.map((decision) => ({ orderId: order._id, ...decision, riderId: objectId(decision.riderId), outcome: "preview", actorRole: req.auth?.role || "system" })));
@@ -1556,28 +1572,29 @@ app.post("/api/v1/dispatch/orders/:id/assign", requireRole("admin", "fleet"), as
   const orderIdParam = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
   const orderId = objectId(orderIdParam);
   if (!orderId) return res.status(400).json({ error: "INVALID_ORDER_ID" });
-  const order = await Order.findOne({ _id: orderId, ...tenantScope(req) }).lean().exec() as any;
+  const order = await findDispatchOrder(orderId, req);
   if (!order) return res.status(404).json({ error: "ORDER_NOT_FOUND" });
   if (order.paymentState !== "paid" && order.paymentMethod !== "cash") return res.status(409).json({ error: "ORDER_NOT_PAID" });
   if (!["accepted", "preparing", "ready_for_pickup"].includes(order.status)) return res.status(409).json({ error: "ORDER_NOT_DISPATCHABLE", status: order.status });
   if (order.riderId || order.assignmentState === "assigned") return res.status(409).json({ error: "ORDER_ALREADY_ASSIGNED" });
-  const restaurant = await Restaurant.findOne({ _id: order.restaurantId, ...tenantScope(req) }).lean().exec() as any;
+  const scope = dispatchScope(req, order);
+  const restaurant = await findDispatchRestaurant(order, req, scope);
   if (!restaurant?.location?.coordinates || !order.deliveryLocation?.coordinates) return res.status(409).json({ error: "MISSING_GEOLOCATION" });
   const freshness = new Date(Date.now() - 90_000);
   const policy = await dispatchLoadPolicy();
-  const riders = await Rider.find({ ...tenantScope(req), status: { $in: ["available", "busy"] }, lastLocationAt: { $gte: freshness }, location: { $exists: true } }).limit(100).lean().exec() as any[];
+  const riders = await Rider.find({ ...scope, status: { $in: ["available", "busy"] }, lastLocationAt: { $gte: freshness }, location: { $exists: true } }).limit(100).lean().exec() as any[];
   const counts = await activeOrderCounts(riders.map((rider) => rider._id));
   const ranked = rankDispatchCandidates(riders.map((rider) => ({ id: String(rider._id), status: rider.status, vehicle: rider.vehicle, location: rider.location, lastLocationAt: rider.lastLocationAt, reliabilityScore: rider.reliabilityScore, activeOrderCount: counts.get(String(rider._id)) || 0, zoneFit: 1, servicePriority: 0.5 })), { restaurantLocation: [restaurant.location.coordinates[0], restaurant.location.coordinates[1]], customerLocation: [order.deliveryLocation.coordinates[0], order.deliveryLocation.coordinates[1]], routeDistanceKm: typeof order.routeDistanceKm === "number" ? order.routeDistanceKm : null, requiredVehicleClasses: Array.isArray(order.requiredVehicleClasses) ? order.requiredVehicleClasses : [], preparationMinutes: parsed.data.preparationMinutes, maxConcurrentOrders: policy.maxConcurrentOrders });
   if (!ranked.length) return res.status(409).json({ error: "NO_ELIGIBLE_RIDER", candidatesConsidered: riders.length });
   for (const decision of ranked) {
     const riderId = objectId(decision.riderId); if (!riderId) continue;
-    const assignmentReservation = await reserveRiderOrderSlot(riderId, order._id, tenantScope(req), policy.maxConcurrentOrders);
+    const assignmentReservation = await reserveRiderOrderSlot(riderId, order._id, scope, policy.maxConcurrentOrders);
     if (!assignmentReservation) continue;
     const rider = assignmentReservation.rider;
-    const assigned = await Order.findOneAndUpdate({ _id: order._id, ...tenantScope(req), riderId: null, assignmentState: { $in: ["unassigned", "expired", "rejected"] } }, { $set: { riderId: rider._id, assignmentState: "assigned", assignmentExpiresAt: null, dispatchScore: decision.score }, $inc: { dispatchAttempts: 1, version: 1 } }, { new: true }).lean().exec() as any;
+    const assigned = await Order.findOneAndUpdate({ _id: order._id, ...scope, riderId: null, assignmentState: { $in: ["unassigned", "expired", "rejected"] } }, { $set: { riderId: rider._id, assignmentState: "assigned", assignmentExpiresAt: null, dispatchScore: decision.score }, $inc: { dispatchAttempts: 1, version: 1 } }, { new: true }).lean().exec() as any;
     if (!assigned) { await releaseRiderOrderSlot(order._id, rider._id); continue; }
     await RiderAssignmentReservation.updateOne({ orderId: assigned._id, riderId: rider._id, status: "reserved" }, { $set: { expiresAt: null } }).exec();
-    await DispatchDecision.create({ ...tenantScope(req), orderId: assigned._id, ...decision, riderId: rider._id, outcome: "accepted", actorRole: req.auth?.role || "system" });
+    await DispatchDecision.create({ ...scope, orderId: assigned._id, ...decision, riderId: rider._id, outcome: "accepted", actorRole: req.auth?.role || "system" });
     void publishRiderOfferEvent(assigned, String(rider._id)).catch((error) => console.warn("Rider offer event failed", error));
     return res.status(201).json({ assignment: { orderId: assigned._id, riderId: rider._id, slot: assignmentReservation.reservation.slot, state: assigned.assignmentState, expiresAt: null, score: decision.score, pickupDistanceKm: decision.pickupDistanceKm, pickupEtaMinutes: decision.pickupEtaMinutes, customerEtaMinutes: decision.customerEtaMinutes, totalEtaMinutes: decision.totalEtaMinutes, algorithmVersion: decision.algorithmVersion, maxConcurrentOrders: policy.maxConcurrentOrders, saturated: policy.saturated, reasons: decision.reasons } });
   }
