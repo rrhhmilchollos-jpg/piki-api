@@ -102,6 +102,27 @@ const pushSubscriptionSchema = new Schema({
 }, { timestamps: true, collection: "push_subscriptions" });
 pushSubscriptionSchema.index({ ownerType: 1, ownerId: 1, surface: 1, endpointHash: 1 }, { unique: true });
 pushSubscriptionSchema.index({ surface: 1, status: 1, updatedAt: -1 });
+const notificationSchema = new Schema({
+  tenantId: { type: Schema.Types.ObjectId, ref: "Tenant", default: null, index: true },
+  surface: { type: String, enum: ["customer", "partner", "fleet", "admin", "rider"], required: true, index: true },
+  ownerType: { type: String, enum: ["customer", "employee"], required: true, index: true },
+  ownerId: { type: Schema.Types.ObjectId, required: true, index: true },
+  category: { type: String, required: true, index: true },
+  title: { type: String, required: true, maxlength: 120 },
+  body: { type: String, required: true, maxlength: 240 },
+  url: { type: String, required: true, maxlength: 500 },
+  entityType: { type: String, default: "", maxlength: 40 },
+  entityId: { type: String, default: "", maxlength: 120 },
+  dedupeKey: { type: String, required: true, unique: true, index: true },
+  readAt: { type: Date, default: null, index: true },
+  pushStatus: { type: String, enum: ["pending", "sending", "retry", "sent", "unavailable", "dead"], default: "pending", index: true },
+  pushAttempts: { type: Number, default: 0 },
+  pushNextAttemptAt: { type: Date, default: Date.now, index: true },
+  pushLockUntil: { type: Date, default: null, index: true },
+}, { timestamps: true, collection: "notifications" });
+notificationSchema.index({ ownerType: 1, ownerId: 1, surface: 1, tenantId: 1, _id: -1 });
+notificationSchema.index({ pushStatus: 1, pushNextAttemptAt: 1, pushLockUntil: 1 });
+notificationSchema.index({ createdAt: 1 }, { expireAfterSeconds: 7_776_000 });
 const riderAssignmentReservationSchema = new Schema({
   tenantId: { type: Schema.Types.ObjectId, ref: "Tenant", default: null, index: true },
   riderId: { type: Schema.Types.ObjectId, ref: "Rider", required: true, index: true },
@@ -208,6 +229,7 @@ export const RiderSlot = mongoose.models.RiderSlot || mongoose.model("RiderSlot"
 export const SignatureRequest = mongoose.models.SignatureRequest || mongoose.model("SignatureRequest", signatureRequestSchema);
 export const PasskeyCredential = mongoose.models.PasskeyCredential || mongoose.model("PasskeyCredential", passkeyCredentialSchema);
 export const PushSubscription = mongoose.models.PushSubscription || mongoose.model("PushSubscription", pushSubscriptionSchema);
+export const Notification = mongoose.models.Notification || mongoose.model("Notification", notificationSchema);
 export const RealtimeEvent = mongoose.models.RealtimeEvent || mongoose.model("RealtimeEvent", realtimeEventSchema);
 export const RiderAssignmentReservation = mongoose.models.RiderAssignmentReservation || mongoose.model("RiderAssignmentReservation", riderAssignmentReservationSchema);
 
@@ -219,7 +241,7 @@ export async function ensureIndexes() {
     }
   }
   await Promise.all([PartnerLocalityGroup.syncIndexes(), Fleet.syncIndexes(), Zone.syncIndexes(), RiderSlot.syncIndexes()]);
-  await Promise.all([Tenant.init(), TenantMembership.init(), Restaurant.init(), PartnerAsset.init(), PartnerLocalityGroup.init(), Fleet.init(), Order.init(), Zone.init(), StripeEvent.init(), CashLedgerEntry.init(), DispatchDecision.init(), RiderIncident.init(), RiderOrderMessage.init(), RiderApplication.init(), CustomerAccount.init(), RiderSlot.init(), SignatureRequest.init(), PasskeyCredential.init(), PushSubscription.init(), RealtimeEvent.init(), RiderAssignmentReservation.init(), EmployeeAccount.init(), AccessAuthorization.init()]);
+  await Promise.all([Tenant.init(), TenantMembership.init(), Restaurant.init(), PartnerAsset.init(), PartnerLocalityGroup.init(), Fleet.init(), Order.init(), Zone.init(), StripeEvent.init(), CashLedgerEntry.init(), DispatchDecision.init(), RiderIncident.init(), RiderOrderMessage.init(), RiderApplication.init(), CustomerAccount.init(), RiderSlot.init(), SignatureRequest.init(), PasskeyCredential.init(), PushSubscription.init(), Notification.init(), RealtimeEvent.init(), RiderAssignmentReservation.init(), EmployeeAccount.init(), AccessAuthorization.init()]);
   const ridersWithoutCode = await Rider.find({ $or: [{ riderCode: { $exists: false } }, { riderCode: null }, { riderCode: "" }] }).select("_id").lean().exec();
   for (const rider of ridersWithoutCode) {
     const base = `PIKI-R-${String(rider._id).slice(-6).toUpperCase()}`;

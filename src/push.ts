@@ -64,13 +64,14 @@ function endpointHash(endpoint: string): string {
   return createHash("sha256").update(endpoint).digest("hex");
 }
 
-export async function savePushSubscription(input: { surface: PikiSurface; ownerType: "customer" | "employee"; ownerId: string; subscription: SubscriptionPayload }) {
+export async function savePushSubscription(input: { surface: PikiSurface; ownerType: "customer" | "employee"; ownerId: string; tenantId?: string | null; subscription: SubscriptionPayload }) {
   if (!pushConfigured()) throw new Error("PUSH_NOT_CONFIGURED");
   const hash = endpointHash(input.subscription.endpoint);
   const saved = await PushSubscription.findOneAndUpdate(
     { ownerType: input.ownerType, ownerId: input.ownerId, surface: input.surface, endpointHash: hash },
     {
       $set: {
+        tenantId: input.tenantId || null,
         endpoint: encrypt(input.subscription.endpoint),
         endpointHash: hash,
         "keys.p256dh": encrypt(input.subscription.keys.p256dh),
@@ -93,10 +94,11 @@ export async function revokePushSubscription(input: { surface: PikiSurface; owne
   await PushSubscription.updateMany(query, { $set: { status: "revoked" } }).exec();
 }
 
-export async function sendPushToOwner(input: { surface: PikiSurface; ownerType: "customer" | "employee"; ownerId: string; payload: PushPayload }) {
-  if (!configureVapid()) return { attempted: 0, delivered: 0 };
-  const subscriptions = await PushSubscription.find({ surface: input.surface, ownerType: input.ownerType, ownerId: input.ownerId, status: "active" }).select("+endpoint +keys.p256dh +keys.auth").exec();
+export async function sendPushToOwner(input: { surface: PikiSurface; ownerType: "customer" | "employee"; ownerId: string; tenantId?: string | null; payload: PushPayload }) {
+  if (!configureVapid()) return { attempted: 0, delivered: 0, failed: 0 };
+  const subscriptions = await PushSubscription.find({ surface: input.surface, ownerType: input.ownerType, ownerId: input.ownerId, tenantId: input.tenantId || null, status: "active" }).select("+endpoint +keys.p256dh +keys.auth").exec();
   let delivered = 0;
+  let failed = 0;
   await Promise.all(subscriptions.map(async (subscription: any) => {
     try {
       await webpush.sendNotification({ endpoint: decrypt(subscription.endpoint), keys: { p256dh: decrypt(subscription.keys.p256dh), auth: decrypt(subscription.keys.auth) } }, JSON.stringify(input.payload), { TTL: 180, urgency: "high" });
@@ -105,12 +107,13 @@ export async function sendPushToOwner(input: { surface: PikiSurface; ownerType: 
     } catch (error: any) {
       const statusCode = Number(error?.statusCode || 0);
       const terminal = statusCode === 404 || statusCode === 410;
+      if (!terminal) failed += 1;
       await PushSubscription.updateOne({ _id: subscription._id }, {
-        $set: { status: terminal ? "expired" : "failed", lastFailureAt: new Date() },
+        $set: { status: terminal ? "expired" : "active", lastFailureAt: new Date() },
         $inc: { failureCount: 1 },
       }).exec();
       console.warn("Web Push delivery failed", { surface: input.surface, statusCode: statusCode || undefined });
     }
   }));
-  return { attempted: subscriptions.length, delivered };
+  return { attempted: subscriptions.length, delivered, failed };
 }
