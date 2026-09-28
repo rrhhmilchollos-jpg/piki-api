@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { buildNoticeCopy } from "./notifications.js";
+import { buildNoticeCopy, notificationRecipientTenantId } from "./notifications.js";
 import { tenantAudienceKey } from "./realtime.js";
 
 const orderId = "66c5c6634d5bb12ea5500101";
@@ -26,6 +26,12 @@ test("admin and fleet realtime groups are isolated by tenant", () => {
   assert.equal(tenantAudienceKey(tenantA, "fleet"), `tenant:${tenantA}:role:fleet`);
   assert.notEqual(tenantAudienceKey(tenantA, "admin"), tenantAudienceKey(tenantB, "admin"));
   assert.equal(tenantAudienceKey(null, "fleet"), "tenant:default:role:fleet");
+});
+
+test("tenantless super-admin notifications stay in the super-admin inbox across tenants", () => {
+  assert.equal(notificationRecipientTenantId(null), null);
+  assert.equal(notificationRecipientTenantId(undefined), null);
+  assert.equal(notificationRecipientTenantId("66c5c6634d5bb12ea5500002"), "66c5c6634d5bb12ea5500002");
 });
 
 test("a rider offer is visible only to the rider surface", () => {

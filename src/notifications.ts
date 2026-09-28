@@ -37,6 +37,10 @@ function tenantQuery(tenantId?: string | null): Record<string, unknown> {
   return id ? { tenantId: new mongoose.Types.ObjectId(id) } : { $or: [{ tenantId: null }, { tenantId: { $exists: false } }] };
 }
 
+export function notificationRecipientTenantId(accountTenantId: unknown): string | null {
+  return validId(accountTenantId);
+}
+
 function orderReference(payload: Record<string, unknown>): string {
   const value = String(payload.publicCode || payload.orderCode || payload.orderId || "").trim();
   return value ? `#${value.slice(0, 60)}` : "tu pedido";
@@ -120,22 +124,23 @@ async function resolveRecipients(input: RealtimeNotificationInput): Promise<Reci
     if (!restaurantId) return [];
     const restaurant = await Restaurant.findById(restaurantId).select("_id tenantId").lean().exec() as any;
     if (!restaurant) return [];
-    const accounts = await EmployeeAccount.find({ apiRole: "partner", restaurantId: restaurant._id, active: true }).select("_id tenantId").limit(500).lean().exec() as any[];
-    return accounts.map((account) => ({ surface: "partner", ownerType: "employee", ownerId: String(account._id), tenantId: validId(account.tenantId) }));
+    const accounts = await EmployeeAccount.find({ apiRole: "partner", restaurantId: restaurant._id, active: true, authorizationStatus: "approved", ...tenantQuery(restaurant.tenantId) }).select("_id tenantId").limit(500).lean().exec() as any[];
+    return accounts.map((account) => ({ surface: "partner", ownerType: "employee", ownerId: String(account._id), tenantId: notificationRecipientTenantId(account.tenantId) }));
   }
   if (input.channel === "rider") {
     const riderId = idFromAudience(input.audienceKey, "rider");
     if (!riderId) return [];
     const rider = await Rider.findById(riderId).select("_id email tenantId").lean().exec() as any;
     if (!rider?.email) return [];
-    const accounts = await EmployeeAccount.find({ apiRole: "rider", email: String(rider.email).toLowerCase(), active: true }).select("_id tenantId").limit(100).lean().exec() as any[];
-    return accounts.map((account) => ({ surface: "rider", ownerType: "employee", ownerId: String(account._id), tenantId: validId(account.tenantId) }));
+    const accounts = await EmployeeAccount.find({ apiRole: "rider", email: String(rider.email).toLowerCase(), active: true, authorizationStatus: "approved", ...tenantQuery(rider.tenantId) }).select("_id tenantId").limit(100).lean().exec() as any[];
+    return accounts.map((account) => ({ surface: "rider", ownerType: "employee", ownerId: String(account._id), tenantId: notificationRecipientTenantId(account.tenantId) }));
   }
 
   const expected = input.channel === "fleet" ? "fleet" : "admin";
   const roleQuery: Record<string, unknown> = {
     apiRole: expected === "fleet" ? { $in: ["fleet", "commercial"] } : "admin",
     active: true,
+    authorizationStatus: "approved",
   };
   if (expected === "admin") {
     const ownerEmail = String(process.env.PIKI_OWNER_EMAIL || "rrhh.milchollos@gmail.com").trim().toLowerCase();
@@ -145,7 +150,7 @@ async function resolveRecipients(input: RealtimeNotificationInput): Promise<Reci
     Object.assign(roleQuery, tenantQuery(tenantId));
   }
   const accounts = await EmployeeAccount.find(roleQuery).select("_id tenantId").limit(500).lean().exec() as any[];
-  return accounts.map((account) => ({ surface: expected, ownerType: "employee", ownerId: String(account._id), tenantId: validId(account.tenantId) || tenantId }));
+  return accounts.map((account) => ({ surface: expected, ownerType: "employee", ownerId: String(account._id), tenantId: notificationRecipientTenantId(account.tenantId) }));
 }
 
 export async function publishInboxNotification(input: RealtimeNotificationInput): Promise<number> {
