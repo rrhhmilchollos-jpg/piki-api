@@ -961,10 +961,10 @@ app.post("/api/v1/admin/dispatch/test-orders", requireRole("admin", "fleet"), as
     const totalCents = subtotalCents + deliveryFeeCents + 79;
     const qaCustomerId = parsed.data.customerId && objectId(parsed.data.customerId) ? objectId(parsed.data.customerId) : null;
     const order = await Order.create({ publicCode: `PIKI-TEST-${Date.now().toString(36).toUpperCase()}-${index + 1}`, ...dailyCode, restaurantId: restaurant._id, customerId: qaCustomerId, customerPhone: "+34960000111", isTestOrder: true, items: [{ itemId: item.id, name: item.name, quantity: 1, unitPriceCents: subtotalCents }], deliveryAddress: parsed.data.deliveryAddress, deliveryLocation: { type: "Point", coordinates: restaurant.location?.coordinates || [-0.52, 38.99] }, subtotalCents, deliveryFeeCents, totalCents, paymentState: "paid", status: parsed.data.status, assignmentState: "unassigned", statusHistory: [{ status: parsed.data.status, actorRole: "admin", reason: "Pedido de prueba creado desde Supervisión de dispatch" }] });
-    const preferredQaRider = process.env.QA_RIDER_EMAIL && parsed.data.customerId === "qa-kfc-e2e" ? await Rider.findOne({ email: process.env.QA_RIDER_EMAIL.toLowerCase() }).select("_id").lean().exec() as any : null;
-    void queueAutomaticDispatch(order._id, preferredQaRider?._id).catch((error) => console.error("Automatic dispatch failed", error));
+    // Fleet QA orders are intentionally manual: preview and "Enviar oferta"
+    // must be the only actions that reserve a Rider during the E2E test.
     const orderId = String(order._id);
-    created.push({ id: orderId, _id: orderId, publicCode: order.publicCode, displayCode: order.displayCode, restaurantId: restaurant._id, restaurantName: restaurant.name, status: order.status, paymentState: order.paymentState, isTestOrder: true, dispatchQueued: true });
+    created.push({ id: orderId, _id: orderId, publicCode: order.publicCode, displayCode: order.displayCode, restaurantId: restaurant._id, restaurantName: restaurant.name, status: order.status, paymentState: order.paymentState, isTestOrder: true, dispatchQueued: false });
   }
   return res.status(201).json({ orders: created, message: `${created.length} pedido(s) de prueba creado(s) y visible(s) en Cocina, Fleet y Dispatch.` });
 });
