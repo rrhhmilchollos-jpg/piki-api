@@ -1060,7 +1060,10 @@ app.get("/api/v1/orders", requireRole("admin", "partner", "rider", "fleet"), asy
   }
   if (req.auth?.role === "fleet") {
     const riders = employee?.fleetId ? await Rider.find({ fleetId: employee.fleetId, ...tenantScope(req) }).select("_id").lean().exec() : [];
-    filter.riderId = { $in: riders.map((rider: any) => rider._id) };
+    // Fleet must see both orders already assigned to its Riders and real
+    // customer orders waiting for their first assignment. The previous
+    // filter only returned assigned orders, hiding fresh KFC/customer orders.
+    filter.$or = [{ riderId: { $in: riders.map((rider: any) => rider._id) } }, { riderId: null }];
   }
   if (typeof req.query.customerId === "string") filter.customerId = req.query.customerId;
   if (typeof req.query.status === "string") filter.status = req.query.status;
