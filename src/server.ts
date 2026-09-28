@@ -1071,6 +1071,16 @@ const supportMessageInput = z.object({ body: z.string().trim().min(1).max(2000) 
 const supportStatusInput = z.object({ status: z.enum(["open", "in_progress", "waiting", "resolved", "closed"]) });
 const supportCancelInput = z.object({ reason: z.string().trim().min(10).max(500), ticketId: z.string().optional() });
 function supportOrderFilter(ref: string): Record<string, unknown> { const id = objectId(ref); return id ? { _id: id } : { $or: [{ publicCode: ref }, { displayCode: ref }] }; }
+async function enrichSupportTickets(tickets: any[]) {
+  const orderIds = tickets.map((ticket) => ticket.orderId?._id || ticket.orderId).filter((id) => id && mongoose.isValidObjectId(id));
+  if (!orderIds.length) return tickets;
+  const orders = await Order.find({ _id: { $in: orderIds } }).select("_id publicCode displayCode status paymentState paymentMethod customerId customerPhone riderId restaurantId items deliveryAddress deliveryLocation subtotalCents deliveryFeeCents serviceFeeCents totalCents createdAt updatedAt statusHistory assignmentState assignedAt deliveredAt cancelledAt").select("+customerPhone").populate("riderId", "name riderCode email phone").populate("restaurantId", "name address phone email").lean().exec() as any[];
+  const customerIds = orders.map((order) => order.customerId).filter((id) => mongoose.isValidObjectId(String(id))).map((id) => new mongoose.Types.ObjectId(String(id)));
+  const customers = customerIds.length ? await CustomerAccount.find({ _id: { $in: customerIds } }).select("name email deliveryAddress").lean().exec() as any[] : [];
+  const customerMap = new Map(customers.map((customer) => [String(customer._id), customer]));
+  const orderMap = new Map(orders.map((order) => [String(order._id), { ...order, customer: order.customerId ? customerMap.get(String(order.customerId)) || null : null, customerPhone: order.customerPhone || null }]));
+  return tickets.map((ticket) => { const orderId = ticket.orderId?._id || ticket.orderId; const order = orderMap.get(String(orderId)); return order ? { ...ticket, orderId: order } : ticket; });
+}
 const supportRoles = ["admin", "partner", "rider", "fleet", "commercial", "gerente_comercial_zona"] as const;
 app.post("/api/v1/support/tickets", requireRole(...supportRoles), async (req, res) => {
   const parsed = supportTicketInput.safeParse(req.body); if (!parsed.success) return res.status(400).json({ error: "INVALID_SUPPORT_TICKET", details: parsed.error.flatten() });
@@ -1095,8 +1105,8 @@ app.get("/api/v1/admin/support/tickets", requireRole("admin"), async (req, res) 
   const filter: Record<string, unknown> = { ...tenantScope(req) };
   if (typeof req.query.status === "string" && req.query.status !== "all") filter.status = req.query.status;
   if (typeof req.query.q === "string" && req.query.q.trim()) { const q = req.query.q.trim(); filter.$or = [{ ticketNumber: q }, { reporterEmail: { $regex: q, $options: "i" } }, { subject: { $regex: q, $options: "i" } }]; }
-  const tickets = await SupportTicket.find(filter).sort({ updatedAt: -1 }).limit(100).populate("orderId", "publicCode displayCode status").populate("assignedTo", "name email").lean().exec();
-  return res.json({ tickets });
+  const tickets = await SupportTicket.find(filter).sort({ updatedAt: -1 }).limit(100).populate("assignedTo", "name email").lean().exec();
+  return res.json({ tickets: await enrichSupportTickets(tickets) });
 });
 app.post("/api/v1/admin/support/tickets", requireRole("admin"), async (req, res) => {
   const parsed = supportTicketInput.safeParse(req.body); if (!parsed.success) return res.status(400).json({ error: "INVALID_SUPPORT_TICKET", details: parsed.error.flatten() });
