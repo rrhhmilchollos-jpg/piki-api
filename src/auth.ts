@@ -3,7 +3,7 @@ import { EmployeeAccount, Rider } from "./models.js";
 import { hashSessionToken } from "./employeeAuth.js";
 import { resolveEmployeeSession } from "./employeeSessions.js";
 
-export const apiRoles = ["admin", "partner", "rider", "fleet", "commercial"] as const;
+export const apiRoles = ["admin", "partner", "rider", "fleet", "commercial", "gerente_comercial_zona"] as const;
 export type ApiRole = (typeof apiRoles)[number];
 export const PIKI_OWNER_EMAIL = "rrhh.milchollos@gmail.com";
 
