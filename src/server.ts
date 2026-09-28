@@ -1074,8 +1074,10 @@ app.get("/api/v1/orders", requireRole("admin", "partner", "rider", "fleet"), asy
   if (typeof req.query.status === "string") filter.status = req.query.status;
   if (req.query.operational === "true") { filter.status = { $in: ["pending", "accepted", "preparing", "ready_for_pickup"] }; filter.paymentState = { $in: ["pending", "paid"] }; }
   else if (req.query.dispatchable === "true") { filter.status = { $in: ["pending", "accepted", "preparing", "ready_for_pickup"] }; filter.paymentState = { $in: ["pending", "paid"] }; }
-  const orders = await Order.find(filter).sort({ createdAt: -1 }).limit(100).lean().exec();
-  res.json({ orders });
+  const orders = await Order.find(filter).sort({ createdAt: -1 }).limit(100).lean().exec() as any[];
+  const restaurants = await Restaurant.find({ _id: { $in: orders.map((order) => order.restaurantId).filter(Boolean) } }).select("name slug").lean().exec() as any[];
+  const restaurantNames = new Map(restaurants.map((restaurant) => [String(restaurant._id), restaurant.name || restaurant.slug || "Establecimiento"]));
+  res.json({ orders: orders.map((order) => ({ ...order, restaurantName: restaurantNames.get(String(order.restaurantId)) || "Establecimiento pendiente" })) });
 });
 
 app.get("/api/v1/orders/:id", requireRole("admin", "partner", "rider", "fleet"), async (req, res) => {
