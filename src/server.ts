@@ -96,7 +96,11 @@ async function employeeScope(req: express.Request) {
 async function fleetRiderFilter(req: express.Request): Promise<Record<string, unknown>> {
   if (req.auth?.role !== "fleet") return {};
   const employee = await employeeScope(req);
-  return employee?.fleetId ? { fleetId: employee.fleetId } : { _id: null };
+  // Newly enabled rider accounts start unassigned. Fleet must be able to see
+  // those accounts so the first slot reservation can link them to this fleet.
+  return employee?.fleetId
+    ? { $or: [{ fleetId: employee.fleetId }, { fleetId: null }, { fleetId: { $exists: false } }] }
+    : { $or: [{ fleetId: null }, { fleetId: { $exists: false } }] };
 }
 async function fleetCanAccessRider(req: express.Request, riderId: mongoose.Types.ObjectId | null) {
   if (!riderId) return false;
@@ -812,7 +816,13 @@ app.post("/api/v1/rider-slots", requireRole("admin", "fleet"), async (req, res) 
   const parsed = riderSlotCreateSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_RIDER_SLOT", details: parsed.error.flatten() });
   const riderId = objectId(parsed.data.riderId); if (!riderId) return res.status(400).json({ error: "INVALID_RIDER_ID" });
-  const rider = await Rider.findOne({ _id: riderId, ...tenantScope(req) }).lean().exec(); if (!rider) return res.status(404).json({ error: "RIDER_NOT_FOUND" });
+  const rider = await Rider.findOne({ _id: riderId, ...tenantScope(req) }).lean().exec() as any; if (!rider) return res.status(404).json({ error: "RIDER_NOT_FOUND" });
+  if (req.auth?.role === "fleet") {
+    const employee = await employeeScope(req);
+    if (!employee?.fleetId) return res.status(403).json({ error: "FLEET_NOT_ASSIGNED" });
+    if (rider.fleetId && String(rider.fleetId) !== String(employee.fleetId)) return res.status(403).json({ error: "FLEET_RIDER_ACCESS_DENIED" });
+    if (!rider.fleetId) await Rider.updateOne({ _id: riderId, fleetId: null }, { $set: { fleetId: employee.fleetId } }).exec();
+  }
   const zone = await Zone.findOne({ ...tenantScope(req), slug: parsed.data.zoneSlug, isActive: true }).lean().exec() as any; if (!zone) return res.status(404).json({ error: "ZONE_NOT_FOUND" });
   const { riderId: _riderId, ...slotData } = parsed.data;
   const slot = await RiderSlot.findOneAndUpdate({ riderId, ...tenantScope(req), date: parsed.data.date, startTime: parsed.data.startTime }, { $set: { ...slotData, ...tenantScope(req), riderId, zoneSlug: zone.slug } }, { upsert: true, new: true }).lean().exec();
