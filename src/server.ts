@@ -12,8 +12,9 @@ import { configuredAuthRoles, requireOwner, requireRole, resolveRole } from "./a
 import { EmployeeSession, issueEmployeeSession, revokeEmployeeSessions, sessionRole } from "./employeeSessions.js";
 import { processStripeWebhook, stripeConfigured, createSignaturitSignature, signaturitBaseUrl, signaturitConfigured, signaturitMode, signatureWebhookUrl, webhookDigest, handleCustomerTrpc, currentCustomer } from "./integrations/index.js";
 import { getVersionPolicy, isPikiSurface, requiresUpdate, setVersionPolicy, syncVersionPolicy, versionPolicySchema, type PikiSurface } from "./appVersion.js";
-import { publicPushConfig, revokePushSubscription, savePushSubscription, sendPushToOwner } from "./push.js";
-import { publishOrderStatusEvents, publishPaidOrderEvents, publishRiderOfferEvent, publishRealtimeEvent, serveRealtimeEvents, startRealtimeRelay } from "./realtime.js";
+import { publicPushConfig, revokePushSubscription, savePushSubscription } from "./push.js";
+import { publishOrderStatusEvents, publishPaidOrderEvents, publishRiderOfferEvent, publishRealtimeEvent, serveRealtimeEvents, startRealtimeRelay, tenantAudienceKey } from "./realtime.js";
+import { listNotifications, markAllNotificationsRead, markNotificationRead, startNotificationWorker, stopNotificationWorker, type NotificationPrincipal } from "./notifications.js";
 import { createCheckoutSession } from "./stripe.js";
 import { rankDispatchCandidates, computeMobilityAdvice, calculateSanctionDecision, defaultSanctionPolicy } from "./algorithms/index.js";
 import { createSessionToken, generateTemporaryPassword, hashPassword, hashSessionToken, verifyPassword } from "./employeeAuth.js";
@@ -110,7 +111,7 @@ async function fleetCanAccessRider(req: express.Request, riderId: mongoose.Types
 }
 const locationSchema = z.object({ latitude: z.number().min(-90).max(90), longitude: z.number().min(-180).max(180) });
 const orderItemSchema = z.object({ itemId: z.string().min(1), quantity: z.number().int().min(1).max(20) });
-const createOrderSchema = z.object({ restaurantId: z.string().min(1), customerId: z.string().max(160).optional(), deliveryAddress: z.string().min(5).max(280), deliveryLocation: locationSchema, items: z.array(orderItemSchema).min(1).max(50), paymentMethod: z.string().optional().default("cash") });
+const createOrderSchema = z.object({ restaurantId: z.string().min(1), deliveryAddress: z.string().min(5).max(280), deliveryLocation: locationSchema, items: z.array(orderItemSchema).min(1).max(50), paymentMethod: z.string().optional().default("cash") });
 const dispatchablePaymentFilter = { $or: [{ paymentState: "paid" }, { paymentMethod: "cash", paymentState: "pending" }] };
 const deliveryQrSecret = String(process.env.DELIVERY_QR_SECRET || "").trim();
 if (process.env.NODE_ENV === "production" && !deliveryQrSecret) throw new Error("DELIVERY_QR_SECRET is required in production");
@@ -228,12 +229,21 @@ function requestedSurface(req: express.Request): PikiSurface | null {
   const value = String(req.header("x-piki-surface") || req.query.surface || "").toLowerCase();
   return isPikiSurface(value) ? value : null;
 }
+async function currentNotificationPrincipal(req: express.Request): Promise<NotificationPrincipal | null> {
+  const surface = requestedSurface(req);
+  if (!surface) return null;
+  if (surface === "customer") {
+    const customer = await currentCustomer(req) as any;
+    return customer ? { surface, ownerType: "customer", ownerId: String(customer._id), tenantId: customer.tenantId ? String(customer.tenantId) : null } : null;
+  }
+  const auth = await resolveRole(req);
+  if (!auth?.employeeId || !employeeSurfaceRoles[surface].includes(auth.role)) return null;
+  const employee = await EmployeeAccount.findById(auth.employeeId).select("_id tenantId active").lean().exec() as any;
+  if (!employee || employee.active === false) return null;
+  return { surface, ownerType: "employee", ownerId: String(employee._id), tenantId: employee.tenantId ? String(employee.tenantId) : null };
+}
 function scheduleCustomerOrderPush(order: any, status: string) {
   void publishOrderStatusEvents(order, status).catch((error) => console.warn("Realtime order status event failed", error instanceof Error ? error.message : error));
-  if (!order?.customerId) return;
-  const titleByStatus: Record<string, string> = { accepted: "Tu pedido ha sido aceptado", preparing: "Tu pedido se está preparando", ready_for_pickup: "Tu pedido está listo", picked_up: "Tu pedido va en camino", on_the_way: "Tu pedido va en camino", delivered: "Pedido entregado", cancelled: "Pedido cancelado" };
-  const title = titleByStatus[status] || "Actualización de tu pedido";
-  void sendPushToOwner({ surface: "customer", ownerType: "customer", ownerId: String(order.customerId), payload: { title, body: "Abre PIKI para consultar el estado de tu pedido.", url: `/?order=${encodeURIComponent(String(order.publicCode || ""))}`, tag: `order-${String(order._id)}`, renotify: true } }).catch((error) => console.warn("Customer push scheduling failed", error instanceof Error ? error.message : error));
 }
 
 app.get("/api/v1/app-version", async (req, res) => {
@@ -294,11 +304,12 @@ app.post("/api/v1/push/subscriptions", rateLimit(20, 60_000, "push-subscribe"), 
     if (surface === "customer") {
       const customer = await currentCustomer(req) as any;
       if (!customer) return res.status(401).json({ error: "AUTHENTICATION_REQUIRED" });
-      return res.status(201).json(await savePushSubscription({ surface, ownerType: "customer", ownerId: String(customer._id), subscription: parsed.data.subscription }));
+      return res.status(201).json(await savePushSubscription({ surface, ownerType: "customer", ownerId: String(customer._id), tenantId: customer.tenantId ? String(customer.tenantId) : null, subscription: parsed.data.subscription }));
     }
     const auth = await resolveRole(req);
     if (!auth?.employeeId || !employeeSurfaceRoles[surface].includes(auth.role)) return res.status(403).json({ error: "FORBIDDEN" });
-    return res.status(201).json(await savePushSubscription({ surface, ownerType: "employee", ownerId: auth.employeeId, subscription: parsed.data.subscription }));
+    const employee = await EmployeeAccount.findById(auth.employeeId).select("tenantId").lean().exec() as any;
+    return res.status(201).json(await savePushSubscription({ surface, ownerType: "employee", ownerId: auth.employeeId, tenantId: employee?.tenantId ? String(employee.tenantId) : null, subscription: parsed.data.subscription }));
   } catch (error) {
     return res.status(503).json({ error: error instanceof Error && error.message === "PUSH_NOT_CONFIGURED" ? "PUSH_NOT_CONFIGURED" : "PUSH_SUBSCRIPTION_FAILED" });
   }
@@ -317,6 +328,32 @@ app.delete("/api/v1/push/subscriptions", rateLimit(20, 60_000, "push-unsubscribe
     await revokePushSubscription({ surface, ownerType: "employee", ownerId: auth.employeeId, endpoint });
   }
   return res.status(204).end();
+});
+app.get("/api/v1/notifications", rateLimit(90, 60_000, "notifications-list"), async (req, res) => {
+  const surface = requestedSurface(req);
+  if (!surface) return res.status(400).json({ error: "INVALID_SURFACE" });
+  const principal = await currentNotificationPrincipal(req);
+  if (!principal) return res.status(401).json({ error: "AUTHENTICATION_REQUIRED" });
+  const limit = Math.max(1, Math.min(50, Number.parseInt(String(req.query.limit || "20"), 10) || 20));
+  const cursor = typeof req.query.cursor === "string" ? req.query.cursor : undefined;
+  if (cursor && !objectId(cursor)) return res.status(400).json({ error: "INVALID_CURSOR" });
+  res.setHeader("Cache-Control", "no-store, max-age=0");
+  return res.json(await listNotifications(principal, { limit, cursor }));
+});
+app.patch("/api/v1/notifications/read-all", rateLimit(30, 60_000, "notifications-read"), async (req, res) => {
+  if (!requestedSurface(req)) return res.status(400).json({ error: "INVALID_SURFACE" });
+  const principal = await currentNotificationPrincipal(req);
+  if (!principal) return res.status(401).json({ error: "AUTHENTICATION_REQUIRED" });
+  return res.json({ updated: await markAllNotificationsRead(principal) });
+});
+app.patch("/api/v1/notifications/:id/read", rateLimit(60, 60_000, "notifications-read"), async (req, res) => {
+  if (!requestedSurface(req)) return res.status(400).json({ error: "INVALID_SURFACE" });
+  const principal = await currentNotificationPrincipal(req);
+  if (!principal) return res.status(401).json({ error: "AUTHENTICATION_REQUIRED" });
+  const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+  if (!objectId(id)) return res.status(400).json({ error: "INVALID_NOTIFICATION_ID" });
+  if (!await markNotificationRead(principal, id)) return res.status(404).json({ error: "NOTIFICATION_NOT_FOUND" });
+  return res.json({ updated: true });
 });
 app.get("/api/v1/realtime/events", serveRealtimeEvents);
 app.all("/api/trpc/:procedure", handleCustomerTrpc);
@@ -854,7 +891,8 @@ app.post("/api/v1/orders", async (req, res) => {
   const totalCents = subtotalCents + deliveryFeeCents + serviceFeeCents;
   const publicCode = `PIKI-${Date.now().toString(36).toUpperCase()}`;
   const dailyCode = await createDailyDisplayCode();
-  const order = await Order.create({ tenantId: restaurant.tenantId || null, publicCode, ...dailyCode, restaurantId: restaurant._id, customerId: parsed.data.customerId || null, items: normalizedItems, deliveryAddress: parsed.data.deliveryAddress, deliveryLocation: { type: "Point", coordinates: deliveryPoint }, coveragePolicySlug: coverage.policySlug, coveragePolicyVersion: coverage.policyVersion, coverageDecision: coverage.reason, straightLineDistanceKm: coverage.straightLineDistanceKm, withinMunicipality: coverage.withinMunicipality, deliveryBaseFeeCents: coverage.deliveryBaseFeeCents, outsideMunicipalitySurchargeCents: coverage.outsideMunicipalitySurchargeCents, routeDistanceKm: route.routeDistanceKm, routeDurationMinutes: route.routeDurationMinutes, routeProvider: route.routeProvider, routingDegraded: route.routingDegraded, requiredVehicleClasses: route.requiredVehicleClasses, subtotalCents, deliveryFeeCents, serviceFeeCents, totalCents, paymentMethod: parsed.data.paymentMethod, paymentState: "pending", statusHistory: [{ status: "pending", actorRole: "customer", reason: parsed.data.paymentMethod === "cash" ? "Pedido en efectivo: cobro pendiente de entrega" : "Pedido creado con política de cobertura Xàtiva" }] });
+  const authenticatedCustomer = await currentCustomer(req) as any;
+  const order = await Order.create({ tenantId: restaurant.tenantId || null, publicCode, ...dailyCode, restaurantId: restaurant._id, customerId: authenticatedCustomer?._id || null, items: normalizedItems, deliveryAddress: parsed.data.deliveryAddress, deliveryLocation: { type: "Point", coordinates: deliveryPoint }, coveragePolicySlug: coverage.policySlug, coveragePolicyVersion: coverage.policyVersion, coverageDecision: coverage.reason, straightLineDistanceKm: coverage.straightLineDistanceKm, withinMunicipality: coverage.withinMunicipality, deliveryBaseFeeCents: coverage.deliveryBaseFeeCents, outsideMunicipalitySurchargeCents: coverage.outsideMunicipalitySurchargeCents, routeDistanceKm: route.routeDistanceKm, routeDurationMinutes: route.routeDurationMinutes, routeProvider: route.routeProvider, routingDegraded: route.routingDegraded, requiredVehicleClasses: route.requiredVehicleClasses, subtotalCents, deliveryFeeCents, serviceFeeCents, totalCents, paymentMethod: parsed.data.paymentMethod, paymentState: "pending", statusHistory: [{ status: "pending", actorRole: "customer", reason: parsed.data.paymentMethod === "cash" ? "Pedido en efectivo: cobro pendiente de entrega" : "Pedido creado con política de cobertura Xàtiva" }] });
   if (parsed.data.paymentMethod === "cash") await publishPaidOrderEvents(order, { settlement: "cash_due", message: "Pedido en efectivo: cobro pendiente de entrega." });
   res.status(201).json({ order: { id: order.id, publicCode, displayCode: order.displayCode, displayCodeDate: order.displayCodeDate, status: order.status, paymentState: parsed.data.paymentMethod === "cash" ? "pending_cash_collection" : order.paymentState, paymentMethod: parsed.data.paymentMethod, cashDueAtDelivery: parsed.data.paymentMethod === "cash", deliveryQrUrl: deliveryQrUrl(publicCode), subtotalCents, deliveryFeeCents, serviceFeeCents, totalCents, coverage, route, etaMinutes: calculateEtaRange([restaurant.etaMinutes[0] || 20, restaurant.etaMinutes[1] || 35], [5, 20]) } });
 });
@@ -1106,10 +1144,13 @@ async function recordCashCollection(order: any, riderId: mongoose.Types.ObjectId
 }
 
 async function publishCashWalletEvent(input: { riderId: mongoose.Types.ObjectId; amountCents: number; type: "cash.wallet_changed" | "cash.handover_recorded"; reference?: string }) {
+  const rider = await Rider.findById(input.riderId).select("tenantId").lean().exec() as any;
+  const tenantId = rider?.tenantId ? String(rider.tenantId) : null;
   const payload = { riderId: String(input.riderId), amountCents: Number(input.amountCents || 0), reference: input.reference || null, occurredAt: new Date().toISOString() };
   await Promise.all([
-    publishRealtimeEvent({ channel: "admin", audienceKey: "role:admin", type: input.type, payload, dedupeKey: `${input.type}:admin:${payload.riderId}:${payload.reference || payload.occurredAt}` }),
-    publishRealtimeEvent({ channel: "fleet", audienceKey: "role:fleet", type: input.type, payload, dedupeKey: `${input.type}:fleet:${payload.riderId}:${payload.reference || payload.occurredAt}` }),
+    publishRealtimeEvent({ channel: "rider", audienceKey: `rider:${payload.riderId}`, tenantId, type: input.type, payload, dedupeKey: `${input.type}:rider:${payload.riderId}:${payload.reference || payload.occurredAt}` }),
+    publishRealtimeEvent({ channel: "admin", audienceKey: tenantAudienceKey(tenantId, "admin"), tenantId, type: input.type, payload, dedupeKey: `${input.type}:admin:${payload.riderId}:${payload.reference || payload.occurredAt}` }),
+    publishRealtimeEvent({ channel: "fleet", audienceKey: tenantAudienceKey(tenantId, "fleet"), tenantId, type: input.type, payload, dedupeKey: `${input.type}:fleet:${payload.riderId}:${payload.reference || payload.occurredAt}` }),
   ]);
 }
 
@@ -1857,13 +1898,13 @@ app.use((error: any, req: express.Request, res: express.Response, next: express.
 
 async function start() {
   const uri = process.env.MONGODB_URI;
-  if (uri) { await mongoose.connect(uri, { dbName: databaseName, serverSelectionTimeoutMS: 10_000 }); await EmployeeAccount.updateMany({ authorizationStatus: { $exists: false } }, { $set: { authorizationStatus: "approved", accessLevel: "subadmin" } }).exec(); await EmployeeAccount.updateOne({ email: ownerEmail }, { $set: { accessLevel: "superadmin", authorizationStatus: "approved", ownerProtected: true, active: true } }).exec(); const owner = await EmployeeAccount.findOne({ email: ownerEmail }).select("_id").lean().exec() as any; const legacyApproved = await EmployeeAccount.find({ email: { $ne: ownerEmail }, authorizationStatus: "approved", authorizedAt: null }).select("_id apiRole accessLevel createdAt").lean().exec() as any[]; for (const employee of legacyApproved) { const authorizedAt = employee.createdAt || new Date(); await EmployeeAccount.updateOne({ _id: employee._id, authorizedAt: null }, { $set: { authorizedAt, authorizedBy: owner?._id || null, authorizationReason: "Migración de autorización aprobada existente." } }).exec(); if (owner?._id && !(await AccessAuthorization.exists({ employeeId: employee._id }))) await AccessAuthorization.create({ employeeId: employee._id, action: "created", previousStatus: null, nextStatus: "approved", previousRole: null, nextRole: employee.apiRole, accessLevel: employee.accessLevel || "subadmin", actorEmployeeId: owner._id, reason: "Migración de autorización aprobada existente." }); } await ensureIndexes(); startRealtimeRelay(); if (process.env.SEED_DEMO_DATA === "true") await seedCatalog(); databaseReady = true; if (process.env.RUN_TENANT_MIGRATION === "true") { if (process.env.ALLOW_TENANT_MIGRATION !== "true") throw new Error("RUN_TENANT_MIGRATION requires ALLOW_TENANT_MIGRATION=true"); console.log(JSON.stringify({ event: "tenant_migration_started" })); console.log(JSON.stringify({ event: "tenant_migration_completed", ...(await runTenantMigration()) })); } } else console.warn("MONGODB_URI is not configured; /ready will remain unavailable.");
+  if (uri) { await mongoose.connect(uri, { dbName: databaseName, serverSelectionTimeoutMS: 10_000 }); await EmployeeAccount.updateMany({ authorizationStatus: { $exists: false } }, { $set: { authorizationStatus: "approved", accessLevel: "subadmin" } }).exec(); await EmployeeAccount.updateOne({ email: ownerEmail }, { $set: { accessLevel: "superadmin", authorizationStatus: "approved", ownerProtected: true, active: true } }).exec(); const owner = await EmployeeAccount.findOne({ email: ownerEmail }).select("_id").lean().exec() as any; const legacyApproved = await EmployeeAccount.find({ email: { $ne: ownerEmail }, authorizationStatus: "approved", authorizedAt: null }).select("_id apiRole accessLevel createdAt").lean().exec() as any[]; for (const employee of legacyApproved) { const authorizedAt = employee.createdAt || new Date(); await EmployeeAccount.updateOne({ _id: employee._id, authorizedAt: null }, { $set: { authorizedAt, authorizedBy: owner?._id || null, authorizationReason: "Migración de autorización aprobada existente." } }).exec(); if (owner?._id && !(await AccessAuthorization.exists({ employeeId: employee._id }))) await AccessAuthorization.create({ employeeId: employee._id, action: "created", previousStatus: null, nextStatus: "approved", previousRole: null, nextRole: employee.apiRole, accessLevel: employee.accessLevel || "subadmin", actorEmployeeId: owner._id, reason: "Migración de autorización aprobada existente." }); } await ensureIndexes(); startRealtimeRelay(); startNotificationWorker(); if (process.env.SEED_DEMO_DATA === "true") await seedCatalog(); databaseReady = true; if (process.env.RUN_TENANT_MIGRATION === "true") { if (process.env.ALLOW_TENANT_MIGRATION !== "true") throw new Error("RUN_TENANT_MIGRATION requires ALLOW_TENANT_MIGRATION=true"); console.log(JSON.stringify({ event: "tenant_migration_started" })); console.log(JSON.stringify({ event: "tenant_migration_completed", ...(await runTenantMigration()) })); } } else console.warn("MONGODB_URI is not configured; /ready will remain unavailable.");
   await EmployeeSession.init();
   const server = app.listen(port, "0.0.0.0", () => console.log(`PIKI API listening on port ${port}`));
   const sweepTimer = setInterval(() => { void runAutomaticDispatchSweep().catch((error) => console.error("Automatic dispatch sweep crashed", error)); }, 5_000).unref();
   void runAutomaticDispatchSweep().catch((error) => console.error("Initial automatic dispatch sweep failed", error));
   process.once("SIGTERM", () => {
-    clearInterval(sweepTimer); databaseReady = false;
+    clearInterval(sweepTimer); stopNotificationWorker(); databaseReady = false;
     server.close(() => { void mongoose.disconnect().finally(() => process.exit(0)); });
     setTimeout(() => process.exit(0), 25_000).unref();
   });
