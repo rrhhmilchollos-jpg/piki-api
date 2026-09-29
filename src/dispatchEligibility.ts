@@ -8,3 +8,15 @@ export const dispatchableOrderStatuses = [
 export function isDispatchableOrderStatus(status: string): boolean {
   return (dispatchableOrderStatuses as readonly string[]).includes(status);
 }
+
+
+export const dispatchablePaymentFilter = {
+  $or: [
+    { paymentState: "paid" },
+    { paymentMethod: "cash", paymentState: "pending" },
+  ],
+};
+
+export function isDispatchablePayment(paymentState: string, paymentMethod?: string): boolean {
+  return paymentState === "paid" || (paymentState === "pending" && paymentMethod === "cash");
+}
