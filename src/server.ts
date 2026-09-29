@@ -433,17 +433,17 @@ const onboardingRequestSchema = z.object({
   requestType: z.enum(["partner", "fleet", "rider"]),
   payload: z.record(z.string(), z.unknown()).refine((value) => Object.keys(value).length > 0, "payload_required"),
 });
-app.post("/api/v1/employee/onboarding-requests", requireRole("gerente_comercial_zona"), async (req, res) => {
+app.post("/api/v1/employee/onboarding-requests", requireRole("gerente_comercial_zona", "commercial"), async (req, res) => {
   const parsed = onboardingRequestSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_ONBOARDING_REQUEST", details: parsed.error.flatten() });
   const employee = await employeeScope(req);
-  if (!employee?.jobRole || employee.jobRole !== "gerente_comercial_zona") return res.status(403).json({ error: "ROLE_SCOPE_REQUIRED" });
+  if (!employee?.jobRole || !["gerente_comercial_zona", "commercial", "zone_manager"].includes(employee.jobRole)) return res.status(403).json({ error: "ROLE_SCOPE_REQUIRED" });
   const zoneSlugs = Array.isArray(employee.zoneSlugs) ? employee.zoneSlugs : [];
   if (!zoneSlugs.includes("valencia")) return res.status(403).json({ error: "ZONE_SCOPE_REQUIRED", requiredZone: "valencia" });
   const request = await OnboardingRequest.create({ ...tenantScope(req), requestedBy: employee._id, requestType: parsed.data.requestType, payload: parsed.data.payload, zoneSlugs, status: "pending" });
   return res.status(201).json({ request: { id: request.id, requestType: request.requestType, status: request.status, zoneSlugs: request.zoneSlugs, createdAt: request.createdAt }, message: "Solicitud enviada al superadmin para aprobación." });
 });
-app.get("/api/v1/employee/onboarding-requests", requireRole("gerente_comercial_zona"), async (req, res) => {
+app.get("/api/v1/employee/onboarding-requests", requireRole("gerente_comercial_zona", "commercial"), async (req, res) => {
   const requests = await OnboardingRequest.find({ ...tenantScope(req), requestedBy: req.auth?.employeeId }).sort({ createdAt: -1 }).limit(100).lean().exec();
   return res.json({ requests });
 });
