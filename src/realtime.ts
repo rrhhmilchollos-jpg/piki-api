@@ -107,7 +107,7 @@ function customerOrderPayload(order: any) {
   };
 }
 
-export async function publishPaidOrderEvents(order: any, settlement: { settlement?: "paid" | "cash_due"; message?: string } = {}) {
+export async function publishOrderIntakeEvents(order: any, settlement: { settlement?: "paid" | "cash_due"; message?: string } = {}) {
   const cashDue = settlement.settlement === "cash_due" || order.paymentMethod === "cash";
   const tenantId = validTenantId(order.tenantId);
   const base = {
@@ -123,8 +123,8 @@ export async function publishPaidOrderEvents(order: any, settlement: { settlemen
     createdAt: new Date(order.createdAt || Date.now()).toISOString(),
   };
   const events: Array<Promise<unknown>> = [
-    publishRealtimeEvent({ channel: "partner", audienceKey: `restaurant:${base.restaurantId}`, tenantId, type: "order.awaiting_partner_acceptance", payload: { ...base, message: cashDue ? "Nuevo pedido en efectivo: el Rider cobrará al entregar." : "Nuevo pedido pagado. PIKI avisa al Partner y busca Rider en paralelo." }, dedupeKey: `${cashDue ? "cash-due" : "paid"}:partner:${base.orderId}` }),
-    publishRealtimeEvent({ channel: "fleet", audienceKey: tenantAudienceKey(tenantId, "fleet"), tenantId, type: "order.awaiting_partner_acceptance", payload: { ...base, queue: "Pedidos por asignar", message: cashDue ? "Pedido en efectivo pendiente de cobro por Rider." : "Pedido pagado: el Rider recibe una oferta mientras el Partner empieza a prepararlo." }, dedupeKey: `${cashDue ? "cash-due" : "paid"}:fleet:${base.orderId}` }),
+    publishRealtimeEvent({ channel: "partner", audienceKey: `restaurant:${base.restaurantId}`, tenantId, type: "order.awaiting_partner_acceptance", payload: { ...base, message: cashDue ? "Nuevo pedido a contrarreembolso: no se cobra ahora; el Rider cobrará al entregar." : "Nuevo pedido pagado online. PIKI avisa al Partner y busca Rider en paralelo." }, dedupeKey: `${cashDue ? "cash-due" : "paid"}:partner:${base.orderId}` }),
+    publishRealtimeEvent({ channel: "fleet", audienceKey: tenantAudienceKey(tenantId, "fleet"), tenantId, type: "order.awaiting_partner_acceptance", payload: { ...base, queue: "Pedidos pendientes del Partner", message: cashDue ? "CONTRARREEMBOLSO · el Rider cobra al entregar." : "Pedido pagado: el Rider recibe una oferta mientras el Partner empieza a prepararlo." }, dedupeKey: `${cashDue ? "cash-due" : "paid"}:fleet:${base.orderId}` }),
     publishRealtimeEvent({ channel: "admin", audienceKey: tenantAudienceKey(tenantId, "admin"), tenantId, type: cashDue ? "order.cash_due" : "order.payment_confirmed", payload: { ...base, gmvDeltaCents: base.totalCents, activeOrdersDelta: 1, message: settlement.message }, dedupeKey: `${cashDue ? "cash-due" : "paid"}:admin:${base.orderId}` }),
   ];
   if (order.customerId && mongoose.isValidObjectId(order.customerId)) {

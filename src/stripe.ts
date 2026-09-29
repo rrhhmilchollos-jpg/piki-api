@@ -1,6 +1,6 @@
 import Stripe from "stripe";
 import { Order, StripeEvent } from "./models.js";
-import { publishPaidOrderEvents } from "./realtime.js";
+import { publishOrderIntakeEvents } from "./realtime.js";
 
 const stripeSecretKey = process.env.STRIPE_SECRET_KEY;
 export const stripe = stripeSecretKey ? new Stripe(stripeSecretKey) : null;
@@ -93,7 +93,7 @@ export async function processStripeWebhook(rawBody: Buffer, signature: string) {
         { new: true },
       ).lean().exec() as any;
       if (order) {
-        await publishPaidOrderEvents(order);
+        await publishOrderIntakeEvents(order);
         activated = true;
       }
     } else {
