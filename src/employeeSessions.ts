@@ -23,8 +23,8 @@ export function sessionRole(employee: { email: string; apiRole: string; roles?: 
   // The protected owner account may operate internal surfaces even though its
   // persisted business role remains admin. Keep the issued session scoped to
   // the requested app and apply this exception before the ordinary role list.
-  if (employee.email === OWNER_EMAIL && employee.ownerProtected && selectedRole === "admin" && ["partner", "fleet"].includes(surface)) return surface;
-  if (surface === "rider" && employee.email === OWNER_EMAIL && employee.ownerProtected && selectedRole === "admin") return "rider";
+  if (employee.email === OWNER_EMAIL && employee.ownerProtected && ["admin", "partner", "fleet"].includes(selectedRole) && ["partner", "fleet"].includes(surface)) return surface;
+  if (surface === "rider" && employee.email === OWNER_EMAIL && employee.ownerProtected && ["admin", "rider"].includes(selectedRole)) return "rider";
   if (!availableRoles.includes(selectedRole)) return null;
   const permitted: Record<string, string[]> = { rider: ["rider"], partner: ["partner"], partners: ["partner"], fleet: ["fleet", "commercial", "gerente_comercial_zona"], admin: ["admin", "partner", "rider", "fleet", "commercial", "gerente_comercial_zona"] };
   return permitted[surface] && !permitted[surface].includes(selectedRole) ? null : selectedRole;
