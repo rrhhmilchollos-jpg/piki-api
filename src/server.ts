@@ -1023,38 +1023,6 @@ app.post("/api/v1/payments/checkout", async (req, res) => {
   }
 });
 
-const testDispatchOrderSchema = z.object({ restaurantId: z.string().optional(), customerId: z.union([z.string().regex(/^[a-f\d]{24}$/i), z.literal("qa-kfc-e2e")]).optional(), count: z.coerce.number().int().min(1).max(10).default(1), deliveryAddress: z.string().min(5).max(280).default("Plaza de la Seu, 1, Xàtiva"), status: z.enum(["accepted", "preparing", "ready_for_pickup"]).default("preparing") });
-app.post("/api/v1/admin/dispatch/test-orders", requireRole("admin", "fleet"), async (req, res) => {
-  const parsed = testDispatchOrderSchema.safeParse(req.body || {});
-  if (!parsed.success) return res.status(400).json({ error: "INVALID_TEST_ORDER_REQUEST", details: parsed.error.flatten() });
-  const restaurantFilter: Record<string, unknown> = { isActive: true, onboardingStatus: "approved" };
-  if (parsed.data.restaurantId) {
-    const id = objectId(parsed.data.restaurantId);
-    if (!id) return res.status(400).json({ error: "INVALID_RESTAURANT_ID" });
-    restaurantFilter._id = id;
-  }
-  const restaurants = await Restaurant.find(restaurantFilter).limit(parsed.data.count).lean().exec() as any[];
-  if (!restaurants.length) return res.status(409).json({ error: "NO_APPROVED_RESTAURANT", message: "No hay establecimientos aprobados para generar el pedido de prueba." });
-  const created = [];
-  for (let index = 0; index < parsed.data.count; index += 1) {
-    const restaurant = restaurants[index % restaurants.length];
-    const item = (restaurant.menu || []).find((candidate: any) => candidate.available !== false) || { id: "test-item", name: "Pedido de prueba PIKI", price: 1 };
-    const dailyCode = await createDailyDisplayCode();
-    const subtotalCents = Math.round(Number(item.price || 0) * 100);
-    const deliveryFeeCents = Number(restaurant.deliveryFeeCents || 0);
-    const totalCents = subtotalCents + deliveryFeeCents + 79;
-    const qaCustomerId = parsed.data.customerId && objectId(parsed.data.customerId) ? objectId(parsed.data.customerId) : null;
-    const order = await Order.create({ publicCode: `PIKI-TEST-${Date.now().toString(36).toUpperCase()}-${index + 1}`, ...dailyCode, restaurantId: restaurant._id, customerId: qaCustomerId, customerPhone: "+34960000111", isTestOrder: true, items: [{ itemId: item.id, name: item.name, quantity: 1, unitPriceCents: subtotalCents }], deliveryAddress: parsed.data.deliveryAddress, deliveryLocation: { type: "Point", coordinates: restaurant.location?.coordinates || [-0.52, 38.99] }, subtotalCents, deliveryFeeCents, totalCents, paymentState: "paid", status: parsed.data.status, assignmentState: "unassigned", statusHistory: [{ status: parsed.data.status, actorRole: "admin", reason: "Pedido de prueba creado desde Supervisión de dispatch" }] });
-    // QA orders use the same automatic dispatcher as real orders. They are
-    // created only for E2E verification and are excluded from Fleet's real
-    // demand list below, so they cannot be mistaken for customer demand.
-    void queueAutomaticDispatch(order._id).catch((error) => console.error("QA automatic dispatch failed", error));
-    const orderId = String(order._id);
-    created.push({ id: orderId, _id: orderId, publicCode: order.publicCode, displayCode: order.displayCode, restaurantId: restaurant._id, restaurantName: restaurant.name, status: order.status, paymentState: order.paymentState, isTestOrder: true, dispatchQueued: true });
-  }
-  return res.status(201).json({ orders: created, message: `${created.length} pedido(s) de prueba creado(s) y visible(s) en Cocina, Fleet y Dispatch.` });
-});
-
 app.post("/api/v1/admin/orders/cleanup-test-data", requireOwner(), async (_req, res) => {
   const testOrders = await Order.find({ isTestOrder: true }).sort({ createdAt: -1 }).select("_id publicCode").lean().exec() as any[];
   const keep = testOrders[0] || null;
@@ -1798,23 +1766,6 @@ app.post("/api/v1/dispatch/orders/:id/offer-response", requireRole("rider", "adm
   return res.json({ assignment: { state: "rejected", orderId } });
 });
 
-app.post("/api/v1/riders/:id/test-orders", requireRole("rider"), async (req, res) => {
-  const riderId = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
-  if (!riderId) return res.status(400).json({ error: "INVALID_RIDER_SESSION" });
-  const rider = await riderAccessForRequest(riderId, req) as any;
-  if (!rider) return res.status(403).json({ error: "RIDER_ACCESS_DENIED" });
-  const existing = await Order.findOne({ riderId, isTestOrder: true, status: { $nin: ["delivered", "cancelled"] } }).select("_id publicCode").lean().exec();
-  if (existing) return res.status(409).json({ error: "TEST_ORDER_ALREADY_ACTIVE", order: existing });
-  const restaurant = await Restaurant.findOne({ isActive: true, onboardingStatus: "approved" }).sort({ promoted: -1, rating: -1 }).lean().exec() as any;
-  if (!restaurant) return res.status(409).json({ error: "NO_TEST_RESTAURANT" });
-  const display = await createDailyDisplayCode();
-  const restaurantPoint = restaurant.location?.coordinates;
-  const deliveryCoordinates = Array.isArray(restaurantPoint) && restaurantPoint.length >= 2 ? [Number(restaurantPoint[0]) + 0.003, Number(restaurantPoint[1]) + 0.002] : undefined;
-  const testOrder = await Order.create({ publicCode: `PIKI-TEST-${randomInt(100000, 999999)}`, ...display, restaurantId: restaurant._id, customerId: null, riderId, isTestOrder: true, status: "ready_for_pickup", paymentState: "paid", assignmentState: "assigned", deliveryAddress: "Dirección de cliente de prueba, Xàtiva", deliveryLocation: deliveryCoordinates ? { type: "Point", coordinates: deliveryCoordinates } : undefined, items: [{ itemId: "test-item", name: "Pedido de prueba PIKI", quantity: 1, unitPriceCents: 100 }], subtotalCents: 100, totalCents: 100, statusHistory: [{ status: "ready_for_pickup", actorRole: "rider", reason: "Pedido de prueba generado desde Riders" }] });
-  await Rider.updateOne({ _id: riderId }, { $set: { status: "busy", activeOrderId: testOrder._id } }).exec();
-  return res.status(201).json({ order: { _id: testOrder._id, publicCode: testOrder.publicCode, displayCode: testOrder.displayCode, status: testOrder.status, paymentState: testOrder.paymentState, assignmentState: testOrder.assignmentState, assignmentExpiresAt: null, items: testOrder.items, vehicle: rider.vehicle, phase: "going_to_restaurant", etaMinutes: null, restaurant: { name: restaurant.name, address: restaurant.address || "", phone: restaurant.phone || "", cuisine: restaurant.cuisine || "", etaMinutes: restaurant.etaMinutes || [] }, customerName: null, deliveryAddress: null, deliveryLocation: null }, message: "Pedido de prueba creado. No genera ningún cobro real." });
-});
-
 app.get("/api/v1/riders/:id/offers", requireRole("rider"), async (req, res) => {
   if (!databaseReady || mongoose.connection.readyState !== 1) return res.status(503).json({ error: "DATABASE_UNAVAILABLE", message: "La API está reconectando la base de datos; vuelve a intentar en unos segundos." });
   const riderId = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
@@ -2003,7 +1954,7 @@ app.use((error: any, req: express.Request, res: express.Response, next: express.
 
 async function start() {
   const uri = process.env.MONGODB_URI;
-  if (uri) { await mongoose.connect(uri, { dbName: databaseName, serverSelectionTimeoutMS: 10_000 }); await EmployeeAccount.updateMany({ authorizationStatus: { $exists: false } }, { $set: { authorizationStatus: "approved", accessLevel: "subadmin" } }).exec(); await EmployeeAccount.updateOne({ email: ownerEmail }, { $set: { accessLevel: "superadmin", authorizationStatus: "approved", ownerProtected: true, active: true } }).exec(); const owner = await EmployeeAccount.findOne({ email: ownerEmail }).select("_id").lean().exec() as any; const legacyApproved = await EmployeeAccount.find({ email: { $ne: ownerEmail }, authorizationStatus: "approved", authorizedAt: null }).select("_id apiRole accessLevel createdAt").lean().exec() as any[]; for (const employee of legacyApproved) { const authorizedAt = employee.createdAt || new Date(); await EmployeeAccount.updateOne({ _id: employee._id, authorizedAt: null }, { $set: { authorizedAt, authorizedBy: owner?._id || null, authorizationReason: "Migración de autorización aprobada existente." } }).exec(); if (owner?._id && !(await AccessAuthorization.exists({ employeeId: employee._id }))) await AccessAuthorization.create({ employeeId: employee._id, action: "created", previousStatus: null, nextStatus: "approved", previousRole: null, nextRole: employee.apiRole, accessLevel: employee.accessLevel || "subadmin", actorEmployeeId: owner._id, reason: "Migración de autorización aprobada existente." }); } await ensureIndexes(); startRealtimeRelay(); startNotificationWorker(); if (process.env.SEED_DEMO_DATA === "true") await seedCatalog(); databaseReady = true; if (process.env.RUN_TENANT_MIGRATION === "true") { if (process.env.ALLOW_TENANT_MIGRATION !== "true") throw new Error("RUN_TENANT_MIGRATION requires ALLOW_TENANT_MIGRATION=true"); console.log(JSON.stringify({ event: "tenant_migration_started" })); console.log(JSON.stringify({ event: "tenant_migration_completed", ...(await runTenantMigration()) })); } } else console.warn("MONGODB_URI is not configured; /ready will remain unavailable.");
+  if (uri) { await mongoose.connect(uri, { dbName: databaseName, serverSelectionTimeoutMS: 10_000 }); await EmployeeAccount.updateMany({ authorizationStatus: { $exists: false } }, { $set: { authorizationStatus: "approved", accessLevel: "subadmin" } }).exec(); await EmployeeAccount.updateOne({ email: ownerEmail }, { $set: { accessLevel: "superadmin", authorizationStatus: "approved", ownerProtected: true, active: true } }).exec(); const owner = await EmployeeAccount.findOne({ email: ownerEmail }).select("_id").lean().exec() as any; const legacyApproved = await EmployeeAccount.find({ email: { $ne: ownerEmail }, authorizationStatus: "approved", authorizedAt: null }).select("_id apiRole accessLevel createdAt").lean().exec() as any[]; for (const employee of legacyApproved) { const authorizedAt = employee.createdAt || new Date(); await EmployeeAccount.updateOne({ _id: employee._id, authorizedAt: null }, { $set: { authorizedAt, authorizedBy: owner?._id || null, authorizationReason: "Migración de autorización aprobada existente." } }).exec(); if (owner?._id && !(await AccessAuthorization.exists({ employeeId: employee._id }))) await AccessAuthorization.create({ employeeId: employee._id, action: "created", previousStatus: null, nextStatus: "approved", previousRole: null, nextRole: employee.apiRole, accessLevel: employee.accessLevel || "subadmin", actorEmployeeId: owner._id, reason: "Migración de autorización aprobada existente." }); } await ensureIndexes(); startRealtimeRelay(); startNotificationWorker(); if (process.env.NODE_ENV !== "production" && process.env.SEED_DEMO_DATA === "true") await seedCatalog(); databaseReady = true; if (process.env.RUN_TENANT_MIGRATION === "true") { if (process.env.ALLOW_TENANT_MIGRATION !== "true") throw new Error("RUN_TENANT_MIGRATION requires ALLOW_TENANT_MIGRATION=true"); console.log(JSON.stringify({ event: "tenant_migration_started" })); console.log(JSON.stringify({ event: "tenant_migration_completed", ...(await runTenantMigration()) })); } } else console.warn("MONGODB_URI is not configured; /ready will remain unavailable.");
   await EmployeeSession.init();
   const server = app.listen(port, "0.0.0.0", () => console.log(`PIKI API listening on port ${port}`));
   const sweepTimer = setInterval(() => { void runAutomaticDispatchSweep().catch((error) => console.error("Automatic dispatch sweep crashed", error)); }, 5_000).unref();
