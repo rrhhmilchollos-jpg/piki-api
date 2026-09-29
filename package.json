@@ -8,7 +8,7 @@
     "build": "esbuild src/server.ts --platform=node --packages=external --bundle --format=esm --outdir=dist",
     "start": "node dist/server.js",
     "check": "tsc --noEmit",
-    "test": "node --import tsx --test src/notifications.test.ts",
+    "test": "node --import tsx --test src/*.test.ts",
     "seed": "tsx src/seed.ts",
     "migrate:tenants": "tsx scripts/migrate-tenants.ts",
     "dispatch:postgis": "node scripts/run-postgis-batch.mjs"

@@ -32,7 +32,7 @@ const rolePermissions: Record<OrderStatus, readonly string[]> = {
 };
 
 export function canTransition(from: OrderStatus, to: OrderStatus, actorRole: string) {
-  if (actorRole === "rider" && to === "picked_up" && ["accepted", "preparing", "ready_for_pickup"].includes(from)) return true;
+  if (actorRole === "rider" && to === "picked_up" && ["pending", "accepted", "preparing", "ready_for_pickup"].includes(from)) return true;
   return allowedTransitions[from].includes(to) && rolePermissions[to].includes(actorRole);
 }
 
