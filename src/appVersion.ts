@@ -61,7 +61,7 @@ const releaseUrls: Record<PikiSurface, string> = {
   customer: "https://pikidelivery.com/release.json",
   partner: "https://partners.pikidelivery.com/release.json",
   fleet: "https://fleet.pikidelivery.com/release.json",
-  admin: "https://admin.pikidelivery.com/release.json",
+  admin: "https://piki-admin.onrender.com/release.json",
   rider: "https://riders.pikidelivery.com/release.json",
 };
 const lastSync = new Map<PikiSurface, number>();
