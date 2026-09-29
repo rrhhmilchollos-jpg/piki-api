@@ -199,7 +199,10 @@ async function resolveAudience(request: Request): Promise<ResolvedAudience | nul
 
 export async function serveRealtimeEvents(request: Request, response: Response) {
   const audience = await resolveAudience(request);
-  if (!audience) return response.status(401).json({ error: "AUTHENTICATION_REQUIRED" });
+  if (!audience) {
+    response.setHeader("WWW-Authenticate", "Bearer realm=\"PIKI API\"");
+    return response.status(401).json({ error: "AUTHENTICATION_REQUIRED" });
+  }
   const suppliedId = String(request.header("last-event-id") || request.query.since || "");
   const after = mongoose.isValidObjectId(suppliedId) ? new mongoose.Types.ObjectId(suppliedId) : null;
   response.status(200);

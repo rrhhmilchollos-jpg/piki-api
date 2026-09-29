@@ -36,7 +36,7 @@ function getSession(req: Request) {
   return cookie ? cookie.slice(COOKIE.length + 1) : null;
 }
 export async function currentCustomer(req: Request) { const raw = getSession(req); return raw ? CustomerAccount.findOne({ sessionHash: hashToken(raw) }).lean().exec() : null; }
-function setSession(res: Response, userId: string) { const raw = randomBytes(32).toString("base64url"); void CustomerAccount.updateOne({ _id: userId }, { $set: { sessionHash: hashToken(raw), lastSignedIn: new Date() } }).exec(); res.setHeader("Set-Cookie", `${COOKIE}=${raw}; Max-Age=31536000; Path=/; HttpOnly; Secure; SameSite=None`); }
+async function setSession(res: Response, userId: string) { const raw = randomBytes(32).toString("base64url"); await CustomerAccount.updateOne({ _id: userId }, { $set: { sessionHash: hashToken(raw), lastSignedIn: new Date() } }).exec(); res.setHeader("Set-Cookie", `${COOKIE}=${raw}; Max-Age=31536000; Path=/; HttpOnly; Secure; SameSite=None`); }
 const customerPaymentMethod = (value: unknown) => {
   const method = String(value || "cash");
   return method === "cash" ? "cash" : null;
@@ -97,12 +97,12 @@ export async function handleCustomerTrpc(req: Request, res: Response) {
       const name = String(input?.name || "").trim(); const email = String(input?.email || "").trim().toLowerCase(); const password = String(input?.password || "");
       if (name.length < 2 || !email.includes("@") || password.length < 8) return fail(res, "Datos de cuenta no válidos");
       if (await CustomerAccount.exists({ email })) return fail(res, "Ya existe una cuenta con este email", "CONFLICT");
-      const user = await CustomerAccount.create({ name, email, passwordHash: hashPassword(password) }); setSession(res, String(user._id)); return reply(res, { user: publicUser(user) });
+      const user = await CustomerAccount.create({ name, email, passwordHash: hashPassword(password) }); await setSession(res, String(user._id)); return reply(res, { user: publicUser(user) });
     }
     if (procedure === "auth.login") {
       const email = String(input?.email || "").trim().toLowerCase(); const user = await CustomerAccount.findOne({ email }).exec();
       if (!user || !checkPassword(String(input?.password || ""), user.passwordHash)) return fail(res, "Email o contraseña incorrectos", "UNAUTHORIZED");
-      setSession(res, String(user._id)); return reply(res, { user: publicUser(user) });
+      await setSession(res, String(user._id)); return reply(res, { user: publicUser(user) });
     }
     if (procedure === "auth.logout") { res.clearCookie(COOKIE); return reply(res, { success: true }); }
     if (procedure === "order.get" || procedure === "order.customerTracking") {

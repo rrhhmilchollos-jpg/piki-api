@@ -10,7 +10,8 @@
     "check": "tsc --noEmit",
     "test": "node --import tsx --test src/notifications.test.ts",
     "seed": "tsx src/seed.ts",
-    "migrate:tenants": "tsx scripts/migrate-tenants.ts"
+    "migrate:tenants": "tsx scripts/migrate-tenants.ts",
+    "dispatch:postgis": "node scripts/run-postgis-batch.mjs"
   },
   "dependencies": {
     "@simplewebauthn/server": "^13.2.2",
@@ -20,6 +21,7 @@
     "express": "^4.22.1",
     "express-async-errors": "^3.1.1",
     "mongoose": "^8.18.0",
+    "pg": "^8.23.0",
     "stripe": "^18.5.0",
     "web-push": "^3.6.7",
     "zod": "^4.2.1"
