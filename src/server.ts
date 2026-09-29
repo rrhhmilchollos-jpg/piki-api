@@ -223,7 +223,7 @@ const pushSubscriptionSchema = z.object({
   }).strict(),
 }).strict();
 const employeeSurfaceRoles: Record<Exclude<PikiSurface, "customer">, string[]> = {
-  partner: ["partner"], fleet: ["fleet", "commercial"], admin: ["admin", "partner", "rider", "fleet", "commercial", "gerente_comercial_zona"], rider: ["rider"],
+  partner: ["partner"], fleet: ["fleet", "commercial", "gerente_comercial_zona"], admin: ["admin", "partner", "rider", "fleet", "commercial", "gerente_comercial_zona"], rider: ["rider"],
 };
 function requestedSurface(req: express.Request): PikiSurface | null {
   const value = String(req.header("x-piki-surface") || req.query.surface || "").toLowerCase();
