@@ -51,14 +51,35 @@ app.use(cors(corsOptions));
 app.options("*", cors(corsOptions));
 
 const requestBuckets = new Map<string, { startedAt: number; count: number }>();
-const rateLimit = (limit: number, windowMs: number, keyPrefix: string) => (req: express.Request, res: express.Response, next: express.NextFunction) => {
+const upstashRedisUrl = String(process.env.UPSTASH_REDIS_REST_URL || "").replace(/\/$/, "");
+const upstashRedisToken = String(process.env.UPSTASH_REDIS_REST_TOKEN || "");
+let upstashWarningShown = false;
+async function incrementDistributedRateLimit(key: string, windowMs: number): Promise<number | null> {
+  if (!upstashRedisUrl || !upstashRedisToken) return null;
+  try {
+    const response = await fetch(`${upstashRedisUrl}/pipeline`, { method: "POST", headers: { Authorization: `Bearer ${upstashRedisToken}`, "Content-Type": "application/json" }, body: JSON.stringify([["INCR", key], ["PEXPIRE", key, String(windowMs), "NX"]]) });
+    if (!response.ok) throw new Error(`Upstash HTTP ${response.status}`);
+    const result = await response.json() as Array<{ result?: unknown; error?: string }>;
+    if (result[0]?.error) throw new Error(result[0].error);
+    const count = Number(result[0]?.result);
+    if (!Number.isFinite(count)) throw new Error("Invalid Upstash counter response");
+    return count;
+  } catch (error) {
+    if (!upstashWarningShown) { upstashWarningShown = true; console.warn("Distributed rate limit unavailable; using local fallback", error instanceof Error ? error.message : error); }
+    return null;
+  }
+}
+const rateLimit = (limit: number, windowMs: number, keyPrefix: string) => async (req: express.Request, res: express.Response, next: express.NextFunction) => {
+  const key = `piki:ratelimit:${keyPrefix}:${req.ip}:${req.path}`;
+  const distributedCount = await incrementDistributedRateLimit(key, windowMs);
   const now = Date.now();
-  const key = `${keyPrefix}:${req.ip}:${req.path}`;
   const current = requestBuckets.get(key);
   const bucket = !current || now - current.startedAt >= windowMs ? { startedAt: now, count: 0 } : current;
   bucket.count += 1; requestBuckets.set(key, bucket);
-  if (bucket.count > limit) return res.status(429).json({ error: "RATE_LIMITED", retryAfterSeconds: Math.ceil((windowMs - (now - bucket.startedAt)) / 1000) });
+  const count = distributedCount ?? bucket.count;
+  if (count > limit) return res.status(429).json({ error: "RATE_LIMITED", retryAfterSeconds: Math.ceil((windowMs - (now - bucket.startedAt)) / 1000) });
   res.setHeader("X-RateLimit-Limit", String(limit));
+  res.setHeader("X-RateLimit-Remaining", String(Math.max(0, limit - count)));
   return next();
 };
 setInterval(() => { const cutoff = Date.now() - 15 * 60_000; for (const [key, bucket] of requestBuckets) if (bucket.startedAt < cutoff) requestBuckets.delete(key); }, 15 * 60_000).unref();
@@ -120,6 +141,9 @@ if (process.env.NODE_ENV === "production" && !deliveryQrSecret) throw new Error(
 const deliveryQrSignature = (orderCode: string) => createHmac("sha256", deliveryQrSecret || "development-only-delivery-qr-secret").update(`delivery:${orderCode}`).digest("hex").slice(0, 24);
 const deliveryPin = (orderCode: string) => deliveryQrSignature(orderCode).slice(-6).toUpperCase();
 const deliveryQrUrl = (orderCode: string) => `${(process.env.CUSTOMER_APP_URL || "https://pikidelivery.com").replace(/\/$/, "")}/?order_id=${encodeURIComponent(orderCode)}&delivery_token=${deliveryQrSignature(orderCode)}`;
+const checkoutTokenSecret = String(process.env.CHECKOUT_TOKEN_SECRET || deliveryQrSecret).trim();
+const checkoutToken = (orderCode: string) => createHmac("sha256", checkoutTokenSecret || "development-only-checkout-secret").update(`checkout:${orderCode}`).digest("base64url");
+const checkoutTokenIsValid = (orderCode: string, raw: unknown) => typeof raw === "string" && raw.length >= 20 && raw === checkoutToken(orderCode);
 const deliveryQrIsValid = (orderCode: string, raw: unknown) => {
   if (String(raw || "").trim().toUpperCase() === deliveryPin(orderCode)) return true;
   try { const url = new URL(String(raw)); return url.searchParams.get("order_id") === orderCode && url.searchParams.get("delivery_token") === deliveryQrSignature(orderCode); } catch { return false; }
@@ -219,12 +243,12 @@ app.get("/", (_req, res) => {
   res.setHeader("Content-Security-Policy", "default-src 'self'; style-src 'unsafe-inline'; img-src 'self'; frame-ancestors 'none'; base-uri 'self'");
   res.type("html").send(`<!doctype html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="application-name" content="Pikidelivery.com"><link rel="icon" type="image/webp" href="/favicon.webp"><title>PIKI Delivery API</title><style>html,body{margin:0;min-height:100%;background:#ffd72e;font-family:Arial,sans-serif;color:#172238}body{display:grid;place-items:center;min-height:100dvh;overflow:hidden}.splash{text-align:center}.splash img{display:block;width:min(92vw,930px);height:min(74dvh,620px);object-fit:contain}.splash strong{display:block;font-size:clamp(18px,3vw,28px);letter-spacing:.12em;text-transform:uppercase}.api{display:none;margin-top:1rem;font-size:14px}.api a{color:#172238;font-weight:700}</style></head><body><main class="splash" role="status" aria-label="PIKI Delivery API"><img src="/piki-splash.webp" alt="PIKI Delivery"><strong>Pikidelivery.com</strong><p class="api">API activa · <a href="/health">comprobar estado</a></p></main><script>window.setTimeout(()=>{document.querySelector('.api').style.display='block'},5000)</script></body></html>`);
 });
-app.get("/health", (_req, res) => res.json({ service: "piki-api", status: "ok", version: "0.2.0", environment: process.env.NODE_ENV || "development" }));
+app.get("/health", (_req, res) => res.json({ service: "piki-api", status: "ok" }));
 app.get("/ready", (_req, res) => {
-  if (!databaseReady || mongoose.connection.readyState !== 1) return res.status(503).json({ service: "piki-api", status: "not_ready", database: "unavailable" });
-  return res.json({ service: "piki-api", status: "ready", database: "connected" });
+  if (!databaseReady || mongoose.connection.readyState !== 1) return res.status(503).json({ service: "piki-api", status: "not_ready" });
+  return res.json({ service: "piki-api", status: "ready" });
 });
-app.get("/api/v1", (_req, res) => res.json({ name: "PIKI API", version: "v1", status: databaseReady ? "ready" : "initializing" }));
+app.get("/api/v1", (_req, res) => res.json({ name: "PIKI API", status: databaseReady ? "ready" : "initializing" }));
 const releasePolicyToken = process.env.PIKI_RELEASE_POLICY_TOKEN || "";
 const pushSubscriptionSchema = z.object({
   subscription: z.object({
@@ -369,7 +393,7 @@ app.patch("/api/v1/notifications/:id/read", rateLimit(60, 60_000, "notifications
 app.get("/api/v1/realtime/events", serveRealtimeEvents);
 app.all("/api/trpc/:procedure", handleCustomerTrpc);
 
-app.get("/api/v1/auth/status", (_req, res) => res.json({ authentication: "bearer", configured_roles: configuredAuthRoles() }));
+app.get("/api/v1/auth/status", (_req, res) => res.json({ authentication: "bearer" }));
 const employeeLoginSchema = z.object({ email: z.string().email(), password: z.string().min(8).max(200) });
 app.post("/api/v1/auth/employee/login", async (req, res) => {
   const parsed = employeeLoginSchema.safeParse(req.body); if (!parsed.success) return res.status(400).json({ error: "INVALID_LOGIN" });
@@ -559,8 +583,8 @@ app.post("/api/v1/admin/owner/bootstrap", requireOwner(), async (req, res) => {
   const owner = await EmployeeAccount.findOneAndUpdate({ email: parsed.data.email }, { $set: { name: parsed.data.name, jobRole: "admin", apiRole: "admin", accessLevel: "superadmin", authorizationStatus: "approved", authorizedAt: new Date(), passwordHash: hashPassword(parsed.data.password), active: true, ownerProtected: true, hiddenFromAdmin: true, mustChangePassword: false, passwordChangedAt: new Date() }, $setOnInsert: { portfolioId: "owner_piki_ceo" } }, { upsert: true, new: true, setDefaultsOnInsert: true }).select("_id email name jobRole apiRole ownerProtected hiddenFromAdmin").lean().exec() as any;
   return res.json({ owner: { id: owner?._id, email: owner?.email, name: owner?.name, role: owner?.jobRole }, protected: true, hiddenFromAdmin: true });
 });
-app.get("/api/v1/payments/status", (_req, res) => res.json({ provider: "stripe", secretKeyConfigured: Boolean(process.env.STRIPE_SECRET_KEY), webhookConfigured: stripeConfigured(), mode: process.env.STRIPE_SECRET_KEY?.startsWith("sk_live_") ? "live" : "test_or_unknown" }));
-app.get("/api/v1/signatures/status", (_req, res) => res.json({ provider: "signaturit", configured: signaturitConfigured(), mode: signaturitMode(), apiBaseUrl: signaturitBaseUrl(), eventsUrlConfigured: Boolean(process.env.SIGNATURIT_EVENTS_URL), webhookProtected: Boolean(process.env.SIGNATURIT_WEBHOOK_TOKEN) }));
+app.get("/api/v1/payments/status", (_req, res) => res.json({ provider: "stripe" }));
+app.get("/api/v1/signatures/status", (_req, res) => res.json({ provider: "signaturit" }));
 app.post("/api/v1/admin/signatures", requireRole("admin"), async (req, res) => {
   const parsed = z.object({ entityType: z.enum(["partner", "rider", "employee"]), entityId: z.string().regex(/^[a-f\d]{24}$/), signerName: z.string().min(2).max(160), signerEmail: z.string().email(), subject: z.string().min(2).max(200), documentName: z.string().min(1).max(180), documentBase64: z.string().min(20).max(8_000_000) }).safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_SIGNATURE_REQUEST", details: parsed.error.flatten() });
@@ -982,7 +1006,7 @@ app.post("/api/v1/internal/customer-orders/sync", async (req, res) => {
       : { settlement: "paid" as const, message: "Pago confirmado desde PIKI Customer." };
     await Promise.all([dispatch, publishOrderIntakeEvents(order, settlement)]);
   }
-  return res.status(existing ? 200 : 201).json({ order: { id: order._id, publicCode: order.publicCode, status: order.status, paymentState: order.paymentState, assignmentState: order.assignmentState } });
+  return res.status(existing ? 200 : 201).json({ order: { id: order._id, publicCode: order.publicCode, checkoutToken: checkoutToken(order.publicCode), status: order.status, paymentState: order.paymentState, assignmentState: order.assignmentState } });
 });
 
 function requireCustomerSyncSecret(req: express.Request, res: express.Response) {
@@ -1039,13 +1063,14 @@ app.post("/api/v1/internal/customer-orders/:publicCode/messages", async (req, re
   return res.json({ messages: messages.map((message: any) => ({ id: String(message._id), senderRole: message.senderRole, body: message.body, createdAt: message.createdAt })) });
 });
 
-const checkoutSchema = z.object({ orderId: z.string().min(1), origin: z.string().url().refine((value) => isAllowedCorsOrigin(value), "INVALID_CHECKOUT_ORIGIN"), customerEmail: z.string().email().optional() });
+const checkoutSchema = z.object({ orderId: z.string().min(1), checkoutToken: z.string().min(20).max(200), origin: z.string().url().refine((value) => isAllowedCorsOrigin(value), "INVALID_CHECKOUT_ORIGIN"), customerEmail: z.string().email().optional() });
 app.post("/api/v1/payments/checkout", rateLimit(20, 60_000, "payments-checkout"), async (req, res) => {
   const parsed = checkoutSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_CHECKOUT_REQUEST", details: parsed.error.flatten() });
   const id = objectId(parsed.data.orderId);
   const order = (id ? await Order.findById(id).lean().exec() : await Order.findOne({ publicCode: parsed.data.orderId }).lean().exec()) as any;
   if (!order) return res.status(404).json({ error: "ORDER_NOT_FOUND" });
+  if (!checkoutTokenIsValid(order.publicCode, parsed.data.checkoutToken)) return res.status(403).json({ error: "INVALID_CHECKOUT_TOKEN" });
   if (order.paymentMethod !== "stripe") return res.status(409).json({ error: "ORDER_USES_CASH", message: "Este pedido está configurado para pago en efectivo." });
   if (order.paymentState === "paid") return res.status(409).json({ error: "ORDER_ALREADY_PAID" });
   try {
