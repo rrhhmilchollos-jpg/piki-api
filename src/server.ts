@@ -101,7 +101,11 @@ const rateLimit = (limit: number, windowMs: number, keyPrefix: string) => async 
   const bucket = !current || now - current.startedAt >= windowMs ? { startedAt: now, count: 0 } : current;
   bucket.count += 1; requestBuckets.set(key, bucket);
   const count = sharedCount ?? bucket.count;
-  if (count > limit) return res.status(429).json({ error: "RATE_LIMITED", retryAfterSeconds: Math.ceil((windowMs - (now - bucket.startedAt)) / 1000) });
+  if (count > limit) {
+    const retryAfterSeconds = Math.ceil((windowMs - (now - bucket.startedAt)) / 1000);
+    console.warn(`[RATE_LIMITED] ${JSON.stringify({ event: "rate_limit_exceeded", keyPrefix, method: req.method, path: req.path, surface: surfaceKey, limit, retryAfterSeconds, requestId: req.header("x-request-id") || null })}`);
+    return res.status(429).json({ error: "RATE_LIMITED", retryAfterSeconds });
+  }
   res.setHeader("X-RateLimit-Limit", String(limit));
   res.setHeader("X-RateLimit-Remaining", String(Math.max(0, limit - count)));
   return next();
