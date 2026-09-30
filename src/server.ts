@@ -394,7 +394,7 @@ app.post("/api/v1/auth/employee/login", async (req, res) => {
   if (!issued) return res.status(403).json({ error: "SURFACE_ROLE_MISMATCH" });
   return res.json({ accessToken: issued.token, requiresPasswordChange: Boolean(employee.mustChangePassword), employee: { id: employee.id, name: employee.name, email: employee.email, jobRole: role === "rider" ? "rider" : employee.jobRole, roles: employee.roles?.length ? employee.roles : [employee.apiRole], primaryRole: employee.primaryRole || employee.apiRole, apiRole: issued.role, accessLevel: employee.accessLevel || (employee.email === ownerEmail ? "superadmin" : "subadmin"), authorizationStatus: employee.authorizationStatus || "approved", portfolioId: employee.portfolioId, fleetId: employee.fleetId, zoneSlugs: employee.zoneSlugs } });
 });
-app.post("/api/v1/auth/employee/switch-role", requireRole("admin", "partner", "rider", "fleet", "commercial", "gerente_comercial_zona"), async (req, res) => {
+app.post("/api/v1/auth/employee/switch-role", requireRole("admin", "partner", "rider", "fleet", "commercial", "gerente_comercial_zona", "finance", "support"), async (req, res) => {
   const requestedRole = typeof req.body?.role === "string" ? req.body.role : "";
   const employee = req.auth?.employeeId ? await EmployeeAccount.findById(req.auth.employeeId).select("email apiRole roles primaryRole ownerProtected authorizationStatus").lean().exec() as any : null;
   if (!employee || !requestedRole) return res.status(400).json({ error: "INVALID_ROLE" });
@@ -405,16 +405,16 @@ app.post("/api/v1/auth/employee/switch-role", requireRole("admin", "partner", "r
   if (oldToken) await EmployeeSession.deleteOne({ tokenHash: hashSessionToken(oldToken) }).exec();
   return res.json({ accessToken: issued.token, role: issued.role, roles: employee.roles?.length ? employee.roles : [employee.apiRole] });
 });
-app.post("/api/v1/auth/employee/logout", requireRole("admin", "partner", "rider", "fleet", "commercial", "gerente_comercial_zona"), async (req, res) => {
+app.post("/api/v1/auth/employee/logout", requireRole("admin", "partner", "rider", "fleet", "commercial", "gerente_comercial_zona", "finance", "support"), async (req, res) => {
   const token = String(req.headers.authorization || "").replace(/^Bearer /i, "").trim();
   if (token) await EmployeeSession.deleteOne({ tokenHash: hashSessionToken(token) }).exec();
   return res.status(204).end();
 });
-app.get("/api/v1/auth/employee/me", requireRole("admin", "partner", "rider", "fleet", "commercial", "gerente_comercial_zona"), async (req, res) => {
+app.get("/api/v1/auth/employee/me", requireRole("admin", "partner", "rider", "fleet", "commercial", "gerente_comercial_zona", "finance", "support"), async (req, res) => {
   const employee = req.auth?.employeeId ? await EmployeeAccount.findById(req.auth.employeeId).select("email ownerProtected accessLevel authorizationStatus jobRole apiRole roles primaryRole zoneSlugs").lean().exec() as any : null;
   return res.json({ employee: { id: req.auth?.employeeId, email: employee?.email || null, role: req.auth?.role, accessLevel: employee?.accessLevel || "subadmin", authorizationStatus: employee?.authorizationStatus || "approved", ownerProtected: Boolean(employee?.ownerProtected), jobRole: employee?.jobRole || null, apiRole: employee?.apiRole || req.auth?.role || null, roles: employee?.roles?.length ? employee.roles : [employee?.apiRole || req.auth?.role], primaryRole: employee?.primaryRole || employee?.apiRole || req.auth?.role, zoneSlugs: employee?.zoneSlugs || [], mustChangePassword: Boolean(req.auth?.mustChangePassword) } });
 });
-app.post("/api/v1/auth/employee/change-password", requireRole("admin", "partner", "rider", "fleet", "commercial", "gerente_comercial_zona"), async (req, res) => {
+app.post("/api/v1/auth/employee/change-password", requireRole("admin", "partner", "rider", "fleet", "commercial", "gerente_comercial_zona", "finance", "support"), async (req, res) => {
   const parsed = z.object({ currentPassword: z.string().min(8), newPassword: z.string().min(12).max(200).regex(/[A-Z]/).regex(/[a-z]/).regex(/[0-9]/) }).safeParse(req.body);
   if (!parsed.success || !req.auth?.employeeId) return res.status(400).json({ error: "INVALID_PASSWORD_CHANGE", message: "La contraseña debe tener 12 caracteres, mayúscula, minúscula y número." });
   const employee = await EmployeeAccount.findById(req.auth.employeeId).select("+passwordHash").exec() as any;
@@ -426,7 +426,7 @@ app.post("/api/v1/auth/employee/change-password", requireRole("admin", "partner"
   await EmployeeSession.updateOne({ tokenHash }, { $set: { issuedAt: employee.passwordChangedAt } }).exec();
   return res.json({ changed: true });
 });
-const employeeCreateSchema = z.object({ name: z.string().min(2).max(160), email: z.string().email(), jobRole: z.enum(["admin", "partner", "rider", "fleet", "zone_manager", "commercial", "gerente_comercial_zona"]), roles: z.array(z.enum(["admin", "partner", "rider", "fleet", "commercial", "gerente_comercial_zona"])).min(1).max(6).optional(), primaryRole: z.enum(["admin", "partner", "rider", "fleet", "commercial", "gerente_comercial_zona"]).optional(), apiRole: z.enum(["admin", "partner", "rider", "fleet", "commercial", "gerente_comercial_zona"]).optional(), restaurantId: z.string().regex(/^[a-f\d]{24}$/).nullable().optional(), fleetId: z.string().regex(/^[a-f\d]{24}$/).nullable().optional(), zoneSlugs: z.array(z.string().regex(/^[a-z0-9-]+$/)).max(100).default([]) });
+const employeeCreateSchema = z.object({ name: z.string().min(2).max(160), email: z.string().email(), jobRole: z.enum(["admin", "partner", "rider", "fleet", "zone_manager", "commercial", "gerente_comercial_zona", "finance", "support"]), roles: z.array(z.enum(["admin", "partner", "rider", "fleet", "commercial", "gerente_comercial_zona", "finance", "support"])).min(1).max(8).optional(), primaryRole: z.enum(["admin", "partner", "rider", "fleet", "commercial", "gerente_comercial_zona", "finance", "support"]).optional(), apiRole: z.enum(["admin", "partner", "rider", "fleet", "commercial", "gerente_comercial_zona", "finance", "support"]).optional(), restaurantId: z.string().regex(/^[a-f\d]{24}$/).nullable().optional(), fleetId: z.string().regex(/^[a-f\d]{24}$/).nullable().optional(), zoneSlugs: z.array(z.string().regex(/^[a-z0-9-]+$/)).max(100).default([]) });
 app.post("/api/v1/admin/employees", requireOwner(), async (req, res) => {
   const parsed = employeeCreateSchema.safeParse(req.body); if (!parsed.success) return res.status(400).json({ error: "INVALID_EMPLOYEE", details: parsed.error.flatten() });
   const apiRole = parsed.data.apiRole || (parsed.data.jobRole === "gerente_comercial_zona" ? "gerente_comercial_zona" : parsed.data.jobRole === "commercial" ? "commercial" : parsed.data.jobRole === "zone_manager" ? "fleet" : parsed.data.jobRole);
@@ -499,7 +499,7 @@ app.post("/api/v1/admin/tenants/:id/memberships", requireOwner(), async (req, re
   await EmployeeAccount.updateOne({ _id: employeeId }, { $set: { tenantId } }).exec();
   return res.status(201).json({ membership });
 });
-app.get("/api/v1/admin/employees", requireRole("admin"), async (_req, res) => res.json({ employees: await EmployeeAccount.find({ email: { $ne: ownerEmail }, hiddenFromAdmin: { $ne: true } }).select("name email jobRole apiRole accessLevel authorizationStatus authorizedAt authorizedBy authorizationReason portfolioId fleetId zoneSlugs active mustChangePassword lastLoginAt createdAt").sort({ createdAt: -1 }).lean().exec() }));
+app.get("/api/v1/admin/employees", requireRole("admin"), async (_req, res) => res.json({ employees: await EmployeeAccount.find({ email: { $ne: ownerEmail }, hiddenFromAdmin: { $ne: true } }).select("name email jobRole apiRole roles primaryRole accessLevel authorizationStatus authorizedAt authorizedBy authorizationReason portfolioId fleetId zoneSlugs active mustChangePassword lastLoginAt createdAt").sort({ createdAt: -1 }).lean().exec() }));
 app.get("/api/v1/admin/authorization-audit", requireOwner(), async (req, res) => {
   const email = typeof req.query.email === "string" ? req.query.email.toLowerCase() : undefined;
   const employee = email ? await EmployeeAccount.findOne({ email }).select("_id name email jobRole apiRole accessLevel authorizationStatus authorizedAt authorizedBy authorizationReason active").lean().exec() as any : null;
@@ -1069,7 +1069,7 @@ async function enrichSupportTickets(tickets: any[]) {
   const orderMap = new Map(orders.map((order) => [String(order._id), { ...order, customer: order.customerId ? customerMap.get(String(order.customerId)) || null : null, customerPhone: order.customerPhone || null }]));
   return tickets.map((ticket) => { const orderId = ticket.orderId?._id || ticket.orderId; const order = orderMap.get(String(orderId)); return order ? { ...ticket, orderId: order } : ticket; });
 }
-const supportRoles = ["admin", "partner", "rider", "fleet", "commercial", "gerente_comercial_zona"] as const;
+const supportRoles = ["admin", "partner", "rider", "fleet", "commercial", "gerente_comercial_zona", "support"] as const;
 app.post("/api/v1/support/tickets", requireRole(...supportRoles), async (req, res) => {
   const parsed = supportTicketInput.safeParse(req.body); if (!parsed.success) return res.status(400).json({ error: "INVALID_SUPPORT_TICKET", details: parsed.error.flatten() });
   const order = parsed.data.orderRef ? await Order.findOne({ ...tenantScope(req), ...supportOrderFilter(parsed.data.orderRef) }).select("_id").lean().exec() as any : null;
@@ -1083,20 +1083,20 @@ app.get("/api/v1/support/tickets/mine", requireRole(...supportRoles), async (req
   const tickets = await SupportTicket.find({ ...tenantScope(req), $or: [{ createdBy: objectId(String(req.auth?.employeeId || "")) }, { reporterEmail: String(req.query.email || "").toLowerCase() }] }).sort({ updatedAt: -1 }).limit(100).lean().exec();
   return res.json({ tickets });
 });
-app.get("/api/v1/admin/support/orders/search", requireRole("admin"), async (req, res) => {
+app.get("/api/v1/admin/support/orders/search", requireRole("admin", "support"), async (req, res) => {
   const q = typeof req.query.q === "string" ? req.query.q.trim() : "";
   if (q.length < 2) return res.json({ orders: [] });
   const orders = await Order.find({ ...tenantScope(req), ...supportOrderFilter(q) }).sort({ createdAt: -1 }).limit(25).select("_id publicCode displayCode status paymentState paymentMethod riderId restaurantId customerId totalCents createdAt statusHistory").populate("riderId", "name riderCode email").populate("restaurantId", "name").lean().exec();
   return res.json({ orders });
 });
-app.get("/api/v1/admin/support/tickets", requireRole("admin"), async (req, res) => {
+app.get("/api/v1/admin/support/tickets", requireRole("admin", "support"), async (req, res) => {
   const filter: Record<string, unknown> = { ...tenantScope(req) };
   if (typeof req.query.status === "string" && req.query.status !== "all") filter.status = req.query.status;
   if (typeof req.query.q === "string" && req.query.q.trim()) { const q = req.query.q.trim(); filter.$or = [{ ticketNumber: q }, { reporterEmail: { $regex: q, $options: "i" } }, { subject: { $regex: q, $options: "i" } }]; }
   const tickets = await SupportTicket.find(filter).sort({ updatedAt: -1 }).limit(100).populate("assignedTo", "name email").lean().exec();
   return res.json({ tickets: await enrichSupportTickets(tickets) });
 });
-app.post("/api/v1/admin/support/tickets", requireRole("admin"), async (req, res) => {
+app.post("/api/v1/admin/support/tickets", requireRole("admin", "support"), async (req, res) => {
   const parsed = supportTicketInput.safeParse(req.body); if (!parsed.success) return res.status(400).json({ error: "INVALID_SUPPORT_TICKET", details: parsed.error.flatten() });
   const order = parsed.data.orderRef ? await Order.findOne({ ...tenantScope(req), ...supportOrderFilter(parsed.data.orderRef) }).select("_id").lean().exec() as any : null;
   if (parsed.data.orderRef && !order) return res.status(404).json({ error: "ORDER_NOT_FOUND" });
@@ -1112,7 +1112,7 @@ async function riderForSupportTicket(ticket: any) {
   const rider = ticket.reporterEmail ? await Rider.findOne({ email: ticket.reporterEmail }).select("_id").lean().exec() as any : null;
   return rider ? String(rider._id) : null;
 }
-app.post("/api/v1/admin/support/tickets/:id/messages", requireRole("admin"), async (req, res) => {
+app.post("/api/v1/admin/support/tickets/:id/messages", requireRole("admin", "support"), async (req, res) => {
   const parsed = supportMessageInput.safeParse(req.body); if (!parsed.success) return res.status(400).json({ error: "INVALID_SUPPORT_MESSAGE" });
   const id = objectId(String(req.params.id)); if (!id) return res.status(400).json({ error: "INVALID_TICKET_ID" });
   const agent = await supportAgent(req); if (!agent) return res.status(403).json({ error: "SUPPORT_AGENT_NOT_FOUND" });
@@ -1126,7 +1126,7 @@ app.post("/api/v1/admin/support/tickets/:id/messages", requireRole("admin"), asy
   if (riderId) void publishRealtimeEvent({ channel: "rider", audienceKey: `rider:${riderId}`, tenantId: current.tenantId, type: "support.message", payload: { ticketId: String(id), status: ticket?.status, senderRole: "support" } });
   return res.json({ ticket });
 });
-app.patch("/api/v1/admin/support/tickets/:id/status", requireRole("admin"), async (req, res) => {
+app.patch("/api/v1/admin/support/tickets/:id/status", requireRole("admin", "support"), async (req, res) => {
   const parsed = supportStatusInput.safeParse(req.body); if (!parsed.success) return res.status(400).json({ error: "INVALID_SUPPORT_STATUS" });
   const id = objectId(String(req.params.id)); if (!id) return res.status(400).json({ error: "INVALID_TICKET_ID" });
   const actorEmployeeId = objectId(String(req.auth?.employeeId || ""));
@@ -1138,7 +1138,7 @@ app.patch("/api/v1/admin/support/tickets/:id/status", requireRole("admin"), asyn
   if (!ticket) return res.status(404).json({ error: "TICKET_NOT_FOUND" });
   return res.json({ ticket });
 });
-app.post("/api/v1/admin/support/orders/:id/cancel", requireRole("admin"), async (req, res) => {
+app.post("/api/v1/admin/support/orders/:id/cancel", requireRole("admin", "support"), async (req, res) => {
   const parsed = supportCancelInput.safeParse(req.body); if (!parsed.success) return res.status(400).json({ error: "INVALID_SUPPORT_CANCELLATION", details: parsed.error.flatten() });
   const orderId = objectId(String(req.params.id)); if (!orderId) return res.status(400).json({ error: "INVALID_ORDER_ID" });
   const order = await Order.findOne({ _id: orderId, ...tenantScope(req) }).lean().exec() as any;
@@ -1230,7 +1230,7 @@ app.get("/api/v1/orders/:id", requireRole("admin", "partner", "rider", "fleet"),
   return res.json({ order });
 });
 
-async function recordCashCollection(order: any, riderId: mongoose.Types.ObjectId, actorRole: "rider" | "admin" | "fleet") {
+async function recordCashCollection(order: any, riderId: mongoose.Types.ObjectId, actorRole: "rider" | "admin" | "fleet" | "finance") {
   if (order.paymentMethod !== "cash") return null;
   const idempotencyKey = `cash-collection:${String(order._id)}`;
   const entry = await CashLedgerEntry.findOneAndUpdate(
@@ -1260,7 +1260,7 @@ async function cashWallet(riderId: mongoose.Types.ObjectId) {
 }
 
 const cashHandoverSchema = z.object({ riderId: z.string().regex(/^[a-f\d]{24}$/i), amountCents: z.number().int().positive().max(1_000_000), reference: z.string().trim().min(3).max(120), note: z.string().trim().max(500).default("") });
-async function recordCashHandover(input: z.infer<typeof cashHandoverSchema>, actorRole: "admin" | "fleet") {
+async function recordCashHandover(input: z.infer<typeof cashHandoverSchema>, actorRole: "admin" | "fleet" | "finance") {
   const riderId = objectId(input.riderId);
   if (!riderId) throw new Error("INVALID_RIDER_ID");
   const wallet = await cashWallet(riderId);
@@ -1411,14 +1411,14 @@ app.get("/api/v1/riders/:id/cash-wallet", requireRole("admin", "rider", "fleet")
   return res.json({ wallet, entries });
 });
 
-app.post("/api/v1/ops/cash-handovers", requireRole("admin", "fleet"), async (req, res) => {
+app.post("/api/v1/ops/cash-handovers", requireRole("admin", "fleet", "finance"), async (req, res) => {
   const parsed = cashHandoverSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_CASH_HANDOVER", details: parsed.error.flatten() });
   const handoverRiderId = objectId(parsed.data.riderId);
   if (!handoverRiderId) return res.status(400).json({ error: "INVALID_RIDER_ID" });
   if (req.auth?.role === "fleet" && !(await fleetCanAccessRider(req, handoverRiderId))) return res.status(403).json({ error: "FLEET_RIDER_ACCESS_DENIED" });
   try {
-    const result = await recordCashHandover(parsed.data, req.auth?.role === "fleet" ? "fleet" : "admin");
+    const result = await recordCashHandover(parsed.data, req.auth?.role === "finance" ? "finance" : req.auth?.role === "fleet" ? "fleet" : "admin");
     await publishCashWalletEvent({ riderId: objectId(parsed.data.riderId)!, amountCents: parsed.data.amountCents, type: "cash.handover_recorded", reference: parsed.data.reference });
     return res.status(201).json(result);
   } catch (error) {
@@ -1428,7 +1428,7 @@ app.post("/api/v1/ops/cash-handovers", requireRole("admin", "fleet"), async (req
   }
 });
 
-app.get("/api/v1/ops/cash-wallets", requireRole("admin", "fleet"), async (_req, res) => {
+app.get("/api/v1/ops/cash-wallets", requireRole("admin", "fleet", "finance"), async (_req, res) => {
   const rows = await CashLedgerEntry.aggregate([{ $group: { _id: "$riderId", collectedCents: { $sum: { $cond: [{ $eq: ["$direction", "in"] }, "$amountCents", 0] } }, handedOverCents: { $sum: { $cond: [{ $eq: ["$direction", "out"] }, "$amountCents", 0] } }, entries: { $sum: 1 } } }]);
   const riderIds = rows.map((row: any) => row._id).filter(Boolean); const riders = await Rider.find({ _id: { $in: riderIds }, ...(await fleetRiderFilter(_req)) }).select("name email fleetId").lean().exec(); const names = new Map(riders.map((rider: any) => [String(rider._id), rider]));
   return res.json({ wallets: rows.map((row: any) => ({ riderId: String(row._id), rider: names.get(String(row._id)) || null, collectedCents: Number(row.collectedCents || 0), handedOverCents: Number(row.handedOverCents || 0), availableCents: Number(row.collectedCents || 0) - Number(row.handedOverCents || 0), entries: Number(row.entries || 0) })) });
@@ -1935,6 +1935,18 @@ app.get("/api/v1/fleets/pending-partner-orders", requireRole("admin", "fleet", "
   const names = new Map(restaurants.map((restaurant) => [String(restaurant._id), restaurant.name]));
   return res.json({ orders: orders.map((order) => ({ id: String(order._id), publicCode: order.publicCode, restaurant: names.get(String(order.restaurantId)) || "Restaurante", totalCents: order.totalCents, createdAt: order.createdAt, status: order.status, paymentState: order.paymentState, paymentMethod: order.paymentMethod || "stripe", cashDueAtDelivery: order.paymentMethod === "cash", assignmentState: order.assignmentState })) });
 });
+app.get("/api/v1/finance/overview", requireRole("admin", "finance"), async (_req, res) => {
+  const startOfDay = new Date(); startOfDay.setHours(0, 0, 0, 0);
+  const [gmv, cashIn, cashOut, pendingCash] = await Promise.all([
+    Order.aggregate([{ $match: { paymentState: "paid", createdAt: { $gte: startOfDay } } }, { $group: { _id: null, totalCents: { $sum: "$totalCents" }, orders: { $sum: 1 } } }]),
+    CashLedgerEntry.aggregate([{ $match: { direction: "in", createdAt: { $gte: startOfDay } } }, { $group: { _id: null, totalCents: { $sum: "$amountCents" } } }]),
+    CashLedgerEntry.aggregate([{ $match: { direction: "out", createdAt: { $gte: startOfDay } } }, { $group: { _id: null, totalCents: { $sum: "$amountCents" } } }]),
+    CashLedgerEntry.aggregate([{ $group: { _id: { riderId: "$riderId", direction: "$direction" }, totalCents: { $sum: "$amountCents" } } }]),
+  ]);
+  const balances = new Map<string, number>(); for (const row of pendingCash as any[]) { const key = String(row._id.riderId); balances.set(key, (balances.get(key) || 0) + (row._id.direction === "in" ? row.totalCents : -row.totalCents)); }
+  return res.json({ service: "piki-api", overview: { gmv_today_cents: Number(gmv[0]?.totalCents || 0), paid_orders_today: Number(gmv[0]?.orders || 0), cash_collected_today_cents: Number(cashIn[0]?.totalCents || 0), cash_handed_over_today_cents: Number(cashOut[0]?.totalCents || 0), cash_pending_cents: Array.from(balances.values()).reduce((sum, value) => sum + Math.max(0, value), 0) } });
+});
+
 app.get("/api/v1/admin/overview", requireRole("admin"), async (_req, res) => {
   const startOfDay = new Date(); startOfDay.setHours(0, 0, 0, 0);
   const [activeRestaurants, pendingRestaurants, riders, openOrders, deliveredToday, gmv] = await Promise.all([

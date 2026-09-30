@@ -7,7 +7,7 @@ export const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const schema = new Schema({
   tokenHash: { type: String, required: true, unique: true, index: true },
   employeeId: { type: Schema.Types.ObjectId, required: true, index: true },
-  role: { type: String, enum: ["admin", "partner", "rider", "fleet", "commercial", "gerente_comercial_zona"], required: true },
+  role: { type: String, enum: ["admin", "partner", "rider", "fleet", "commercial", "gerente_comercial_zona", "finance", "support"], required: true },
   surface: { type: String, required: true },
   expiresAt: { type: Date, required: true },
   issuedAt: { type: Date, required: true },
@@ -26,7 +26,7 @@ export function sessionRole(employee: { email: string; apiRole: string; roles?: 
   if (employee.email === OWNER_EMAIL && employee.ownerProtected && ["admin", "partner", "fleet"].includes(selectedRole) && ["partner", "fleet"].includes(surface)) return surface;
   if (surface === "rider" && employee.email === OWNER_EMAIL && employee.ownerProtected && ["admin", "rider"].includes(selectedRole)) return "rider";
   if (!availableRoles.includes(selectedRole)) return null;
-  const permitted: Record<string, string[]> = { rider: ["rider"], partner: ["partner"], partners: ["partner"], fleet: ["fleet", "commercial", "gerente_comercial_zona"], admin: ["admin", "partner", "rider", "fleet", "commercial", "gerente_comercial_zona"] };
+  const permitted: Record<string, string[]> = { rider: ["rider"], partner: ["partner"], partners: ["partner"], fleet: ["fleet", "commercial", "gerente_comercial_zona"], admin: ["admin", "partner", "rider", "fleet", "commercial", "gerente_comercial_zona", "finance", "support"] };
   return permitted[surface] && !permitted[surface].includes(selectedRole) ? null : selectedRole;
 }
 
