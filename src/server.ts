@@ -1,6 +1,7 @@
 import "dotenv/config";
 import "express-async-errors";
 import { createHash, createHmac, randomInt } from "node:crypto";
+import { fileURLToPath } from "node:url";
 import cors from "cors";
 import express from "express";
 import mongoose from "mongoose";
@@ -207,7 +208,16 @@ async function releaseRiderOrderSlot(orderId: mongoose.Types.ObjectId, riderId: 
   await Rider.updateOne({ _id: riderId }, remaining ? { $set: { status: "busy" } } : { $set: { status: "available", activeOrderId: null } }).exec();
 }
 
-app.get("/", (_req, res) => res.json({ service: "piki-api", name: "PIKI Delivery API", version: "0.2.0", status: databaseReady ? "ready" : "initializing", health: "/health", readiness: "/ready" }));
+const pikiSplashPath = fileURLToPath(new URL("./assets/piki-splash.webp", import.meta.url));
+const pikiFaviconPath = fileURLToPath(new URL("./assets/piki-favicon.webp", import.meta.url));
+const sendPikiAsset = (path: string, res: express.Response) => res.type("webp").sendFile(path);
+app.get("/piki-splash.webp", (_req, res) => sendPikiAsset(pikiSplashPath, res));
+app.get("/favicon.webp", (_req, res) => sendPikiAsset(pikiFaviconPath, res));
+app.get("/favicon.ico", (_req, res) => sendPikiAsset(pikiFaviconPath, res));
+app.get("/", (_req, res) => {
+  res.setHeader("Content-Security-Policy", "default-src 'self'; style-src 'unsafe-inline'; img-src 'self'; frame-ancestors 'none'; base-uri 'self'");
+  res.type("html").send(`<!doctype html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="application-name" content="Pikidelivery.com"><link rel="icon" type="image/webp" href="/favicon.webp"><title>PIKI Delivery API</title><style>html,body{margin:0;min-height:100%;background:#ffd72e;font-family:Arial,sans-serif;color:#172238}body{display:grid;place-items:center;min-height:100dvh;overflow:hidden}.splash{text-align:center}.splash img{display:block;width:min(92vw,930px);height:min(74dvh,620px);object-fit:contain}.splash strong{display:block;font-size:clamp(18px,3vw,28px);letter-spacing:.12em;text-transform:uppercase}.api{display:none;margin-top:1rem;font-size:14px}.api a{color:#172238;font-weight:700}</style></head><body><main class="splash" role="status" aria-label="PIKI Delivery API"><img src="/piki-splash.webp" alt="PIKI Delivery"><strong>Pikidelivery.com</strong><p class="api">API activa · <a href="/health">comprobar estado</a></p></main><script>window.setTimeout(()=>{document.querySelector('.api').style.display='block'},5000)</script></body></html>`);
+});
 app.get("/health", (_req, res) => res.json({ service: "piki-api", status: "ok", version: "0.2.0", environment: process.env.NODE_ENV || "development" }));
 app.get("/ready", (_req, res) => {
   if (!databaseReady || mongoose.connection.readyState !== 1) return res.status(503).json({ service: "piki-api", status: "not_ready", database: "unavailable" });

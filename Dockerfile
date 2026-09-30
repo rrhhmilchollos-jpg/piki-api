@@ -12,5 +12,6 @@ ENV NODE_ENV=production
 COPY package*.json ./
 RUN npm install --omit=dev
 COPY --from=build /app/dist ./dist
+COPY --from=build /app/src/assets ./dist/assets
 EXPOSE 3000
 CMD ["npm", "start"]
