@@ -25,6 +25,7 @@ import { runTenantMigration } from "./tenantMigration.js";
 import { activeOperationalOrderStatuses, dispatchableOrderStatuses, dispatchablePaymentFilter, isDispatchableOrderStatus } from "./dispatchEligibility.js";
 
 export const app = express();
+app.set("trust proxy", 1);
 const port = Number(process.env.PORT || 3000);
 const defaultOrigins = ["http://localhost:3000", "http://localhost:5173", "https://pikidelivery.com", "https://www.pikidelivery.com", "https://app.pikidelivery.com", "https://partners.pikidelivery.com", "https://admin.pikidelivery.com", "https://support.pikidelivery.com", "https://piki-admin-live.vercel.app", "https://piki-support.vercel.app", "https://riders.pikidelivery.com", "https://fleet.pikidelivery.com", "https://piki-customer.onrender.com", "https://piki-riders.onrender.com", "https://piki-admin.onrender.com", "https://edpexgfa.manus.space"];
 const configuredOrigins = (process.env.CORS_ORIGINS || "").split(",").map((origin) => origin.trim()).filter(Boolean);
@@ -51,6 +52,26 @@ app.use(cors(corsOptions));
 app.options("*", cors(corsOptions));
 
 const requestBuckets = new Map<string, { startedAt: number; count: number }>();
+let mongoRateLimitIndexReady = false;
+async function incrementMongoRateLimit(key: string, windowMs: number): Promise<number | null> {
+  if (!databaseReady || mongoose.connection.readyState !== 1) return null;
+  try {
+    const collection = mongoose.connection.collection("piki_rate_limit_buckets") as any;
+    if (!mongoRateLimitIndexReady) {
+      await collection.createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 });
+      mongoRateLimitIndexReady = true;
+    }
+    const windowStart = Math.floor(Date.now() / windowMs) * windowMs;
+    const bucketId = `${key}:${windowStart}`;
+    const expiresAt = new Date(windowStart + windowMs + 60_000);
+    await collection.updateOne({ _id: bucketId }, { $inc: { count: 1 }, $set: { expiresAt } }, { upsert: true });
+    const bucket = await collection.findOne({ _id: bucketId }, { projection: { count: 1 } });
+    return Number(bucket?.count || 0);
+  } catch (error) {
+    if (!upstashWarningShown) console.warn("Mongo distributed rate limit unavailable; continuing with fallback", error instanceof Error ? error.message : error);
+    return null;
+  }
+}
 const upstashRedisUrl = String(process.env.UPSTASH_REDIS_REST_URL || "").replace(/\/$/, "");
 const upstashRedisToken = String(process.env.UPSTASH_REDIS_REST_TOKEN || "");
 let upstashWarningShown = false;
@@ -71,13 +92,15 @@ async function incrementDistributedRateLimit(key: string, windowMs: number): Pro
 }
 const rateLimit = (limit: number, windowMs: number, keyPrefix: string) => async (req: express.Request, res: express.Response, next: express.NextFunction) => {
   const surfaceKey = String(req.header("x-piki-surface") || req.query.surface || "-").toLowerCase();
-  const key = `piki:ratelimit:${keyPrefix}:${req.ip}:${req.path}:${surfaceKey}`;
+  const clientIp = String(req.ip || req.header("x-forwarded-for")?.split(",")[0] || "unknown").trim();
+  const key = `piki:ratelimit:${keyPrefix}:${clientIp}:${req.path}:${surfaceKey}`;
   const distributedCount = await incrementDistributedRateLimit(key, windowMs);
+  const sharedCount = distributedCount ?? await incrementMongoRateLimit(key, windowMs);
   const now = Date.now();
   const current = requestBuckets.get(key);
   const bucket = !current || now - current.startedAt >= windowMs ? { startedAt: now, count: 0 } : current;
   bucket.count += 1; requestBuckets.set(key, bucket);
-  const count = distributedCount ?? bucket.count;
+  const count = sharedCount ?? bucket.count;
   if (count > limit) return res.status(429).json({ error: "RATE_LIMITED", retryAfterSeconds: Math.ceil((windowMs - (now - bucket.startedAt)) / 1000) });
   res.setHeader("X-RateLimit-Limit", String(limit));
   res.setHeader("X-RateLimit-Remaining", String(Math.max(0, limit - count)));
