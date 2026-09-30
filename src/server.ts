@@ -577,7 +577,7 @@ app.post("/api/v1/admin/signatures", requireRole("admin"), async (req, res) => {
     return res.status(502).json({ error: "SIGNATURIT_REQUEST_FAILED", message: error instanceof Error ? error.message : "No se pudo crear la solicitud de firma" });
   }
 });
-app.post("/api/v1/signatures/signaturit/events", async (req, res) => {
+app.post("/api/v1/signatures/signaturit/events", rateLimit(100, 60_000, "signaturit-webhook"), async (req, res) => {
   const webhookToken = process.env.SIGNATURIT_WEBHOOK_TOKEN;
   if (!webhookToken || req.query.token !== webhookToken) return res.status(401).json({ error: "INVALID_SIGNATURE_WEBHOOK_TOKEN" });
   const raw = JSON.stringify(req.body || {});
@@ -923,7 +923,7 @@ app.post("/api/v1/rider-slots", requireRole("admin", "fleet"), async (req, res) 
   return res.status(201).json({ slot });
 });
 
-app.post("/api/v1/orders", async (req, res) => {
+app.post("/api/v1/orders", rateLimit(20, 60_000, "orders-create"), async (req, res) => {
   const parsed = createOrderSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_ORDER", details: parsed.error.flatten() });
   if (parsed.data.paymentMethod !== "cash") return res.status(409).json({ error: "PAYMENT_METHOD_UNAVAILABLE", message: "Tarjeta y Bizum todavía no están disponibles. Selecciona efectivo al recibir." });
@@ -1039,8 +1039,8 @@ app.post("/api/v1/internal/customer-orders/:publicCode/messages", async (req, re
   return res.json({ messages: messages.map((message: any) => ({ id: String(message._id), senderRole: message.senderRole, body: message.body, createdAt: message.createdAt })) });
 });
 
-const checkoutSchema = z.object({ orderId: z.string().min(1), origin: z.string().url(), customerEmail: z.string().email().optional() });
-app.post("/api/v1/payments/checkout", async (req, res) => {
+const checkoutSchema = z.object({ orderId: z.string().min(1), origin: z.string().url().refine((value) => isAllowedCorsOrigin(value), "INVALID_CHECKOUT_ORIGIN"), customerEmail: z.string().email().optional() });
+app.post("/api/v1/payments/checkout", rateLimit(20, 60_000, "payments-checkout"), async (req, res) => {
   const parsed = checkoutSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_CHECKOUT_REQUEST", details: parsed.error.flatten() });
   const id = objectId(parsed.data.orderId);
