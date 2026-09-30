@@ -989,6 +989,29 @@ function requireCustomerSyncSecret(req: express.Request, res: express.Response) 
   if (!expected || req.header("x-piki-customer-sync-secret") !== expected) { res.status(401).json({ error: "INVALID_SYNC_AUTH" }); return false; }
   return true;
 }
+
+const customerSupportCreateSchema = z.object({ customerId: z.string().trim().min(1).max(160), customerName: z.string().trim().min(1).max(160), customerEmail: z.string().email(), orderRef: z.string().trim().max(120).optional(), category: z.enum(["order", "account", "technical", "other"]).default("order"), priority: z.enum(["low", "normal", "high"]).default("normal"), subject: z.string().trim().min(3).max(180), description: z.string().trim().min(3).max(4000) });
+const customerSupportListSchema = z.object({ customerId: z.string().trim().min(1).max(160), customerEmail: z.string().email() });
+app.post("/api/v1/internal/customer-support/tickets", async (req, res) => {
+  if (!requireCustomerSyncSecret(req, res)) return;
+  const parsed = customerSupportCreateSchema.safeParse(req.body); if (!parsed.success) return res.status(400).json({ error: "INVALID_CUSTOMER_SUPPORT_TICKET", details: parsed.error.flatten() });
+  const input = parsed.data;
+  let orderId: mongoose.Types.ObjectId | null = null;
+  if (input.orderRef) {
+    const order = await Order.findOne({ ...supportOrderFilter(input.orderRef), customerId: input.customerId }).select("_id").lean().exec() as any;
+    if (!order) return res.status(404).json({ error: "CUSTOMER_ORDER_NOT_FOUND" });
+    orderId = order._id;
+  }
+  const ticket = await SupportTicket.create({ customerId: input.customerId, reporterEmail: input.customerEmail, sourceSurface: "customer", sourceRole: "customer", category: input.category, priority: input.priority, subject: input.subject, description: input.description, orderId, ticketNumber: `SUP-${new Date().toISOString().slice(0, 10).replace(/-/g, "")}-${randomInt(1000, 9999)}`, actions: [{ action: "ticket_created", metadata: { sourceSurface: "customer", customerId: input.customerId, customerName: input.customerName, orderRef: input.orderRef || null } }] });
+  return res.status(201).json({ ticket: { _id: ticket._id, ticketNumber: ticket.ticketNumber, subject: ticket.subject, description: ticket.description, category: ticket.category, priority: ticket.priority, status: ticket.status, reporterEmail: ticket.reporterEmail, messages: ticket.messages, createdAt: ticket.createdAt, updatedAt: ticket.updatedAt } });
+});
+app.post("/api/v1/internal/customer-support/tickets/list", async (req, res) => {
+  if (!requireCustomerSyncSecret(req, res)) return;
+  const parsed = customerSupportListSchema.safeParse(req.body); if (!parsed.success) return res.status(400).json({ error: "INVALID_CUSTOMER_SUPPORT_QUERY" });
+  const { customerId, customerEmail } = parsed.data;
+  const tickets = await SupportTicket.find({ $or: [{ customerId }, { customerId: "", reporterEmail: customerEmail }] }).sort({ updatedAt: -1 }).limit(100).lean().exec();
+  return res.json({ tickets });
+});
 app.get("/api/v1/internal/customer-orders/:publicCode/tracking", async (req, res) => {
   if (!requireCustomerSyncSecret(req, res)) return;
   const order = await Order.findOne({ publicCode: String(req.params.publicCode) }).lean().exec() as any;
