@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { dispatchableOrderStatuses, dispatchablePaymentFilter, isDispatchableOrderStatus, isDispatchablePayment } from "./dispatchEligibility.js";
+import { activeOperationalOrderStatuses, dispatchableOrderStatuses, dispatchablePaymentFilter, isDispatchableOrderStatus, isDispatchablePayment } from "./dispatchEligibility.js";
 import { canTransition } from "./workflow.js";
 
 test("pending orders are eligible for rider dispatch before Partner acceptance", () => {
@@ -14,9 +14,16 @@ test("pending orders are eligible for rider dispatch before Partner acceptance",
   assert.equal(isDispatchableOrderStatus("delivered"), false);
 });
 
-test("a Rider can confirm pickup from a pending order, but a Partner cannot", () => {
-  assert.equal(canTransition("pending", "picked_up", "rider"), true);
+test("a Rider can confirm pickup while the Partner is still processing the order", () => {
+  for (const status of ["pending", "accepted", "preparing", "ready_for_pickup"] as const) {
+    assert.equal(canTransition(status, "picked_up", "rider"), true);
+  }
   assert.equal(canTransition("pending", "picked_up", "partner"), false);
+});
+
+test("the active operations list keeps orders visible through pickup and transit", () => {
+  assert.deepEqual(activeOperationalOrderStatuses, [...dispatchableOrderStatuses, "picked_up", "on_the_way"]);
+  assert.equal((activeOperationalOrderStatuses as readonly string[]).includes("delivered"), false);
 });
 
 

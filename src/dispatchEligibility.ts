@@ -5,6 +5,12 @@ export const dispatchableOrderStatuses = [
   "ready_for_pickup",
 ] as const;
 
+export const activeOperationalOrderStatuses = [
+  ...dispatchableOrderStatuses,
+  "picked_up",
+  "on_the_way",
+] as const;
+
 export function isDispatchableOrderStatus(status: string): boolean {
   return (dispatchableOrderStatuses as readonly string[]).includes(status);
 }
