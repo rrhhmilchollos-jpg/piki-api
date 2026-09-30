@@ -1094,9 +1094,11 @@ async function enrichSupportTickets(tickets: any[]) {
 }
 const supportRoles = ["admin", "partner", "rider", "fleet", "commercial", "gerente_comercial_zona", "support"] as const;
 const financeTicketCategories = ["billing", "finance"] as const;
-const financeTicketScope = (req: express.Request): Record<string, unknown> => req.auth?.role === "finance" ? { category: { $in: financeTicketCategories } } : {};
+const isFinanceTicketCategory = (category: string) => financeTicketCategories.includes(category as typeof financeTicketCategories[number]);
+const ticketRoleScope = (req: express.Request): Record<string, unknown> => req.auth?.role === "finance" ? { category: { $in: financeTicketCategories } } : req.auth?.role === "support" ? { category: { $nin: financeTicketCategories } } : {};
 app.post("/api/v1/support/tickets", requireRole(...supportRoles), async (req, res) => {
   const parsed = supportTicketInput.safeParse(req.body); if (!parsed.success) return res.status(400).json({ error: "INVALID_SUPPORT_TICKET", details: parsed.error.flatten() });
+  if (req.auth?.role === "support" && isFinanceTicketCategory(parsed.data.category)) return res.status(403).json({ error: "SUPPORT_TICKET_CATEGORY_RESTRICTED" });
   const order = parsed.data.orderRef ? await Order.findOne({ ...tenantScope(req), ...supportOrderFilter(parsed.data.orderRef) }).select("_id").lean().exec() as any : null;
   if (parsed.data.orderRef && !order) return res.status(404).json({ error: "ORDER_NOT_FOUND" });
   const actorEmployeeId = objectId(String(req.auth?.employeeId || ""));
@@ -1105,7 +1107,7 @@ app.post("/api/v1/support/tickets", requireRole(...supportRoles), async (req, re
   return res.status(201).json({ ticket });
 });
 app.get("/api/v1/support/tickets/mine", requireRole(...supportRoles), async (req, res) => {
-  const tickets = await SupportTicket.find({ ...tenantScope(req), $or: [{ createdBy: objectId(String(req.auth?.employeeId || "")) }, { reporterEmail: String(req.query.email || "").toLowerCase() }] }).sort({ updatedAt: -1 }).limit(100).lean().exec();
+  const tickets = await SupportTicket.find({ ...tenantScope(req), ...ticketRoleScope(req), $or: [{ createdBy: objectId(String(req.auth?.employeeId || "")) }, { reporterEmail: String(req.query.email || "").toLowerCase() }] }).sort({ updatedAt: -1 }).limit(100).lean().exec();
   return res.json({ tickets });
 });
 app.get("/api/v1/admin/support/orders/search", requireRole("admin", "support"), async (req, res) => {
@@ -1115,7 +1117,7 @@ app.get("/api/v1/admin/support/orders/search", requireRole("admin", "support"), 
   return res.json({ orders });
 });
 app.get("/api/v1/admin/support/tickets", requireRole("admin", "support", "finance"), async (req, res) => {
-  const filter: Record<string, unknown> = { ...tenantScope(req), ...financeTicketScope(req) };
+  const filter: Record<string, unknown> = { ...tenantScope(req), ...ticketRoleScope(req) };
   if (typeof req.query.status === "string" && req.query.status !== "all") filter.status = req.query.status;
   if (typeof req.query.q === "string" && req.query.q.trim()) { const q = req.query.q.trim(); filter.$or = [{ ticketNumber: q }, { reporterEmail: { $regex: q, $options: "i" } }, { subject: { $regex: q, $options: "i" } }]; }
   const tickets = await SupportTicket.find(filter).sort({ updatedAt: -1 }).limit(100).populate("assignedTo", "name email").lean().exec();
@@ -1123,7 +1125,8 @@ app.get("/api/v1/admin/support/tickets", requireRole("admin", "support", "financ
 });
 app.post("/api/v1/admin/support/tickets", requireRole("admin", "support", "finance"), async (req, res) => {
   const parsed = supportTicketInput.safeParse(req.body); if (!parsed.success) return res.status(400).json({ error: "INVALID_SUPPORT_TICKET", details: parsed.error.flatten() });
-  if (req.auth?.role === "finance" && !financeTicketCategories.includes(parsed.data.category as typeof financeTicketCategories[number])) return res.status(403).json({ error: "FINANCE_TICKET_CATEGORY_REQUIRED" });
+  if (req.auth?.role === "finance" && !isFinanceTicketCategory(parsed.data.category)) return res.status(403).json({ error: "FINANCE_TICKET_CATEGORY_REQUIRED" });
+  if (req.auth?.role === "support" && isFinanceTicketCategory(parsed.data.category)) return res.status(403).json({ error: "SUPPORT_TICKET_CATEGORY_RESTRICTED" });
   const order = parsed.data.orderRef ? await Order.findOne({ ...tenantScope(req), ...supportOrderFilter(parsed.data.orderRef) }).select("_id").lean().exec() as any : null;
   if (parsed.data.orderRef && !order) return res.status(404).json({ error: "ORDER_NOT_FOUND" });
   const actorEmployeeId = objectId(String(req.auth?.employeeId || ""));
@@ -1143,11 +1146,11 @@ app.post("/api/v1/admin/support/tickets/:id/messages", requireRole("admin", "sup
   const id = objectId(String(req.params.id)); if (!id) return res.status(400).json({ error: "INVALID_TICKET_ID" });
   const agent = await supportAgent(req); if (!agent) return res.status(403).json({ error: "SUPPORT_AGENT_NOT_FOUND" });
   const agentDisplayName = String(agent.name || agent.email || "Agente de soporte").trim().split(/\s+/).slice(0, 2).join(" ");
-  const current = await SupportTicket.findOne({ _id: id, ...tenantScope(req), ...financeTicketScope(req) }).lean().exec() as any;
+  const current = await SupportTicket.findOne({ _id: id, ...tenantScope(req), ...ticketRoleScope(req) }).lean().exec() as any;
   if (!current) return res.status(404).json({ error: "TICKET_NOT_FOUND" });
   if (["resolved", "closed"].includes(current.status)) return res.status(409).json({ error: "SUPPORT_CHAT_CLOSED" });
   if (current.assignedTo && String(current.assignedTo) !== String(agent._id)) return res.status(409).json({ error: "SUPPORT_TICKET_ASSIGNED", assignedTo: String(current.assignedTo) });
-  const ticket = await SupportTicket.findOneAndUpdate({ _id: id, ...tenantScope(req), ...financeTicketScope(req), $or: [{ assignedTo: null }, { assignedTo: agent._id }] }, { $push: { messages: { senderRole: "support", senderEmployeeId: agent._id, senderName: agentDisplayName, body: parsed.data.body } }, $set: { status: "in_progress", assignedTo: agent._id } }, { new: true }).populate("assignedTo", "name email").lean().exec() as any;
+  const ticket = await SupportTicket.findOneAndUpdate({ _id: id, ...tenantScope(req), ...ticketRoleScope(req), $or: [{ assignedTo: null }, { assignedTo: agent._id }] }, { $push: { messages: { senderRole: "support", senderEmployeeId: agent._id, senderName: agentDisplayName, body: parsed.data.body } }, $set: { status: "in_progress", assignedTo: agent._id } }, { new: true }).populate("assignedTo", "name email").lean().exec() as any;
   const riderId = await riderForSupportTicket(current);
   if (riderId) void publishRealtimeEvent({ channel: "rider", audienceKey: `rider:${riderId}`, tenantId: current.tenantId, type: "support.message", payload: { ticketId: String(id), status: ticket?.status, senderRole: "support" } });
   return res.json({ ticket });
@@ -1157,10 +1160,10 @@ app.patch("/api/v1/admin/support/tickets/:id/status", requireRole("admin", "supp
   const id = objectId(String(req.params.id)); if (!id) return res.status(400).json({ error: "INVALID_TICKET_ID" });
   const actorEmployeeId = objectId(String(req.auth?.employeeId || ""));
   const agent = await supportAgent(req); if (!agent) return res.status(403).json({ error: "SUPPORT_AGENT_NOT_FOUND" });
-  const current = await SupportTicket.findOne({ _id: id, ...tenantScope(req), ...financeTicketScope(req) }).select("assignedTo category").lean().exec() as any;
+  const current = await SupportTicket.findOne({ _id: id, ...tenantScope(req), ...ticketRoleScope(req) }).select("assignedTo category").lean().exec() as any;
   if (!current) return res.status(404).json({ error: "TICKET_NOT_FOUND" });
   if (current.assignedTo && String(current.assignedTo) !== String(agent._id)) return res.status(409).json({ error: "SUPPORT_TICKET_ASSIGNED", assignedTo: String(current.assignedTo) });
-  const ticket = await SupportTicket.findOneAndUpdate({ _id: id, ...tenantScope(req), ...financeTicketScope(req) }, { $set: { status: parsed.data.status, assignedTo: agent._id, ...(parsed.data.status === "resolved" || parsed.data.status === "closed" ? { resolvedAt: new Date() } : {}) }, $push: { actions: { action: "status_changed", actorEmployeeId, reason: parsed.data.status === "closed" ? `Conversación cerrada por ${String(agent.name || agent.email || "Agente de soporte").trim().split(/\s+/).slice(0, 2).join(" ")}.` : "", metadata: { status: parsed.data.status, agentName: String(agent.name || agent.email || "Agente de soporte").trim().split(/\s+/).slice(0, 2).join(" ") } } } }, { new: true }).populate("assignedTo", "name email").lean().exec();
+  const ticket = await SupportTicket.findOneAndUpdate({ _id: id, ...tenantScope(req), ...ticketRoleScope(req) }, { $set: { status: parsed.data.status, assignedTo: agent._id, ...(parsed.data.status === "resolved" || parsed.data.status === "closed" ? { resolvedAt: new Date() } : {}) }, $push: { actions: { action: "status_changed", actorEmployeeId, reason: parsed.data.status === "closed" ? `Conversación cerrada por ${String(agent.name || agent.email || "Agente de soporte").trim().split(/\s+/).slice(0, 2).join(" ")}.` : "", metadata: { status: parsed.data.status, agentName: String(agent.name || agent.email || "Agente de soporte").trim().split(/\s+/).slice(0, 2).join(" ") } } } }, { new: true }).populate("assignedTo", "name email").lean().exec();
   if (!ticket) return res.status(404).json({ error: "TICKET_NOT_FOUND" });
   return res.json({ ticket });
 });
