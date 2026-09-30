@@ -1,11 +1,15 @@
 import { createHash, createHmac, randomBytes, scryptSync, timingSafeEqual } from "node:crypto";
 import type { Request, Response } from "express";
 import { Order, Restaurant, CustomerAccount, RiderOrderMessage } from "./models.js";
-import { publishPaidOrderEvents } from "./realtime.js";
+import { publishOrderIntakeEvents } from "./realtime.js";
 import { evaluateXativaCoverage } from "./coverage/xativaPolicy.js";
 import { quoteDeliveryRoute } from "./coverage/routing.js";
 
 const COOKIE = "piki_customer_session";
+let dispatchCustomerOrder: ((orderId: string) => Promise<unknown>) | null = null;
+export function setCustomerOrderDispatcher(dispatcher: (orderId: string) => Promise<unknown>) {
+  dispatchCustomerOrder = dispatcher;
+}
 const hashToken = (value: string) => createHash("sha256").update(value).digest("hex");
 const hashPassword = (value: string, salt = randomBytes(16).toString("hex")) => `${salt}:${scryptSync(value, salt, 64).toString("hex")}`;
 const checkPassword = (value: string, encoded: string) => {
@@ -176,8 +180,11 @@ export async function handleCustomerTrpc(req: Request, res: Response) {
       const subtotalCents = normalized.reduce((sum, item) => sum + item.unitPriceCents * item.quantity, 0);
       const deliveryCents = coverage.deliveryFeeCents; const serviceCents = coverage.serviceFeeCents; const totalCents = subtotalCents + deliveryCents + serviceCents;
       const code = `PIKI-${Date.now().toString(36).toUpperCase()}`;
-      const order = await Order.create({ publicCode: code, restaurantId: restaurant._id, customerId: String(user._id), items: normalized, deliveryAddress: String(input.address || "").trim(), deliveryLocation: { type: "Point", coordinates: deliveryPoint }, coveragePolicySlug: coverage.policySlug, coveragePolicyVersion: coverage.policyVersion, coverageDecision: coverage.reason, straightLineDistanceKm: coverage.straightLineDistanceKm, withinMunicipality: coverage.withinMunicipality, deliveryBaseFeeCents: coverage.deliveryBaseFeeCents, outsideMunicipalitySurchargeCents: coverage.outsideMunicipalitySurchargeCents, routeDistanceKm: route.routeDistanceKm, routeDurationMinutes: route.routeDurationMinutes, routeProvider: route.routeProvider, routingDegraded: route.routingDegraded, requiredVehicleClasses: route.requiredVehicleClasses, subtotalCents, deliveryFeeCents: deliveryCents, serviceFeeCents: serviceCents, totalCents, paymentMethod, paymentState: "pending", statusHistory: [{ status: "pending", actorRole: "customer", reason: "Pedido confirmado: cobro en efectivo pendiente de entrega" }] });
-      await publishPaidOrderEvents(order, { settlement: "cash_due", message: "Pedido confirmado: el Rider cobrará el efectivo exacto al entregar." });
+      const order = await Order.create({ publicCode: code, restaurantId: restaurant._id, customerId: String(user._id), items: normalized, deliveryAddress: String(input.address || "").trim(), deliveryLocation: { type: "Point", coordinates: deliveryPoint }, coveragePolicySlug: coverage.policySlug, coveragePolicyVersion: coverage.policyVersion, coverageDecision: coverage.reason, straightLineDistanceKm: coverage.straightLineDistanceKm, withinMunicipality: coverage.withinMunicipality, deliveryBaseFeeCents: coverage.deliveryBaseFeeCents, outsideMunicipalitySurchargeCents: coverage.outsideMunicipalitySurchargeCents, routeDistanceKm: route.routeDistanceKm, routeDurationMinutes: route.routeDurationMinutes, routeProvider: route.routeProvider, routingDegraded: route.routingDegraded, requiredVehicleClasses: route.requiredVehicleClasses, subtotalCents, deliveryFeeCents: deliveryCents, serviceFeeCents: serviceCents, totalCents, paymentMethod, paymentState: "pending", statusHistory: [{ status: "pending", actorRole: "customer", reason: "Pedido a contrarreembolso; cobro pendiente hasta la entrega" }] });
+      const dispatch = dispatchCustomerOrder
+        ? dispatchCustomerOrder(String(order._id)).catch((error) => console.warn("Customer compatibility order dispatch failed", error instanceof Error ? error.message : error))
+        : Promise.resolve();
+      await Promise.all([dispatch, publishOrderIntakeEvents(order, { settlement: "cash_due", message: "Pedido a contrarreembolso: el Rider cobrará en efectivo al entregar." })]);
       return reply(res, { orderId: code, checkoutUrl: null, totalCents, paymentMethod, paymentState: "pending_cash_collection", cashDueAtDelivery: true, deliveryQrUrl: deliveryQrUrl(code), coverage, route });
     }
     return fail(res, `Procedimiento no soportado: ${procedure}`, "NOT_FOUND");

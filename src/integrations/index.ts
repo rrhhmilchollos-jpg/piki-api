@@ -15,4 +15,4 @@ export {
   signatureWebhookUrl,
   webhookDigest,
 } from "../signaturit.js";
-export { handleCustomerTrpc, currentCustomer } from "../customerCompat.js";
+export { handleCustomerTrpc, currentCustomer, setCustomerOrderDispatcher } from "../customerCompat.js";
