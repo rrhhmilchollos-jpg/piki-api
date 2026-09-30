@@ -92,8 +92,7 @@ async function incrementDistributedRateLimit(key: string, windowMs: number): Pro
 }
 const rateLimit = (limit: number, windowMs: number, keyPrefix: string) => async (req: express.Request, res: express.Response, next: express.NextFunction) => {
   const surfaceKey = String(req.header("x-piki-surface") || req.query.surface || "-").toLowerCase();
-  const forwardedClientIp = req.header("x-forwarded-for")?.split(",")[0]?.trim();
-  const clientIp = forwardedClientIp || String(req.ip || "unknown").trim();
+  const clientIp = String(req.ip || "unknown").trim();
   const key = `piki:ratelimit:${keyPrefix}:${clientIp}:${req.path}:${surfaceKey}`;
   const distributedCount = await incrementDistributedRateLimit(key, windowMs);
   const sharedCount = distributedCount ?? await incrementMongoRateLimit(key, windowMs);
