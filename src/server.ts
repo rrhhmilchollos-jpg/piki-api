@@ -107,7 +107,7 @@ const rateLimit = (limit: number, windowMs: number, keyPrefix: string) => async 
   return next();
 };
 setInterval(() => { const cutoff = Date.now() - 15 * 60_000; for (const [key, bucket] of requestBuckets) if (bucket.startedAt < cutoff) requestBuckets.delete(key); }, 15 * 60_000).unref();
-app.use("/api/v1/auth", rateLimit(10, 60_000, "auth"));
+app.use("/api/v1/auth", rateLimit(3, 60_000, "auth"));
 app.use("/api/v1/internal", rateLimit(10, 60_000, "internal-sync"));
 app.use("/api/v1/partners/onboarding", rateLimit(10, 60_000, "partner-onboarding"));
 app.use("/api/v1/riders/applications", rateLimit(10, 60_000, "rider-onboarding"));
@@ -415,7 +415,7 @@ app.patch("/api/v1/notifications/:id/read", rateLimit(60, 60_000, "notifications
   return res.json({ updated: true });
 });
 app.get("/api/v1/realtime/events", serveRealtimeEvents);
-app.use("/api/trpc/auth.login", rateLimit(10, 60_000, "customer-auth"));
+app.use("/api/trpc/auth.login", rateLimit(3, 60_000, "customer-auth"));
 app.all("/api/trpc/:procedure", handleCustomerTrpc);
 
 app.get("/api/v1/auth/status", (_req, res) => res.json({ authentication: "bearer" }));
