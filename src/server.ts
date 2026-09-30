@@ -63,6 +63,7 @@ const rateLimit = (limit: number, windowMs: number, keyPrefix: string) => (req: 
 };
 setInterval(() => { const cutoff = Date.now() - 15 * 60_000; for (const [key, bucket] of requestBuckets) if (bucket.startedAt < cutoff) requestBuckets.delete(key); }, 15 * 60_000).unref();
 app.use("/api/v1/auth", rateLimit(20, 60_000, "auth"));
+app.use("/api/v1/internal", rateLimit(10, 60_000, "internal-sync"));
 app.use("/api/v1/partners/onboarding", rateLimit(10, 60_000, "partner-onboarding"));
 app.use("/api/v1/riders/applications", rateLimit(10, 60_000, "rider-onboarding"));
 app.use("/api/v1/payments/webhook", rateLimit(100, 60_000, "stripe-webhook"));
