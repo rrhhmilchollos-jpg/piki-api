@@ -585,20 +585,45 @@ app.post("/api/v1/admin/employees/:id/reset-password", requireOwner(), async (re
 });
 app.patch("/api/v1/admin/employees/:id/authorization", requireOwner(), async (req, res) => {
   const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id); if (!id) return res.status(400).json({ error: "INVALID_EMPLOYEE_ID" });
-  const parsed = z.object({ status: z.enum(["approved", "suspended", "revoked"]), apiRole: z.enum(["admin", "partner", "rider", "fleet", "commercial"]).optional(), jobRole: z.enum(["admin", "partner", "rider", "fleet", "zone_manager", "commercial"]).optional(), fleetId: z.string().regex(/^[a-f\d]{24}$/).nullable().optional(), zoneSlugs: z.array(z.string().regex(/^[a-z0-9-]+$/)).max(100).optional(), reason: z.string().max(500).default("") }).safeParse(req.body);
+  const parsed = z.object({
+    status: z.enum(["approved", "suspended", "revoked"]),
+    apiRole: z.enum(employeeSessionRoles).optional(),
+    jobRole: z.enum(["admin", "partner", "rider", "fleet", "zone_manager", "commercial", "gerente_comercial_zona", "finance", "support"]).optional(),
+    roles: z.array(z.enum(employeeSessionRoles)).min(1).max(8).optional(),
+    primaryRole: z.enum(employeeSessionRoles).optional(),
+    partnerRoles: z.array(z.enum(partnerOperationalRoles)).min(1).max(10).optional(),
+    restaurantIds: z.array(z.string().regex(/^[a-f\d]{24}$/i)).min(1).max(100).optional(),
+    fleetId: z.string().regex(/^[a-f\d]{24}$/).nullable().optional(),
+    zoneSlugs: z.array(z.string().regex(/^[a-z0-9-]+$/)).max(100).optional(),
+    reason: z.string().max(500).default(""),
+  }).safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_AUTHORIZATION", details: parsed.error.flatten() });
-  const target = await EmployeeAccount.findById(id).select("email ownerProtected jobRole apiRole accessLevel authorizationStatus").lean().exec() as any;
+  const target = await EmployeeAccount.findById(id).select("email ownerProtected jobRole apiRole roles primaryRole partnerRoles restaurantId restaurantIds accessLevel authorizationStatus").lean().exec() as any;
   if (!target) return res.status(404).json({ error: "EMPLOYEE_NOT_FOUND" });
   if (target.ownerProtected || target.email === ownerEmail) return res.status(403).json({ error: "OWNER_ACCOUNT_PROTECTED" });
+  const effectiveRoles = parsed.data.roles || (target.roles?.length ? target.roles : [parsed.data.apiRole || target.apiRole]);
+  const effectivePrimaryRole = parsed.data.primaryRole || target.primaryRole || effectiveRoles[0];
+  if (!effectiveRoles.includes(effectivePrimaryRole)) return res.status(400).json({ error: "PRIMARY_ROLE_NOT_ASSIGNED" });
   const update: Record<string, unknown> = { authorizationStatus: parsed.data.status, active: parsed.data.status === "approved", authorizedAt: parsed.data.status === "approved" ? new Date() : null, authorizedBy: objectId(req.auth!.employeeId!), authorizationReason: parsed.data.reason };
   if (parsed.data.apiRole) update.apiRole = parsed.data.apiRole;
   if (parsed.data.jobRole) update.jobRole = parsed.data.jobRole;
+  if (parsed.data.roles) update.roles = parsed.data.roles;
+  if (parsed.data.primaryRole) update.primaryRole = parsed.data.primaryRole;
+  if (parsed.data.partnerRoles) update.partnerRoles = parsed.data.partnerRoles;
+  if (parsed.data.restaurantIds) {
+    const restaurantIds = [...new Set(parsed.data.restaurantIds)];
+    const approvedCount = await Restaurant.countDocuments({ _id: { $in: restaurantIds.map((restaurantId) => objectId(restaurantId)) }, onboardingStatus: "approved" });
+    if (approvedCount !== restaurantIds.length) return res.status(409).json({ error: "PARTNER_RESTAURANT_ASSIGNMENT_INVALID", message: "Solo se pueden asignar locales existentes y aprobados." });
+    update.restaurantId = objectId(restaurantIds[0]);
+    update.restaurantIds = restaurantIds.map((restaurantId) => objectId(restaurantId));
+  }
   if (parsed.data.fleetId !== undefined) update.fleetId = parsed.data.fleetId ? objectId(parsed.data.fleetId) : null;
   if (parsed.data.zoneSlugs) update.zoneSlugs = parsed.data.zoneSlugs;
-  if (parsed.data.status !== "approved") update.sessionHash = null;
-  const employee = await EmployeeAccount.findByIdAndUpdate(id, { $set: update }, { new: true }).select("name email jobRole apiRole accessLevel authorizationStatus authorizedAt authorizedBy authorizationReason fleetId zoneSlugs active mustChangePassword").lean().exec() as any;
-  await AccessAuthorization.create({ employeeId: id, action: parsed.data.apiRole || parsed.data.jobRole ? "role_changed" : parsed.data.status, previousStatus: target.authorizationStatus || null, nextStatus: parsed.data.status, previousRole: target.apiRole, nextRole: employee.apiRole, accessLevel: employee.accessLevel || "subadmin", actorEmployeeId: objectId(req.auth!.employeeId!), reason: parsed.data.reason });
-  if (parsed.data.status !== "approved") await revokeEmployeeSessions(id);
+  const accessChanged = Boolean(parsed.data.apiRole || parsed.data.jobRole || parsed.data.roles || parsed.data.primaryRole || parsed.data.partnerRoles || parsed.data.restaurantIds || parsed.data.status !== "approved");
+  if (accessChanged) update.sessionHash = null;
+  const employee = await EmployeeAccount.findByIdAndUpdate(id, { $set: update }, { new: true }).select("name email jobRole apiRole roles primaryRole partnerRoles restaurantId restaurantIds accessLevel authorizationStatus authorizedAt authorizedBy authorizationReason fleetId zoneSlugs active mustChangePassword").lean().exec() as any;
+  await AccessAuthorization.create({ employeeId: id, action: parsed.data.apiRole || parsed.data.jobRole || parsed.data.roles || parsed.data.partnerRoles || parsed.data.restaurantIds ? "role_changed" : parsed.data.status, previousStatus: target.authorizationStatus || null, nextStatus: parsed.data.status, previousRole: JSON.stringify({ apiRole: target.apiRole, roles: target.roles || [], partnerRoles: target.partnerRoles || [], restaurantIds: assignedRestaurantIds(target) }), nextRole: JSON.stringify({ apiRole: employee.apiRole, roles: employee.roles || [], partnerRoles: employee.partnerRoles || [], restaurantIds: assignedRestaurantIds(employee) }), accessLevel: employee.accessLevel || "subadmin", actorEmployeeId: objectId(req.auth!.employeeId!), reason: parsed.data.reason });
+  if (accessChanged) await revokeEmployeeSessions(id);
   return res.json({ employee, authorization: { status: parsed.data.status, persisted: true } });
 });
 

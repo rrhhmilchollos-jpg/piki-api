@@ -30,3 +30,15 @@ test("explicit admin role is preserved for the protected owner session", () => {
   assert.equal(sessionRole(employee, "admin", "admin"), "admin");
   assert.equal(sessionRole(employee, "admin"), "admin");
 });
+
+test("demo commercial can enter Partner Orders with its primary partner role", () => {
+  const employee = {
+    email: "mendezadolfo5@gmail.com",
+    apiRole: "partner",
+    roles: ["partner", "commercial", "gerente_comercial_zona"],
+    primaryRole: "partner",
+    authorizationStatus: "approved",
+  };
+  assert.equal(sessionRole(employee, "partner"), "partner");
+  assert.equal(sessionRole(employee, "admin", "commercial"), "commercial");
+});
