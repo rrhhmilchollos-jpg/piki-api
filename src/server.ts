@@ -1201,7 +1201,7 @@ app.get("/api/v1/admin/support/tickets", requireRole("admin", "support", "financ
   const filter: Record<string, unknown> = { ...tenantScope(req), ...ticketRoleScope(req) };
   if (typeof req.query.status === "string" && req.query.status !== "all") filter.status = req.query.status;
   if (typeof req.query.q === "string" && req.query.q.trim()) { const q = req.query.q.trim(); filter.$or = [{ ticketNumber: q }, { reporterEmail: { $regex: q, $options: "i" } }, { subject: { $regex: q, $options: "i" } }]; }
-  const tickets = await SupportTicket.find(filter).sort({ updatedAt: -1 }).limit(100).populate("assignedTo", "name email").lean().exec();
+  const tickets = await SupportTicket.find(filter).sort({ updatedAt: -1 }).limit(500).populate("assignedTo", "name email").lean().exec();
   return res.json({ tickets: await enrichSupportTickets(tickets) });
 });
 app.post("/api/v1/admin/support/tickets", requireRole("admin", "support", "finance"), async (req, res) => {
@@ -1231,7 +1231,7 @@ app.post("/api/v1/admin/support/tickets/:id/messages", requireRole("admin", "sup
   if (!current) return res.status(404).json({ error: "TICKET_NOT_FOUND" });
   if (["resolved", "closed"].includes(current.status)) return res.status(409).json({ error: "SUPPORT_CHAT_CLOSED" });
   if (current.assignedTo && String(current.assignedTo) !== String(agent._id)) return res.status(409).json({ error: "SUPPORT_TICKET_ASSIGNED", assignedTo: String(current.assignedTo) });
-  const ticket = await SupportTicket.findOneAndUpdate({ _id: id, ...tenantScope(req), ...ticketRoleScope(req), $or: [{ assignedTo: null }, { assignedTo: agent._id }] }, { $push: { messages: { senderRole: "support", senderEmployeeId: agent._id, senderName: agentDisplayName, body: parsed.data.body } }, $set: { status: "in_progress", assignedTo: agent._id } }, { new: true }).populate("assignedTo", "name email").lean().exec() as any;
+  const ticket = await SupportTicket.findOneAndUpdate({ _id: id, ...tenantScope(req), ...ticketRoleScope(req), $or: [{ assignedTo: null }, { assignedTo: agent._id }] }, { $push: { messages: { senderRole: "support", senderEmployeeId: agent._id, senderName: agentDisplayName, body: parsed.data.body } }, $set: { status: "in_progress", assignedTo: agent._id, agentTypingAt: null } }, { new: true }).populate("assignedTo", "name email").lean().exec() as any;
   const riderId = await riderForSupportTicket(current);
   if (riderId) void publishRealtimeEvent({ channel: "rider", audienceKey: `rider:${riderId}`, tenantId: current.tenantId, type: "support.message", payload: { ticketId: String(id), status: ticket?.status, senderRole: "support" } });
   return res.json({ ticket });
@@ -1284,13 +1284,29 @@ app.get("/api/v1/riders/:riderId/support/tickets", requireRole("rider"), async (
   const tickets = await SupportTicket.find({ ...tenantScope(req), reporterEmail: rider.email }).sort({ updatedAt: -1 }).limit(50).populate("assignedTo", "name email").lean().exec();
   return res.json({ tickets });
 });
+app.post("/api/v1/admin/support/tickets/:id/typing", requireRole("admin", "support", "finance"), async (req, res) => {
+  const agent = await supportAgent(req); if (!agent) return res.status(403).json({ error: "SUPPORT_AGENT_NOT_FOUND" });
+  const active = Boolean(req.body?.active);
+  const ticket = await SupportTicket.findOneAndUpdate({ _id: req.params.id, ...tenantScope(req), ...ticketRoleScope(req), $or: [{ assignedTo: null }, { assignedTo: agent._id }] }, { $set: { agentTypingAt: active ? new Date() : null, ...(active ? { assignedTo: agent._id, status: "in_progress" } : {}) } }, { new: true }).lean().exec() as any;
+  if (!ticket) return res.status(404).json({ error: "TICKET_NOT_FOUND_OR_ASSIGNED" });
+  return res.json({ ok: true, agentTypingAt: ticket.agentTypingAt });
+});
+
+app.post("/api/v1/riders/:riderId/support/tickets/:ticketId/typing", requireRole("rider"), async (req, res) => {
+  const rider = await Rider.findById(req.params.riderId).lean().exec() as any; if (!rider) return res.status(404).json({ error: "RIDER_NOT_FOUND" });
+  const active = Boolean(req.body?.active);
+  const ticket = await SupportTicket.findOneAndUpdate({ _id: req.params.ticketId, reporterEmail: rider.email, ...tenantScope(req), status: { $nin: ["resolved", "closed"] } }, { $set: { riderTypingAt: active ? new Date() : null } }, { new: true }).lean().exec() as any;
+  if (!ticket) return res.status(404).json({ error: "TICKET_NOT_FOUND" });
+  return res.json({ ok: true, riderTypingAt: ticket.riderTypingAt });
+});
+
 app.post("/api/v1/riders/:riderId/support/tickets/:ticketId/messages", requireRole("rider"), async (req, res) => {
   const parsed = supportMessageInput.safeParse(req.body); if (!parsed.success) return res.status(400).json({ error: "INVALID_SUPPORT_MESSAGE" });
   const riderId = objectId(String(req.params.riderId)); const ticketId = objectId(String(req.params.ticketId)); if (!riderId || !ticketId || !(await canAccessRiderShift(riderId, req))) return res.status(403).json({ error: "RIDER_ACCESS_DENIED" });
   const rider = await Rider.findOne({ _id: riderId, ...tenantScope(req) }).select("email name").lean().exec() as any; if (!rider) return res.status(404).json({ error: "RIDER_NOT_FOUND" });
   const current = await SupportTicket.findOne({ _id: ticketId, reporterEmail: rider.email, ...tenantScope(req) }).lean().exec() as any; if (!current) return res.status(404).json({ error: "TICKET_NOT_FOUND" });
   if (["resolved", "closed"].includes(current.status)) return res.status(409).json({ error: "SUPPORT_CHAT_CLOSED" });
-  const ticket = await SupportTicket.findOneAndUpdate({ _id: ticketId, reporterEmail: rider.email, ...tenantScope(req) }, { $push: { messages: { senderRole: "rider", senderName: rider.name, body: parsed.data.body } }, $set: { status: current.assignedTo ? "in_progress" : "open" } }, { new: true }).populate("assignedTo", "name email").lean().exec();
+  const ticket = await SupportTicket.findOneAndUpdate({ _id: ticketId, reporterEmail: rider.email, ...tenantScope(req) }, { $push: { messages: { senderRole: "rider", senderName: rider.name, body: parsed.data.body } }, $set: { status: current.assignedTo ? "in_progress" : "open", riderTypingAt: null } }, { new: true }).populate("assignedTo", "name email").lean().exec();
   return res.json({ ticket });
 });
 app.get("/api/v1/orders", requireRole("admin", "partner", "rider", "fleet"), async (req, res) => {
