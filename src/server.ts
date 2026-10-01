@@ -23,6 +23,7 @@ import { evaluateXativaCoverage } from "./coverage/xativaPolicy.js";
 import { quoteDeliveryRoute } from "./coverage/routing.js";
 import { runTenantMigration } from "./tenantMigration.js";
 import { activeOperationalOrderStatuses, dispatchableOrderStatuses, dispatchablePaymentFilter, isDispatchableOrderStatus } from "./dispatchEligibility.js";
+import { partnerCan, partnerPermissions, partnerRolesForEmployee, permissionsForPartnerRoles, type PartnerPermission } from "./partnerAccess.js";
 
 export const app = express();
 app.set("trust proxy", 1);
@@ -424,7 +425,9 @@ app.use("/api/trpc/auth.login", rateLimit(3, 60_000, "customer-auth"));
 app.all("/api/trpc/:procedure", handleCustomerTrpc);
 
 app.get("/api/v1/auth/status", (_req, res) => res.json({ authentication: "bearer" }));
-const employeeLoginSchema = z.object({ email: z.string().email(), password: z.string().min(8).max(200) });
+const employeeSessionRoles = ["admin", "partner", "rider", "fleet", "commercial", "gerente_comercial_zona", "finance", "support"] as const;
+const partnerOperationalRoles = ["partner_admin", "area_manager", "zone_manager", "store_manager", "manager", "cashier", "cajero", "kitchen", "cocina", "cook", "catalog", "catalogue", "menu_manager", "viewer", "read_only", "solo_lectura"] as const;
+const employeeLoginSchema = z.object({ email: z.string().email(), password: z.string().min(8).max(200), role: z.enum(employeeSessionRoles).optional() });
 app.post("/api/v1/auth/employee/login", async (req, res) => {
   const parsed = employeeLoginSchema.safeParse(req.body); if (!parsed.success) return res.status(400).json({ error: "INVALID_LOGIN" });
   if (String(req.headers["x-piki-surface"] || "").toLowerCase() === "admin" && parsed.data.email.toLowerCase() !== ownerEmail) { /* subadmins are allowed; destructive operations remain superadmin-only */ }
@@ -435,7 +438,7 @@ app.post("/api/v1/auth/employee/login", async (req, res) => {
     return res.status(403).json({ error: isPartner ? "PARTNER_PENDING_APPROVAL" : "ACCOUNT_NOT_ACTIVE", message: isPartner ? "Tu solicitud está pendiente de revisión por Administración. Podrás iniciar sesión cuando se aprueben el comercio y la documentación." : "Esta cuenta no está activa." });
   }
   const surface = String(req.headers["x-piki-surface"] || "").toLowerCase();
-  const requestedRole = typeof req.body?.role === "string" ? req.body.role : undefined;
+  const requestedRole = parsed.data.role;
   const role = sessionRole(employee, surface, requestedRole);
   if (!role) return res.status(403).json({ error: "SURFACE_ROLE_MISMATCH", message: "Esta cuenta no tiene acceso a esta aplicación." });
   // The authenticated owner explicitly uses an independent test Rider profile.
@@ -450,7 +453,8 @@ app.post("/api/v1/auth/employee/login", async (req, res) => {
   return res.json({ accessToken: issued.token, requiresPasswordChange: Boolean(employee.mustChangePassword), employee: { id: employee.id, name: employee.name, email: employee.email, jobRole: role === "rider" ? "rider" : employee.jobRole, roles: employee.roles?.length ? employee.roles : [employee.apiRole], primaryRole: employee.primaryRole || employee.apiRole, apiRole: issued.role, accessLevel: employee.accessLevel || (employee.email === ownerEmail ? "superadmin" : "subadmin"), authorizationStatus: employee.authorizationStatus || "approved", portfolioId: employee.portfolioId, fleetId: employee.fleetId, zoneSlugs: employee.zoneSlugs } });
 });
 app.post("/api/v1/auth/employee/switch-role", requireRole("admin", "partner", "rider", "fleet", "commercial", "gerente_comercial_zona", "finance", "support"), async (req, res) => {
-  const requestedRole = typeof req.body?.role === "string" ? req.body.role : "";
+  const parsed = z.object({ role: z.enum(employeeSessionRoles) }).safeParse(req.body);
+  const requestedRole = parsed.success ? parsed.data.role : "";
   const employee = req.auth?.employeeId ? await EmployeeAccount.findById(req.auth.employeeId).select("email apiRole roles primaryRole ownerProtected authorizationStatus").lean().exec() as any : null;
   if (!employee || !requestedRole) return res.status(400).json({ error: "INVALID_ROLE" });
   const surface = String(req.headers["x-piki-surface"] || "admin").toLowerCase();
@@ -466,8 +470,11 @@ app.post("/api/v1/auth/employee/logout", requireRole("admin", "partner", "rider"
   return res.status(204).end();
 });
 app.get("/api/v1/auth/employee/me", requireRole("admin", "partner", "rider", "fleet", "commercial", "gerente_comercial_zona", "finance", "support"), async (req, res) => {
-  const employee = req.auth?.employeeId ? await EmployeeAccount.findById(req.auth.employeeId).select("email ownerProtected accessLevel authorizationStatus jobRole apiRole roles primaryRole zoneSlugs").lean().exec() as any : null;
-  return res.json({ employee: { id: req.auth?.employeeId, email: employee?.email || null, role: req.auth?.role, accessLevel: employee?.accessLevel || "subadmin", authorizationStatus: employee?.authorizationStatus || "approved", ownerProtected: Boolean(employee?.ownerProtected), jobRole: employee?.jobRole || null, apiRole: employee?.apiRole || req.auth?.role || null, roles: employee?.roles?.length ? employee.roles : [employee?.apiRole || req.auth?.role], primaryRole: employee?.primaryRole || employee?.apiRole || req.auth?.role, zoneSlugs: employee?.zoneSlugs || [], mustChangePassword: Boolean(req.auth?.mustChangePassword) } });
+  const employee = req.auth?.employeeId ? await EmployeeAccount.findById(req.auth.employeeId).select("name email ownerProtected accessLevel authorizationStatus jobRole apiRole roles partnerRoles primaryRole zoneSlugs restaurantId restaurantIds").lean().exec() as any : null;
+  const roles = partnerRolesForEmployee(employee);
+  const permissions = [...permissionsForPartnerRoles(roles)];
+  const locations = employee ? await partnerLocationsFor(employee, roles, permissions) : [];
+  return res.json({ employee: { id: req.auth?.employeeId, name: employee?.name || null, email: employee?.email || null, role: req.auth?.role, accessLevel: employee?.accessLevel || "subadmin", authorizationStatus: employee?.authorizationStatus || "approved", ownerProtected: Boolean(employee?.ownerProtected), jobRole: employee?.jobRole || null, apiRole: employee?.apiRole || req.auth?.role || null, roles, permissions, primaryRole: employee?.primaryRole || employee?.apiRole || req.auth?.role, zoneSlugs: employee?.zoneSlugs || [], locations, mustChangePassword: Boolean(req.auth?.mustChangePassword) } });
 });
 app.post("/api/v1/auth/employee/change-password", requireRole("admin", "partner", "rider", "fleet", "commercial", "gerente_comercial_zona", "finance", "support"), async (req, res) => {
   const parsed = z.object({ currentPassword: z.string().min(8), newPassword: z.string().min(12).max(200).regex(/[A-Z]/).regex(/[a-z]/).regex(/[0-9]/) }).safeParse(req.body);
@@ -736,7 +743,7 @@ app.post("/api/v1/partners/onboarding", async (req, res) => {
   const groupKey = localityKey(locality);
   const partner = await Restaurant.create({ slug, name: contact.name, cuisine, category: cuisine, locality, partnerGroupKey: groupKey, address: operatingAddress, tagline: "Solicitud recibida por PIKI", onboardingStatus: "pending_review", isActive: false, email: contact.email, phone: contact.phone, partnerProfile: { legalName, taxId: taxId.toUpperCase(), legalForm, representativeName, representativeRole, representativeDocument, fiscalAddress, operatingAddress, postalCode, city, province, iban: iban.toUpperCase(), bankAccountHolder, cuisine, vatRate, commissionAccepted, termsAcceptedAt, contractAcceptedAt: contractAccepted ? termsAcceptedAt : null, privacyAcceptedAt, dataProcessingAcceptedAt, pdaUnits, pdaUnitCostCents, pdaCostAcceptedAt: pdaCostAccepted ? pdaCostAcceptedAt : null, openingHours, documents: documents.map(({ contentBase64, ...metadata }) => ({ ...metadata, contentBase64, status: "received" })) } });
   try {
-    await EmployeeAccount.create({ name: contact.name, email: normalizedEmail, jobRole: "partner", apiRole: "partner", accessLevel: "subadmin", authorizationStatus: "pending", restaurantId: partner._id, passwordHash: hashPassword(parsed.data.password), mustChangePassword: false, active: false });
+    await EmployeeAccount.create({ name: contact.name, email: normalizedEmail, jobRole: "partner", apiRole: "partner", roles: ["partner"], partnerRoles: ["partner_admin"], accessLevel: "subadmin", authorizationStatus: "pending", restaurantId: partner._id, restaurantIds: [partner._id], passwordHash: hashPassword(parsed.data.password), mustChangePassword: false, active: false });
   } catch (error) {
     await Restaurant.findByIdAndDelete(partner._id).exec();
     if ((error as any)?.code === 11000) return res.status(409).json({ error: "PARTNER_EMAIL_ALREADY_EXISTS", message: "Ya existe una solicitud o cuenta con este correo." });
@@ -746,13 +753,52 @@ app.post("/api/v1/partners/onboarding", async (req, res) => {
   res.status(201).json({ message: "Solicitud recibida para revisión.", partner: { id: partner.id, name: partner.name, email: partner.email, phone: partner.phone, locality, partnerGroupKey: groupKey, onboarding_status: partner.onboardingStatus } });
 });
 
-async function employeeRestaurant(req: express.Request) {
+function assignedRestaurantIds(employee: any): string[] {
+  const ids = [
+    ...(Array.isArray(employee?.restaurantIds) ? employee.restaurantIds : []),
+    employee?.restaurantId,
+  ].map((value) => String(value || "")).filter((value) => Boolean(objectId(value)));
+  return [...new Set(ids)];
+}
+
+async function partnerLocationsFor(employee: any, roles = partnerRolesForEmployee(employee), permissions = [...permissionsForPartnerRoles(roles)]) {
+  const ids = assignedRestaurantIds(employee);
+  if (!ids.length) return [];
+  const restaurants = await Restaurant.find({ _id: { $in: ids } }).select("_id name address isActive onboardingStatus").lean().exec() as any[];
+  const byId = new Map(restaurants.map((restaurant) => [String(restaurant._id), restaurant]));
+  return ids.map((id) => byId.get(id)).filter(Boolean).map((restaurant: any) => ({
+    id: String(restaurant._id),
+    name: restaurant.name,
+    address: restaurant.address || "",
+    isOpen: Boolean(restaurant.isActive && restaurant.onboardingStatus === "approved"),
+    roles,
+    permissions,
+  }));
+}
+
+async function partnerAccessForRequest(req: express.Request) {
+  if (!req.auth?.employeeId) return null;
+  const employee = await EmployeeAccount.findById(req.auth.employeeId).select("restaurantId restaurantIds jobRole apiRole roles partnerRoles").lean().exec() as any;
+  if (!employee) return null;
+  const roles = partnerRolesForEmployee(employee);
+  return { employee, restaurantIds: assignedRestaurantIds(employee), roles, permissions: [...permissionsForPartnerRoles(roles)] };
+}
+
+async function employeeRestaurant(req: express.Request, access?: Awaited<ReturnType<typeof partnerAccessForRequest>>) {
   if (!req.auth?.employeeId) {
     const scopedRestaurantId = String(process.env.PARTNER_API_RESTAURANT_ID || "").trim();
     return req.auth?.role === "partner" && objectId(scopedRestaurantId) ? scopedRestaurantId : null;
   }
-  const employee = await EmployeeAccount.findById(req.auth.employeeId).select("restaurantId jobRole").lean().exec() as any;
-  return employee?.restaurantId ? String(employee.restaurantId) : null;
+  const resolvedAccess = access ?? await partnerAccessForRequest(req);
+  if (!resolvedAccess?.restaurantIds.length) return null;
+  const requested = String(req.header("x-piki-restaurant-id") || "").trim();
+  if (requested) return resolvedAccess.restaurantIds.includes(requested) ? requested : null;
+  return resolvedAccess.restaurantIds[0] || null;
+}
+
+async function partnerRequestAccess(req: express.Request, permission: PartnerPermission) {
+  const access = await partnerAccessForRequest(req);
+  return { access, allowed: Boolean(access && partnerCan(access.roles, permission)) };
 }
 const menuModifierSchema = z.object({ id: z.string().min(1).max(80), name: z.string().min(1).max(120), price: z.number().min(0).max(1000), required: z.boolean().default(false), options: z.array(z.string().max(120)).max(30).default([]) });
 const partnerMenuItemSchema = z.object({ id: z.string().min(1).max(80), name: z.string().min(1).max(160), description: z.string().max(500).default(""), price: z.number().min(0).max(1000), category: z.string().max(100).default("General"), image: z.string().max(1200).refine((value) => value === "" || value.startsWith("https://api.pikidelivery.com/api/v1/catalog/assets/"), "La imagen debe proceder del almacenamiento de PIKI").default(""), allergens: z.array(z.string().max(80)).max(30).default([]), modifiers: z.array(menuModifierSchema).max(20).default([]), available: z.boolean().default(true), vegetarian: z.boolean().default(false), popular: z.boolean().default(false) });
@@ -767,8 +813,10 @@ app.get("/api/v1/catalog/assets/:id", async (req, res) => {
   return res.send(Buffer.from(asset.contentBase64, "base64"));
 });
 app.post("/api/v1/partners/menu/assets", requireRole("partner"), async (req, res) => {
-  const restaurantId = await employeeRestaurant(req);
-  if (!restaurantId) return res.status(403).json({ error: "PARTNER_RESTAURANT_NOT_ASSIGNED" });
+  const { access, allowed } = await partnerRequestAccess(req, "menu:write");
+  if (!allowed) return res.status(403).json({ error: "PARTNER_PERMISSION_DENIED", permission: "menu:write" });
+  const restaurantId = await employeeRestaurant(req, access);
+  if (!restaurantId) return res.status(403).json({ error: access?.restaurantIds.length ? "PARTNER_RESTAURANT_ACCESS_DENIED" : "PARTNER_RESTAURANT_NOT_ASSIGNED" });
   const parsed = z.object({ fileName: z.string().min(1).max(180), mimeType: z.enum(MENU_IMAGE_MIME_TYPES), sizeBytes: z.number().int().positive().max(MAX_MENU_IMAGE_BYTES), sha256: z.string().regex(/^[a-f0-9]{64}$/i), contentBase64: z.string().min(1).max(300000), kind: z.literal("menu_image").default("menu_image") }).safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_MENU_IMAGE", maxBytes: MAX_MENU_IMAGE_BYTES, allowedTypes: MENU_IMAGE_MIME_TYPES, details: parsed.error.flatten() });
   const rawBase64 = parsed.data.contentBase64.replace(/^data:[^;]+;base64,/, "");
@@ -785,10 +833,94 @@ app.post("/api/v1/partners/menu/assets", requireRole("partner"), async (req, res
   return res.status(201).json({ asset: { id: asset.id, fileName: asset.fileName, mimeType: asset.mimeType, sizeBytes: asset.sizeBytes, sha256: asset.sha256, folderKey: asset.folderKey, locality: asset.locality, url: publicAssetUrl(asset.id) } });
 });
 app.get("/api/v1/admin/partner-groups/locality", requireRole("admin"), async (_req, res) => res.json({ groups: await PartnerLocalityGroup.find({ isActive: true }).sort({ localityName: 1 }).lean().exec() }));
-app.get("/api/v1/partners/menu", requireRole("partner"), async (req, res) => { const restaurantId = await employeeRestaurant(req); if (!restaurantId) return res.status(403).json({ error: "PARTNER_RESTAURANT_NOT_ASSIGNED" }); const restaurant = await Restaurant.findById(restaurantId).select("name menu").lean().exec() as any; if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" }); return res.json({ restaurant, menu: restaurant.menu || [] }); });
-app.put("/api/v1/partners/menu", requireRole("partner"), async (req, res) => { const restaurantId = await employeeRestaurant(req); if (!restaurantId) return res.status(403).json({ error: "PARTNER_RESTAURANT_NOT_ASSIGNED" }); const parsed = z.object({ items: z.array(partnerMenuItemSchema).max(500) }).safeParse(req.body); if (!parsed.success) return res.status(400).json({ error: "INVALID_MENU", details: parsed.error.flatten() }); const restaurant = await Restaurant.findByIdAndUpdate(restaurantId, { $set: { menu: parsed.data.items } }, { new: true }).select("name menu").lean().exec() as any; if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" }); return res.json({ restaurant, menu: restaurant.menu || [] }); });
-app.get("/api/v1/partners/kitchen/orders", requireRole("partner"), async (req, res) => { const restaurantId = await employeeRestaurant(req); if (!restaurantId) return res.status(403).json({ error: "PARTNER_RESTAURANT_NOT_ASSIGNED" }); const orders = await Order.find({ restaurantId, ...dispatchablePaymentFilter, status: { $in: ["pending", "accepted", "preparing", "ready_for_pickup"] } }).sort({ createdAt: 1 }).lean().exec() as any[]; const [restaurantRecord, customers] = await Promise.all([Restaurant.findById(restaurantId).select("name address phone cuisine").lean().exec(), CustomerAccount.find({ _id: { $in: orders.map((order) => order.customerId).filter(Boolean) } }).select("name email").lean().exec()]); const restaurant = restaurantRecord as any; const customerMap = new Map(customers.map((customer: any) => [String(customer._id), customer])); return res.json({ orders: orders.map((order: any) => ({ ...order, restaurant: restaurant ? { name: restaurant.name, address: restaurant.address || "", phone: restaurant.phone || "", cuisine: restaurant.cuisine || "" } : null, customer: order.customerId ? customerMap.get(String(order.customerId)) || null : null, pickupQrUrl: order.status === "ready_for_pickup" ? pickupQrUrl(order.publicCode) : null, pickupPin: order.status === "ready_for_pickup" ? pickupQrPin(order.publicCode) : null })) }); });
-app.patch("/api/v1/partners/kitchen/orders/:id/status", requireRole("partner"), async (req, res) => { const restaurantId = await employeeRestaurant(req); if (!restaurantId) return res.status(403).json({ error: "PARTNER_RESTAURANT_NOT_ASSIGNED" }); const parsed = z.object({ status: z.enum(["accepted", "preparing", "ready_for_pickup", "cancelled"]) }).safeParse(req.body); if (!parsed.success) return res.status(400).json({ error: "INVALID_KITCHEN_STATUS" }); const orderId = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id); if (!orderId) return res.status(400).json({ error: "INVALID_ORDER_ID" }); const order = await Order.findOne({ _id: orderId, restaurantId }); if (!order) return res.status(404).json({ error: "ORDER_NOT_FOUND" }); const current = order.status as any; const target = parsed.data.status; const allowed: Record<string, string[]> = { pending: ["accepted", "cancelled"], accepted: ["preparing", "cancelled"], preparing: ["ready_for_pickup", "cancelled"] }; if (!allowed[current]?.includes(target)) return res.status(409).json({ error: "INVALID_ORDER_TRANSITION", from: current, to: target }); if (target === "accepted" && order.paymentState !== "paid" && order.paymentMethod !== "cash") return res.status(409).json({ error: "PAYMENT_NOT_CONFIRMED" }); order.status = target as any; order.statusHistory.push({ status: target, actorRole: "partner", reason: "Actualización desde pantalla de cocina" } as any); await order.save(); await publishOrderStatusEvents(order, target).catch((error) => console.warn("Realtime partner status event failed", error instanceof Error ? error.message : error)); scheduleCustomerOrderPush(order, target); return res.json({ order }); });
+app.get("/api/v1/partners/locations", requireRole("partner"), async (req, res) => {
+  const access = await partnerAccessForRequest(req);
+  return res.json({ locations: access ? await partnerLocationsFor(access.employee, access.roles, access.permissions) : [] });
+});
+app.patch("/api/v1/partners/store/status", requireRole("partner"), async (req, res) => {
+  const { access, allowed } = await partnerRequestAccess(req, "store:write");
+  if (!allowed) return res.status(403).json({ error: "PARTNER_PERMISSION_DENIED", permission: "store:write" });
+  const restaurantId = await employeeRestaurant(req, access);
+  if (!restaurantId) return res.status(403).json({ error: access?.restaurantIds.length ? "PARTNER_RESTAURANT_ACCESS_DENIED" : "PARTNER_RESTAURANT_NOT_ASSIGNED" });
+  const parsed = z.object({ status: z.enum(["open", "paused"]) }).safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "INVALID_STORE_STATUS" });
+  const restaurant = await Restaurant.findOneAndUpdate({ _id: restaurantId, onboardingStatus: "approved" }, { $set: { isActive: parsed.data.status === "open" } }, { new: true }).select("_id name isActive").lean().exec() as any;
+  if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
+  return res.json({ restaurant: { id: String(restaurant._id), name: restaurant.name }, status: restaurant.isActive ? "open" : "paused", isOpen: Boolean(restaurant.isActive) });
+});
+app.get("/api/v1/partners/menu", requireRole("partner"), async (req, res) => {
+  const { access, allowed } = await partnerRequestAccess(req, "menu:read");
+  if (!allowed) return res.status(403).json({ error: "PARTNER_PERMISSION_DENIED", permission: "menu:read" });
+  const restaurantId = await employeeRestaurant(req, access);
+  if (!restaurantId) return res.status(403).json({ error: access?.restaurantIds.length ? "PARTNER_RESTAURANT_ACCESS_DENIED" : "PARTNER_RESTAURANT_NOT_ASSIGNED" });
+  const restaurant = await Restaurant.findById(restaurantId).select("name menu").lean().exec() as any;
+  if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
+  return res.json({ restaurant, menu: restaurant.menu || [] });
+});
+app.put("/api/v1/partners/menu", requireRole("partner"), async (req, res) => {
+  const { access, allowed } = await partnerRequestAccess(req, "menu:write");
+  if (!allowed) return res.status(403).json({ error: "PARTNER_PERMISSION_DENIED", permission: "menu:write" });
+  const restaurantId = await employeeRestaurant(req, access);
+  if (!restaurantId) return res.status(403).json({ error: access?.restaurantIds.length ? "PARTNER_RESTAURANT_ACCESS_DENIED" : "PARTNER_RESTAURANT_NOT_ASSIGNED" });
+  const parsed = z.object({ items: z.array(partnerMenuItemSchema).max(500) }).safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "INVALID_MENU", details: parsed.error.flatten() });
+  const restaurant = await Restaurant.findByIdAndUpdate(restaurantId, { $set: { menu: parsed.data.items } }, { new: true }).select("name menu").lean().exec() as any;
+  if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
+  return res.json({ restaurant, menu: restaurant.menu || [] });
+});
+app.get("/api/v1/partners/kitchen/orders", requireRole("partner"), async (req, res) => {
+  const { access, allowed } = await partnerRequestAccess(req, "orders:read");
+  if (!allowed) return res.status(403).json({ error: "PARTNER_PERMISSION_DENIED", permission: "orders:read" });
+  const restaurantId = await employeeRestaurant(req, access);
+  if (!restaurantId) return res.status(403).json({ error: access?.restaurantIds.length ? "PARTNER_RESTAURANT_ACCESS_DENIED" : "PARTNER_RESTAURANT_NOT_ASSIGNED" });
+  const orders = await Order.find({ restaurantId, ...dispatchablePaymentFilter, status: { $in: ["pending", "accepted", "preparing", "ready_for_pickup"] } }).sort({ createdAt: 1 }).lean().exec() as any[];
+  const [restaurantRecord, customers] = await Promise.all([Restaurant.findById(restaurantId).select("name address phone cuisine").lean().exec(), CustomerAccount.find({ _id: { $in: orders.map((order) => order.customerId).filter(Boolean) } }).select("name email").lean().exec()]);
+  const restaurant = restaurantRecord as any;
+  const customerMap = new Map(customers.map((customer: any) => [String(customer._id), customer]));
+  return res.json({ orders: orders.map((order: any) => ({ ...order, restaurant: restaurant ? { name: restaurant.name, address: restaurant.address || "", phone: restaurant.phone || "", cuisine: restaurant.cuisine || "" } : null, customer: order.customerId ? customerMap.get(String(order.customerId)) || null : null, pickupQrUrl: order.status === "ready_for_pickup" ? pickupQrUrl(order.publicCode) : null, pickupPin: order.status === "ready_for_pickup" ? pickupQrPin(order.publicCode) : null })) });
+});
+app.patch("/api/v1/partners/kitchen/orders/:id/status", requireRole("partner"), async (req, res) => {
+  const parsed = z.object({ status: z.enum(["accepted", "preparing", "ready_for_pickup", "cancelled"]) }).safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "INVALID_KITCHEN_STATUS" });
+  const permission: PartnerPermission = parsed.data.status === "cancelled" ? "orders:cancel" : parsed.data.status === "accepted" ? "orders:write" : "orders:prepare";
+  const { access, allowed: permissionGranted } = await partnerRequestAccess(req, permission);
+  if (!permissionGranted) return res.status(403).json({ error: "PARTNER_PERMISSION_DENIED", permission });
+  const restaurantId = await employeeRestaurant(req, access);
+  if (!restaurantId) return res.status(403).json({ error: access?.restaurantIds.length ? "PARTNER_RESTAURANT_ACCESS_DENIED" : "PARTNER_RESTAURANT_NOT_ASSIGNED" });
+  const orderId = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
+  if (!orderId) return res.status(400).json({ error: "INVALID_ORDER_ID" });
+  const order = await Order.findOne({ _id: orderId, restaurantId });
+  if (!order) return res.status(404).json({ error: "ORDER_NOT_FOUND" });
+  const current = order.status as any;
+  const target = parsed.data.status;
+  const allowedTransitions: Record<string, string[]> = { pending: ["accepted", "cancelled"], accepted: ["preparing", "cancelled"], preparing: ["ready_for_pickup", "cancelled"] };
+  if (!allowedTransitions[current]?.includes(target)) return res.status(409).json({ error: "INVALID_ORDER_TRANSITION", from: current, to: target });
+  if (target === "accepted" && order.paymentState !== "paid" && order.paymentMethod !== "cash") return res.status(409).json({ error: "PAYMENT_NOT_CONFIRMED" });
+  order.status = target as any;
+  order.statusHistory.push({ status: target, actorRole: "partner", reason: "Actualización desde pantalla de cocina" } as any);
+  await order.save();
+  await publishOrderStatusEvents(order, target).catch((error) => console.warn("Realtime partner status event failed", error instanceof Error ? error.message : error));
+  scheduleCustomerOrderPush(order, target);
+  return res.json({ order });
+});
+app.get("/api/v1/partners/metrics/overview", requireRole("partner"), async (req, res) => {
+  const { access, allowed } = await partnerRequestAccess(req, "metrics:read");
+  if (!allowed) return res.status(403).json({ error: "PARTNER_PERMISSION_DENIED", permission: "metrics:read" });
+  const restaurantId = await employeeRestaurant(req, access);
+  if (!restaurantId) return res.status(403).json({ error: access?.restaurantIds.length ? "PARTNER_RESTAURANT_ACCESS_DENIED" : "PARTNER_RESTAURANT_NOT_ASSIGNED" });
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const yesterday = new Date(today);
+  yesterday.setDate(yesterday.getDate() - 1);
+  const [todayRows, yesterdayCount, restaurant] = await Promise.all([
+    Order.aggregate([{ $match: { restaurantId: objectId(restaurantId), createdAt: { $gte: today } } }, { $group: { _id: null, orders: { $sum: 1 }, cancellations: { $sum: { $cond: [{ $eq: ["$status", "cancelled"] }, 1, 0] } }, revenueCents: { $sum: { $cond: [{ $ne: ["$status", "cancelled"] }, "$totalCents", 0] } } } }]),
+    Order.countDocuments({ restaurantId, createdAt: { $gte: yesterday, $lt: today } }),
+    Restaurant.findById(restaurantId).select("rating").lean().exec(),
+  ]);
+  const overview = todayRows[0] || { orders: 0, cancellations: 0, revenueCents: 0 };
+  const trend = yesterdayCount ? ((Number(overview.orders) - yesterdayCount) / yesterdayCount) * 100 : Number(overview.orders) ? 100 : 0;
+  return res.json({ overview: { orders: Number(overview.orders), revenueCents: Number(overview.revenueCents), cancellations: Number(overview.cancellations), rating: Number((restaurant as any)?.rating || 0), trend } });
+});
 
 app.get("/api/v1/commercial/portfolio", requireRole("commercial"), async (req, res) => {
   const employeeId = req.auth?.employeeId;
@@ -806,6 +938,24 @@ app.patch("/api/v1/admin/restaurants/:id/assign-commercial", requireOwner(), asy
   const restaurant = await Restaurant.findByIdAndUpdate(restaurantId, { $set: { commercialEmployeeId: commercialId } }, { new: true }).lean().exec();
   if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
   return res.json({ restaurant, portfolioId: commercial.portfolioId });
+});
+
+app.patch("/api/v1/admin/employees/:id/partner-locations", requireOwner(), async (req, res) => {
+  const employeeId = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
+  if (!employeeId) return res.status(400).json({ error: "INVALID_EMPLOYEE_ID" });
+  const parsed = z.object({ restaurantIds: z.array(z.string().regex(/^[a-f\d]{24}$/i)).min(1).max(100), partnerRoles: z.array(z.enum(partnerOperationalRoles)).min(1).max(10).optional() }).safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "INVALID_PARTNER_ASSIGNMENT", details: parsed.error.flatten() });
+  const employee = await EmployeeAccount.findById(employeeId).select("apiRole roles partnerRoles authorizationStatus accessLevel restaurantId restaurantIds").lean().exec() as any;
+  if (!employee || (employee.apiRole !== "partner" && !(employee.roles || []).includes("partner"))) return res.status(404).json({ error: "PARTNER_ACCOUNT_NOT_FOUND" });
+  const uniqueIds = [...new Set(parsed.data.restaurantIds)];
+  const restaurants = await Restaurant.find({ _id: { $in: uniqueIds.map((id) => objectId(id)) }, onboardingStatus: "approved" }).select("_id name address isActive onboardingStatus").lean().exec() as any[];
+  if (restaurants.length !== uniqueIds.length) return res.status(409).json({ error: "PARTNER_RESTAURANT_ASSIGNMENT_INVALID", message: "Solo se pueden asignar locales existentes y aprobados." });
+  const partnerRoles = parsed.data.partnerRoles || partnerRolesForEmployee(employee);
+  const updated = await EmployeeAccount.findByIdAndUpdate(employeeId, { $set: { restaurantId: objectId(uniqueIds[0]), restaurantIds: uniqueIds.map((id) => objectId(id)), partnerRoles } }, { new: true }).select("_id name email restaurantId restaurantIds partnerRoles roles apiRole accessLevel authorizationStatus").lean().exec() as any;
+  await AccessAuthorization.create({ employeeId, action: "role_changed", previousStatus: employee.authorizationStatus || "approved", nextStatus: updated.authorizationStatus || "approved", previousRole: JSON.stringify({ restaurantIds: assignedRestaurantIds(employee), partnerRoles: employee.partnerRoles || [] }), nextRole: JSON.stringify({ restaurantIds: uniqueIds, partnerRoles }), accessLevel: updated.accessLevel || "subadmin", actorEmployeeId: objectId(req.auth!.employeeId!), reason: "Asignación actualizada para operación PIKI Partner Orders" });
+  await revokeEmployeeSessions(employeeId);
+  const permissions = [...permissionsForPartnerRoles(partnerRoles)];
+  return res.json({ employee: { id: String(updated._id), email: updated.email, roles: partnerRoles, locations: await partnerLocationsFor(updated, partnerRoles, permissions) } });
 });
 
 app.get("/api/v1/admin/restaurants", requireRole("admin"), async (req, res) => {
