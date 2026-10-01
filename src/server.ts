@@ -151,9 +151,10 @@ async function fleetRiderFilter(req: express.Request): Promise<Record<string, un
   const employee = await employeeScope(req);
   // Newly enabled rider accounts start unassigned. Fleet must be able to see
   // those accounts so the first slot reservation can link them to this fleet.
+  const realRiderFilter = { isTestRider: { $ne: true } };
   return employee?.fleetId
-    ? { $or: [{ fleetId: employee.fleetId }, { fleetId: null }, { fleetId: { $exists: false } }] }
-    : { $or: [{ fleetId: null }, { fleetId: { $exists: false } }] };
+    ? { ...realRiderFilter, $or: [{ fleetId: employee.fleetId }, { fleetId: null }, { fleetId: { $exists: false } }] }
+    : { ...realRiderFilter, $or: [{ fleetId: null }, { fleetId: { $exists: false } }] };
 }
 async function fleetCanAccessRider(req: express.Request, riderId: mongoose.Types.ObjectId | null) {
   if (!riderId) return false;
@@ -1746,7 +1747,7 @@ async function assignOrderAutomatically(orderId: mongoose.Types.ObjectId, prefer
     if (!restaurant?.location?.coordinates || !order.deliveryLocation?.coordinates) return { state: "missing_geolocation" as const };
     const policy = await dispatchLoadPolicy();
     const freshness = new Date(Date.now() - 90_000);
-    const riderFilter: Record<string, unknown> = { ...tenantFilter, status: { $in: ["available", "busy"] }, lastLocationAt: { $gte: freshness }, location: { $exists: true } };
+    const riderFilter: Record<string, unknown> = { ...tenantFilter, isTestRider: { $ne: true }, status: { $in: ["available", "busy"] }, lastLocationAt: { $gte: freshness }, location: { $exists: true } };
     if (preferredRiderId) riderFilter._id = preferredRiderId;
     const riders = await Rider.find(riderFilter).limit(100).lean().exec() as any[];
     const counts = await activeOrderCounts(riders.map((rider) => rider._id));
@@ -1825,7 +1826,7 @@ app.get("/api/v1/dispatch/orders/:id/preview", requireRole("admin", "fleet"), as
   if (!orderId) return res.status(400).json({ error: "INVALID_ORDER_ID" });
   const order = await findDispatchOrder(orderId, req);
   if (!order) return res.status(404).json({ error: "ORDER_NOT_FOUND" });
-  const scope = dispatchScope(req, order);
+  const scope = { ...dispatchScope(req, order), isTestRider: { $ne: true } };
   const restaurant = await findDispatchRestaurant(order, req, scope);
   if (!restaurant?.location?.coordinates || !order.deliveryLocation?.coordinates) return res.status(409).json({ error: "MISSING_GEOLOCATION" });
   const freshness = new Date(Date.now() - 90_000);
@@ -2068,7 +2069,7 @@ app.get("/api/v1/admin/overview", requireRole("admin"), async (_req, res) => {
   const [activeRestaurants, pendingRestaurants, riders, openOrders, deliveredToday, gmv] = await Promise.all([
     Restaurant.countDocuments({ isActive: true, onboardingStatus: "approved" }),
     Restaurant.countDocuments({ onboardingStatus: "pending_review" }),
-    Rider.countDocuments(),
+    Rider.countDocuments({ isTestRider: { $ne: true } }),
     Order.countDocuments({ status: { $in: ["pending", "accepted", "preparing", "ready_for_pickup", "picked_up", "on_the_way"] } }),
     Order.countDocuments({ status: "delivered", deliveredAt: { $gte: startOfDay } }),
     Order.aggregate([{ $match: { paymentState: "paid", createdAt: { $gte: startOfDay } } }, { $group: { _id: null, totalCents: { $sum: "$totalCents" }, orders: { $sum: 1 } } }]),
@@ -2077,7 +2078,7 @@ app.get("/api/v1/admin/overview", requireRole("admin"), async (_req, res) => {
 });
 
 app.get("/api/v1/admin/operations/live", requireRole("admin"), async (_req, res) => {
-  const riders = await Rider.find({ location: { $exists: true } }).select("riderCode name email status vehicle location lastLocationAt activeOrderId fleetId").lean().exec() as any[];
+  const riders = await Rider.find({ isTestRider: { $ne: true }, location: { $exists: true } }).select("riderCode name email status vehicle location lastLocationAt activeOrderId fleetId").lean().exec() as any[];
   const activeOrderIds = riders.map((rider) => rider.activeOrderId).filter(Boolean);
   const orders = await Order.find({ _id: { $in: activeOrderIds } }).select("publicCode displayCode status assignmentState deliveryAddress restaurantId customerId riderId").select("+customerPhone").lean().exec() as any[];
   const restaurants = await Restaurant.find({ _id: { $in: orders.map((order) => order.restaurantId) } }).select("name address").lean().exec() as any[];
