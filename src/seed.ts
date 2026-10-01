@@ -20,11 +20,31 @@ export const pikiRestaurants = [
   { slug: "sait-nit-i-dia", name: "Sait – Nit i Dia", cuisine: "Arrocería · Brasa", category: "Arroces", tagline: "Arroces, brasa y cocina mediterránea.", etaMinutes: [30, 45], deliveryFeeCents: 299, rating: 4.7, reviews: 0, image: "https://images.unsplash.com/photo-1534080564583-6be75777b70a?auto=format&fit=crop&w=1200&q=80", accent: "#2B5360", menu: [{ id: "sait-1", name: "Arroz del senyoret", description: "Arroz mediterráneo con pescado y marisco.", price: 17.5, popular: true }, { id: "sait-2", name: "Pollo a la brasa", description: "Guarnición de patata y ensalada.", price: 14.5 }, { id: "sait-3", name: "Tarta de queso", description: "Textura cremosa y coulis.", price: 6.5, vegetarian: true }] },
 ] as const;
 
+export const operationalZones = [
+  { name: "Xàtiva Pueblo", slug: "xativa-pueblo", maxEtaMinutes: 45, polygon: [[[-0.536, 38.975], [-0.505, 38.975], [-0.505, 39.006], [-0.536, 39.006], [-0.536, 38.975]]] },
+  { name: "Xàtiva Norte", slug: "xativa-norte", maxEtaMinutes: 60, polygon: [[[-0.555, 39.006], [-0.505, 39.006], [-0.505, 39.045], [-0.555, 39.045], [-0.555, 39.006]]] },
+  { name: "Xàtiva Sur", slug: "xativa-sur", maxEtaMinutes: 60, polygon: [[[-0.555, 38.940], [-0.505, 38.940], [-0.505, 38.975], [-0.555, 38.975], [-0.555, 38.940]]] },
+  { name: "Alrededores Xàtiva Oeste", slug: "alrededores-xativa-oeste", maxEtaMinutes: 75, polygon: [[[-0.600, 38.940], [-0.555, 38.940], [-0.555, 39.045], [-0.600, 39.045], [-0.600, 38.940]]] },
+  { name: "Alrededores Xàtiva Este", slug: "alrededores-xativa-este", maxEtaMinutes: 75, polygon: [[[-0.505, 38.940], [-0.450, 38.940], [-0.450, 39.045], [-0.505, 39.045], [-0.505, 38.940]]] },
+] as const;
+
+export async function seedOperationalZones() {
+  for (const zone of operationalZones) {
+    await Zone.updateOne(
+      { slug: zone.slug },
+      { $set: { name: zone.name, slug: zone.slug, isActive: true, serviceFeeCents: 0, maxEtaMinutes: zone.maxEtaMinutes, polygon: { type: "Polygon", coordinates: zone.polygon } } },
+      { upsert: true },
+    );
+  }
+  return operationalZones.length;
+}
+
 export async function seedCatalog() {
   const locations: Record<string, [number, number]> = {
     solera: [-0.5188, 38.9898], "taller-verde": [-0.5201, 38.9911], "forno-rossi": [-0.5212, 38.9904], "nori-club": [-0.5192, 38.9920], "brasa-callejera": [-0.5178, 38.9915], "miga-dulce": [-0.5207, 38.9899], "ganesh-xativa": [-0.5220, 38.9895], "el-tunel-xativa": [-0.5217, 38.9900], "il-padrino-due": [-0.5205, 38.9910], "casa-la-abuela": [-0.5199, 38.9908], "gourmet-socarrat": [-0.5187, 38.9909], "picaeta-carmeta": [-0.5194, 38.9896], "sait-nit-i-dia": [-0.5170, 38.9905], "kfc-xativa": [-0.5189, 38.9902],
   };
   for (const restaurant of pikiRestaurants) await Restaurant.updateOne({ slug: restaurant.slug }, { $set: { ...restaurant, address: "Xàtiva, València", location: { type: "Point", coordinates: locations[restaurant.slug] } } }, { upsert: true });
+  await seedOperationalZones();
   await Zone.updateOne({ slug: "xativa-centro" }, { $set: { name: "Xàtiva Centro", slug: "xativa-centro", isActive: true, serviceFeeCents: 0, maxEtaMinutes: 60, polygon: { type: "Polygon", coordinates: [[[-0.545, 38.975], [-0.495, 38.975], [-0.495, 39.010], [-0.545, 39.010], [-0.545, 38.975]]] } } }, { upsert: true });
   return pikiRestaurants.length;
 }
