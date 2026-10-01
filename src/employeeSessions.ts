@@ -21,6 +21,9 @@ export const EmployeeSession = mongoose.models.EmployeeSession || mongoose.model
 export function sessionRole(employee: { email: string; apiRole: string; roles?: string[]; primaryRole?: string | null; ownerProtected?: boolean; authorizationStatus?: string }, surface: string, requestedRole?: string): string | null {
   if (employee.authorizationStatus && employee.authorizationStatus !== "approved") return null;
   const availableRoles = Array.isArray(employee.roles) && employee.roles.length ? employee.roles : [employee.apiRole];
+  // An explicitly persisted admin membership must open the administrative
+  // surface as admin even when the account's operational default is Partner.
+  if (surface === "admin" && availableRoles.includes("admin")) return "admin";
   const selectedRole = requestedRole || employee.primaryRole || employee.apiRole;
   // The protected owner account may operate internal surfaces even though its
   // persisted business role remains admin. Keep the issued session scoped to

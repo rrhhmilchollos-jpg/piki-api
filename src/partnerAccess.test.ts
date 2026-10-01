@@ -20,12 +20,13 @@ test("kitchen access remains scoped to preparation actions", () => {
 });
 
 test("explicit admin role is preserved for the protected owner session", () => {
-  const role = sessionRole({
+  const employee = {
     email: "rrhh.milchollos@gmail.com",
     apiRole: "partner",
     roles: ["admin"],
     ownerProtected: true,
     authorizationStatus: "approved",
-  }, "admin", "admin");
-  assert.equal(role, "admin");
+  };
+  assert.equal(sessionRole(employee, "admin", "admin"), "admin");
+  assert.equal(sessionRole(employee, "admin"), "admin");
 });
