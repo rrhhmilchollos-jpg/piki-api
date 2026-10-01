@@ -1831,20 +1831,19 @@ app.get("/api/v1/dispatch/orders/:id/preview", requireRole("admin", "fleet"), as
   const freshness = new Date(Date.now() - 90_000);
   const policy = await dispatchLoadPolicy();
   const maxConcurrentOrders = order.isTestOrder ? 2 : policy.maxConcurrentOrders;
-  const diagnosticPool = order.isTestOrder && req.auth?.role === "fleet"
-    ? await Rider.find({}).select("_id riderCode name status lastLocationAt location tenantId fleetId activeOrderId").limit(200).lean().exec() as any[]
-    : [];
-  const riders = await Rider.find({ ...scope, status: { $in: ["available", "busy"] }, lastLocationAt: { $gte: freshness }, location: { $exists: true } }).limit(100).lean().exec() as any[];
+  const diagnosticPool = await Rider.find({ ...scope }).select("_id riderCode name status lastLocationAt location tenantId fleetId activeOrderId zoneSlug").limit(200).lean().exec() as any[];
+  const riders = diagnosticPool.filter((rider: any) => ["available", "busy"].includes(rider.status) && rider.lastLocationAt && new Date(rider.lastLocationAt).getTime() >= freshness.getTime() && rider.location?.coordinates?.length >= 2).slice(0, 100);
   const counts = await activeOrderCounts(riders.map((rider) => rider._id));
   const ranked = rankDispatchCandidates(riders.map((rider) => ({ id: String(rider._id), status: rider.status, vehicle: rider.vehicle, location: rider.location, lastLocationAt: rider.lastLocationAt, reliabilityScore: rider.reliabilityScore, activeOrderCount: counts.get(String(rider._id)) || 0, zoneFit: 1, servicePriority: 0.5 })), { restaurantLocation: [restaurant.location.coordinates[0], restaurant.location.coordinates[1]], customerLocation: [order.deliveryLocation.coordinates[0], order.deliveryLocation.coordinates[1]], routeDistanceKm: typeof order.routeDistanceKm === "number" ? order.routeDistanceKm : null, requiredVehicleClasses: Array.isArray(order.requiredVehicleClasses) ? order.requiredVehicleClasses : [], preparationMinutes: parsed.data.preparationMinutes, maxCustomerEtaMinutes: parsed.data.maxCustomerEtaMinutes, maxConcurrentOrders });
   await DispatchDecision.insertMany(ranked.map((decision) => ({ orderId: order._id, ...decision, riderId: objectId(decision.riderId), outcome: "preview", actorRole: req.auth?.role || "system" })));
-  const diagnostic = diagnosticPool.length ? {
+  const diagnostic = {
     totalRiders: diagnosticPool.length,
     onlineRiders: diagnosticPool.filter((rider) => ["available", "busy"].includes(rider.status)).length,
     freshGpsRiders: diagnosticPool.filter((rider) => rider.lastLocationAt && new Date(rider.lastLocationAt).getTime() >= freshness.getTime()).length,
     ridersWithLocation: diagnosticPool.filter((rider) => rider.location?.coordinates?.length >= 2).length,
-    visibleRiders: diagnosticPool.map((rider) => ({ riderCode: rider.riderCode, name: rider.name, status: rider.status, lastLocationAt: rider.lastLocationAt, hasLocation: Boolean(rider.location?.coordinates?.length >= 2), hasActiveOrder: Boolean(rider.activeOrderId), sameTenant: !order.tenantId || String(rider.tenantId || "") === String(order.tenantId || "") })),
-  } : undefined;
+    eligibleRiders: riders.length,
+    visibleRiders: diagnosticPool.map((rider) => ({ riderCode: rider.riderCode, name: rider.name, status: rider.status, lastLocationAt: rider.lastLocationAt, hasLocation: Boolean(rider.location?.coordinates?.length >= 2), hasFreshGps: Boolean(rider.lastLocationAt && new Date(rider.lastLocationAt).getTime() >= freshness.getTime()), hasActiveOrder: Boolean(rider.activeOrderId), sameTenant: !order.tenantId || String(rider.tenantId || "") === String(order.tenantId || ""), exclusion: !["available", "busy"].includes(rider.status) ? "not_available" : !rider.location?.coordinates?.length ? "missing_gps" : !rider.lastLocationAt || new Date(rider.lastLocationAt).getTime() < freshness.getTime() ? "gps_stale" : rider.activeOrderId ? "active_order" : null })),
+  };
   return res.json({ algorithmVersion: ranked[0]?.algorithmVersion || "piki-jarvis-v1", orderId: order._id, policy, candidatesConsidered: riders.length, eligibleCandidates: ranked.length, candidates: ranked, diagnostic });
 });
 
@@ -1872,7 +1871,8 @@ app.post("/api/v1/dispatch/orders/:id/assign", requireRole("admin", "fleet"), as
   const freshness = new Date(Date.now() - 90_000);
   const policy = await dispatchLoadPolicy();
   const maxConcurrentOrders = order.isTestOrder ? 2 : policy.maxConcurrentOrders;
-  const riders = await Rider.find({ ...scope, status: { $in: ["available", "busy"] }, lastLocationAt: { $gte: freshness }, location: { $exists: true } }).limit(100).lean().exec() as any[];
+  const riderPool = await Rider.find({ ...scope }).select("_id riderCode name status lastLocationAt location tenantId fleetId activeOrderId zoneSlug vehicle reliabilityScore").limit(200).lean().exec() as any[];
+  const riders = riderPool.filter((rider: any) => ["available", "busy"].includes(rider.status) && rider.lastLocationAt && new Date(rider.lastLocationAt).getTime() >= freshness.getTime() && rider.location?.coordinates?.length >= 2).slice(0, 100);
   const counts = await activeOrderCounts(riders.map((rider) => rider._id));
   const ranked = rankDispatchCandidates(riders.map((rider) => ({ id: String(rider._id), status: rider.status, vehicle: rider.vehicle, location: rider.location, lastLocationAt: rider.lastLocationAt, reliabilityScore: rider.reliabilityScore, activeOrderCount: counts.get(String(rider._id)) || 0, zoneFit: 1, servicePriority: 0.5 })), { restaurantLocation: [restaurant.location.coordinates[0], restaurant.location.coordinates[1]], customerLocation: [order.deliveryLocation.coordinates[0], order.deliveryLocation.coordinates[1]], routeDistanceKm: typeof order.routeDistanceKm === "number" ? order.routeDistanceKm : null, requiredVehicleClasses: Array.isArray(order.requiredVehicleClasses) ? order.requiredVehicleClasses : [], preparationMinutes: parsed.data.preparationMinutes, maxConcurrentOrders });
   if (!ranked.length) return res.status(409).json({ error: "NO_ELIGIBLE_RIDER", candidatesConsidered: riders.length });
@@ -2025,10 +2025,11 @@ app.get("/api/v1/fleets", requireRole("admin", "fleet"), async (req, res) => {
   return res.json({ fleets });
 });
 
+const fleetInputSchema = z.object({ name: z.string().trim().min(2).max(120), legalName: z.string().trim().max(180).default(""), taxId: z.string().trim().max(32).default(""), managerName: z.string().trim().min(2).max(120), contactEmail: z.string().trim().email().or(z.literal("")), contactPhone: z.string().trim().min(6).max(40), address: z.string().trim().min(5).max(240), postalCode: z.string().trim().min(3).max(12), city: z.string().trim().min(2).max(120), vehicleTypes: z.array(z.enum(["bike", "electric_bike", "electric_scooter", "motorcycle", "scooter", "car"])).min(1).max(6), maxRiders: z.coerce.number().int().min(1).max(10000), serviceZones: z.array(z.string().regex(/^[a-z0-9-]+$/)).min(1).max(300), notes: z.string().trim().max(2000).default("") });
 app.post("/api/v1/fleets", requireRole("admin"), async (req, res) => {
-  const parsed = z.object({ name: z.string().min(2).max(120), managerName: z.string().max(120).default(""), serviceZones: z.array(z.string().regex(/^[a-z0-9-]+$/)).default([]) }).safeParse(req.body);
+  const parsed = fleetInputSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_FLEET", details: parsed.error.flatten() });
-  const fleet = await Fleet.findOneAndUpdate({ ...tenantScope(req), name: parsed.data.name }, { $set: { ...parsed.data, ...tenantScope(req) } }, { upsert: true, new: true }).lean().exec();
+  const fleet = await Fleet.findOneAndUpdate({ ...tenantScope(req), name: parsed.data.name }, { $set: { ...parsed.data, ...tenantScope(req), taxId: parsed.data.taxId.toUpperCase() } }, { upsert: true, new: true, runValidators: true }).lean().exec();
   return res.status(201).json({ fleet });
 });
 
