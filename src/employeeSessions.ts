@@ -3,7 +3,9 @@ import { EmployeeAccount, Rider } from "./models.js";
 import { createSessionToken, hashSessionToken } from "./employeeAuth.js";
 
 export const OWNER_EMAIL = "rrhh.milchollos@gmail.com";
-export const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+// Persistent PWA sessions survive closing/reopening the app while remaining
+// bounded; password changes, suspension and explicit logout still revoke them.
+export const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const schema = new Schema({
   tokenHash: { type: String, required: true, unique: true, index: true },
   employeeId: { type: Schema.Types.ObjectId, required: true, index: true },
