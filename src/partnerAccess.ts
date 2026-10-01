@@ -16,6 +16,8 @@ type PartnerEmployee = {
   jobRole?: unknown;
   roles?: unknown;
   partnerRoles?: unknown;
+  email?: unknown;
+  ownerProtected?: unknown;
 };
 
 const fullAccessRoles = new Set(["owner", "partner_admin", "admin", "administrator", "propietario", "partner"]);
@@ -30,6 +32,15 @@ export function partnerRolesForEmployee(employee: PartnerEmployee | null | undef
 
   const fallback = typeof employee?.jobRole === "string" ? employee.jobRole : employee?.apiRole;
   return fallback === "partner" ? ["partner_admin"] : typeof fallback === "string" && fallback ? [fallback] : [];
+}
+
+/** The protected owner may be assigned a narrowly scoped Partner location for live support. */
+export function canReceivePartnerLocations(employee: PartnerEmployee | null | undefined, ownerEmail: string): boolean {
+  if (!employee) return false;
+  const roles = Array.isArray(employee.roles) ? employee.roles : [];
+  const isPartnerAccount = employee.apiRole === "partner" || roles.includes("partner");
+  const isProtectedOwner = employee.ownerProtected === true && employee.email === ownerEmail;
+  return isPartnerAccount || isProtectedOwner;
 }
 
 export function permissionsForPartnerRoles(roles: string[]): Set<string> {

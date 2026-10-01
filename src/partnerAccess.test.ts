@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { partnerCan, partnerRolesForEmployee } from "./partnerAccess.js";
+import { canReceivePartnerLocations, partnerCan, partnerRolesForEmployee } from "./partnerAccess.js";
 import { sessionRole } from "./employeeSessions.js";
 import { isTemporaryPasswordAllowedPath } from "./auth.js";
 
@@ -48,4 +48,10 @@ test("temporary credentials only reach the password-change endpoint", () => {
   assert.equal(isTemporaryPasswordAllowedPath("/api/v1/auth/employee/change-password"), true);
   assert.equal(isTemporaryPasswordAllowedPath("/api/v1/auth/employee/me"), false);
   assert.equal(isTemporaryPasswordAllowedPath("/api/v1/partners/kitchen/orders"), false);
+});
+
+test("protected owner can receive a scoped Partner location without losing admin membership", () => {
+  const owner = { email: "rrhh.milchollos@gmail.com", ownerProtected: true, apiRole: "admin", roles: ["admin"] };
+  assert.equal(canReceivePartnerLocations(owner, "rrhh.milchollos@gmail.com"), true);
+  assert.equal(canReceivePartnerLocations({ email: "other@example.com", ownerProtected: true, apiRole: "admin", roles: ["admin"] }, "rrhh.milchollos@gmail.com"), false);
 });
