@@ -952,6 +952,31 @@ app.get("/api/v1/riders", requireRole("admin", "fleet"), async (req, res) => {
   return res.json({ riders });
 });
 
+const riderZoneSchema = z.object({ zoneSlug: z.string().regex(/^[a-z0-9-]+$/).nullable() });
+app.patch("/api/v1/riders/:id/zone", requireRole("admin", "fleet"), async (req, res) => {
+  const riderId = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
+  if (!riderId) return res.status(400).json({ error: "INVALID_RIDER_ID" });
+  const parsed = riderZoneSchema.safeParse({ zoneSlug: req.body?.zoneSlug ?? req.body?.zone ?? null });
+  if (!parsed.success) return res.status(400).json({ error: "INVALID_RIDER_ZONE" });
+  const employee = req.auth?.role === "fleet" ? await employeeScope(req) : null;
+  if (req.auth?.role === "fleet" && !employee?.fleetId) return res.status(403).json({ error: "FLEET_NOT_ASSIGNED" });
+  const rider = await Rider.findOne({ _id: riderId, ...tenantScope(req), ...(await fleetRiderFilter(req)) }).lean().exec() as any;
+  if (!rider) return res.status(404).json({ error: "RIDER_NOT_FOUND" });
+  let zone = null;
+  if (parsed.data.zoneSlug) {
+    zone = await Zone.findOne({ ...tenantScope(req), slug: parsed.data.zoneSlug, isActive: true }).lean().exec() as any;
+    if (!zone) return res.status(404).json({ error: "ZONE_NOT_FOUND", message: "La zona seleccionada no está activa o no existe." });
+    if (req.auth?.role === "fleet") {
+      const allowedZones = Array.isArray(employee?.zoneSlugs) && employee.zoneSlugs.length ? employee.zoneSlugs : (await Fleet.findById(employee.fleetId).select("serviceZones").lean().exec() as any)?.serviceZones || [];
+      if (allowedZones.length && !allowedZones.includes(zone.slug)) return res.status(403).json({ error: "ZONE_ACCESS_DENIED" });
+    }
+  }
+  const update: Record<string, unknown> = { zoneSlug: parsed.data.zoneSlug };
+  if (req.auth?.role === "fleet" && !rider.fleetId) update.fleetId = employee?.fleetId;
+  const updated = await Rider.findOneAndUpdate({ _id: riderId, ...tenantScope(req) }, { $set: update }, { new: true }).lean().exec() as any;
+  return res.json({ rider: updated, zone });
+});
+
 app.get("/api/v1/rider-slots", requireRole("admin", "fleet", "rider"), async (req, res) => {
   const riderId = typeof req.query.riderId === "string" ? objectId(req.query.riderId) : null;
   const filter = riderId ? { riderId, ...tenantScope(req) } : { ...tenantScope(req) };
@@ -1983,7 +2008,13 @@ app.post("/api/v1/zones", requireRole("admin"), async (req, res) => {
 
 app.get("/api/v1/zones", requireRole("admin", "fleet"), async (req, res) => {
   const employee = await employeeScope(req);
-  const zones = await Zone.find(req.auth?.role === "fleet" ? { slug: { $in: employee?.zoneSlugs || [] } } : {}).sort({ name: 1 }).lean().exec();
+  let filter: Record<string, unknown> = { ...tenantScope(req), isActive: true };
+  if (req.auth?.role === "fleet") {
+    const fleet = employee?.fleetId ? await Fleet.findById(employee.fleetId).select("serviceZones").lean().exec() as any : null;
+    const allowedZones = Array.isArray(employee?.zoneSlugs) && employee.zoneSlugs.length ? employee.zoneSlugs : fleet?.serviceZones || [];
+    if (allowedZones.length) filter.slug = { $in: allowedZones };
+  }
+  const zones = await Zone.find(filter).sort({ name: 1 }).lean().exec();
   return res.json({ zones });
 });
 
