@@ -37,6 +37,10 @@ export async function resolveRole(request: Request): Promise<{ role: ApiRole; em
   return employee ? { role: employee.apiRole as ApiRole, employeeId: String(employee._id), tenantId: employee.tenantId ? String(employee.tenantId) : undefined, mustChangePassword: employee.mustChangePassword, accessLevel: employee.accessLevel } : null;
 }
 
+export function isTemporaryPasswordAllowedPath(path: string): boolean {
+  return path.endsWith("/employee/change-password");
+}
+
 export function requireRole(...allowedRoles: ApiRole[]) {
   return async (request: Request, response: Response, next: NextFunction) => {
     const auth = await resolveRole(request);
@@ -45,7 +49,10 @@ export function requireRole(...allowedRoles: ApiRole[]) {
       return response.status(401).json({ error: "AUTHENTICATION_REQUIRED" });
     }
     if (!allowedRoles.includes(auth.role)) return response.status(403).json({ error: "FORBIDDEN", role: auth.role });
-    if (auth.mustChangePassword && !request.path.endsWith("/employee/change-password") && !request.path.endsWith("/employee/me")) return response.status(428).json({ error: "PASSWORD_CHANGE_REQUIRED" });
+    // A temporary credential only grants access to the password-change endpoint.
+    // The profile endpoint is deliberately blocked too, preventing API clients
+    // from treating the UI-only gate as an optional warning.
+    if (auth.mustChangePassword && !isTemporaryPasswordAllowedPath(request.path)) return response.status(428).json({ error: "PASSWORD_CHANGE_REQUIRED" });
     request.auth = auth;
     const riderResource = request.path.match(/^\/api\/v1\/riders\/([a-f\d]{24})(?:\/|$)/i);
     if (auth.role === "rider" && riderResource) {

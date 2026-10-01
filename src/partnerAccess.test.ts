@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { partnerCan, partnerRolesForEmployee } from "./partnerAccess.js";
 import { sessionRole } from "./employeeSessions.js";
+import { isTemporaryPasswordAllowedPath } from "./auth.js";
 
 test("legacy partner accounts receive partner administrator permissions", () => {
   const roles = partnerRolesForEmployee({ apiRole: "partner", jobRole: "partner" });
@@ -41,4 +42,10 @@ test("demo commercial can enter Partner Orders with its primary partner role", (
   };
   assert.equal(sessionRole(employee, "partner"), "partner");
   assert.equal(sessionRole(employee, "admin", "commercial"), "commercial");
+});
+
+test("temporary credentials only reach the password-change endpoint", () => {
+  assert.equal(isTemporaryPasswordAllowedPath("/api/v1/auth/employee/change-password"), true);
+  assert.equal(isTemporaryPasswordAllowedPath("/api/v1/auth/employee/me"), false);
+  assert.equal(isTemporaryPasswordAllowedPath("/api/v1/partners/kitchen/orders"), false);
 });
