@@ -1205,6 +1205,34 @@ app.post("/api/v1/rider-slots/week", requireRole("admin", "fleet"), async (req, 
   }
   return res.status(201).json({ slots, count: slots.length });
 });
+app.patch("/api/v1/rider-slots/:id", requireRole("admin", "fleet"), async (req, res) => {
+  const slotId = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
+  if (!slotId) return res.status(400).json({ error: "INVALID_RIDER_SLOT_ID" });
+  const parsed = riderSlotSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "INVALID_RIDER_SLOT", details: parsed.error.flatten() });
+  if (parsed.data.startTime === parsed.data.endTime) return res.status(400).json({ error: "INVALID_SLOT_TIME_RANGE" });
+  const existing = await RiderSlot.findOne({ _id: slotId, ...tenantScope(req) }).lean().exec() as any;
+  if (!existing) return res.status(404).json({ error: "RIDER_SLOT_NOT_FOUND" });
+  if (req.auth?.role === "fleet" && !(await fleetCanAccessRider(req, existing.riderId))) return res.status(403).json({ error: "FLEET_RIDER_ACCESS_DENIED" });
+  const zone = await Zone.findOne({ ...tenantScope(req), slug: parsed.data.zoneSlug, isActive: true }).select("slug").lean().exec() as any;
+  if (!zone) return res.status(404).json({ error: "ZONE_NOT_FOUND" });
+  try {
+    const slot = await RiderSlot.findOneAndUpdate({ _id: slotId, ...tenantScope(req) }, { $set: { ...parsed.data, zoneSlug: zone.slug } }, { new: true }).lean().exec();
+    return res.json({ slot });
+  } catch (error: any) {
+    if (error?.code === 11000) return res.status(409).json({ error: "RIDER_SLOT_ALREADY_EXISTS", message: "Ya existe otro turno para ese rider, fecha y hora de inicio." });
+    throw error;
+  }
+});
+app.delete("/api/v1/rider-slots/:id", requireRole("admin", "fleet"), async (req, res) => {
+  const slotId = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
+  if (!slotId) return res.status(400).json({ error: "INVALID_RIDER_SLOT_ID" });
+  const existing = await RiderSlot.findOne({ _id: slotId, ...tenantScope(req) }).lean().exec() as any;
+  if (!existing) return res.status(404).json({ error: "RIDER_SLOT_NOT_FOUND" });
+  if (req.auth?.role === "fleet" && !(await fleetCanAccessRider(req, existing.riderId))) return res.status(403).json({ error: "FLEET_RIDER_ACCESS_DENIED" });
+  const slot = await RiderSlot.findOneAndUpdate({ _id: slotId, ...tenantScope(req) }, { $set: { status: "cancelled" } }, { new: true }).lean().exec();
+  return res.json({ slot, message: "Turno eliminado" });
+});
 
 app.post("/api/v1/orders", rateLimit(20, 60_000, "orders-create"), async (req, res) => {
   const parsed = createOrderSchema.safeParse(req.body);
