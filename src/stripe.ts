@@ -37,7 +37,7 @@ export async function createCheckoutSession(input: {
     metadata,
     // Do not send payment_method_types: Stripe Dynamic Payment Methods decides
     // card, Apple Pay, Google Pay and Bizum eligibility in the Dashboard.
-    payment_intent_data: { metadata },
+    payment_intent_data: { metadata, capture_method: "manual" },
     success_url: `${input.origin}/?checkout=success&order_id=${encodeURIComponent(input.publicCode)}`,
     cancel_url: `${input.origin}/?checkout=cancelled&order_id=${encodeURIComponent(input.publicCode)}`,
   }, { idempotencyKey: `piki-checkout-${input.publicCode}` });
@@ -66,29 +66,30 @@ export async function processStripeWebhook(rawBody: Buffer, signature: string) {
   const orderCode = metadata?.order_code || null;
   if (!(await reserveStripeEvent(event, orderCode))) return { duplicate: true, eventType: event.type, orderCode, activated: false };
 
-  const paid = event.type === "checkout.session.completed" || event.type === "checkout.session.async_payment_succeeded" || event.type === "payment_intent.succeeded";
+  const authorized = event.type === "payment_intent.amount_capturable_updated";
+  const paid = event.type === "payment_intent.succeeded";
   const failed = event.type === "checkout.session.async_payment_failed" || event.type === "payment_intent.payment_failed";
   const refunded = event.type === "charge.refunded";
   const expired = event.type === "checkout.session.expired";
-  const paymentState = paid ? "paid" : failed ? "failed" : refunded ? "refunded" : expired ? "expired" : null;
+  const paymentState = paid ? "paid" : authorized ? "authorized" : failed ? "failed" : refunded ? "refunded" : expired ? "expired" : null;
   let activated = false;
 
   if (orderCode && paymentState) {
     const session = object as Stripe.Checkout.Session;
     const paymentIntent = "payment_intent" in session && typeof session.payment_intent === "string" ? session.payment_intent : undefined;
-    if (paid) {
+    if (paid || authorized) {
       const order = await Order.findOneAndUpdate(
         { publicCode: orderCode, paymentState: { $ne: "paid" } },
         {
           $set: {
-            paymentState: "paid",
+            paymentState,
             status: "pending",
             assignmentState: "unassigned",
             ...(event.type.startsWith("checkout.session") ? { stripeCheckoutSessionId: session.id } : {}),
             ...(paymentIntent ? { stripePaymentIntentId: paymentIntent } : {}),
           },
           $inc: { version: 1 },
-          $push: { statusHistory: { status: "pending", actorRole: "system", reason: "Pago Stripe confirmado" } },
+          $push: { statusHistory: { status: "pending", actorRole: "system", reason: authorized ? "Pago Stripe autorizado; se capturará al confirmar la entrega" : "Pago Stripe capturado tras entrega confirmada" } },
         },
         { new: true },
       ).lean().exec() as any;
@@ -104,4 +105,12 @@ export async function processStripeWebhook(rawBody: Buffer, signature: string) {
     }
   }
   return { duplicate: false, eventType: event.type, orderCode, activated };
+}
+
+
+export async function captureStripePaymentIntent(paymentIntentId: string) {
+  if (!stripe) throw new Error("STRIPE_SECRET_KEY no configurada");
+  const intent = await stripe.paymentIntents.capture(paymentIntentId, {}, { idempotencyKey: `piki-capture-${paymentIntentId}` });
+  if (intent.status !== "succeeded") throw new Error(`STRIPE_CAPTURE_STATUS_${intent.status}`);
+  return intent;
 }

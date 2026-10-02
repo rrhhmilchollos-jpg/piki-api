@@ -56,7 +56,7 @@ npm run seed
 | `GET` | `/api/v1/fleets/overview` | Resume flotas y pedidos operativos. |
 | `POST` | `/api/v1/orders` | Valida catálogo, recalcula importes y crea un pedido pendiente de pago. |
 | `POST` | `/api/v1/payments/checkout` | Crea una Checkout Session de Stripe usando los importes guardados en MongoDB. |
-| `POST` | `/api/webhooks/stripe` | Endpoint canónico Stripe: verifica `Stripe-Signature`, deduplica y activa el pedido pagado. |
+| `POST` | `/api/webhooks/stripe` | Endpoint canónico Stripe: verifica `Stripe-Signature`, deduplica, autoriza el pago y solo lo captura al validar la entrega. |
 | `POST` | `/api/v1/payments/webhook` | Alias compatible del endpoint canónico Stripe. |
 | `GET` | `/api/v1/realtime/events` | Stream SSE autenticado y reanudable de eventos operativos por superficie. |
 | `GET` | `/api/v1/fleets/pending-partner-orders` | Cola Fleet de pedidos pagados que esperan aceptación del Partner. |
@@ -90,3 +90,10 @@ El archivo `.env` no se versiona. Las credenciales se configuran en Render y los
 ## Próxima integración
 
 La siguiente iteración introduce autenticación por rol, una máquina de estados transaccional de pedido, pagos y el motor de asignación de riders. El modelo ya contiene índices por categoría, actividad, estado de pedido, identificador público y geoíndices para las posiciones que se habilitarán al activar el servicio de localización.
+
+
+### Rutas y pagos retenidos
+
+El API intenta calcular cada ruta restaurante → cliente con Google Maps Directions usando `GOOGLE_MAPS_API_KEY`. Si Google no responde, utiliza OSRM; si ambos fallan, marca `routingDegraded=true` y aplica la restricción conservadora de vehículos. La duración persistida se usa en el ranking de Riders.
+
+Stripe usa `capture_method=manual`: `payment_intent.amount_capturable_updated` deja el pedido en `authorized`, lo que permite el despacho sin considerar el dinero liquidado. La captura se ejecuta idempotentemente después de QR/PIN válido en `confirm-delivery`; solo entonces el pedido pasa a `paymentState=paid`. Los pedidos `cash` no pasan por Stripe.

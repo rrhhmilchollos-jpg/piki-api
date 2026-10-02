@@ -3,7 +3,7 @@ import { XATIVA_COVERAGE_POLICY, requiredVehiclesForRoute, type VehicleClass } f
 export type DeliveryRouteQuote = {
   routeDistanceKm: number | null;
   routeDurationMinutes: number | null;
-  routeProvider: "osrm" | "unavailable";
+  routeProvider: "google_maps" | "osrm" | "unavailable";
   routingDegraded: boolean;
   requiredVehicleClasses: VehicleClass[];
 };
@@ -36,9 +36,34 @@ export async function quoteDeliveryRoute(origin: [number, number], destination: 
   const existing = cache.get(key);
   if (existing && existing.expiresAt > Date.now()) return existing.value;
 
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  let controller = new AbortController();
+  let timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
+    const googleKey = String(process.env.GOOGLE_MAPS_API_KEY || "").trim();
+    if (googleKey) {
+      const googleUrl = new URL("https://maps.googleapis.com/maps/api/directions/json");
+      googleUrl.searchParams.set("origin", `${origin[1]},${origin[0]}`);
+      googleUrl.searchParams.set("destination", `${destination[1]},${destination[0]}`);
+      googleUrl.searchParams.set("mode", "driving");
+      googleUrl.searchParams.set("language", "es");
+      googleUrl.searchParams.set("region", "es");
+      googleUrl.searchParams.set("key", googleKey);
+      const response = await fetch(googleUrl, { signal: controller.signal, headers: { Accept: "application/json", "User-Agent": "PIKI-Delivery/0.2 routing" } });
+      const payload = await response.json().catch(() => null) as { status?: string; routes?: Array<{ legs?: Array<{ distance?: { value?: number }; duration?: { value?: number } }> }> } | null;
+      const leg = payload?.status === "OK" ? payload.routes?.[0]?.legs?.[0] : undefined;
+      const distanceMeters = Number(leg?.distance?.value);
+      const durationSeconds = Number(leg?.duration?.value);
+      if (Number.isFinite(distanceMeters) && distanceMeters > 0 && Number.isFinite(durationSeconds) && durationSeconds >= 0) {
+        const routeDistanceKm = Math.round((distanceMeters / 1000) * 1000) / 1000;
+        const value: DeliveryRouteQuote = { routeDistanceKm, routeDurationMinutes: Math.max(1, Math.ceil(durationSeconds / 60)), routeProvider: "google_maps", routingDegraded: false, requiredVehicleClasses: requiredVehiclesForRoute(routeDistanceKm) };
+        cache.set(key, { expiresAt: Date.now() + 10 * 60_000, value });
+        return value;
+      }
+      console.warn("Google Maps route unavailable; falling back to OSRM", payload?.status || "invalid_response");
+    }
+    clearTimeout(timer);
+    controller = new AbortController();
+    timer = setTimeout(() => controller.abort(), timeoutMs);
     const base = String(process.env.ROUTING_OSRM_URL || "https://router.project-osrm.org").replace(/\/$/, "");
     const url = `${base}/route/v1/driving/${origin[0]},${origin[1]};${destination[0]},${destination[1]}?overview=false&alternatives=false&steps=false`;
     const response = await fetch(url, { signal: controller.signal, headers: { Accept: "application/json", "User-Agent": "PIKI-Delivery/0.2 routing" } });
@@ -48,13 +73,7 @@ export async function quoteDeliveryRoute(origin: [number, number], destination: 
     const durationSeconds = Number(route?.duration);
     if (!Number.isFinite(distanceMeters) || distanceMeters <= 0 || !Number.isFinite(durationSeconds) || durationSeconds < 0) throw new Error("ROUTING_RESPONSE_INVALID");
     const routeDistanceKm = Math.round((distanceMeters / 1000) * 1000) / 1000;
-    const value: DeliveryRouteQuote = {
-      routeDistanceKm,
-      routeDurationMinutes: Math.max(1, Math.ceil(durationSeconds / 60)),
-      routeProvider: "osrm",
-      routingDegraded: false,
-      requiredVehicleClasses: requiredVehiclesForRoute(routeDistanceKm),
-    };
+    const value: DeliveryRouteQuote = { routeDistanceKm, routeDurationMinutes: Math.max(1, Math.ceil(durationSeconds / 60)), routeProvider: "osrm", routingDegraded: false, requiredVehicleClasses: requiredVehiclesForRoute(routeDistanceKm) };
     cache.set(key, { expiresAt: Date.now() + 10 * 60_000, value });
     return value;
   } catch (error) {

@@ -18,11 +18,11 @@ export function isDispatchableOrderStatus(status: string): boolean {
 
 export const dispatchablePaymentFilter = {
   $or: [
-    { paymentState: "paid" },
+    { paymentState: { $in: ["authorized", "paid"] } },
     { paymentMethod: "cash", paymentState: "pending" },
   ],
 };
 
 export function isDispatchablePayment(paymentState: string, paymentMethod?: string): boolean {
-  return paymentState === "paid" || (paymentState === "pending" && paymentMethod === "cash");
+  return ["authorized", "paid"].includes(paymentState) || (paymentState === "pending" && paymentMethod === "cash");
 }

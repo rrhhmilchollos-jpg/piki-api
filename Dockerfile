@@ -9,6 +9,9 @@ RUN npm run check && npm run build
 FROM node:22-alpine
 WORKDIR /app
 ENV NODE_ENV=production
+# ClamAV se ejecuta en modo fail-closed: si no está disponible, la API rechaza la subida.
+RUN apk add --no-cache clamav \
+  && freshclam --stdout --verbose || true
 COPY package*.json ./
 RUN npm install --omit=dev
 COPY --from=build /app/dist ./dist
