@@ -9,7 +9,6 @@ import mongoose from "mongoose";
 import { z } from "zod";
 import { CashLedgerEntry, CustomerAccount, DispatchDecision, EmployeeAccount, AccessAuthorization, Fleet, Order, Restaurant, PartnerAsset, PartnerLocalityGroup, Rider, RiderApplication, PartnerLead, RiderLead, RiderIncident, RiderOrderMessage, RiderSlot, SignatureRequest, Zone, PushSubscription, RealtimeEvent, Tenant, TenantMembership, RiderAssignmentReservation, SupportTicket, OnboardingRequest, ensureIndexes } from "./models.js";
 import { normalizeLeadEmail, partnerLeadSubmissionSchema, riderLeadSubmissionSchema, webLeadReviewSchema, webLeadStatusSchema } from "./webLeads.js";
-import { seedCatalog, seedOperationalZones } from "./seed.js";
 import { assertTransition, calculateEtaRange, transitionSchema, validateCoordinates } from "./algorithms/index.js";
 import { configuredAuthRoles, requireOwner, requireRole, resolveRole } from "./auth.js";
 import { EmployeeSession, issueEmployeeSession, revokeEmployeeSessions, sessionRole } from "./employeeSessions.js";
@@ -451,13 +450,6 @@ app.post("/api/v1/auth/employee/login", async (req, res) => {
   const requestedRole = parsed.data.role;
   const role = sessionRole(employee, surface, requestedRole);
   if (!role) return res.status(403).json({ error: "SURFACE_ROLE_MISMATCH", message: "Esta cuenta no tiene acceso a esta aplicación." });
-  // The authenticated owner explicitly uses an independent test Rider profile.
-  // No password or admin role is changed, and no shift starts automatically.
-  if (role === "rider" && employee.email === ownerEmail && employee.ownerProtected) {
-    if (!(await Rider.exists({ email: employee.email }))) {
-      await Rider.findOneAndUpdate({ email: employee.email }, { $setOnInsert: { name: "PIKI · Rider propietario (QA)", email: employee.email, riderCode: await nextRiderCode(), status: "offline", isTestRider: true } }, { upsert: true, new: true, setDefaultsOnInsert: true });
-    }
-  }
   const issued = await issueEmployeeSession(employee, surface, requestedRole);
   if (!issued) return res.status(403).json({ error: "SURFACE_ROLE_MISMATCH" });
   return res.json({ accessToken: issued.token, requiresPasswordChange: Boolean(employee.mustChangePassword), employee: { id: employee.id, name: employee.name, email: employee.email, jobRole: role === "rider" ? "rider" : employee.jobRole, roles: employee.roles?.length ? employee.roles : [employee.apiRole], primaryRole: employee.primaryRole || employee.apiRole, apiRole: issued.role, accessLevel: employee.accessLevel || (employee.email === ownerEmail ? "superadmin" : "subadmin"), authorizationStatus: employee.authorizationStatus || "approved", portfolioId: employee.portfolioId, fleetId: employee.fleetId, zoneSlugs: employee.zoneSlugs } });
@@ -1537,17 +1529,7 @@ app.post("/api/v1/payments/checkout", rateLimit(20, 60_000, "payments-checkout")
   }
 });
 
-app.post("/api/v1/admin/orders/cleanup-test-data", requireOwner(), async (_req, res) => {
-  const testOrders = await Order.find({ isTestOrder: true }).sort({ createdAt: -1 }).select("_id publicCode").lean().exec() as any[];
-  const keep = testOrders[0] || null;
-  const removeIds = testOrders.slice(1).map((order) => order._id);
-  if (removeIds.length) {
-    await Rider.updateMany({ activeOrderId: { $in: removeIds } }, { $set: { activeOrderId: null, status: "available" } }).exec();
-    await DispatchDecision.deleteMany({ orderId: { $in: removeIds } }).exec();
-    await Order.deleteMany({ _id: { $in: removeIds } }).exec();
-  }
-  return res.json({ deletedTestOrders: removeIds.length, keptTestOrder: keep ? { id: keep._id, publicCode: keep.publicCode } : null, productionOrdersPreserved: true });
-});
+
 const supportTicketInput = z.object({ orderRef: z.string().trim().max(120).optional(), reporterEmail: z.string().email().optional(), category: z.enum(["order", "rider", "partner", "account", "technical", "billing", "finance", "other"]).default("order"), priority: z.enum(["low", "normal", "high", "urgent"]).default("normal"), subject: z.string().trim().min(3).max(180), description: z.string().trim().min(3).max(4000) });
 const supportMessageInput = z.object({ body: z.string().trim().min(1).max(2000) });
 const supportStatusInput = z.object({ status: z.enum(["open", "in_progress", "waiting", "resolved", "closed"]) });
@@ -2220,18 +2202,14 @@ async function runAutomaticDispatchSweep() {
 async function findDispatchOrder(orderId: mongoose.Types.ObjectId, req: express.Request) {
   const scoped = await Order.findOne({ _id: orderId, ...tenantScope(req) }).lean().exec() as any;
   if (scoped || req.auth?.role !== "fleet") return scoped;
-  // QA orders are intentionally created without tenant data so they can be
-  // used by the isolated Fleet test account. They remain explicitly marked
-  // as test orders and never grant access to production orders.
-  return await Order.findOne({ _id: orderId, isTestOrder: true }).lean().exec() as any;
+  return null;
 }
 function dispatchScope(req: express.Request, order: any) {
-  return req.auth?.role === "fleet" && order?.isTestOrder ? {} : tenantScope(req);
+  return tenantScope(req);
 }
 async function findDispatchRestaurant(order: any, req: express.Request, scope: Record<string, unknown>) {
   const scoped = await Restaurant.findOne({ _id: order.restaurantId, ...scope }).lean().exec() as any;
-  if (scoped || !order.isTestOrder || req.auth?.role !== "fleet") return scoped;
-  return await Restaurant.findById(order.restaurantId).lean().exec() as any;
+  return scoped;
 }
 app.get("/api/v1/dispatch/orders/:id/preview", requireRole("admin", "fleet"), async (req, res) => {
   const parsed = dispatchSchema.safeParse(req.query);
@@ -2246,7 +2224,7 @@ app.get("/api/v1/dispatch/orders/:id/preview", requireRole("admin", "fleet"), as
   if (!restaurant?.location?.coordinates || !order.deliveryLocation?.coordinates) return res.status(409).json({ error: "MISSING_GEOLOCATION" });
   const freshness = new Date(Date.now() - 90_000);
   const policy = await dispatchLoadPolicy();
-  const maxConcurrentOrders = order.isTestOrder ? 2 : policy.maxConcurrentOrders;
+  const maxConcurrentOrders = policy.maxConcurrentOrders;
   const diagnosticPool = await Rider.find({ ...scope }).select("_id riderCode name status lastLocationAt location tenantId fleetId activeOrderId zoneSlug").limit(200).lean().exec() as any[];
   const currentRiderIds = new Set((await currentSlotRiderIds(scope)).map((id) => String(id)));
   const riders = diagnosticPool.filter((rider: any) => currentRiderIds.has(String(rider._id)) && ["available", "busy"].includes(rider.status) && rider.lastLocationAt && new Date(rider.lastLocationAt).getTime() >= freshness.getTime() && rider.location?.coordinates?.length >= 2).slice(0, 100);
@@ -2287,7 +2265,7 @@ app.post("/api/v1/dispatch/orders/:id/assign", requireRole("admin", "fleet"), as
   if (!restaurant?.location?.coordinates || !order.deliveryLocation?.coordinates) return res.status(409).json({ error: "MISSING_GEOLOCATION" });
   const freshness = new Date(Date.now() - 90_000);
   const policy = await dispatchLoadPolicy();
-  const maxConcurrentOrders = order.isTestOrder ? 2 : policy.maxConcurrentOrders;
+  const maxConcurrentOrders = policy.maxConcurrentOrders;
   const riderPool = await Rider.find({ ...scope }).select("_id riderCode name status lastLocationAt location tenantId fleetId activeOrderId zoneSlug vehicle reliabilityScore").limit(200).lean().exec() as any[];
   const currentRiderIds = new Set((await currentSlotRiderIds(scope)).map((id) => String(id)));
   const riders = riderPool.filter((rider: any) => currentRiderIds.has(String(rider._id)) && ["available", "busy"].includes(rider.status) && rider.lastLocationAt && new Date(rider.lastLocationAt).getTime() >= freshness.getTime() && rider.location?.coordinates?.length >= 2).slice(0, 100);
@@ -2587,7 +2565,7 @@ async function repairConfiguredPartnerAccess() {
 
 async function start() {
   const uri = process.env.MONGODB_URI;
-  if (uri) { await mongoose.connect(uri, { dbName: databaseName, serverSelectionTimeoutMS: 10_000 }); await EmployeeAccount.updateMany({ authorizationStatus: { $exists: false } }, { $set: { authorizationStatus: "approved", accessLevel: "subadmin" } }).exec(); await EmployeeAccount.updateOne({ email: ownerEmail }, { $set: { accessLevel: "superadmin", authorizationStatus: "approved", ownerProtected: true, active: true } }).exec(); const owner = await EmployeeAccount.findOne({ email: ownerEmail }).select("_id").lean().exec() as any; const legacyApproved = await EmployeeAccount.find({ email: { $ne: ownerEmail }, authorizationStatus: "approved", authorizedAt: null }).select("_id apiRole accessLevel createdAt").lean().exec() as any[]; for (const employee of legacyApproved) { const authorizedAt = employee.createdAt || new Date(); await EmployeeAccount.updateOne({ _id: employee._id, authorizedAt: null }, { $set: { authorizedAt, authorizedBy: owner?._id || null, authorizationReason: "Migración de autorización aprobada existente." } }).exec(); if (owner?._id && !(await AccessAuthorization.exists({ employeeId: employee._id }))) await AccessAuthorization.create({ employeeId: employee._id, action: "created", previousStatus: null, nextStatus: "approved", previousRole: null, nextRole: employee.apiRole, accessLevel: employee.accessLevel || "subadmin", actorEmployeeId: owner._id, reason: "Migración de autorización aprobada existente." }); } await ensureIndexes(); startRealtimeRelay(); startNotificationWorker(); if (process.env.NODE_ENV !== "production" && process.env.SEED_DEMO_DATA === "true") await seedCatalog(); if (process.env.REPAIR_PARTNER_EMAIL) await repairConfiguredPartnerAccess(); databaseReady = true; if (process.env.RUN_TENANT_MIGRATION === "true") { if (process.env.ALLOW_TENANT_MIGRATION !== "true") throw new Error("RUN_TENANT_MIGRATION requires ALLOW_TENANT_MIGRATION=true"); console.log(JSON.stringify({ event: "tenant_migration_started" })); console.log(JSON.stringify({ event: "tenant_migration_completed", ...(await runTenantMigration()) })); } } else console.warn("MONGODB_URI is not configured; /ready will remain unavailable.");
+  if (uri) { await mongoose.connect(uri, { dbName: databaseName, serverSelectionTimeoutMS: 10_000 }); await EmployeeAccount.updateMany({ authorizationStatus: { $exists: false } }, { $set: { authorizationStatus: "approved", accessLevel: "subadmin" } }).exec(); await EmployeeAccount.updateOne({ email: ownerEmail }, { $set: { accessLevel: "superadmin", authorizationStatus: "approved", ownerProtected: true, active: true } }).exec(); const owner = await EmployeeAccount.findOne({ email: ownerEmail }).select("_id").lean().exec() as any; const legacyApproved = await EmployeeAccount.find({ email: { $ne: ownerEmail }, authorizationStatus: "approved", authorizedAt: null }).select("_id apiRole accessLevel createdAt").lean().exec() as any[]; for (const employee of legacyApproved) { const authorizedAt = employee.createdAt || new Date(); await EmployeeAccount.updateOne({ _id: employee._id, authorizedAt: null }, { $set: { authorizedAt, authorizedBy: owner?._id || null, authorizationReason: "Migración de autorización aprobada existente." } }).exec(); if (owner?._id && !(await AccessAuthorization.exists({ employeeId: employee._id }))) await AccessAuthorization.create({ employeeId: employee._id, action: "created", previousStatus: null, nextStatus: "approved", previousRole: null, nextRole: employee.apiRole, accessLevel: employee.accessLevel || "subadmin", actorEmployeeId: owner._id, reason: "Migración de autorización aprobada existente." }); } await ensureIndexes(); startRealtimeRelay(); startNotificationWorker(); if (process.env.REPAIR_PARTNER_EMAIL) await repairConfiguredPartnerAccess(); databaseReady = true; if (process.env.RUN_TENANT_MIGRATION === "true") { if (process.env.ALLOW_TENANT_MIGRATION !== "true") throw new Error("RUN_TENANT_MIGRATION requires ALLOW_TENANT_MIGRATION=true"); console.log(JSON.stringify({ event: "tenant_migration_started" })); console.log(JSON.stringify({ event: "tenant_migration_completed", ...(await runTenantMigration()) })); } } else console.warn("MONGODB_URI is not configured; /ready will remain unavailable.");
   await EmployeeSession.init();
   const server = app.listen(port, "0.0.0.0", () => console.log(`PIKI API listening on port ${port}`));
   const sweepTimer = setInterval(() => { void runAutomaticDispatchSweep().catch((error) => console.error("Automatic dispatch sweep crashed", error)); }, 5_000).unref();
