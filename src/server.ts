@@ -1887,7 +1887,18 @@ app.post("/api/v1/riders/:id/shift/start", requireRole("admin", "rider", "fleet"
   if (!rider) return res.status(404).json({ error: "RIDER_NOT_FOUND" });
   if (!(await canAccessRiderShift(riderId, req))) return res.status(403).json({ error: "RIDER_ACCESS_DENIED" });
   const { now, slot } = await findCurrentRiderSlot(riderId);
-  if (!slot) return res.status(409).json({ error: "SHIFT_RESERVATION_REQUIRED", message: "No tienes un slot asignado para esta franja. Contacta con Fleet para que te asigne día, horario y zona.", now });
+  if (!slot) {
+    if (req.auth?.role === "rider") {
+      const tenantId = req.auth?.tenantId ?? null;
+      const eventId = `security:rider-shift-out-of-hours:${String(riderId)}:${now.date}:${now.time}`;
+      const payload = { riderId: String(riderId), riderName: rider.name, riderEmail: rider.email, riderCode: rider.riderCode, date: now.date, time: now.time, reason: "SHIFT_RESERVATION_REQUIRED" };
+      await Promise.allSettled([
+        publishRealtimeEvent({ channel: "fleet", audienceKey: tenantAudienceKey(tenantId, "fleet"), type: "security.rider_shift_out_of_hours", payload, tenantId, dedupeKey: `${eventId}:fleet` }),
+        publishRealtimeEvent({ channel: "admin", audienceKey: tenantAudienceKey(tenantId, "admin"), type: "security.rider_shift_out_of_hours", payload, tenantId, dedupeKey: `${eventId}:admin` }),
+      ]);
+    }
+    return res.status(409).json({ error: "SHIFT_RESERVATION_REQUIRED", message: "No tienes un slot asignado para esta franja. Contacta con Fleet para que te asigne día, horario y zona.", now });
+  }
   const currentSlot = slot as any;
   const updatedSlot = await RiderSlot.findOneAndUpdate({ _id: currentSlot._id, status: { $in: ["planned", "active"] } }, { $set: { status: "active" } }, { new: true }).lean().exec();
   const hasOrders = await Order.exists({ riderId, status: { $nin: ["delivered", "cancelled"] }, assignmentState: { $in: ["offered", "assigned"] } });

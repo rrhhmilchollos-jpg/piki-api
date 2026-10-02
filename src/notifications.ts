@@ -88,6 +88,21 @@ export function buildNoticeCopy(input: RealtimeNotificationInput, recipient: Rec
     if (recipient.surface !== "rider") return null;
     return { category: "delivery", title: "Nuevo reparto asignado", body: `Tienes una nueva oferta para ${orderRef}.`, url, entityType: "order", entityId: orderId };
   }
+  if (input.type === "security.rider_shift_out_of_hours") {
+    if (!["fleet", "admin"].includes(recipient.surface)) return null;
+    const riderName = String(input.payload.riderName || input.payload.riderEmail || "Rider desconocido").slice(0, 120);
+    const riderCode = String(input.payload.riderCode || "").trim();
+    const attemptedAt = `${String(input.payload.date || "")} ${String(input.payload.time || "")}`.trim();
+    const suffix = riderCode ? ` (${riderCode})` : "";
+    return {
+      category: "security",
+      title: "Intento de jornada fuera de horario",
+      body: `${riderName}${suffix} intentó iniciar jornada fuera de su slot reservado${attemptedAt ? ` · ${attemptedAt}` : ""}.`,
+      url: "/",
+      entityType: "rider",
+      entityId: String(input.payload.riderId || ""),
+    };
+  }
   if (input.type === "order.status_changed") {
     const status = String(input.payload.status || "");
     const label = statusLabel[status] || "actualizado";
