@@ -19,6 +19,7 @@ export type DispatchInput = {
   customerLocation: [number, number];
   preparationMinutes: number;
   routeDistanceKm?: number | null;
+  routeDurationMinutes?: number | null;
   requiredVehicleClasses?: DispatchCandidate["vehicle"][];
   now?: Date;
   maxGpsAgeSeconds?: number;
@@ -97,7 +98,7 @@ export function scoreDispatchCandidate(candidate: DispatchCandidate, input: Disp
   // Haversine remains only as an ETA fallback when the provider was unavailable.
   const customerDistanceKm = input.routeDistanceKm ?? distanceKm(input.restaurantLocation, input.customerLocation);
   const pickupEtaMinutes = travelMinutes(pickupDistanceKm, candidate.vehicle);
-  const customerEtaMinutes = travelMinutes(customerDistanceKm, candidate.vehicle);
+  const customerEtaMinutes = input.routeDurationMinutes != null && Number.isFinite(input.routeDurationMinutes) ? Math.max(1, Math.ceil(input.routeDurationMinutes)) : travelMinutes(customerDistanceKm, candidate.vehicle);
   const totalEtaMinutes = input.preparationMinutes + Math.max(input.preparationMinutes, pickupEtaMinutes) + customerEtaMinutes;
   if (input.maxCustomerEtaMinutes && totalEtaMinutes > input.maxCustomerEtaMinutes) return null;
 
@@ -138,6 +139,7 @@ export function scoreDispatchCandidate(candidate: DispatchCandidate, input: Disp
       `entrega estimada en ${totalEtaMinutes} min`,
       `distancia de recogida ${pickupDistanceKm.toFixed(2)} km`,
       input.routeDistanceKm == null ? "ruta sin proveedor: restricción conservadora aplicada" : `ruta al cliente ${input.routeDistanceKm.toFixed(2)} km`,
+      ...(input.routeDurationMinutes != null ? [`duración Google Maps/OSRM ${Math.ceil(input.routeDurationMinutes)} min`] : []),
       ...(requiredVehicleClasses.length ? [`vehículo requerido: ${requiredVehicleClasses.join(" o ")}`] : []),
       `espera de preparación ${preparationWait} min`,
       `carga activa ${activeOrderCount}/${maxConcurrentOrders}`,
