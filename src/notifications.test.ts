@@ -64,3 +64,22 @@ test("cash-wallet notices are limited to operational surfaces", () => {
   assert.equal(buildNoticeCopy(input, principal("admin"))?.category, "cash");
   assert.equal(buildNoticeCopy(input, principal("customer")), null);
 });
+
+test("shift outside-hours alert is visible only to Fleet and Admin", () => {
+  const input = event("security.rider_shift_out_of_hours", {
+    riderId: "66c5c6634d5bb12ea5500011",
+    riderName: "PIKI QA Rider",
+    riderEmail: "rider@example.com",
+    riderCode: "PIKI-R-123456",
+    date: "2026-10-02",
+    time: "03:03",
+  }, "fleet");
+  const fleet = buildNoticeCopy(input, principal("fleet"));
+  const admin = buildNoticeCopy(input, principal("admin"));
+  assert.equal(fleet?.category, "security");
+  assert.equal(fleet?.entityType, "rider");
+  assert.match(fleet?.body || "", /PIKI QA Rider.*PIKI-R-123456/);
+  assert.match(fleet?.body || "", /2026-10-02 03:03/);
+  assert.equal(admin?.title, "Intento de jornada fuera de horario");
+  assert.equal(buildNoticeCopy(input, principal("rider")), null);
+});
