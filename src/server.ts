@@ -2021,11 +2021,15 @@ app.get("/api/v1/riders/session", requireRole("rider"), async (req, res) => {
   const employee = await EmployeeAccount.findById(employeeId).lean().exec() as any;
   const rider = employee ? await Rider.findOne({ email: employee.email }).lean().exec() as any : null;
   if (!rider) return res.status(404).json({ error: "RIDER_ACCOUNT_NOT_LINKED" });
-  const { slot } = await findCurrentRiderSlot(rider._id);
+  const { now, slot } = await findCurrentRiderSlot(rider._id);
+  // A previous browser session must never keep a rider online after its slot ended.
+  await RiderSlot.updateMany({ riderId: rider._id, status: "active", date: { $lt: now.date } }, { $set: { status: "completed" } }).exec();
   const hasActiveOrder = Boolean(await Order.exists({ riderId: rider._id, status: { $nin: ["delivered", "cancelled"] }, assignmentState: { $in: ["offered", "assigned"] } }));
   const effectiveStatus = hasActiveOrder ? "busy" : (slot as any)?.status === "active" ? rider.status : "offline";
-  if (effectiveStatus !== rider.status) await Rider.updateOne({ _id: rider._id }, { $set: { status: effectiveStatus } }).exec();
-  return res.json({ rider: { id: rider._id, riderCode: rider.riderCode, name: rider.name, email: rider.email, status: effectiveStatus, fleetId: rider.fleetId } });
+  const update: Record<string, unknown> = { status: effectiveStatus };
+  if (!hasActiveOrder && effectiveStatus === "offline") update.activeOrderId = null;
+  if (effectiveStatus !== rider.status || update.activeOrderId === null) await Rider.updateOne({ _id: rider._id }, { $set: update }).exec();
+  return res.json({ rider: { id: rider._id, riderCode: rider.riderCode, name: rider.name, email: rider.email, status: effectiveStatus, fleetId: rider.fleetId }, now, slot: slot || null });
 });
 
 app.get("/api/v1/riders/:id/shift", requireRole("admin", "rider", "fleet"), async (req, res) => {
