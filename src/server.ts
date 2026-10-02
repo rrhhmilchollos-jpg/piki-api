@@ -26,6 +26,7 @@ import { quoteDeliveryRoute } from "./coverage/routing.js";
 import { runTenantMigration } from "./tenantMigration.js";
 import { activeOperationalOrderStatuses, dispatchableOrderStatuses, dispatchablePaymentFilter, isDispatchableOrderStatus } from "./dispatchEligibility.js";
 import { canReceivePartnerLocations, partnerCan, partnerPermissions, partnerRolesForEmployee, permissionsForPartnerRoles, type PartnerPermission } from "./partnerAccess.js";
+import { buildApprovedRiderOperationalProfile } from "./riderApproval.js";
 
 export const app = express();
 app.set("trust proxy", 1);
@@ -755,6 +756,22 @@ app.get("/api/v1/coverage", async (req, res) => {
   res.json({ ...coverage, catalogAvailable, restaurants });
 });
 
+async function notifyOnboarding(input: { channel: "admin" | "fleet"; type: string; entityId: string; tenantId?: unknown; payload?: Record<string, unknown> }) {
+  const tenantId = input.tenantId == null ? null : String(input.tenantId);
+  try {
+    await publishRealtimeEvent({
+      channel: input.channel,
+      audienceKey: tenantAudienceKey(tenantId, input.channel),
+      tenantId,
+      type: input.type,
+      payload: { entityId: input.entityId, ...(input.payload || {}) },
+      dedupeKey: `onboarding:${input.type}:${input.entityId}:${Date.now()}`,
+    });
+  } catch (error) {
+    console.warn("Onboarding notification enqueue failed", error instanceof Error ? error.message : "unknown error");
+  }
+}
+
 app.post("/api/v1/public/partner-leads", async (req, res) => {
   const parsed = partnerLeadSubmissionSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_PARTNER_LEAD", details: parsed.error.flatten() });
@@ -762,6 +779,7 @@ app.post("/api/v1/public/partner-leads", async (req, res) => {
   const { website: _website, ...data } = parsed.data;
   try {
     const lead = await PartnerLead.create({ ...data, email: normalizeLeadEmail(data.email), privacyNoticeAcceptedAt: new Date(), status: "new", history: [{ status: "new", notes: "Solicitud recibida desde Únete a PIKI." }] });
+    await notifyOnboarding({ channel: "admin", type: "onboarding.partner_lead.created", entityId: String(lead._id), tenantId: (lead as any).tenantId });
     return res.status(201).json({ message: "Solicitud recibida. El equipo comercial revisará tus datos.", lead: { id: String(lead._id), status: lead.status } });
   } catch (error) {
     if ((error as any)?.code === 11000) return res.status(409).json({ error: "APPLICATION_ALREADY_EXISTS", message: "Ya existe una solicitud activa con este correo." });
@@ -819,6 +837,7 @@ app.post("/api/v1/partners/onboarding", async (req, res) => {
     throw error;
   }
   await PartnerLocalityGroup.findOneAndUpdate({ localityKey: groupKey }, { $set: { localityName: locality, province, isActive: true }, $addToSet: { restaurantIds: partner._id } }, { upsert: true, new: true });
+  await notifyOnboarding({ channel: "admin", type: "onboarding.partner_application.created", entityId: String(partner._id), tenantId: (partner as any).tenantId });
   res.status(201).json({ message: "Solicitud recibida para revisión.", partner: { id: partner.id, name: partner.name, email: partner.email, phone: partner.phone, locality, partnerGroupKey: groupKey, onboarding_status: partner.onboardingStatus } });
 });
 
@@ -1107,6 +1126,9 @@ app.patch("/api/v1/admin/restaurants/:id/status", requireOwner(), async (req, re
     if (!approved) await revokeEmployeeSessions(String(partnerAccount._id));
     await AccessAuthorization.create({ employeeId: partnerAccount._id, action: parsed.data.status, previousStatus: partnerAccount.authorizationStatus || "pending", nextStatus, previousRole: "partner", nextRole: "partner", accessLevel: "subadmin", actorEmployeeId: objectId(req.auth!.employeeId!), reason: `Estado del comercio: ${parsed.data.status}` });
   }
+  if (parsed.data.status === "approved" && existing.onboardingStatus !== "approved") {
+    await notifyOnboarding({ channel: "admin", type: "onboarding.partner_application.approved", entityId: String(restaurant._id), tenantId: (restaurant as any).tenantId });
+  }
   return res.json({ restaurant, partnerAccount: partnerAccount ? { id: String(partnerAccount._id), access: parsed.data.status === "approved" ? "enabled" : "disabled" } : null });
 });
 
@@ -1145,6 +1167,7 @@ app.post("/api/v1/public/rider-leads", async (req, res) => {
   const { website: _website, ...data } = parsed.data;
   try {
     const lead = await RiderLead.create({ ...data, email: normalizeLeadEmail(data.email), privacyNoticeAcceptedAt: new Date(), status: "new", history: [{ status: "new", notes: "Solicitud recibida desde Únete a PIKI." }] });
+    await notifyOnboarding({ channel: "admin", type: "onboarding.rider_lead.created", entityId: String(lead._id), tenantId: (lead as any).tenantId });
     return res.status(201).json({ message: "Solicitud recibida. El equipo Fleet revisará tus datos y te contactará.", lead: { id: String(lead._id), status: lead.status } });
   } catch (error) {
     if ((error as any)?.code === 11000) return res.status(409).json({ error: "APPLICATION_ALREADY_EXISTS", message: "Ya existe una solicitud activa con este correo." });
@@ -1189,29 +1212,27 @@ app.post("/api/v1/riders/applications", async (req, res) => {
   const duplicate = await RiderApplication.findOne({ email: parsed.data.email.toLowerCase(), status: { $in: ["pending", "contacted", "approved"] } }).lean().exec();
   if (duplicate) return res.status(409).json({ error: "APPLICATION_ALREADY_EXISTS" });
   const application = await RiderApplication.create({ ...parsed.data, email: parsed.data.email.toLowerCase(), status: "pending", source: "rider_landing" });
+  await notifyOnboarding({ channel: "admin", type: "onboarding.rider_application.created", entityId: String(application._id), tenantId: (application as any).tenantId });
   return res.status(201).json({ message: "Solicitud recibida. El equipo Fleet se pondrá en contacto contigo.", application: { id: application.id, status: application.status } });
 });
 
-app.get("/api/v1/rider-applications", requireRole("admin", "fleet"), async (req, res) => {
+app.get("/api/v1/rider-applications", requireRole("admin"), async (req, res) => {
   const status = typeof req.query.status === "string" ? req.query.status : undefined;
-  const filter = { ...(status ? { status } : {}), ...(await (async () => req.auth?.role === "fleet" ? { assignedFleetId: (await employeeScope(req))?.fleetId || null } : {})()) };
-  const applications = await RiderApplication.find(filter).sort({ createdAt: -1 }).limit(200).lean().exec();
+  const applications = await RiderApplication.find(status ? { status } : {}).sort({ createdAt: -1 }).limit(200).lean().exec();
   return res.json({ applications });
 });
 
-app.get("/api/v1/rider-applications/:id/documents", requireRole("admin", "fleet"), async (req, res) => {
+app.get("/api/v1/rider-applications/:id/documents", requireRole("admin"), async (req, res) => {
   const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
   if (!id) return res.status(400).json({ error: "INVALID_APPLICATION_ID" });
-  const applicationFilter = { _id: id, ...(req.auth?.role === "fleet" ? { assignedFleetId: (await employeeScope(req))?.fleetId || null } : {}) };
-  const application = await RiderApplication.findOne(applicationFilter).select("name email documents").lean().exec() as any;
+  const application = await RiderApplication.findById(id).select("name email documents").lean().exec() as any;
   if (!application) return res.status(404).json({ error: "APPLICATION_NOT_FOUND" });
   return res.json({ applicationId: application._id, name: application.name, email: application.email, documents: (application.documents || []).map(({ contentBase64, ...metadata }: any) => metadata) });
 });
-app.get("/api/v1/rider-applications/:id/documents/:documentId/content", requireRole("admin", "fleet"), async (req, res) => {
+app.get("/api/v1/rider-applications/:id/documents/:documentId/content", requireRole("admin"), async (req, res) => {
   const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
   if (!id) return res.status(400).json({ error: "INVALID_APPLICATION_ID" });
-  const applicationFilter = { _id: id, "documents._id": req.params.documentId, ...(req.auth?.role === "fleet" ? { assignedFleetId: (await employeeScope(req))?.fleetId || null } : {}) };
-  const application = await RiderApplication.findOne(applicationFilter).select("+documents.contentBase64").lean().exec() as any;
+  const application = await RiderApplication.findOne({ _id: id, "documents._id": req.params.documentId }).select("+documents.contentBase64").lean().exec() as any;
   const document = application?.documents?.find((item: any) => String(item._id) === req.params.documentId);
   if (!document) return res.status(404).json({ error: "DOCUMENT_NOT_FOUND" });
   return res.json({ fileName: document.fileName, mimeType: document.mimeType, sizeBytes: document.sizeBytes, sha256: document.sha256, contentBase64: document.contentBase64 });
@@ -1230,7 +1251,7 @@ app.patch("/api/v1/rider-applications/:id/status", requireOwner(), async (req, r
   const id = objectId(idParam); if (!id) return res.status(400).json({ error: "INVALID_APPLICATION_ID" });
   const parsed = z.object({ status: z.enum(["pending", "contacted", "approved", "rejected"]), notes: z.string().max(1000).optional(), assignedFleetId: z.string().regex(/^[a-f\d]{24}$/).nullable().optional() }).safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_APPLICATION_STATUS", details: parsed.error.flatten() });
-  const existing = await RiderApplication.findById(id).select("documents status").lean().exec() as any;
+  const existing = await RiderApplication.findById(id).select("documents status tenantId").lean().exec() as any;
   if (!existing) return res.status(404).json({ error: "APPLICATION_NOT_FOUND" });
   if (parsed.data.status === "approved") {
     const documents = existing.documents || [];
@@ -1243,9 +1264,17 @@ app.patch("/api/v1/rider-applications/:id/status", requireOwner(), async (req, r
   if (parsed.data.assignedFleetId !== undefined) update.assignedFleetId = parsed.data.assignedFleetId ? objectId(parsed.data.assignedFleetId) : null;
   const application = await RiderApplication.findByIdAndUpdate(id, { $set: update }, { new: true }).lean().exec() as any;
   if (!application) return res.status(404).json({ error: "APPLICATION_NOT_FOUND" });
+  let approvedRiderId = "";
   if (parsed.data.status === "approved") {
     const existingRider = await Rider.findOne({ email: application.email }).select("_id riderCode").lean().exec() as any;
-    await Rider.findOneAndUpdate({ email: application.email }, { $set: { name: application.name, email: application.email, vehicle: application.vehicle, fleetId: application.assignedFleetId || null, status: "offline" }, $setOnInsert: { riderCode: existingRider?.riderCode || await nextRiderCode() } }, { upsert: true, new: true }).exec();
+    const approvedRider = await Rider.findOneAndUpdate({ email: application.email }, { $set: { tenantId: application.tenantId || null, ...buildApprovedRiderOperationalProfile(application), fleetId: application.assignedFleetId || null, status: "offline" }, $setOnInsert: { riderCode: existingRider?.riderCode || await nextRiderCode() } }, { upsert: true, new: true }).select("_id").lean().exec() as any;
+    approvedRiderId = approvedRider ? String(approvedRider._id) : "";
+  }
+  if (existing.status !== parsed.data.status && ["approved", "rejected"].includes(parsed.data.status)) {
+    const type = `onboarding.rider_application.${parsed.data.status}`;
+    const payload = { applicationId: String(application._id), riderId: approvedRiderId };
+    await notifyOnboarding({ channel: "admin", type, entityId: String(application._id), tenantId: (application as any).tenantId, payload });
+    if (parsed.data.status === "approved") await notifyOnboarding({ channel: "fleet", type, entityId: approvedRiderId || String(application._id), tenantId: (application as any).tenantId, payload });
   }
   const documentReviewPending = (application.documents || []).some((document: any) => document.status !== "approved");
   return res.json({ application, documentReviewPending, warning: documentReviewPending ? "La solicitud se ha gestionado; el expediente documental continúa pendiente de revisión." : undefined });

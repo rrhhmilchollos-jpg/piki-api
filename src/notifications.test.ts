@@ -57,6 +57,27 @@ test("partner receives a new-order message without customer-facing details", () 
   assert.equal(buildNoticeCopy(input, principal("rider")), null);
 });
 
+test("onboarding notices deep-link to internal queues without exposing applicant PII", () => {
+  const lead = event("onboarding.rider_lead.created", { entityId: "66c5c6634d5bb12ea5500012", email: "private@example.com", phone: "600000000" }, "admin");
+  const leadNotice = buildNoticeCopy(lead, principal("admin"));
+  assert.equal(leadNotice?.url, "/?section=Solicitudes%20web");
+  assert.equal(leadNotice?.entityType, "rider_lead");
+  assert.doesNotMatch(`${leadNotice?.title} ${leadNotice?.body}`, /private@example\.com|600000000/);
+
+  const approval = event("onboarding.rider_application.approved", {
+    applicationId: "66c5c6634d5bb12ea5500013",
+    riderId: "66c5c6634d5bb12ea5500014",
+    email: "private@example.com",
+  }, "fleet");
+  const adminNotice = buildNoticeCopy(approval, principal("admin"));
+  const fleetNotice = buildNoticeCopy(approval, principal("fleet"));
+  assert.equal(adminNotice?.url, "/?section=Riders");
+  assert.equal(adminNotice?.entityId, "66c5c6634d5bb12ea5500013");
+  assert.equal(fleetNotice?.entityId, "66c5c6634d5bb12ea5500014");
+  assert.doesNotMatch(`${fleetNotice?.title} ${fleetNotice?.body}`, /private@example\.com/);
+  assert.equal(buildNoticeCopy(approval, principal("partner")), null);
+});
+
 test("cash-wallet notices are limited to operational surfaces", () => {
   const input = event("cash.wallet_changed", { riderId: "66c5c6634d5bb12ea5500010", amountCents: 1668 }, "fleet");
   assert.equal(buildNoticeCopy(input, principal("rider"))?.category, "cash");
