@@ -65,14 +65,23 @@ function writeEvent(response: Response, event: PersistedRealtimeEvent) {
 }
 
 export async function publishRealtimeEvent(input: { channel: RealtimeChannel; audienceKey: string; type: string; payload: RealtimeEventPayload; tenantId?: string | mongoose.Types.ObjectId | null; dedupeKey?: string }) {
-  const document = await RealtimeEvent.create({
+  const eventData = {
     tenantId: validTenantId(input.tenantId),
     channel: input.channel,
     audienceKey: input.audienceKey,
     type: input.type,
     payload: input.payload,
     ...(input.dedupeKey ? { dedupeKey: input.dedupeKey } : {}),
-  });
+  };
+  // Use Mongo's unique dedupe index as the cross-instance lock. This makes
+  // retries safe even when two Render instances publish the same event at once.
+  const document = input.dedupeKey
+    ? await RealtimeEvent.findOneAndUpdate(
+        { dedupeKey: input.dedupeKey },
+        { $setOnInsert: eventData },
+        { upsert: true, new: true, setDefaultsOnInsert: true },
+      ).exec()
+    : await RealtimeEvent.create(eventData);
   const event = document.toObject() as PersistedRealtimeEvent;
   emitOnce(event);
   try {
