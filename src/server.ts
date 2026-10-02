@@ -7,7 +7,8 @@ import cors from "cors";
 import express from "express";
 import mongoose from "mongoose";
 import { z } from "zod";
-import { CashLedgerEntry, CustomerAccount, DispatchDecision, EmployeeAccount, AccessAuthorization, Fleet, Order, Restaurant, PartnerAsset, PartnerLocalityGroup, Rider, RiderApplication, RiderIncident, RiderOrderMessage, RiderSlot, SignatureRequest, Zone, PushSubscription, RealtimeEvent, Tenant, TenantMembership, RiderAssignmentReservation, SupportTicket, OnboardingRequest, ensureIndexes } from "./models.js";
+import { CashLedgerEntry, CustomerAccount, DispatchDecision, EmployeeAccount, AccessAuthorization, Fleet, Order, Restaurant, PartnerAsset, PartnerLocalityGroup, Rider, RiderApplication, PartnerLead, RiderLead, RiderIncident, RiderOrderMessage, RiderSlot, SignatureRequest, Zone, PushSubscription, RealtimeEvent, Tenant, TenantMembership, RiderAssignmentReservation, SupportTicket, OnboardingRequest, ensureIndexes } from "./models.js";
+import { normalizeLeadEmail, partnerLeadSubmissionSchema, riderLeadSubmissionSchema, webLeadReviewSchema, webLeadStatusSchema } from "./webLeads.js";
 import { seedCatalog, seedOperationalZones } from "./seed.js";
 import { assertTransition, calculateEtaRange, transitionSchema, validateCoordinates } from "./algorithms/index.js";
 import { configuredAuthRoles, requireOwner, requireRole, resolveRole } from "./auth.js";
@@ -117,6 +118,8 @@ app.use("/api/v1/auth", rateLimit(3, 60_000, "auth"));
 app.use("/api/v1/internal", rateLimit(10, 60_000, "internal-sync"));
 app.use("/api/v1/partners/onboarding", rateLimit(10, 60_000, "partner-onboarding"));
 app.use("/api/v1/riders/applications", rateLimit(10, 60_000, "rider-onboarding"));
+app.use("/api/v1/public/partner-leads", rateLimit(10, 60_000, "partner-leads"));
+app.use("/api/v1/public/rider-leads", rateLimit(10, 60_000, "rider-leads"));
 app.use("/api/v1/partners/menu/assets", rateLimit(20, 60_000, "partner-assets"));
 app.use("/api/v1/payments/webhook", rateLimit(100, 60_000, "stripe-webhook"));
 app.use("/api/webhooks/stripe", rateLimit(100, 60_000, "stripe-webhook"));
@@ -752,6 +755,41 @@ app.get("/api/v1/coverage", async (req, res) => {
   res.json({ ...coverage, catalogAvailable, restaurants });
 });
 
+app.post("/api/v1/public/partner-leads", async (req, res) => {
+  const parsed = partnerLeadSubmissionSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "INVALID_PARTNER_LEAD", details: parsed.error.flatten() });
+  if (parsed.data.website) return res.status(400).json({ error: "INVALID_PARTNER_LEAD" });
+  const { website: _website, ...data } = parsed.data;
+  try {
+    const lead = await PartnerLead.create({ ...data, email: normalizeLeadEmail(data.email), privacyNoticeAcceptedAt: new Date(), status: "new", history: [{ status: "new", notes: "Solicitud recibida desde Únete a PIKI." }] });
+    return res.status(201).json({ message: "Solicitud recibida. El equipo comercial revisará tus datos.", lead: { id: String(lead._id), status: lead.status } });
+  } catch (error) {
+    if ((error as any)?.code === 11000) return res.status(409).json({ error: "APPLICATION_ALREADY_EXISTS", message: "Ya existe una solicitud activa con este correo." });
+    throw error;
+  }
+});
+
+app.get("/api/v1/admin/partner-leads", requireRole("admin", "commercial", "gerente_comercial_zona"), async (req, res) => {
+  const rawStatus = typeof req.query.status === "string" ? req.query.status : undefined;
+  const parsedStatus = rawStatus && rawStatus !== "all" ? webLeadStatusSchema.safeParse(rawStatus) : null;
+  if (parsedStatus && !parsedStatus.success) return res.status(400).json({ error: "INVALID_LEAD_STATUS" });
+  const leads = await PartnerLead.find(parsedStatus?.success ? { status: parsedStatus.data } : {}).sort({ createdAt: -1 }).limit(200).lean().exec();
+  return res.json({ leads });
+});
+
+app.patch("/api/v1/admin/partner-leads/:id", requireRole("admin", "commercial", "gerente_comercial_zona"), async (req, res) => {
+  const idParam = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+  const id = objectId(idParam);
+  if (!id) return res.status(400).json({ error: "INVALID_LEAD_ID" });
+  const parsed = webLeadReviewSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "INVALID_LEAD_REVIEW", details: parsed.error.flatten() });
+  if (parsed.data.status === "info_requested" && !parsed.data.notes) return res.status(400).json({ error: "INFO_REQUEST_NOTES_REQUIRED" });
+  const actor = req.auth?.employeeId ? objectId(req.auth.employeeId) : null;
+  const lead = await PartnerLead.findByIdAndUpdate(id, { $set: { status: parsed.data.status, notes: parsed.data.notes, reviewedBy: actor, reviewedAt: new Date() }, $push: { history: { status: parsed.data.status, notes: parsed.data.notes, actorEmployeeId: actor, changedAt: new Date() } } }, { new: true }).lean().exec();
+  if (!lead) return res.status(404).json({ error: "PARTNER_LEAD_NOT_FOUND" });
+  return res.json({ lead });
+});
+
 const partnerDocumentSchema = z.object({ type: z.enum(["tax_id", "bank_certificate", "insurance", "activity_license", "food_sanitary_authorization", "identity", "other"]), fileName: z.string().min(1).max(180), mimeType: z.enum(["application/pdf", "image/jpeg", "image/png"]), sizeBytes: z.number().int().positive().max(2_500_000), sha256: z.string().regex(/^[a-f0-9]{64}$/), contentBase64: z.string().min(20).max(3_500_000) });
 const openingHoursSchema = z.record(z.string().min(2).max(15), z.object({ open: z.string().regex(/^\d{2}:\d{2}$/), close: z.string().regex(/^\d{2}:\d{2}$/), closed: z.boolean() }));
 const partnerSchema = z.object({ name: z.string().min(2).max(160), email: z.string().email(), password: z.string().min(12).max(200).regex(/[A-Z]/).regex(/[a-z]/).regex(/[0-9]/), phone: z.string().min(6).max(40), address: z.string().min(5).max(280), legalName: z.string().min(2).max(180), taxId: z.string().regex(/^[A-Za-z0-9-]{5,20}$/), legalForm: z.enum(["autonomo", "sl", "sa", "cooperativa", "otra"]), representativeName: z.string().min(2).max(160), representativeRole: z.string().min(2).max(100), representativeDocument: z.string().min(5).max(30), fiscalAddress: z.string().min(5).max(280), operatingAddress: z.string().min(5).max(280), postalCode: z.string().regex(/^\d{5}$/), city: z.string().min(2).max(100), province: z.string().min(2).max(100), iban: z.string().regex(/^[A-Z]{2}\d{2}[A-Z0-9]{10,30}$/), bankAccountHolder: z.string().min(2).max(180), cuisine: z.string().min(2).max(100), vatRate: z.union([z.literal(4), z.literal(10), z.literal(21)]), commissionAccepted: z.literal(true), termsAcceptedAt: z.coerce.date(), contractAccepted: z.literal(true), privacyAccepted: z.literal(true), dataProcessingAccepted: z.literal(true), pdaUnits: z.number().int().min(1).max(50), pdaUnitCostCents: z.literal(30000), pdaCostAccepted: z.literal(true), pdaCostAcceptedAt: z.coerce.date(), privacyAcceptedAt: z.coerce.date(), dataProcessingAcceptedAt: z.coerce.date(), openingHours: openingHoursSchema, documents: z.array(partnerDocumentSchema).length(5) });
@@ -1100,6 +1138,41 @@ app.patch("/api/v1/admin/restaurants/:id/documents/:documentId/status", requireO
   return res.json({ restaurantId, document: document ? { _id: document._id, type: document.type, fileName: document.fileName, status: document.status } : null });
 });
 
+app.post("/api/v1/public/rider-leads", async (req, res) => {
+  const parsed = riderLeadSubmissionSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "INVALID_RIDER_LEAD", details: parsed.error.flatten() });
+  if (parsed.data.website) return res.status(400).json({ error: "INVALID_RIDER_LEAD" });
+  const { website: _website, ...data } = parsed.data;
+  try {
+    const lead = await RiderLead.create({ ...data, email: normalizeLeadEmail(data.email), privacyNoticeAcceptedAt: new Date(), status: "new", history: [{ status: "new", notes: "Solicitud recibida desde Únete a PIKI." }] });
+    return res.status(201).json({ message: "Solicitud recibida. El equipo Fleet revisará tus datos y te contactará.", lead: { id: String(lead._id), status: lead.status } });
+  } catch (error) {
+    if ((error as any)?.code === 11000) return res.status(409).json({ error: "APPLICATION_ALREADY_EXISTS", message: "Ya existe una solicitud activa con este correo." });
+    throw error;
+  }
+});
+
+app.get("/api/v1/admin/rider-leads", requireRole("admin", "commercial", "gerente_comercial_zona"), async (req, res) => {
+  const rawStatus = typeof req.query.status === "string" ? req.query.status : undefined;
+  const parsedStatus = rawStatus && rawStatus !== "all" ? webLeadStatusSchema.safeParse(rawStatus) : null;
+  if (parsedStatus && !parsedStatus.success) return res.status(400).json({ error: "INVALID_LEAD_STATUS" });
+  const leads = await RiderLead.find(parsedStatus?.success ? { status: parsedStatus.data } : {}).sort({ createdAt: -1 }).limit(200).lean().exec();
+  return res.json({ leads });
+});
+
+app.patch("/api/v1/admin/rider-leads/:id", requireRole("admin", "commercial", "gerente_comercial_zona"), async (req, res) => {
+  const idParam = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+  const id = objectId(idParam);
+  if (!id) return res.status(400).json({ error: "INVALID_LEAD_ID" });
+  const parsed = webLeadReviewSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "INVALID_LEAD_REVIEW", details: parsed.error.flatten() });
+  if (parsed.data.status === "info_requested" && !parsed.data.notes) return res.status(400).json({ error: "INFO_REQUEST_NOTES_REQUIRED" });
+  const actor = req.auth?.employeeId ? objectId(req.auth.employeeId) : null;
+  const lead = await RiderLead.findByIdAndUpdate(id, { $set: { status: parsed.data.status, notes: parsed.data.notes, reviewedBy: actor, reviewedAt: new Date() }, $push: { history: { status: parsed.data.status, notes: parsed.data.notes, actorEmployeeId: actor, changedAt: new Date() } } }, { new: true }).lean().exec();
+  if (!lead) return res.status(404).json({ error: "RIDER_LEAD_NOT_FOUND" });
+  return res.json({ lead });
+});
+
 app.post("/api/v1/riders/applications", async (req, res) => {
   const ip = req.ip || req.socket.remoteAddress || "unknown";
   if (!allowRiderApplication(ip)) return res.status(429).json({ error: "APPLICATION_RATE_LIMITED", retryAfterSeconds: 900 });
@@ -1159,11 +1232,14 @@ app.patch("/api/v1/rider-applications/:id/status", requireOwner(), async (req, r
   if (!parsed.success) return res.status(400).json({ error: "INVALID_APPLICATION_STATUS", details: parsed.error.flatten() });
   const existing = await RiderApplication.findById(id).select("documents status").lean().exec() as any;
   if (!existing) return res.status(404).json({ error: "APPLICATION_NOT_FOUND" });
-  if (["approved", "rejected"].includes(parsed.data.status)) {
+  if (parsed.data.status === "approved") {
     const documents = existing.documents || [];
-    void documents;
+    const allDocumentsApproved = documents.length > 0 && documents.every((document: any) => document.status === "approved");
+    const identityApproved = documents.some((document: any) => ["identity", "residence_permit"].includes(document.type) && document.status === "approved");
+    if (!allDocumentsApproved || !identityApproved) return res.status(409).json({ error: "RIDER_DOCUMENT_REVIEW_REQUIRED", message: "Valida todos los documentos, incluida la identidad, antes de aprobar el alta." });
   }
   const update: Record<string, unknown> = { status: parsed.data.status, notes: parsed.data.notes };
+  if (parsed.data.status === "approved") update.identityVerificationStatus = "verified";
   if (parsed.data.assignedFleetId !== undefined) update.assignedFleetId = parsed.data.assignedFleetId ? objectId(parsed.data.assignedFleetId) : null;
   const application = await RiderApplication.findByIdAndUpdate(id, { $set: update }, { new: true }).lean().exec() as any;
   if (!application) return res.status(404).json({ error: "APPLICATION_NOT_FOUND" });
