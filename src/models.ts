@@ -25,12 +25,15 @@ const partnerAssetSchema = new Schema({
   organizationKey: { type: String, required: true, index: true },
   folderKey: { type: String, required: true, index: true },
   locality: { type: String, required: true, index: true },
-  kind: { type: String, enum: ["menu_image", "restaurant_image", "document"], required: true },
+  kind: { type: String, enum: ["menu_image", "menu_file", "restaurant_image", "document"], required: true },
   fileName: { type: String, required: true, trim: true },
-  mimeType: { type: String, enum: ["image/webp", "image/jpeg", "image/png"], required: true },
-  sizeBytes: { type: Number, required: true, min: 1, max: 204800 },
+  mimeType: { type: String, enum: ["image/webp", "image/jpeg", "image/png", "image/gif", "application/pdf"], required: true },
+  sizeBytes: { type: Number, required: true, min: 1, max: 4_194_304 },
   sha256: { type: String, required: true, match: /^[a-f0-9]{64}$/i },
   contentBase64: { type: String, required: true, select: false },
+  scanStatus: { type: String, enum: ["clean", "rejected"], default: "clean", index: true },
+  scanEngine: { type: String, default: "ClamAV" },
+  scannedAt: { type: Date, default: null },
 }, { timestamps: true, collection: "partner_assets" });
 partnerAssetSchema.index({ restaurantId: 1, kind: 1, createdAt: -1 });
 const partnerLocalityGroupSchema = new Schema({
