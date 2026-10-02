@@ -27,6 +27,7 @@ import { runTenantMigration } from "./tenantMigration.js";
 import { activeOperationalOrderStatuses, dispatchableOrderStatuses, dispatchablePaymentFilter, isDispatchableOrderStatus } from "./dispatchEligibility.js";
 import { canReceivePartnerLocations, partnerCan, partnerPermissions, partnerRolesForEmployee, permissionsForPartnerRoles, type PartnerPermission } from "./partnerAccess.js";
 import { buildApprovedRiderOperationalProfile } from "./riderApproval.js";
+import { effectiveRiderStatus, selectCurrentSlot } from "./shiftPolicy.js";
 
 export const app = express();
 app.set("trust proxy", 1);
@@ -1995,19 +1996,18 @@ function madridNow() {
   return { date: `${values.year}-${values.month}-${values.day}`, time: `${values.hour}:${values.minute}` };
 }
 function previousCalendarDate(date: string) { const value = new Date(`${date}T12:00:00Z`); value.setUTCDate(value.getUTCDate() - 1); return value.toISOString().slice(0, 10); }
-function slotContainsTime(slot: { startTime: string; endTime: string }, time: string) { return slot.startTime < slot.endTime ? slot.startTime <= time && time < slot.endTime : time >= slot.startTime || time < slot.endTime; }
-
 async function findCurrentRiderSlot(riderId: mongoose.Types.ObjectId) {
   const now = madridNow();
-  const candidates = await RiderSlot.find({ riderId, date: { $in: [now.date, previousCalendarDate(now.date)] }, status: { $in: ["planned", "active"] } }).sort({ date: 1, startTime: 1 }).lean().exec();
-  const slot = candidates.find((candidate: any) => slotContainsTime(candidate, now.time) && (candidate.date === now.date || candidate.startTime >= candidate.endTime));
+  const previousDate = previousCalendarDate(now.date);
+  const candidates = await RiderSlot.find({ riderId, date: { $in: [now.date, previousDate] }, status: { $in: ["planned", "active"] } }).sort({ date: 1, startTime: 1 }).lean().exec();
+  const slot = selectCurrentSlot(candidates as any[], now, previousDate);
   return { now, slot, selfStartAllowed: false };
 }
 
 async function currentSlotRiderIds(scope: Record<string, unknown> = {}) {
   const now = madridNow();
   const candidates = await RiderSlot.find({ ...scope, date: { $in: [now.date, previousCalendarDate(now.date)] }, status: { $in: ["planned", "active"] } }).select("riderId date startTime endTime").lean().exec();
-  return [...new Set(candidates.filter((candidate: any) => slotContainsTime(candidate, now.time) && (candidate.date === now.date || candidate.startTime >= candidate.endTime)).map((candidate: any) => candidate.riderId))];
+  return [...new Set(candidates.filter((candidate: any) => Boolean(selectCurrentSlot([candidate], now, previousCalendarDate(now.date)))).map((candidate: any) => candidate.riderId))];
 }
 
 async function canAccessRiderShift(riderId: mongoose.Types.ObjectId, req: express.Request) {
@@ -2025,7 +2025,7 @@ app.get("/api/v1/riders/session", requireRole("rider"), async (req, res) => {
   // A previous browser session must never keep a rider online after its slot ended.
   await RiderSlot.updateMany({ riderId: rider._id, status: "active", date: { $lt: now.date } }, { $set: { status: "completed" } }).exec();
   const hasActiveOrder = Boolean(await Order.exists({ riderId: rider._id, status: { $nin: ["delivered", "cancelled"] }, assignmentState: { $in: ["offered", "assigned"] } }));
-  const effectiveStatus = hasActiveOrder ? "busy" : (slot as any)?.status === "active" ? rider.status : "offline";
+  const effectiveStatus = effectiveRiderStatus({ riderStatus: rider.status, hasActiveOrder, slotStatus: (slot as any)?.status });
   const update: Record<string, unknown> = { status: effectiveStatus };
   if (!hasActiveOrder && effectiveStatus === "offline") update.activeOrderId = null;
   if (effectiveStatus !== rider.status || update.activeOrderId === null) await Rider.updateOne({ _id: rider._id }, { $set: update }).exec();
