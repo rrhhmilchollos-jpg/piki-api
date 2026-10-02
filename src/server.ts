@@ -2077,6 +2077,32 @@ app.get("/api/v1/admin/overview", requireRole("admin"), async (_req, res) => {
   res.json({ service: "piki-api", overview: { active_restaurants: activeRestaurants, pending_restaurants: pendingRestaurants, riders, open_orders: openOrders, delivered_today: deliveredToday, gmv_today_cents: Number(gmv[0]?.totalCents || 0), paid_orders_today: Number(gmv[0]?.orders || 0) } });
 });
 
+app.get("/api/v1/admin/operations/health", requireRole("admin", "fleet"), async (_req, res) => {
+  const now = Date.now();
+  const freshCutoff = new Date(now - 90_000);
+  const staleCutoff = new Date(now - 10 * 60_000);
+  const [riders, dispatchQueue, activeOffers, activeOrders] = await Promise.all([
+    Rider.find({ isTestRider: { $ne: true } }).select("status lastLocationAt location fleetId zoneSlug").lean().exec(),
+    Order.countDocuments({ riderId: null, assignmentState: { $in: ["unassigned", "expired", "rejected"] }, ...dispatchablePaymentFilter, status: { $in: [...dispatchableOrderStatuses] } }),
+    Order.countDocuments({ assignmentState: "offered", assignmentExpiresAt: { $gt: new Date() } }),
+    Order.countDocuments({ status: { $in: [...activeOperationalOrderStatuses] } }),
+  ]);
+  const summary = riders.reduce((acc: any, rider: any) => {
+    const hasGps = Array.isArray(rider.location?.coordinates) && rider.location.coordinates.length >= 2;
+    const last = rider.lastLocationAt ? new Date(rider.lastLocationAt) : null;
+    const freshGps = Boolean(last && last >= freshCutoff && hasGps);
+    const staleGps = Boolean(last && last < freshCutoff && last >= staleCutoff);
+    acc.total += 1;
+    if (["available", "busy"].includes(rider.status)) acc.online += 1;
+    if (rider.status === "offline") acc.offline += 1;
+    if (freshGps) acc.freshGps += 1;
+    else if (staleGps) acc.staleGps += 1;
+    else if (!hasGps || !last) acc.missingGps += 1;
+    return acc;
+  }, { total: 0, online: 0, offline: 0, freshGps: 0, staleGps: 0, missingGps: 0 });
+  return res.json({ service: "piki-api", generatedAt: new Date().toISOString(), riders: summary, dispatch: { queue: dispatchQueue, activeOffers, activeOrders }, thresholds: { freshGpsSeconds: 90, staleGpsMinutes: 10 } });
+});
+
 app.get("/api/v1/admin/operations/live", requireRole("admin"), async (_req, res) => {
   const riders = await Rider.find({ isTestRider: { $ne: true }, location: { $exists: true } }).select("riderCode name email status vehicle location lastLocationAt activeOrderId fleetId").lean().exec() as any[];
   const activeOrderIds = riders.map((rider) => rider.activeOrderId).filter(Boolean);
