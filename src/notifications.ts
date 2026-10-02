@@ -88,6 +88,61 @@ export function buildNoticeCopy(input: RealtimeNotificationInput, recipient: Rec
     if (recipient.surface !== "rider") return null;
     return { category: "delivery", title: "Nuevo reparto asignado", body: `Tienes una nueva oferta para ${orderRef}.`, url, entityType: "order", entityId: orderId };
   }
+  if (input.type === "security.rider_shift_out_of_hours") {
+    if (!["fleet", "admin"].includes(recipient.surface)) return null;
+    const riderName = String(input.payload.riderName || input.payload.riderEmail || "Rider desconocido").slice(0, 120);
+    const riderCode = String(input.payload.riderCode || "").trim();
+    const attemptedAt = `${String(input.payload.date || "")} ${String(input.payload.time || "")}`.trim();
+    const suffix = riderCode ? ` (${riderCode})` : "";
+    return {
+      category: "security",
+      title: "Intento de jornada fuera de horario",
+      body: `${riderName}${suffix} intentó iniciar jornada fuera de su slot reservado${attemptedAt ? ` · ${attemptedAt}` : ""}.`,
+      url: "/",
+      entityType: "rider",
+      entityId: String(input.payload.riderId || ""),
+    };
+  }
+  if (input.type.startsWith("onboarding.")) {
+    const entityId = String(input.payload.entityId || input.payload.applicationId || input.payload.leadId || "");
+    const applicationId = String(input.payload.applicationId || entityId);
+    if (input.type === "onboarding.partner_lead.created") {
+      if (recipient.surface !== "admin") return null;
+      return { category: "onboarding", title: "Nueva solicitud de partner", body: "Hay una solicitud web pendiente de revisión en Solicitudes web.", url: "/?section=Solicitudes%20web", entityType: "partner_lead", entityId };
+    }
+    if (input.type === "onboarding.rider_lead.created") {
+      if (recipient.surface !== "admin") return null;
+      return { category: "onboarding", title: "Nueva solicitud de rider", body: "Hay una solicitud web pendiente de revisión en Solicitudes web.", url: "/?section=Solicitudes%20web", entityType: "rider_lead", entityId };
+    }
+    if (input.type === "onboarding.partner_application.created") {
+      if (recipient.surface !== "admin") return null;
+      return { category: "onboarding", title: "Expediente partner recibido", body: "Hay documentación de partner pendiente de revisión en Comercios.", url: "/?section=Comercios", entityType: "partner_application", entityId };
+    }
+    if (input.type === "onboarding.rider_application.created") {
+      if (recipient.surface !== "admin") return null;
+      return { category: "onboarding", title: "Expediente rider recibido", body: "Hay documentación de rider pendiente de revisión en Riders.", url: "/?section=Riders", entityType: "rider_application", entityId };
+    }
+    if (input.type === "onboarding.partner_application.approved") {
+      if (recipient.surface !== "admin") return null;
+      return { category: "onboarding", title: "Partner aprobado", body: "El comercio y su documentación han sido aprobados; el acceso Partner está activado.", url: "/?section=Comercios", entityType: "partner_application", entityId };
+    }
+    if (input.type === "onboarding.rider_application.approved") {
+      if (recipient.surface === "admin") {
+        return { category: "onboarding", title: "Rider aprobado", body: "La revisión documental terminó. El expediente está disponible en Riders.", url: "/?section=Riders", entityType: "rider_application", entityId: applicationId };
+      }
+      if (recipient.surface === "fleet") {
+        const riderId = String(input.payload.riderId || "");
+        return { category: "onboarding", title: "Nuevo rider aprobado", body: "El rider ya está disponible en la lista operativa de Fleet.", url: "/?section=Riders", entityType: "rider", entityId: riderId };
+      }
+      return null;
+    }
+    if (input.type === "onboarding.partner_application.rejected" || input.type === "onboarding.rider_application.rejected") {
+      if (recipient.surface !== "admin") return null;
+      const partner = input.type.includes("partner");
+      return { category: "onboarding", title: partner ? "Solicitud partner rechazada" : "Solicitud rider rechazada", body: "La decisión queda registrada en el expediente de alta.", url: partner ? "/?section=Comercios" : "/?section=Riders", entityType: partner ? "partner_application" : "rider_application", entityId };
+    }
+    return null;
+  }
   if (input.type === "order.status_changed") {
     const status = String(input.payload.status || "");
     const label = statusLabel[status] || "actualizado";

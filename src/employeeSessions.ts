@@ -3,7 +3,9 @@ import { EmployeeAccount, Rider } from "./models.js";
 import { createSessionToken, hashSessionToken } from "./employeeAuth.js";
 
 export const OWNER_EMAIL = "rrhh.milchollos@gmail.com";
-export const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+// Persistent PWA sessions survive closing/reopening the app while remaining
+// bounded; password changes, suspension and explicit logout still revoke them.
+export const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const schema = new Schema({
   tokenHash: { type: String, required: true, unique: true, index: true },
   employeeId: { type: Schema.Types.ObjectId, required: true, index: true },
@@ -19,6 +21,9 @@ export const EmployeeSession = mongoose.models.EmployeeSession || mongoose.model
 export function sessionRole(employee: { email: string; apiRole: string; roles?: string[]; primaryRole?: string | null; ownerProtected?: boolean; authorizationStatus?: string }, surface: string, requestedRole?: string): string | null {
   if (employee.authorizationStatus && employee.authorizationStatus !== "approved") return null;
   const availableRoles = Array.isArray(employee.roles) && employee.roles.length ? employee.roles : [employee.apiRole];
+  // An explicitly persisted admin membership must open the administrative
+  // surface as admin even when the account's operational default is Partner.
+  if (surface === "admin" && availableRoles.includes("admin")) return "admin";
   const selectedRole = requestedRole || employee.primaryRole || employee.apiRole;
   // The protected owner account may operate internal surfaces even though its
   // persisted business role remains admin. Keep the issued session scoped to
