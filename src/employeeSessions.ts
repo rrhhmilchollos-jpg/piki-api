@@ -24,7 +24,10 @@ export function sessionRole(employee: { email: string; apiRole: string; roles?: 
   // An explicitly persisted admin membership must open the administrative
   // surface as admin even when the account's operational default is Partner.
   if (surface === "admin" && availableRoles.includes("admin")) return "admin";
-  const selectedRole = requestedRole || employee.primaryRole || employee.apiRole;
+  // A multi-role employee opening a specific app must receive that app's
+  // role by default. Partner and Rider sessions remain independent.
+  const surfaceDefault = surface === "rider" ? "rider" : surface === "partner" || surface === "partners" ? "partner" : surface === "fleet" ? "fleet" : surface === "admin" ? "admin" : null;
+  const selectedRole = requestedRole || (surfaceDefault && availableRoles.includes(surfaceDefault) ? surfaceDefault : employee.primaryRole || employee.apiRole);
   // The protected owner account may operate internal surfaces even though its
   // persisted business role remains admin. Keep the issued session scoped to
   // the requested app and apply this exception before the ordinary role list.

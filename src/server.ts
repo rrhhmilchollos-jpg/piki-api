@@ -2682,7 +2682,7 @@ app.use((error: any, req: express.Request, res: express.Response, next: express.
 async function repairConfiguredPartnerAccess() {
   const email = String(process.env.REPAIR_PARTNER_EMAIL || "").trim().toLowerCase();
   if (!email) return;
-  const account = await EmployeeAccount.findOne({ email }).select("_id email restaurantId apiRole jobRole active authorizationStatus").lean().exec() as any;
+  const account = await EmployeeAccount.findOne({ email }).select("_id email restaurantId apiRole jobRole roles primaryRole active authorizationStatus").lean().exec() as any;
   if (!account) { console.log(JSON.stringify({ event: "partner_access_repair", email, result: "account_not_found" })); return; }
   const restaurant = account.restaurantId
     ? await Restaurant.findById(account.restaurantId).select("_id email onboardingStatus isActive").lean().exec() as any
@@ -2691,8 +2691,10 @@ async function repairConfiguredPartnerAccess() {
   if (restaurant.onboardingStatus !== "approved" || restaurant.isActive !== true) {
     console.log(JSON.stringify({ event: "partner_access_repair", email, result: "restaurant_not_approved", restaurantId: String(restaurant._id), onboardingStatus: restaurant.onboardingStatus, isActive: restaurant.isActive })); return;
   }
-  await EmployeeAccount.updateOne({ _id: account._id }, { $set: { restaurantId: restaurant._id, apiRole: "partner", jobRole: "partner", active: true, authorizationStatus: "approved", authorizedAt: new Date(), authorizationReason: "Reparación de acceso Partner solicitada por PIKI para pruebas operativas." } }).exec();
-  console.log(JSON.stringify({ event: "partner_access_repair", email, result: "repaired", restaurantId: String(restaurant._id), previous: { active: account.active, authorizationStatus: account.authorizationStatus, apiRole: account.apiRole, jobRole: account.jobRole, restaurantId: account.restaurantId ? String(account.restaurantId) : null } }));
+  const roles = [...new Set([...(Array.isArray(account.roles) ? account.roles : []), "partner", "rider"])];
+  await EmployeeAccount.updateOne({ _id: account._id }, { $set: { restaurantId: restaurant._id, restaurantIds: [restaurant._id], apiRole: "partner", jobRole: "partner", roles, primaryRole: "partner", active: true, authorizationStatus: "approved", authorizedAt: new Date(), authorizationReason: "Reparación de acceso Partner + Rider solicitada por PIKI para pruebas operativas." } }).exec();
+  const rider = await Rider.findOneAndUpdate({ email }, { $set: { email, name: account.email, status: "offline" }, $setOnInsert: { riderCode: await nextRiderCode() } }, { upsert: true, new: true, setDefaultsOnInsert: true }).select("_id email status").lean().exec() as any;
+  console.log(JSON.stringify({ event: "partner_rider_access_repair", email, result: "repaired", restaurantId: String(restaurant._id), riderId: rider?._id ? String(rider._id) : null, previous: { active: account.active, authorizationStatus: account.authorizationStatus, apiRole: account.apiRole, jobRole: account.jobRole, roles: account.roles || [], restaurantId: account.restaurantId ? String(account.restaurantId) : null } }));
 }
 
 async function start() {
