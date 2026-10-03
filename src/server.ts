@@ -2236,6 +2236,18 @@ app.get("/api/v1/riders/:id/sanction-status", requireRole("admin", "fleet", "rid
 });
 
 const automaticDispatchInFlight = new Set<string>();
+const automaticDispatchSweepStats = {
+  runs: 0,
+  skippedDatabase: 0,
+  errors: 0,
+  reassigned: 0,
+  expiredOffers: 0,
+  queued: 0,
+  lastStartedAt: null as string | null,
+  lastCompletedAt: null as string | null,
+  lastDurationMs: null as number | null,
+  lastError: null as string | null,
+};
 const PICKUP_REASSIGN_AFTER_MS = Math.max(60_000, Number(process.env.PIKI_PICKUP_REASSIGN_AFTER_MINUTES || 10) * 60_000);
 const PICKUP_ARRIVAL_RADIUS_METERS = Math.max(50, Number(process.env.PIKI_PICKUP_ARRIVAL_RADIUS_METERS || 250));
 function pointDistanceMeters(a: any, b: any) {
@@ -2250,6 +2262,7 @@ function pointDistanceMeters(a: any, b: any) {
 }
 async function reassignLatePickupOrders() {
   const now = new Date();
+  let reassigned = 0;
   const legacyAssigned = await Order.find({ assignmentState: "assigned", riderId: { $ne: null }, pickupDeadlineAt: null, status: { $in: ["pending", "accepted", "preparing", "ready_for_pickup"] } }).select("_id updatedAt").limit(100).lean().exec() as any[];
   for (const order of legacyAssigned) {
     const deadline = new Date(new Date(order.updatedAt || now).getTime() + PICKUP_REASSIGN_AFTER_MS);
@@ -2265,9 +2278,11 @@ async function reassignLatePickupOrders() {
     if (!released?.riderId) continue;
     await releaseRiderOrderSlot(released._id, released.riderId);
     await DispatchDecision.updateMany({ orderId: released._id, riderId: released.riderId, outcome: { $in: ["accepted", "offered"] } }, { $set: { outcome: "expired", actorRole: "system" } }).exec();
+    reassigned += 1;
     await publishOrderStatusEvents(released, released.status).catch((error) => console.warn("Late pickup event failed", error instanceof Error ? error.message : error));
     void queueAutomaticDispatch(released._id as mongoose.Types.ObjectId).catch((error) => console.error("Late pickup reassignment failed", error));
   }
+  return reassigned;
 }
 
 /**
@@ -2331,21 +2346,42 @@ setCustomerOrderDispatcher(async (orderId) => {
 });
 
 async function expireStaleOffers() {
+  let expiredCount = 0;
   const expired = await Order.find({ assignmentState: "offered", assignmentExpiresAt: { $lte: new Date() } }).select("_id riderId").limit(100).lean().exec() as any[];
   for (const offer of expired) {
     const released = await Order.findOneAndUpdate({ _id: offer._id, assignmentState: "offered", assignmentExpiresAt: { $lte: new Date() } }, { $set: { assignmentState: "expired", riderId: null, assignmentExpiresAt: null, pickupDeadlineAt: null }, $inc: { version: 1 } }, { new: false }).lean().exec() as any;
     if (!released?.riderId) continue;
     await releaseRiderOrderSlot(released._id, released.riderId);
+    expiredCount += 1;
     await DispatchDecision.updateMany({ orderId: released._id, riderId: released.riderId, outcome: "offered" }, { $set: { outcome: "expired" } }).exec();
   }
+  return expiredCount;
 }
 
 async function runAutomaticDispatchSweep() {
-  if (!databaseReady || mongoose.connection.readyState !== 1) return;
-  await reassignLatePickupOrders();
-  await expireStaleOffers();
-  const candidates = await Order.find({ riderId: null, assignmentState: { $in: ["unassigned", "expired", "rejected"] }, ...dispatchablePaymentFilter, status: { $in: [...dispatchableOrderStatuses] } }).select("_id").sort({ createdAt: 1 }).limit(25).lean().exec();
-  for (const order of candidates) void queueAutomaticDispatch(order._id as mongoose.Types.ObjectId).catch((error) => console.error("Automatic dispatch sweep failed", error));
+  if (!databaseReady || mongoose.connection.readyState !== 1) { automaticDispatchSweepStats.skippedDatabase += 1; return; }
+  const startedAt = Date.now();
+  automaticDispatchSweepStats.lastStartedAt = new Date(startedAt).toISOString();
+  try {
+    const reassigned = await reassignLatePickupOrders();
+    const expiredOffers = await expireStaleOffers();
+    const candidates = await Order.find({ riderId: null, assignmentState: { $in: ["unassigned", "expired", "rejected"] }, ...dispatchablePaymentFilter, status: { $in: [...dispatchableOrderStatuses] } }).select("_id").sort({ createdAt: 1 }).limit(25).lean().exec();
+    for (const order of candidates) void queueAutomaticDispatch(order._id as mongoose.Types.ObjectId).catch((error) => console.error("Automatic dispatch sweep failed", error));
+    automaticDispatchSweepStats.runs += 1;
+    automaticDispatchSweepStats.reassigned += reassigned;
+    automaticDispatchSweepStats.expiredOffers += expiredOffers;
+    automaticDispatchSweepStats.queued += candidates.length;
+    automaticDispatchSweepStats.lastCompletedAt = new Date().toISOString();
+    automaticDispatchSweepStats.lastDurationMs = Date.now() - startedAt;
+    automaticDispatchSweepStats.lastError = null;
+    if (automaticDispatchSweepStats.runs % 12 === 0) console.log(JSON.stringify({ event: "automatic_dispatch_sweep", intervalSeconds: 5, ...automaticDispatchSweepStats }));
+  } catch (error) {
+    automaticDispatchSweepStats.errors += 1;
+    automaticDispatchSweepStats.lastError = error instanceof Error ? error.message : String(error);
+    automaticDispatchSweepStats.lastDurationMs = Date.now() - startedAt;
+    console.error(JSON.stringify({ event: "automatic_dispatch_sweep_error", error: automaticDispatchSweepStats.lastError }));
+    throw error;
+  }
 }
 async function findDispatchOrder(orderId: mongoose.Types.ObjectId, req: express.Request) {
   const scoped = await Order.findOne({ _id: orderId, ...tenantScope(req) }).lean().exec() as any;
@@ -2658,7 +2694,7 @@ app.get("/api/v1/admin/operations/health", requireRole("admin", "fleet"), async 
     else if (!hasGps || !last) acc.missingGps += 1;
     return acc;
   }, { total: 0, online: 0, offline: 0, freshGps: 0, staleGps: 0, missingGps: 0 });
-  return res.json({ service: "piki-api", generatedAt: new Date().toISOString(), riders: summary, dispatch: { queue: dispatchQueue, activeOffers, activeOrders }, thresholds: { freshGpsSeconds: 90, staleGpsMinutes: 10 } });
+  return res.json({ service: "piki-api", generatedAt: new Date().toISOString(), riders: summary, dispatch: { queue: dispatchQueue, activeOffers, activeOrders }, automaticDispatchSweep: { ...automaticDispatchSweepStats, intervalSeconds: 5, healthy: automaticDispatchSweepStats.runs > 0 && automaticDispatchSweepStats.errors === 0 && Boolean(automaticDispatchSweepStats.lastCompletedAt) }, thresholds: { freshGpsSeconds: 90, staleGpsMinutes: 10, pickupReassignMinutes: 10, pickupArrivalRadiusMeters: PICKUP_ARRIVAL_RADIUS_METERS, partnerPreparationMinutes: PARTNER_PREPARATION_LIMIT_MINUTES, customerDeliveryTargetMinutes: CUSTOMER_DELIVERY_TARGET_MINUTES } });
 });
 
 app.get("/api/v1/admin/operations/live", requireRole("admin"), async (_req, res) => {
