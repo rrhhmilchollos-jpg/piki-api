@@ -27,6 +27,7 @@ import { activeOperationalOrderStatuses, dispatchableOrderStatuses, dispatchable
 import { canReceivePartnerLocations, partnerCan, partnerPermissions, partnerRolesForEmployee, permissionsForPartnerRoles, type PartnerPermission } from "./partnerAccess.js";
 import { awardRiderRecruitmentMilestones, claimRiderReferralCode, completeRiderShiftIncentiveTracking, incentiveProgramStatus, loadRiderIncentiveSnapshot, trackRiderLocationForIncentive, trackRiderShiftStart } from "./riderIncentives.js";
 import { buildApprovedRiderOperationalProfile } from "./riderApproval.js";
+import { CUSTOMER_CATALOG_RESTAURANT_FILTER, presentCustomerCatalogRestaurant } from "./customerCatalogPolicy.js";
 
 export const app = express();
 app.set("trust proxy", 1);
@@ -696,7 +697,7 @@ app.post("/api/v1/signatures/signaturit/events", rateLimit(100, 60_000, "signatu
 app.get("/api/v1/catalog/restaurants", async (req, res) => {
   const query = typeof req.query.q === "string" ? req.query.q.trim().slice(0, 120).replace(/[.*+?^${}()|[\]\\]/g, "\\$&") : "";
   const category = typeof req.query.category === "string" ? req.query.category.trim() : "";
-  const filter: Record<string, unknown> = { isActive: true, onboardingStatus: "approved" };
+  const filter: Record<string, unknown> = { ...CUSTOMER_CATALOG_RESTAURANT_FILTER };
   if (category && category !== "Todos") filter.category = category;
   if (query) filter.$or = [{ name: { $regex: query, $options: "i" } }, { cuisine: { $regex: query, $options: "i" } }, { category: { $regex: query, $options: "i" } }];
   const restaurants = await Restaurant.find(filter)
@@ -704,7 +705,7 @@ app.get("/api/v1/catalog/restaurants", async (req, res) => {
     // partnerProfile.documents having select:false nested fields.
     .select("slug name cuisine category locality partnerGroupKey tagline etaMinutes deliveryFeeCents rating reviews promoted image accent phone address location menu isActive onboardingStatus")
     .sort({ promoted: -1, rating: -1, reviews: -1 }).lean().exec();
-  res.json({ restaurants });
+  res.json({ restaurants: restaurants.map((restaurant: any) => presentCustomerCatalogRestaurant(restaurant)) });
 });
 
 app.get("/api/v1/locations/search", async (req, res) => {
@@ -747,11 +748,12 @@ app.get("/api/v1/coverage", async (req, res) => {
   let catalogAvailable = true;
   if (coverage.covered) {
     try {
-      restaurants = await Restaurant.find({ isActive: true, onboardingStatus: "approved" })
+      const rows = await Restaurant.find(CUSTOMER_CATALOG_RESTAURANT_FILTER)
         // Inclusive projection avoids a MongoDB path collision with the
         // select:false document payload nested under partnerProfile.
         .select("slug name cuisine category locality tagline etaMinutes deliveryFeeCents rating reviews promoted image accent phone address location menu")
         .sort({ promoted: -1, rating: -1, reviews: -1 }).lean().exec();
+      restaurants = rows.map((restaurant: any) => presentCustomerCatalogRestaurant(restaurant));
     } catch (error) {
       // The price decision is deterministic and must never disappear because a
       // catalogue/index query is temporarily unavailable. The storefront has
@@ -1108,6 +1110,21 @@ app.get("/api/v1/admin/restaurants", requireRole("admin"), async (req, res) => {
   const filter = status ? { onboardingStatus: status } : {};
   const restaurants = await Restaurant.find(filter).sort({ createdAt: -1 }).limit(200).lean().exec();
   return res.json({ restaurants });
+});
+
+app.patch("/api/v1/admin/restaurants/:id/customer-name", requireOwner(), async (req, res) => {
+  const idParam = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+  const id = objectId(idParam);
+  if (!id) return res.status(400).json({ error: "INVALID_RESTAURANT_ID" });
+  const parsed = z.object({ name: z.literal("PIKI Delivery") }).safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "INVALID_CUSTOMER_RESTAURANT_NAME", details: parsed.error.flatten() });
+  const restaurant = await Restaurant.findOneAndUpdate(
+    { _id: id, slug: "kfc-xativa" },
+    { $set: { name: parsed.data.name } },
+    { new: true },
+  ).select("_id slug name").lean().exec() as any;
+  if (!restaurant) return res.status(404).json({ error: "TARGET_RESTAURANT_NOT_FOUND" });
+  return res.json({ restaurant: { id: String(restaurant._id), slug: restaurant.slug, name: restaurant.name } });
 });
 
 app.patch("/api/v1/admin/restaurants/:id/status", requireRole("admin"), async (req, res) => {
