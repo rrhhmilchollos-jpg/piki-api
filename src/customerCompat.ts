@@ -5,6 +5,7 @@ import { publishOrderIntakeEvents } from "./realtime.js";
 import { evaluateXativaCoverage } from "./coverage/xativaPolicy.js";
 import { quoteDeliveryRoute } from "./coverage/routing.js";
 import { CUSTOMER_CATALOG_RESTAURANT_FILTER, customerCatalogRestaurantName } from "./customerCatalogPolicy.js";
+import { modifierGroupsForItem, quoteMenuItem, usesReferenceAddOns } from "./menuModifiers.js";
 
 const COOKIE = "piki_customer_session";
 let dispatchCustomerOrder: ((orderId: string) => Promise<unknown>) | null = null;
@@ -60,7 +61,8 @@ const deliveryPin = (orderCode: string) => {
 };
 
 function restaurantView(row: any) {
-  return { id: String(row._id), name: customerCatalogRestaurantName(row), cuisine: row.cuisine, category: row.category, tagline: row.tagline || "Descubre este establecimiento en PIKI.", eta: `${row.etaMinutes?.[0] || 20}–${row.etaMinutes?.[1] || 35} min`, fee: (row.deliveryFeeCents || 0) / 100, rating: row.rating || 0, reviews: row.reviews || 0, promoted: row.promoted, image: row.image || "", accent: row.accent || "#FFD72E", menu: (row.menu || []).map((item: any) => ({ id: item.id, name: item.name, description: item.description || "", price: item.price, vegetarian: Boolean(item.vegetarian), popular: Boolean(item.popular) })) };
+  const useReferenceFallback = usesReferenceAddOns(row);
+  return { id: String(row._id), name: customerCatalogRestaurantName(row), cuisine: row.cuisine, category: row.category, tagline: row.tagline || "Descubre este establecimiento en PIKI.", eta: `${row.etaMinutes?.[0] || 20}–${row.etaMinutes?.[1] || 35} min`, fee: (row.deliveryFeeCents || 0) / 100, rating: row.rating || 0, reviews: row.reviews || 0, promoted: row.promoted, image: row.image || "", accent: row.accent || "#FFD72E", menu: (row.menu || []).map((item: any) => ({ id: item.id, name: item.name, description: item.description || "", price: item.price, vegetarian: Boolean(item.vegetarian), popular: Boolean(item.popular), modifierGroups: modifierGroupsForItem(item, useReferenceFallback) })) };
 }
 
 export async function handleCustomerTrpc(req: Request, res: Response) {
@@ -165,9 +167,19 @@ export async function handleCustomerTrpc(req: Request, res: Response) {
       const restaurant = await Restaurant.findOne({ _id: input?.restaurantId, ...CUSTOMER_CATALOG_RESTAURANT_FILTER }).lean().exec() as any;
       if (!restaurant) return fail(res, "Restaurante no encontrado", "NOT_FOUND");
       const requested = Array.isArray(input?.items) ? input.items : [];
-      const items = requested.map((line: any) => { const item = restaurant.menu.find((candidate: any) => candidate.id === line.id); return item ? { itemId: item.id, name: item.name, quantity: Number(line.quantity), unitPriceCents: Math.round(item.price * 100) } : null; });
+      const useReferenceFallback = usesReferenceAddOns(restaurant);
+      const items = requested.map((line: any) => {
+        const item = restaurant.menu.find((candidate: any) => candidate.id === line.id);
+        if (!item) return null;
+        try {
+          const quote = quoteMenuItem(item, line.selections, useReferenceFallback);
+          return { itemId: item.id, name: quote.name, quantity: Number(line.quantity), unitPriceCents: quote.unitPriceCents, selectedOptions: quote.selectedOptions };
+        } catch {
+          return null;
+        }
+      });
       if (!items.length || items.some((item: any) => !item || !Number.isInteger(item.quantity) || item.quantity < 1)) return fail(res, "La cesta no es válida");
-      const normalized = items as Array<{itemId: string; name: string; quantity: number; unitPriceCents: number}>;
+      const normalized = items as Array<{itemId: string; name: string; quantity: number; unitPriceCents: number; selectedOptions: Array<{ groupId: string; groupName: string; optionId: string; optionName: string; unitPriceCents: number }>}>;
       const paymentMethod = customerPaymentMethod(input?.paymentMethod);
       if (!paymentMethod) return fail(res, "Tarjeta y Bizum todavía no están disponibles. Selecciona efectivo al recibir.", "PAYMENT_METHOD_UNAVAILABLE");
       const latitude = Number(input?.deliveryLocation?.latitude); const longitude = Number(input?.deliveryLocation?.longitude);

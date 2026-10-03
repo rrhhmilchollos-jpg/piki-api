@@ -28,6 +28,7 @@ import { canReceivePartnerLocations, partnerCan, partnerPermissions, partnerRole
 import { awardRiderRecruitmentMilestones, claimRiderReferralCode, completeRiderShiftIncentiveTracking, incentiveProgramStatus, loadRiderIncentiveSnapshot, trackRiderLocationForIncentive, trackRiderShiftStart } from "./riderIncentives.js";
 import { buildApprovedRiderOperationalProfile } from "./riderApproval.js";
 import { CUSTOMER_CATALOG_RESTAURANT_FILTER, presentCustomerCatalogRestaurant } from "./customerCatalogPolicy.js";
+import { quoteMenuItem, usesReferenceAddOns } from "./menuModifiers.js";
 
 export const app = express();
 app.set("trust proxy", 1);
@@ -173,7 +174,8 @@ async function fleetCanAccessRider(req: express.Request, riderId: mongoose.Types
   return Boolean(employee?.fleetId && await Rider.exists({ _id: riderId, fleetId: employee.fleetId }));
 }
 const locationSchema = z.object({ latitude: z.number().min(-90).max(90), longitude: z.number().min(-180).max(180) });
-const orderItemSchema = z.object({ itemId: z.string().min(1), quantity: z.number().int().min(1).max(20) });
+const customerModifierSelectionSchema = z.object({ groupId: z.string().min(1).max(80), optionIds: z.array(z.string().min(1).max(80)).max(12) });
+const orderItemSchema = z.object({ itemId: z.string().min(1), quantity: z.number().int().min(1).max(20), selections: z.array(customerModifierSelectionSchema).max(12).optional() });
 const createOrderSchema = z.object({ restaurantId: z.string().min(1), deliveryAddress: z.string().min(5).max(280), deliveryLocation: locationSchema, items: z.array(orderItemSchema).min(1).max(50), paymentMethod: z.string().optional().default("cash") });
 const deliveryQrSecret = String(process.env.DELIVERY_QR_SECRET || "").trim();
 if (process.env.NODE_ENV === "production" && !deliveryQrSecret) throw new Error("DELIVERY_QR_SECRET is required in production");
@@ -898,7 +900,8 @@ async function partnerRequestAccess(req: express.Request, permission: PartnerPer
   const access = await partnerAccessForRequest(req);
   return { access, allowed: Boolean(access && partnerCan(access.roles, permission)) };
 }
-const menuModifierSchema = z.object({ id: z.string().min(1).max(80), name: z.string().min(1).max(120), price: z.number().min(0).max(1000), required: z.boolean().default(false), options: z.array(z.string().max(120)).max(30).default([]) });
+const menuModifierOptionSchema = z.union([z.string().max(120), z.object({ id: z.string().min(1).max(80), name: z.string().min(1).max(120), price: z.number().min(0).max(1000) })]);
+const menuModifierSchema = z.object({ id: z.string().min(1).max(80), name: z.string().min(1).max(120), description: z.string().max(240).default(""), price: z.number().min(0).max(1000).default(0), required: z.boolean().default(false), minSelections: z.number().int().min(0).max(30).default(0), maxSelections: z.number().int().min(1).max(30).default(1), options: z.array(menuModifierOptionSchema).max(30).default([]) });
 const partnerMenuItemSchema = z.object({ id: z.string().min(1).max(80), name: z.string().min(1).max(160), description: z.string().max(500).default(""), price: z.number().min(0).max(1000), category: z.string().max(100).default("General"), image: z.string().max(1200).refine((value) => value === "" || value.startsWith("https://api.pikidelivery.com/api/v1/catalog/assets/"), "La imagen debe proceder del almacenamiento de PIKI").default(""), allergens: z.array(z.string().max(80)).max(30).default([]), modifiers: z.array(menuModifierSchema).max(20).default([]), available: z.boolean().default(true), vegetarian: z.boolean().default(false), popular: z.boolean().default(false) });
 function detectedMenuMime(bytes: Buffer): string | null {
   if (bytes.length >= 12 && bytes.subarray(0, 3).equals(Buffer.from([0xff, 0xd8, 0xff]))) return "image/jpeg";
@@ -1452,9 +1455,19 @@ app.post("/api/v1/orders", rateLimit(20, 60_000, "orders-create"), async (req, r
   if (!restaurantObjectId) return res.status(400).json({ error: "INVALID_RESTAURANT_ID" });
   const restaurant = await Restaurant.findOne({ _id: restaurantObjectId, isActive: true, onboardingStatus: "approved" }).lean().exec() as any;
   if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_AVAILABLE" });
-  const items = parsed.data.items.map((requested) => { const item = restaurant.menu.find((candidate: any) => candidate.id === requested.itemId); return item ? { itemId: item.id, name: item.name, quantity: requested.quantity, unitPriceCents: Math.round(item.price * 100) } : null; });
+  const useReferenceFallback = usesReferenceAddOns(restaurant);
+  const items = parsed.data.items.map((requested) => {
+    const item = restaurant.menu.find((candidate: any) => candidate.id === requested.itemId);
+    if (!item) return null;
+    try {
+      const quote = quoteMenuItem(item, requested.selections, useReferenceFallback);
+      return { itemId: item.id, name: quote.name, quantity: requested.quantity, unitPriceCents: quote.unitPriceCents, selectedOptions: quote.selectedOptions };
+    } catch {
+      return null;
+    }
+  });
   if (items.some((item) => !item)) return res.status(400).json({ error: "INVALID_MENU_ITEM" });
-  const normalizedItems = items as Array<{ itemId: string; name: string; quantity: number; unitPriceCents: number }>;
+  const normalizedItems = items as Array<{ itemId: string; name: string; quantity: number; unitPriceCents: number; selectedOptions: Array<{ groupId: string; groupName: string; optionId: string; optionName: string; unitPriceCents: number }> }>;
   const deliveryPoint: [number, number] = [parsed.data.deliveryLocation.longitude, parsed.data.deliveryLocation.latitude];
   const coverage = evaluateXativaCoverage(deliveryPoint);
   if (!coverage.covered || coverage.deliveryFeeCents === null || coverage.serviceFeeCents === null) {
