@@ -172,6 +172,48 @@ export async function publishRiderOfferEvent(order: any, riderId: string) {
   });
 }
 
+export async function publishRiderArrivalEvent(order: any, rider: any, distanceMeters: number, source: "rider" | "gps_sweep") {
+  const tenantId = validTenantId(order.tenantId);
+  const base = {
+    orderId: String(order._id), publicCode: order.publicCode, restaurantId: String(order.restaurantId), riderId: String(rider._id),
+    status: order.status, assignmentState: order.assignmentState, arrivedAt: order.riderArrivedAt || new Date(),
+    distanceMeters: Math.round(distanceMeters), source,
+  };
+  const events: Array<Promise<unknown>> = [
+    publishRealtimeEvent({ channel: "rider", audienceKey: `rider:${base.riderId}`, tenantId, type: "order.rider_arrived_at_partner", payload: base, dedupeKey: `arrival:rider:${base.orderId}:${order.version || 0}` }),
+    publishRealtimeEvent({ channel: "partner", audienceKey: `restaurant:${base.restaurantId}`, tenantId, type: "order.rider_arrived_at_partner", payload: base, dedupeKey: `arrival:partner:${base.orderId}:${order.version || 0}` }),
+    publishRealtimeEvent({ channel: "fleet", audienceKey: tenantAudienceKey(tenantId, "fleet"), tenantId, type: "order.rider_arrived_at_partner", payload: base, dedupeKey: `arrival:fleet:${base.orderId}:${order.version || 0}` }),
+    publishRealtimeEvent({ channel: "admin", audienceKey: tenantAudienceKey(tenantId, "admin"), tenantId, type: "order.rider_arrived_at_partner", payload: base, dedupeKey: `arrival:admin:${base.orderId}:${order.version || 0}` }),
+  ];
+  if (order.customerId && mongoose.isValidObjectId(order.customerId)) {
+    events.push(publishRealtimeEvent({ channel: "customer", audienceKey: `customer:${String(order.customerId)}`, tenantId, type: "order.rider_arrived_at_partner", payload: { ...customerOrderPayload(order), message: "Tu repartidor ya está en el establecimiento." }, dedupeKey: `arrival:customer:${base.orderId}:${order.version || 0}` }));
+  }
+  await Promise.all(events);
+}
+
+/** Emits a compact location update only for an active delivery and its authorised audiences. */
+export async function publishRiderLocationEvents(order: any, rider: any) {
+  const coordinates = rider?.location?.coordinates;
+  if (!Array.isArray(coordinates) || coordinates.length < 2) return;
+  const [longitude, latitude] = coordinates;
+  if (!Number.isFinite(Number(latitude)) || !Number.isFinite(Number(longitude))) return;
+  const tenantId = validTenantId(order.tenantId);
+  const recordedAt = new Date(rider.lastLocationAt || Date.now()).toISOString();
+  const bucket = Math.floor(new Date(recordedAt).getTime() / 5_000);
+  const base = {
+    orderId: String(order._id), publicCode: order.publicCode, riderId: String(rider._id), status: order.status,
+    latitude: Number(Number(latitude).toFixed(5)), longitude: Number(Number(longitude).toFixed(5)), recordedAt,
+  };
+  const events: Array<Promise<unknown>> = [
+    publishRealtimeEvent({ channel: "fleet", audienceKey: tenantAudienceKey(tenantId, "fleet"), tenantId, type: "rider.location_updated", payload: base, dedupeKey: `location:fleet:${base.orderId}:${bucket}` }),
+    publishRealtimeEvent({ channel: "admin", audienceKey: tenantAudienceKey(tenantId, "admin"), tenantId, type: "rider.location_updated", payload: base, dedupeKey: `location:admin:${base.orderId}:${bucket}` }),
+  ];
+  if (order.customerId && mongoose.isValidObjectId(order.customerId)) {
+    events.push(publishRealtimeEvent({ channel: "customer", audienceKey: `customer:${String(order.customerId)}`, tenantId, type: "rider.location_updated", payload: base, dedupeKey: `location:customer:${base.orderId}:${bucket}` }));
+  }
+  await Promise.all(events);
+}
+
 async function resolveAudience(request: Request): Promise<ResolvedAudience | null> {
   const surface = String(request.header("x-piki-surface") || request.query.surface || "").toLowerCase();
   if (surface === "customer") {
@@ -236,7 +278,10 @@ export async function serveRealtimeEvents(request: Request, response: Response) 
   };
   const heartbeat = setInterval(() => response.write(`: heartbeat ${Date.now()}\n\n`), HEARTBEAT_MS);
   stream.on("event", listener);
-  const backlog = await RealtimeEvent.find(query).sort({ _id: 1 }).limit(REPLAY_LIMIT).lean().exec() as unknown as PersistedRealtimeEvent[];
+  const backlog = (after
+    ? await RealtimeEvent.find(query).sort({ _id: 1 }).limit(REPLAY_LIMIT).lean().exec()
+    : (await RealtimeEvent.find(query).sort({ _id: -1 }).limit(REPLAY_LIMIT).lean().exec()).reverse()
+  ) as unknown as PersistedRealtimeEvent[];
   backlog.forEach((event) => writeUniqueEvent(event));
   const close = () => { clearInterval(heartbeat); stream.off("event", listener); };
   request.on("close", close);
