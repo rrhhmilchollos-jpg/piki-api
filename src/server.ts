@@ -1838,7 +1838,7 @@ app.post("/api/v1/orders/:id/transitions", requireRole("admin", "partner", "ride
   }
   try { assertTransition(order.status, parsed.data.status, actorRole); } catch (error) { return res.status(409).json({ error: "INVALID_ORDER_TRANSITION", message: error instanceof Error ? error.message : "Transition not allowed" }); }
   if (parsed.data.status === "delivered" && order.paymentMethod === "cash") return res.status(409).json({ error: "DELIVERY_QR_REQUIRED", message: "Un pedido a contrarreembolso debe cerrarse con el QR del Customer para registrar el cobro en efectivo una sola vez." });
-  const update: Record<string, unknown> = { $set: { status: parsed.data.status, ...(actorRole === "rider" && parsed.data.status === "picked_up" && order.assignmentState === "offered" ? { assignmentState: "assigned", assignmentExpiresAt: null } : {}) }, $inc: { version: 1 }, $push: { statusHistory: { status: parsed.data.status, actorRole, reason: parsed.data.reason || "" } } };
+  const update: Record<string, unknown> = { $set: { status: parsed.data.status, ...(actorRole === "rider" && parsed.data.status === "picked_up" && order.assignmentState === "offered" ? { assignmentState: "assigned", assignmentExpiresAt: null, pickupDeadlineAt: null } : {}) }, $inc: { version: 1 }, $push: { statusHistory: { status: parsed.data.status, actorRole, reason: parsed.data.reason || "" } } };
   if (parsed.data.status === "delivered") update.$set = { status: "delivered", deliveredAt: new Date() };
   if (parsed.data.status === "cancelled") update.$set = { status: "cancelled", cancelledAt: new Date() };
   const updated = await Order.findOneAndUpdate({ _id: id, version: order.version, status: order.status }, update, { new: true }).lean().exec();
@@ -1928,7 +1928,7 @@ app.post("/api/v1/riders/:riderId/orders/:orderId/confirm-pickup", requireRole("
   if (pickupCode && !pickupQrIsValid(order.publicCode, pickupCode)) return res.status(422).json({ error: "PICKUP_QR_INVALID", message: "El QR o PIN de recogida no es válido." });
   const updated = await Order.findOneAndUpdate(
     { _id: orderId, riderId, assignmentState: { $in: ["offered", "assigned"] }, status: order.status, version: order.version },
-    { $set: { status: "picked_up", assignmentState: "assigned", assignmentExpiresAt: null }, $inc: { version: 1 }, $push: { statusHistory: { status: "picked_up", actorRole: "rider", reason: pickupCode ? "Recogida confirmada por Rider con QR/PIN" : order.status === "ready_for_pickup" ? "Recogida confirmada por Rider" : "Recogida confirmada antes de que Partner marcara el pedido como listo" } } },
+    { $set: { status: "picked_up", assignmentState: "assigned", assignmentExpiresAt: null, pickupDeadlineAt: null }, $inc: { version: 1 }, $push: { statusHistory: { status: "picked_up", actorRole: "rider", reason: pickupCode ? "Recogida confirmada por Rider con QR/PIN" : order.status === "ready_for_pickup" ? "Recogida confirmada por Rider" : "Recogida confirmada antes de que Partner marcara el pedido como listo" } } },
     { new: true },
   ).lean().exec();
   if (!updated) return res.status(409).json({ error: "ORDER_CHANGED_RETRY" });
@@ -2201,6 +2201,39 @@ app.get("/api/v1/riders/:id/sanction-status", requireRole("admin", "fleet", "rid
 });
 
 const automaticDispatchInFlight = new Set<string>();
+const PICKUP_REASSIGN_AFTER_MS = Math.max(60_000, Number(process.env.PIKI_PICKUP_REASSIGN_AFTER_MINUTES || 10) * 60_000);
+const PICKUP_ARRIVAL_RADIUS_METERS = Math.max(50, Number(process.env.PIKI_PICKUP_ARRIVAL_RADIUS_METERS || 250));
+function pointDistanceMeters(a: any, b: any) {
+  const [lon1, lat1] = a?.coordinates || [];
+  const [lon2, lat2] = b?.coordinates || [];
+  if (![lon1, lat1, lon2, lat2].every((value) => Number.isFinite(Number(value)))) return null;
+  const radians = (value: number) => value * Math.PI / 180;
+  const dLat = radians(lat2 - lat1);
+  const dLon = radians(lon2 - lon1);
+  const h = Math.sin(dLat / 2) ** 2 + Math.cos(radians(lat1)) * Math.cos(radians(lat2)) * Math.sin(dLon / 2) ** 2;
+  return 6_371_000 * 2 * Math.atan2(Math.sqrt(h), Math.sqrt(Math.max(0, 1 - h)));
+}
+async function reassignLatePickupOrders() {
+  const now = new Date();
+  const legacyAssigned = await Order.find({ assignmentState: "assigned", riderId: { $ne: null }, pickupDeadlineAt: null, status: { $in: ["pending", "accepted", "preparing", "ready_for_pickup"] } }).select("_id updatedAt").limit(100).lean().exec() as any[];
+  for (const order of legacyAssigned) {
+    const deadline = new Date(new Date(order.updatedAt || now).getTime() + PICKUP_REASSIGN_AFTER_MS);
+    await Order.updateOne({ _id: order._id, assignmentState: "assigned", pickupDeadlineAt: null }, { $set: { pickupDeadlineAt: deadline } }).exec();
+  }
+  const lateOrders = await Order.find({ assignmentState: "assigned", riderId: { $ne: null }, pickupDeadlineAt: { $ne: null, $lte: now }, status: { $in: ["pending", "accepted", "preparing", "ready_for_pickup"] } }).select("_id riderId restaurantId tenantId publicCode status version").limit(100).lean().exec() as any[];
+  for (const order of lateOrders) {
+    const [rider, restaurant] = await Promise.all([Rider.findById(order.riderId).select("_id location lastLocationAt").lean().exec() as any, Restaurant.findById(order.restaurantId).select("_id location").lean().exec() as any]);
+    const distanceMeters = pointDistanceMeters(rider?.location, restaurant?.location);
+    const arrived = distanceMeters != null && distanceMeters <= PICKUP_ARRIVAL_RADIUS_METERS;
+    if (arrived) { await Order.updateOne({ _id: order._id, assignmentState: "assigned", riderId: order.riderId }, { $set: { pickupDeadlineAt: null } }).exec(); continue; }
+    const released = await Order.findOneAndUpdate({ _id: order._id, assignmentState: "assigned", riderId: order.riderId, version: order.version }, { $set: { riderId: null, assignmentState: "expired", assignmentExpiresAt: null, pickupDeadlineAt: null }, $inc: { dispatchAttempts: 1, version: 1 }, $push: { statusHistory: { status: order.status, actorRole: "system", reason: `Reasignación automática: rider fuera del Partner tras ${Math.round(PICKUP_REASSIGN_AFTER_MS / 60_000)} minutos (${distanceMeters == null ? "GPS no disponible" : `${Math.round(distanceMeters)} m`}).` } } }, { new: false }).lean().exec() as any;
+    if (!released?.riderId) continue;
+    await releaseRiderOrderSlot(released._id, released.riderId);
+    await DispatchDecision.updateMany({ orderId: released._id, riderId: released.riderId, outcome: { $in: ["accepted", "offered"] } }, { $set: { outcome: "expired", actorRole: "system" } }).exec();
+    await publishOrderStatusEvents(released, released.status).catch((error) => console.warn("Late pickup event failed", error instanceof Error ? error.message : error));
+    void queueAutomaticDispatch(released._id as mongoose.Types.ObjectId).catch((error) => console.error("Late pickup reassignment failed", error));
+  }
+}
 
 /**
  * Asignación automática idempotente. El algoritmo solo acepta riders con sesión
@@ -2235,7 +2268,7 @@ async function assignOrderAutomatically(orderId: mongoose.Types.ObjectId, prefer
       if (!assignmentReservation) continue;
       const rider = assignmentReservation.rider;
       const expiresAt = assignmentReservation.reservation.expiresAt;
-      const assigned = await Order.findOneAndUpdate({ _id: order._id, ...tenantFilter, riderId: null, assignmentState: { $in: ["unassigned", "expired", "rejected"] } }, { $set: { riderId: rider._id, assignmentState: "offered", assignmentExpiresAt: expiresAt, dispatchScore: decision.score }, $inc: { dispatchAttempts: 1, version: 1 } }, { new: true }).lean().exec() as any;
+      const assigned = await Order.findOneAndUpdate({ _id: order._id, ...tenantFilter, riderId: null, assignmentState: { $in: ["unassigned", "expired", "rejected"] } }, { $set: { riderId: rider._id, assignmentState: "offered", assignmentExpiresAt: expiresAt, pickupDeadlineAt: null, dispatchScore: decision.score }, $inc: { dispatchAttempts: 1, version: 1 } }, { new: true }).lean().exec() as any;
       if (!assigned) { await releaseRiderOrderSlot(order._id, rider._id); continue; }
       await DispatchDecision.create({ ...tenantFilter, orderId: assigned._id, ...decision, riderId: rider._id, outcome: "offered", actorRole: "system" });
       await publishRiderOfferEvent(assigned, String(rider._id));
@@ -2265,7 +2298,7 @@ setCustomerOrderDispatcher(async (orderId) => {
 async function expireStaleOffers() {
   const expired = await Order.find({ assignmentState: "offered", assignmentExpiresAt: { $lte: new Date() } }).select("_id riderId").limit(100).lean().exec() as any[];
   for (const offer of expired) {
-    const released = await Order.findOneAndUpdate({ _id: offer._id, assignmentState: "offered", assignmentExpiresAt: { $lte: new Date() } }, { $set: { assignmentState: "expired", riderId: null, assignmentExpiresAt: null }, $inc: { version: 1 } }, { new: false }).lean().exec() as any;
+    const released = await Order.findOneAndUpdate({ _id: offer._id, assignmentState: "offered", assignmentExpiresAt: { $lte: new Date() } }, { $set: { assignmentState: "expired", riderId: null, assignmentExpiresAt: null, pickupDeadlineAt: null }, $inc: { version: 1 } }, { new: false }).lean().exec() as any;
     if (!released?.riderId) continue;
     await releaseRiderOrderSlot(released._id, released.riderId);
     await DispatchDecision.updateMany({ orderId: released._id, riderId: released.riderId, outcome: "offered" }, { $set: { outcome: "expired" } }).exec();
@@ -2274,6 +2307,7 @@ async function expireStaleOffers() {
 
 async function runAutomaticDispatchSweep() {
   if (!databaseReady || mongoose.connection.readyState !== 1) return;
+  await reassignLatePickupOrders();
   await expireStaleOffers();
   const candidates = await Order.find({ riderId: null, assignmentState: { $in: ["unassigned", "expired", "rejected"] }, ...dispatchablePaymentFilter, status: { $in: [...dispatchableOrderStatuses] } }).select("_id").sort({ createdAt: 1 }).limit(25).lean().exec();
   for (const order of candidates) void queueAutomaticDispatch(order._id as mongoose.Types.ObjectId).catch((error) => console.error("Automatic dispatch sweep failed", error));
@@ -2356,7 +2390,7 @@ app.post("/api/v1/dispatch/orders/:id/assign", requireRole("admin", "fleet"), as
     const assignmentReservation = await reserveRiderOrderSlot(riderId, order._id, scope, maxConcurrentOrders);
     if (!assignmentReservation) continue;
     const rider = assignmentReservation.rider;
-    const assigned = await Order.findOneAndUpdate({ _id: order._id, ...scope, riderId: null, assignmentState: { $in: ["unassigned", "expired", "rejected"] } }, { $set: { riderId: rider._id, assignmentState: "assigned", assignmentExpiresAt: null, dispatchScore: decision.score }, $inc: { dispatchAttempts: 1, version: 1 } }, { new: true }).lean().exec() as any;
+    const assigned = await Order.findOneAndUpdate({ _id: order._id, ...scope, riderId: null, assignmentState: { $in: ["unassigned", "expired", "rejected"] } }, { $set: { riderId: rider._id, assignmentState: "assigned", assignmentExpiresAt: null, pickupDeadlineAt: new Date(Date.now() + PICKUP_REASSIGN_AFTER_MS), dispatchScore: decision.score }, $inc: { dispatchAttempts: 1, version: 1 } }, { new: true }).lean().exec() as any;
     if (!assigned) { await releaseRiderOrderSlot(order._id, rider._id); continue; }
     await RiderAssignmentReservation.updateOne({ orderId: assigned._id, riderId: rider._id, status: "reserved" }, { $set: { expiresAt: null } }).exec();
     await DispatchDecision.create({ ...scope, orderId: assigned._id, ...decision, riderId: rider._id, outcome: "accepted", actorRole: req.auth?.role || "system" });
@@ -2384,7 +2418,7 @@ app.post("/api/v1/dispatch/orders/:id/offer-response", requireRole("rider", "adm
     return res.status(409).json({ error: "OFFER_EXPIRED", message: "La oferta ha vencido y se ha devuelto a la cola de reparto." });
   }
   if (parsed.data.accept) {
-    const updated = await Order.findOneAndUpdate({ _id: orderId, ...tenantScope(req), assignmentState: "offered", riderId: order.riderId }, { $set: { assignmentState: "assigned" }, $inc: { version: 1 } }, { new: true }).lean().exec() as any;
+    const updated = await Order.findOneAndUpdate({ _id: orderId, ...tenantScope(req), assignmentState: "offered", riderId: order.riderId }, { $set: { assignmentState: "assigned", pickupDeadlineAt: new Date(Date.now() + PICKUP_REASSIGN_AFTER_MS) }, $inc: { version: 1 } }, { new: true }).lean().exec() as any;
     if (!updated) return res.status(409).json({ error: "OFFER_CHANGED_RETRY" });
     await RiderAssignmentReservation.updateOne({ orderId: updated._id, riderId: updated.riderId, status: "reserved" }, { $set: { expiresAt: null } }).exec();
     await DispatchDecision.updateMany({ orderId: updated._id, riderId: updated.riderId, outcome: "offered" }, { $set: { outcome: "accepted", actorRole: "rider" } }).exec();
@@ -2404,7 +2438,7 @@ app.get("/api/v1/riders/:id/offers", requireRole("rider"), async (req, res) => {
   const rider = await riderAccessForRequest(riderId, req);
   if (!rider) return res.status(403).json({ error: "RIDER_ACCESS_DENIED" });
   const offers = await Order.find({ riderId, assignmentState: { $in: ["offered", "assigned"] }, status: { $nin: ["delivered", "cancelled"] } })
-    .select("_id publicCode displayCode displayCodeDate restaurantId customerId riderId status paymentState paymentMethod totalCents assignmentState assignmentExpiresAt deliveryAddress deliveryLocation items createdAt +customerPhone")
+    .select("_id publicCode displayCode displayCodeDate restaurantId customerId riderId status paymentState paymentMethod totalCents assignmentState assignmentExpiresAt pickupDeadlineAt deliveryAddress deliveryLocation items createdAt +customerPhone")
     .sort({ createdAt: -1 }).limit(10).lean().exec() as any[];
   const riderProfile = await Rider.findById(riderId).select("vehicle").lean().exec() as any;
   const restaurantIds = offers.map((offer) => offer.restaurantId).filter(Boolean);
@@ -2432,6 +2466,7 @@ app.get("/api/v1/riders/:id/offers", requireRole("rider"), async (req, res) => {
       totalCents: Number(offer.totalCents || 0),
       assignmentState: offer.assignmentState,
       assignmentExpiresAt: offer.assignmentExpiresAt,
+      pickupDeadlineAt: offer.pickupDeadlineAt,
       items: offer.items,
       createdAt: offer.createdAt,
       vehicle: riderProfile?.vehicle || "unknown",
