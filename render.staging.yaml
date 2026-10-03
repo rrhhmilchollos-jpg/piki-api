@@ -1,0 +1,47 @@
+services:
+  - type: web
+    name: piki-api-staging
+    runtime: docker
+    region: frankfurt
+    plan: starter
+    branch: staging
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /ready
+    autoDeploy: true
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PIKI_ENVIRONMENT
+        value: staging
+      - key: PIKI_ALLOW_TEST_ORDERS
+        value: "true"
+      - key: MONGODB_URI
+        sync: false
+      - key: MONGODB_DB
+        value: piki_staging
+      - key: CORS_ORIGINS
+        sync: false
+      - key: PUBLIC_API_URL
+        sync: false
+      - key: CHECKOUT_TOKEN_SECRET
+        sync: false
+      - key: ADMIN_API_TOKEN
+        sync: false
+      - key: PARTNER_API_TOKEN
+        sync: false
+      - key: RIDER_API_TOKEN
+        sync: false
+      - key: FLEET_API_TOKEN
+        sync: false
+      - key: PICKUP_QR_SECRET
+        sync: false
+      - key: DELIVERY_QR_SECRET
+        sync: false
+      - key: PIKI_CUSTOMER_SYNC_SECRET
+        sync: false
+      - key: GOOGLE_MAPS_API_KEY
+        sync: false
+      - key: UPSTASH_REDIS_REST_URL
+        sync: false
+      - key: UPSTASH_REDIS_REST_TOKEN
+        sync: false

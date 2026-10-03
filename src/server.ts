@@ -2360,7 +2360,8 @@ async function assignOrderAutomatically(orderId: mongoose.Types.ObjectId, prefer
     const policy = await dispatchLoadPolicy();
     const freshness = new Date(Date.now() - 90_000);
     const currentRiderIds = await currentSlotRiderIds(tenantFilter);
-    const riderFilter: Record<string, unknown> = { ...tenantFilter, isTestRider: { $ne: true }, _id: { $in: currentRiderIds }, status: { $in: ["available", "busy"] }, lastLocationAt: { $gte: freshness }, location: { $exists: true } };
+    const allowStagingTestRiders = process.env.PIKI_ENVIRONMENT === "staging" && process.env.PIKI_ALLOW_TEST_ORDERS === "true";
+    const riderFilter: Record<string, unknown> = { ...tenantFilter, ...(allowStagingTestRiders ? {} : { isTestRider: { $ne: true } }), _id: { $in: currentRiderIds }, status: { $in: ["available", "busy"] }, lastLocationAt: { $gte: freshness }, location: { $exists: true } };
     if (preferredRiderId) riderFilter._id = { $in: currentRiderIds.filter((id) => String(id) === String(preferredRiderId)) };
     const riders = await Rider.find(riderFilter).limit(100).lean().exec() as any[];
     const counts = await activeOrderCounts(riders.map((rider) => rider._id));
@@ -2397,6 +2398,83 @@ async function queueAutomaticDispatch(orderId: mongoose.Types.ObjectId, preferre
 setCustomerOrderDispatcher(async (orderId) => {
   if (!mongoose.Types.ObjectId.isValid(orderId)) return { state: "invalid_order_id" as const };
   return queueAutomaticDispatch(new mongoose.Types.ObjectId(orderId));
+});
+
+/**
+ * Escenario QA aislado: crea un Partner, dos Riders de prueba y un pedido ya
+ * vencido. Solo existe cuando Render identifica explícitamente el servicio
+ * como staging; producción devuelve 404 incluso a cuentas admin.
+ */
+app.post("/api/v1/admin/qa/reassignment-simulation", requireRole("admin"), async (_req, res) => {
+  const qaEnabled = process.env.PIKI_ENVIRONMENT === "staging" && process.env.PIKI_ALLOW_TEST_ORDERS === "true";
+  if (!qaEnabled) return res.status(404).json({ error: "STAGING_QA_DISABLED" });
+
+  const now = new Date();
+  const today = madridNow(now).date;
+  const partnerPoint: [number, number] = [-0.5217, 38.9886];
+  const customerPoint: [number, number] = [-0.5168, 38.9927];
+  const assignedPoint: [number, number] = [-0.545, 39.005];
+  const replacementPoint: [number, number] = [-0.5220, 38.9889];
+  const [partner, assignedRider, replacementRider] = await Promise.all([
+    Restaurant.findOneAndUpdate(
+      { slug: "qa-staging-partner" },
+      { $set: { slug: "qa-staging-partner", name: "QA Partner · Staging", cuisine: "QA", category: "qa", isActive: true, onboardingStatus: "approved", location: { type: "Point", coordinates: partnerPoint }, menu: [{ id: "qa-item", name: "Pedido QA", priceCents: 100 }] } },
+      { upsert: true, new: true, setDefaultsOnInsert: true },
+    ).lean().exec(),
+    Rider.findOneAndUpdate(
+      { email: "qa-assigned@staging.pikidelivery.invalid" },
+      { $set: { riderCode: "QA-ASSIGNED", name: "QA Rider asignado", email: "qa-assigned@staging.pikidelivery.invalid", status: "available", vehicle: "electric_scooter", reliabilityScore: 0.8, isTestRider: true, location: { type: "Point", coordinates: assignedPoint }, lastLocationAt: now, activeOrderId: null, zoneSlug: "qa-staging" } },
+      { upsert: true, new: true, setDefaultsOnInsert: true },
+    ).lean().exec(),
+    Rider.findOneAndUpdate(
+      { email: "qa-replacement@staging.pikidelivery.invalid" },
+      { $set: { riderCode: "QA-REPLACEMENT", name: "QA Rider cercano", email: "qa-replacement@staging.pikidelivery.invalid", status: "available", vehicle: "electric_scooter", reliabilityScore: 0.95, isTestRider: true, location: { type: "Point", coordinates: replacementPoint }, lastLocationAt: now, activeOrderId: null, zoneSlug: "qa-staging" } },
+      { upsert: true, new: true, setDefaultsOnInsert: true },
+    ).lean().exec(),
+  ]) as any[];
+
+  await Promise.all([
+    RiderSlot.findOneAndUpdate({ riderId: assignedRider._id, date: today, startTime: "00:00" }, { $set: { riderId: assignedRider._id, date: today, startTime: "00:00", endTime: "23:59", zoneSlug: "qa-staging", status: "active", notes: "QA staging" } }, { upsert: true, new: true }).exec(),
+    RiderSlot.findOneAndUpdate({ riderId: replacementRider._id, date: today, startTime: "00:00" }, { $set: { riderId: replacementRider._id, date: today, startTime: "00:00", endTime: "23:59", zoneSlug: "qa-staging", status: "active", notes: "QA staging" } }, { upsert: true, new: true }).exec(),
+    Order.updateMany({ isTestOrder: true, assignmentState: { $in: ["offered", "assigned"] } }, { $set: { status: "cancelled", assignmentState: "expired", riderId: null, assignmentExpiresAt: null, pickupDeadlineAt: null, cancelledAt: now } }).exec(),
+    RiderAssignmentReservation.updateMany({ status: "reserved", riderId: { $in: [assignedRider._id, replacementRider._id] } }, { $set: { status: "released" } }).exec(),
+  ]);
+
+  const order = await Order.create({
+    publicCode: `QA-REASSIGN-${Date.now().toString(36).toUpperCase()}-${randomInt(100, 999)}`,
+    restaurantId: partner._id,
+    riderId: assignedRider._id,
+    isTestOrder: true,
+    status: "ready_for_pickup",
+    paymentState: "paid",
+    paymentMethod: "cash",
+    assignmentState: "assigned",
+    pickupDeadlineAt: new Date(now.getTime() - PICKUP_REASSIGN_AFTER_MS - 5_000),
+    riderArrivedAt: null,
+    items: [{ itemId: "qa-item", name: "Pedido QA", quantity: 1, unitPriceCents: 100 }],
+    deliveryAddress: "QA Customer · Xàtiva",
+    deliveryLocation: { type: "Point", coordinates: customerPoint },
+    routeDistanceKm: 0.8,
+    routeDurationMinutes: 5,
+    totalCents: 100,
+    subtotalCents: 100,
+    statusHistory: [{ status: "ready_for_pickup", actorRole: "qa", reason: "Escenario staging: Rider asignado sin llegada al Partner durante más de 10 minutos." }],
+  });
+
+  const reassigned = await reassignLatePickupOrders();
+  const dispatch = await queueAutomaticDispatch(order._id as mongoose.Types.ObjectId);
+  const result = await Order.findById(order._id).select("publicCode riderId assignmentState dispatchAttempts pickupDeadlineAt riderArrivedAt isTestOrder").lean().exec() as any;
+  const replacementSelected = String(result?.riderId || "") === String(replacementRider._id) && result?.assignmentState === "offered";
+  if (!replacementSelected) return res.status(409).json({ error: "QA_REASSIGNMENT_FAILED", reassigned, dispatch, order: result });
+
+  return res.status(201).json({
+    passed: true,
+    environment: "staging",
+    policy: { pickupReassignMinutes: Math.round(PICKUP_REASSIGN_AFTER_MS / 60_000), partnerPreparationMinutes: PARTNER_PREPARATION_LIMIT_MINUTES, customerDeliveryTargetMinutes: CUSTOMER_DELIVERY_TARGET_MINUTES },
+    reassigned,
+    dispatch: { state: dispatch.state, selectedRiderId: String(result.riderId), expectedRiderId: String(replacementRider._id) },
+    order: { id: String(order._id), publicCode: order.publicCode, isTestOrder: true, assignmentState: result.assignmentState, dispatchAttempts: result.dispatchAttempts },
+  });
 });
 
 async function expireStaleOffers() {
