@@ -206,6 +206,7 @@ const dispatchSchema = z.object({ preparationMinutes: z.coerce.number().int().mi
 const riderIncidentSchema = z.object({ reason: z.enum(["late_acceptance", "late_delivery", "no_show", "unsafe_driving", "fraud_signal", "customer_complaint", "document_expired", "other"]), evidence: z.array(z.string().url()).max(10).default([]), occurredAt: z.coerce.date().optional() });
 const riderSlotSchema = z.object({ zoneSlug: z.string().regex(/^[a-z0-9-]+$/), date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/), startTime: z.string().regex(/^(?:[01]\d|2[0-3]):[0-5]\d$/), endTime: z.string().regex(/^(?:[01]\d|2[0-3]):[0-5]\d$/), status: z.enum(["planned", "active", "completed", "cancelled"]).default("planned"), notes: z.string().max(500).default("") });
 const riderSlotCreateSchema = riderSlotSchema.extend({ riderId: z.string().regex(/^[a-f\d]{24}$/) });
+const riderSlotWeekSchema = riderSlotCreateSchema.extend({ weekdays: z.array(z.number().int().min(0).max(6)).min(1).max(7).default([0, 1, 2, 3, 4, 5, 6]) });
 const riderDocumentInputSchema = z.object({ type: z.enum(["identity", "residence_permit", "social_security_number", "bank_certificate", "driving_license", "insurance", "vehicle_registration", "vehicle_technical_sheet", "scooter_responsible_declaration", "dgt_mvp_homologation", "other"]), fileName: z.string().min(1).max(180), mimeType: z.string().min(1).max(120), sizeBytes: z.number().int().min(1).max(2_500_000), sha256: z.string().regex(/^[a-f0-9]{64}$/i), contentBase64: z.string().min(1).max(3_500_000) });
 const riderApplicationSchema = z.object({ name: z.string().min(2).max(160), email: z.string().email(), phone: z.string().min(6).max(40), city: z.string().min(2).max(120), vehicle: z.enum(["bike", "electric_bike", "electric_scooter", "motorcycle", "scooter", "car"]), availability: z.string().min(2).max(160), socialSecurityNumber: z.string().min(4).max(40), identityVerificationMethod: z.literal("online_scan"), safetyDeclarationAccepted: z.literal(true), documents: z.array(riderDocumentInputSchema).min(3).max(12), website: z.string().max(0).optional() });
 const riderApplicationAttempts = new Map<string, { count: number; resetAt: number }>();
@@ -1365,7 +1366,7 @@ app.post("/api/v1/rider-slots", requireRole("admin", "fleet"), async (req, res) 
   return res.status(201).json({ slot });
 });
 app.post("/api/v1/rider-slots/week", requireRole("admin", "fleet"), async (req, res) => {
-  const parsed = riderSlotCreateSchema.safeParse(req.body);
+  const parsed = riderSlotWeekSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_RIDER_SLOT", details: parsed.error.flatten() });
   if (parsed.data.startTime === parsed.data.endTime) return res.status(400).json({ error: "INVALID_SLOT_TIME_RANGE" });
   const riderId = objectId(parsed.data.riderId); if (!riderId) return res.status(400).json({ error: "INVALID_RIDER_ID" });
@@ -1397,7 +1398,7 @@ app.post("/api/v1/rider-slots/week", requireRole("admin", "fleet"), async (req, 
         ).select("_id").lean().exec();
         if (!assigned) throw new Error("FLEET_RIDER_ACCESS_DENIED");
       }
-      for (let day = 0; day < 7; day += 1) {
+      for (const day of parsed.data.weekdays) {
         const date = new Date(start); date.setUTCDate(start.getUTCDate() + day);
         const dateString = date.toISOString().slice(0, 10);
         const slot = await RiderSlot.findOneAndUpdate(
@@ -1408,7 +1409,7 @@ app.post("/api/v1/rider-slots/week", requireRole("admin", "fleet"), async (req, 
         slots.push(slot);
       }
     });
-    return res.status(201).json({ slots, count: slots.length, message: "Los siete turnos semanales se guardaron juntos." });
+    return res.status(201).json({ slots, count: slots.length, weekdays: parsed.data.weekdays, message: `${slots.length} turnos semanales guardados.` });
   } catch (error: any) {
     slots.length = 0;
     if (error?.message === "FLEET_RIDER_ACCESS_DENIED") return res.status(403).json({ error: "FLEET_RIDER_ACCESS_DENIED" });
