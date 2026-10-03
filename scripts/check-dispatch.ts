@@ -9,11 +9,13 @@ const ranked = rankDispatchCandidates([
 ], {
   restaurantLocation: [-0.521, 38.991],
   customerLocation: [-0.518, 38.995],
-  preparationMinutes: 15,
+  preparationMinutes: 10,
   now,
+  maxCustomerEtaMinutes: 30,
 });
 
 assert.equal(ranked.length, 1);
 assert.equal(ranked[0]?.riderId, "near");
 assert.ok(ranked[0]?.pickupEtaMinutes >= 1);
+assert.ok(ranked[0]?.totalEtaMinutes <= 30);
 console.log(JSON.stringify({ ok: true, selected: ranked[0] }, null, 2));
