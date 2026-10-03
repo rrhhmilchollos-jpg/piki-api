@@ -2497,12 +2497,24 @@ app.get("/api/v1/fleets", requireRole("admin", "fleet"), async (req, res) => {
   return res.json({ fleets });
 });
 
-const fleetInputSchema = z.object({ name: z.string().trim().min(2).max(120), managerName: z.string().trim().min(2).max(120), managerDni: z.string().trim().min(5).max(20), contactEmail: z.string().trim().email().or(z.literal("")), contactPhone: z.string().trim().min(6).max(40), address: z.string().trim().min(5).max(240), postalCode: z.string().trim().min(3).max(12), city: z.string().trim().min(2).max(120), vehicleTypes: z.array(z.enum(["bike", "electric_bike", "electric_scooter", "motorcycle", "scooter", "car"])).min(1).max(6), maxRiders: z.coerce.number().int().min(1).max(10000), serviceZones: z.array(z.string().regex(/^[a-z0-9-]+$/)).min(1).max(300), notes: z.string().trim().max(2000).default("") });
-app.post("/api/v1/fleets", requireRole("admin"), async (req, res) => {
+const fleetInputSchema = z.object({ name: z.string().trim().min(2).max(120), legalName: z.string().trim().max(180).default(""), taxId: z.string().trim().max(32).default(""), managerName: z.string().trim().min(2).max(120), managerDni: z.string().trim().min(5).max(20), contactEmail: z.string().trim().email().or(z.literal("")), contactPhone: z.string().trim().min(6).max(40), address: z.string().trim().min(5).max(240), postalCode: z.string().trim().min(3).max(12), city: z.string().trim().min(2).max(120), vehicleTypes: z.array(z.enum(["bike", "electric_bike", "electric_scooter", "motorcycle", "scooter", "car"])).min(1).max(6), maxRiders: z.coerce.number().int().min(1).max(10000), serviceZones: z.array(z.string().regex(/^[a-z0-9-]+$/)).min(1).max(300), notes: z.string().trim().max(2000).default("") });
+app.post("/api/v1/fleets", requireRole("admin", "fleet"), async (req, res) => {
   const parsed = fleetInputSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_FLEET", details: parsed.error.flatten() });
-  const fleet = await Fleet.findOneAndUpdate({ ...tenantScope(req), name: parsed.data.name }, { $set: { ...parsed.data, ...tenantScope(req), managerDni: parsed.data.managerDni.toUpperCase() } }, { upsert: true, new: true, runValidators: true }).lean().exec();
-  return res.status(201).json({ fleet });
+  const employee = await employeeScope(req);
+  if (req.auth?.role === "fleet" && employee?.fleetId) return res.status(409).json({ error: "FLEET_ALREADY_ASSIGNED", message: "Tu cuenta ya está vinculada a una Fleet y no puede crear otra." });
+  const zoneCount = await Zone.countDocuments({ ...tenantScope(req), slug: { $in: parsed.data.serviceZones }, isActive: true });
+  if (zoneCount !== parsed.data.serviceZones.length) return res.status(400).json({ error: "INVALID_FLEET_ZONES", message: "Una o más zonas no existen o no están activas." });
+  const duplicate = await Fleet.exists({ ...tenantScope(req), name: parsed.data.name });
+  if (duplicate) return res.status(409).json({ error: "FLEET_NAME_ALREADY_EXISTS", message: "Ya existe una Fleet con ese nombre operativo." });
+  try {
+    const fleet = await Fleet.create({ ...parsed.data, ...tenantScope(req), taxId: parsed.data.taxId.toUpperCase(), managerDni: parsed.data.managerDni.toUpperCase(), createdBy: req.auth?.employeeId ? objectId(req.auth.employeeId) : null, createdByRole: req.auth?.role || null });
+    if (req.auth?.role === "fleet" && req.auth.employeeId) await EmployeeAccount.updateOne({ _id: req.auth.employeeId, fleetId: null }, { $set: { fleetId: fleet._id } }).exec();
+    return res.status(201).json({ created: true, fleet: fleet.toObject() });
+  } catch (error) {
+    if ((error as any)?.code === 11000) return res.status(409).json({ error: "FLEET_NAME_ALREADY_EXISTS", message: "Ya existe una Fleet con ese nombre operativo." });
+    throw error;
+  }
 });
 
 app.patch("/api/v1/rider-applications/:id/assign-fleet", requireRole("admin", "fleet"), async (req, res) => {
