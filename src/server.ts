@@ -2463,8 +2463,16 @@ app.post("/api/v1/admin/qa/reassignment-simulation", requireRole("admin"), async
 
   const reassigned = await reassignLatePickupOrders();
   const dispatch = await queueAutomaticDispatch(order._id as mongoose.Types.ObjectId);
-  const result = await Order.findById(order._id).select("publicCode riderId assignmentState dispatchAttempts pickupDeadlineAt riderArrivedAt isTestOrder").lean().exec() as any;
-  const replacementSelected = String(result?.riderId || "") === String(replacementRider._id) && result?.assignmentState === "offered";
+  // El sweep inicia también un dispatch asíncrono. Esperar su resultado evita
+  // interpretar el estado transitorio "in_progress" como un fallo de negocio.
+  let result: any = null;
+  let replacementSelected = false;
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    result = await Order.findById(order._id).select("publicCode riderId assignmentState dispatchAttempts pickupDeadlineAt riderArrivedAt isTestOrder").lean().exec() as any;
+    replacementSelected = String(result?.riderId || "") === String(replacementRider._id) && result?.assignmentState === "offered";
+    if (replacementSelected) break;
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
   if (!replacementSelected) return res.status(409).json({ error: "QA_REASSIGNMENT_FAILED", reassigned, dispatch, order: result });
 
   return res.status(201).json({
