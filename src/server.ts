@@ -1250,8 +1250,20 @@ app.post("/api/v1/riders/applications", async (req, res) => {
 
 app.get("/api/v1/rider-applications", requireRole("admin"), async (req, res) => {
   const status = typeof req.query.status === "string" ? req.query.status : undefined;
-  const applications = await RiderApplication.find(status ? { status } : {}).sort({ createdAt: -1 }).limit(200).lean().exec();
-  return res.json({ applications });
+  const leadStatus = status === "pending" ? "new" : status === "contacted" ? "info_requested" : status === "approved" ? "qualified" : status === "rejected" ? "rejected" : undefined;
+  const [applications, leads] = await Promise.all([
+    RiderApplication.find(status ? { status } : {}).sort({ createdAt: -1 }).limit(200).lean().exec(),
+    RiderLead.find(leadStatus ? { status: leadStatus } : {}).sort({ createdAt: -1 }).limit(200).lean().exec(),
+  ]);
+  const normalizedLeads = leads.map((lead: any) => ({
+    ...lead,
+    source: "web_lead",
+    status: lead.status === "new" ? "pending" : lead.status === "info_requested" ? "contacted" : lead.status === "qualified" ? "approved" : "rejected",
+    documents: [],
+  }));
+  const normalizedApplications = applications.map((application: any) => ({ ...application, source: application.source || "rider_landing" }));
+  const combined = [...normalizedApplications, ...normalizedLeads].sort((a: any, b: any) => new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime()).slice(0, 200);
+  return res.json({ applications: combined, counts: { applications: applications.length, webLeads: leads.length, total: combined.length } });
 });
 
 app.get("/api/v1/rider-applications/:id/documents", requireRole("admin"), async (req, res) => {
