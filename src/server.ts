@@ -39,7 +39,7 @@ const CUSTOMER_DELIVERY_TARGET_MINUTES = 30;
 const isStaging = process.env.PIKI_ENVIRONMENT === "staging";
 const defaultOrigins = ["http://localhost:3000", "http://localhost:5173", "https://pikidelivery.com", "https://www.pikidelivery.com", "https://app.pikidelivery.com", "https://partners.pikidelivery.com", "https://admin.pikidelivery.com", "https://support.pikidelivery.com", "https://piki-admin-live.vercel.app", "https://piki-support.vercel.app", "https://riders.pikidelivery.com", "https://fleet.pikidelivery.com", "https://piki-customer.onrender.com", "https://piki-riders.onrender.com", "https://piki-admin.onrender.com", "https://edpexgfa.manus.space"];
 const configuredOrigins = (process.env.CORS_ORIGINS || "").split(",").map((origin) => origin.trim()).filter(Boolean);
-const allowedOrigins = new Set([...(isStaging ? ["http://localhost:3000", "http://localhost:5173"] : defaultOrigins), ...configuredOrigins]);
+const allowedOrigins = new Set([...(isStaging ? ["http://localhost:3000", "http://localhost:5173", "https://localhost"] : defaultOrigins), ...configuredOrigins]);
 const managedPikiVercelOrigin = /^https:\/\/piki-(?:customer|partner|admin|fleet|rider|support)(?:-[a-z0-9-]+)?-rrhhmilchollos-jpgs-projects\.vercel\.app$/i;
 const isAllowedCorsOrigin = (origin?: string) => !origin || allowedOrigins.has(origin) || (!isStaging && managedPikiVercelOrigin.test(origin));
 const corsOptions = { origin: (origin: string | undefined, callback: (error: Error | null, allowed?: boolean) => void) => callback(null, isAllowedCorsOrigin(origin)), credentials: true };
