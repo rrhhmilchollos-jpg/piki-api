@@ -1552,16 +1552,30 @@ app.post("/api/v1/admin/document-requests/:id/send-email", requireRole("admin"),
   if (request.status === "revoked" || new Date(request.expiresAt).getTime() <= Date.now()) return res.status(410).json({ error: "DOCUMENT_REQUEST_UNAVAILABLE", message: "El enlace ha caducado o ha sido revocado. Genera uno nuevo." });
   if (request.emailSentAt) return res.json({ emailSent: true, recipientEmail: request.recipientEmail, alreadySent: true });
   if (!corporateEmailConfiguration().configured) return res.status(503).json({ error: "CORPORATE_EMAIL_NOT_CONFIGURED", message: "El envío corporativo no está configurado en el API. El enlace sigue disponible, pero no se ha enviado ningún correo." });
-  const emailSent = await sendDocumentRequestEmail({ requestId: String(request._id), subjectType: request.subjectType, recipientName: request.recipientName, recipientEmail: request.recipientEmail, message: request.message, uploadUrl: documentRequestUploadUrl(parsed.data.token), expiresAt: new Date(request.expiresAt) });
-  if (!emailSent) return res.status(503).json({ error: "CORPORATE_EMAIL_DELIVERY_FAILED", message: "El proveedor de correo no ha aceptado el envío. Conserva el enlace y revisa el remitente corporativo." });
-  await DocumentRequest.updateOne({ _id: request._id }, { $set: { emailSentAt: new Date() } }).exec();
-  return res.json({ emailSent: true, recipientEmail: request.recipientEmail });
+  const lock = randomBytes(16).toString("hex");
+  const claimed = await DocumentRequest.findOneAndUpdate({ _id: request._id, emailSentAt: null, status: { $in: ["open", "partially_submitted", "submitted"] }, expiresAt: { $gt: new Date() }, $or: [{ emailSendingAt: null }, { emailSendingAt: { $lt: new Date(Date.now() - 120_000) } }] }, { $set: { emailSendingAt: new Date(), emailSendLock: lock } }, { new: true }).select("_id").lean().exec();
+  if (!claimed) {
+    const latest = await DocumentRequest.findById(request._id).select("emailSentAt status expiresAt").lean().exec() as any;
+    if (latest?.status === "revoked" || !latest || new Date(latest.expiresAt).getTime() <= Date.now()) return res.status(410).json({ error: "DOCUMENT_REQUEST_UNAVAILABLE", message: "El enlace ya no está disponible." });
+    if (latest.emailSentAt) return res.json({ emailSent: true, recipientEmail: request.recipientEmail, alreadySent: true });
+    return res.status(409).json({ error: "CORPORATE_EMAIL_SEND_IN_PROGRESS", message: "Este correo ya se está enviando. Espera unos segundos antes de comprobarlo de nuevo." });
+  }
+  try {
+    const emailSent = await sendDocumentRequestEmail({ requestId: String(request._id), subjectType: request.subjectType, recipientName: request.recipientName, recipientEmail: request.recipientEmail, message: request.message, uploadUrl: documentRequestUploadUrl(parsed.data.token), expiresAt: new Date(request.expiresAt) });
+    if (!emailSent) return res.status(503).json({ error: "CORPORATE_EMAIL_DELIVERY_FAILED", message: "El proveedor de correo no ha aceptado el envío. Conserva el enlace y revisa el remitente corporativo." });
+    await DocumentRequest.updateOne({ _id: request._id, emailSendLock: lock }, { $set: { emailSentAt: new Date() } }).exec();
+    return res.json({ emailSent: true, recipientEmail: request.recipientEmail });
+  } finally {
+    await DocumentRequest.updateOne({ _id: request._id, emailSendLock: lock }, { $set: { emailSendingAt: null, emailSendLock: null } }).exec().catch(() => console.warn("Corporate email lock release failed"));
+  }
 });
 
 app.get("/api/v1/admin/document-requests", requireRole("admin"), async (req, res) => {
   const subjectType = typeof req.query.subjectType === "string" ? documentRequestSubjectSchema.safeParse(req.query.subjectType) : null;
   if (subjectType && !subjectType.success) return res.status(400).json({ error: "INVALID_DOCUMENT_REQUEST_SUBJECT" });
-  const requests = await DocumentRequest.find({ ...await onboardingScope(req), ...(subjectType?.success ? { subjectType: subjectType.data } : {}) }).sort({ createdAt: -1 }).limit(200).lean().exec();
+  const subjectId = typeof req.query.subjectId === "string" ? objectId(req.query.subjectId) : null;
+  if (req.query.subjectId !== undefined && !subjectId) return res.status(400).json({ error: "INVALID_DOCUMENT_REQUEST_SUBJECT_ID" });
+  const requests = await DocumentRequest.find({ ...await onboardingScope(req), ...(subjectType?.success ? { subjectType: subjectType.data } : {}), ...(subjectId ? { subjectId } : {}) }).sort({ createdAt: -1 }).limit(200).lean().exec();
   return res.json({ requests: requests.map((request: any) => ({ id: String(request._id), subjectType: request.subjectType, subjectId: String(request.subjectId), recipientName: request.recipientName, recipientEmail: request.recipientEmail, status: request.status, requirements: request.requirements, documents: request.documents, dueAt: request.dueAt, expiresAt: request.expiresAt, createdAt: request.createdAt, emailSentAt: request.emailSentAt || null, submittedAt: request.submittedAt, revokedAt: request.revokedAt })) });
 });
 
