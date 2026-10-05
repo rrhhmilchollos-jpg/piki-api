@@ -220,6 +220,7 @@ const documentRequestCreateSchema = z.object({ subjectType: documentRequestSubje
 const publicDocumentUploadSchema = z.object({ documents: z.array(z.object({ type: z.string().regex(/^[a-z0-9_]{2,80}$/), fileName: z.string().trim().min(1).max(180), mimeType: z.enum(["application/pdf", "image/jpeg", "image/png"]), sizeBytes: z.number().int().min(1).max(2_500_000), sha256: z.string().regex(/^[a-f0-9]{64}$/i), contentBase64: z.string().min(1).max(3_500_000) })).min(1).max(5) });
 const riderDocumentRequestTypes = new Set(["identity", "residence_permit", "social_security_number", "bank_certificate", "profile_photo", "driving_license", "insurance", "vehicle_registration", "vehicle_technical_sheet", "scooter_responsible_declaration", "dgt_mvp_homologation", "work_authorization_confirmation", "ppe_and_safety", "other"]);
 const partnerDocumentRequestTypes = new Set(["tax_id", "bank_certificate", "insurance", "activity_license", "food_sanitary_authorization", "identity", "other"]);
+const leadDocumentInputSchema = z.object({ type: z.string().trim().min(2).max(80), fileName: z.string().trim().min(1).max(180), mimeType: z.enum(["application/pdf", "image/jpeg", "image/png"]), sizeBytes: z.number().int().min(1).max(2_500_000), sha256: z.string().regex(/^[a-f0-9]{64}$/i), contentBase64: z.string().min(20).max(3_500_000) });
 const riderApplicationAttempts = new Map<string, { count: number; resetAt: number }>();
 const ownerEmail = "rrhh.milchollos@gmail.com";
 const MAX_MENU_IMAGE_BYTES = 200 * 1024;
@@ -1247,6 +1248,55 @@ app.post("/api/v1/public/rider-leads", async (req, res) => {
   }
 });
 
+const leadDocumentTypes: Record<"partner" | "rider", string[]> = {
+  partner: ["identity", "tax_id", "bank_certificate", "activity_license", "insurance", "food_sanitary_authorization"],
+  rider: ["identity", "residence_permit", "social_security_number", "bank_certificate", "driving_license", "insurance", "vehicle_registration", "vehicle_technical_sheet", "scooter_responsible_declaration", "dgt_mvp_homologation"],
+};
+function leadModel(kind: string) { return kind === "partner" ? PartnerLead : kind === "rider" ? RiderLead : null; }
+app.post("/api/v1/admin/:kind-leads/:id/documents", requireRole("admin", "commercial", "gerente_comercial_zona"), async (req, res) => {
+  const kind = req.params.kind as "partner" | "rider";
+  const Model = leadModel(kind) as any;
+  const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
+  if (!Model || !id) return res.status(400).json({ error: "INVALID_LEAD_DOCUMENT_TARGET" });
+  const parsed = leadDocumentInputSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "INVALID_LEAD_DOCUMENT", details: parsed.error.flatten() });
+  if (!leadDocumentTypes[kind].includes(parsed.data.type)) return res.status(400).json({ error: "INVALID_LEAD_DOCUMENT_TYPE", allowed: leadDocumentTypes[kind] });
+  const rawBase64 = parsed.data.contentBase64.replace(/^data:[^;]+;base64,/, "");
+  const bytes = Buffer.from(rawBase64, "base64");
+  if (bytes.length !== parsed.data.sizeBytes) return res.status(400).json({ error: "LEAD_DOCUMENT_SIZE_MISMATCH" });
+  const digest = createHash("sha256").update(bytes).digest("hex");
+  if (digest.toLowerCase() !== parsed.data.sha256.toLowerCase()) return res.status(400).json({ error: "LEAD_DOCUMENT_CHECKSUM_MISMATCH" });
+  const lead = await Model.findByIdAndUpdate(id, { $push: { documents: { ...parsed.data, contentBase64: rawBase64, status: "received" } } }, { new: true }).select("name email documents").lean().exec() as any;
+  if (!lead) return res.status(404).json({ error: "LEAD_NOT_FOUND" });
+  return res.status(201).json({ leadId: lead._id, documents: (lead.documents || []).map(({ contentBase64, ...metadata }: any) => metadata) });
+});
+app.get("/api/v1/admin/:kind-leads/:id/documents", requireRole("admin", "commercial", "gerente_comercial_zona"), async (req, res) => {
+  const Model = leadModel(Array.isArray(req.params.kind) ? req.params.kind[0] : req.params.kind) as any;
+  const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
+  if (!Model || !id) return res.status(400).json({ error: "INVALID_LEAD_DOCUMENT_TARGET" });
+  const lead = await Model.findById(id).lean().exec() as any;
+  if (!lead) return res.status(404).json({ error: "LEAD_NOT_FOUND" });
+  return res.json({ leadId: lead._id, name: lead.name, email: lead.email, documents: lead.documents || [] });
+});
+app.get("/api/v1/admin/:kind-leads/:id/documents/:documentId/content", requireRole("admin", "commercial", "gerente_comercial_zona"), async (req, res) => {
+  const Model = leadModel(Array.isArray(req.params.kind) ? req.params.kind[0] : req.params.kind) as any;
+  const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
+  if (!Model || !id) return res.status(400).json({ error: "INVALID_LEAD_DOCUMENT_TARGET" });
+  const lead = await Model.findOne({ _id: id, "documents._id": req.params.documentId }).select("+documents.contentBase64").lean().exec() as any;
+  const document = lead?.documents?.find((item: any) => String(item._id) === req.params.documentId);
+  if (!document) return res.status(404).json({ error: "DOCUMENT_NOT_FOUND" });
+  return res.json({ fileName: document.fileName, mimeType: document.mimeType, sizeBytes: document.sizeBytes, sha256: document.sha256, contentBase64: document.contentBase64 });
+});
+app.patch("/api/v1/admin/:kind-leads/:id/documents/:documentId/status", requireRole("admin", "commercial", "gerente_comercial_zona"), async (req, res) => {
+  const Model = leadModel(Array.isArray(req.params.kind) ? req.params.kind[0] : req.params.kind) as any;
+  const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
+  if (!Model || !id) return res.status(400).json({ error: "INVALID_LEAD_DOCUMENT_TARGET" });
+  const parsed = z.object({ status: z.enum(["received", "approved", "rejected"]), reviewNotes: z.string().max(1000).default("") }).safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "INVALID_DOCUMENT_STATUS", details: parsed.error.flatten() });
+  const lead = await Model.findOneAndUpdate({ _id: id, "documents._id": req.params.documentId }, { $set: { "documents.$.status": parsed.data.status, "documents.$.reviewNotes": parsed.data.reviewNotes, "documents.$.reviewedAt": new Date(), "documents.$.reviewedBy": objectId(req.auth!.employeeId!) } }, { new: true }).lean().exec() as any;
+  if (!lead) return res.status(404).json({ error: "DOCUMENT_NOT_FOUND" });
+  return res.json({ leadId: lead._id, documents: (lead.documents || []).map(({ contentBase64, ...metadata }: any) => metadata) });
+});
 app.get("/api/v1/admin/rider-leads", requireRole("admin", "commercial", "gerente_comercial_zona"), async (req, res) => {
   const rawStatus = typeof req.query.status === "string" ? req.query.status : undefined;
   const parsedStatus = rawStatus && rawStatus !== "all" ? webLeadStatusSchema.safeParse(rawStatus) : null;
