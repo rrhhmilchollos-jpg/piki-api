@@ -23,6 +23,8 @@ import { createSessionToken, generateTemporaryPassword, hashPassword, hashSessio
 import { evaluateXativaCoverage } from "./coverage/xativaPolicy.js";
 import { quoteDeliveryRoute } from "./coverage/routing.js";
 import { runTenantMigration } from "./tenantMigration.js";
+import { onboardingScope } from "./onboardingScope.js";
+import { corporateEmailConfiguration, sendLeadContactEmail } from "./corporateEmail.js";
 import { activeOperationalOrderStatuses, dispatchableOrderStatuses, dispatchablePaymentFilter, isDispatchableOrderStatus } from "./dispatchEligibility.js";
 import { canReceivePartnerLocations, partnerCan, partnerPermissions, partnerRolesForEmployee, permissionsForPartnerRoles, type PartnerPermission } from "./partnerAccess.js";
 import { awardRiderRecruitmentMilestones, claimRiderReferralCode, completeRiderShiftIncentiveTracking, incentiveProgramStatus, loadRiderIncentiveSnapshot, trackRiderLocationForIncentive, trackRiderShiftStart } from "./riderIncentives.js";
@@ -234,7 +236,7 @@ const riderDocumentInputSchema = z.object({ type: z.enum(["identity", "residence
 const riderApplicationSchema = z.object({ name: z.string().min(2).max(160), email: z.string().email(), phone: z.string().min(6).max(40), city: z.string().min(2).max(120), vehicle: z.enum(["bike", "electric_bike", "electric_scooter", "motorcycle", "scooter", "car"]), availability: z.string().min(2).max(160), socialSecurityNumber: z.string().min(4).max(40), identityVerificationMethod: z.literal("online_scan"), safetyDeclarationAccepted: z.literal(true), documents: z.array(riderDocumentInputSchema).min(3).max(12), website: z.string().max(0).optional() });
 const documentRequestSubjectSchema = z.enum(["rider_application", "restaurant", "rider_lead", "partner_lead"]);
 const documentRequestRequirementInputSchema = z.object({ type: z.string().regex(/^[a-z0-9_]{2,80}$/), label: z.string().trim().min(2).max(160), description: z.string().trim().max(500).default("") });
-const documentRequestCreateSchema = z.object({ subjectType: documentRequestSubjectSchema, subjectId: z.string().regex(/^[a-f\d]{24}$/), message: z.string().trim().min(10).max(2000), dueAt: z.coerce.date().nullable().optional(), requirements: z.array(documentRequestRequirementInputSchema).min(1).max(12) });
+const documentRequestCreateSchema = z.object({ subjectType: documentRequestSubjectSchema, subjectId: z.string().regex(/^[a-f\d]{24}$/), message: z.string().trim().min(10).max(2000), dueAt: z.coerce.date().nullable().optional(), requirements: z.array(documentRequestRequirementInputSchema).min(1).max(12), sendEmail: z.boolean().default(true) });
 const publicDocumentUploadSchema = z.object({ documents: z.array(z.object({ type: z.string().regex(/^[a-z0-9_]{2,80}$/), fileName: z.string().trim().min(1).max(180), mimeType: z.enum(["application/pdf", "image/jpeg", "image/png"]), sizeBytes: z.number().int().min(1).max(2_500_000), sha256: z.string().regex(/^[a-f0-9]{64}$/i), contentBase64: z.string().min(1).max(3_500_000) })).min(1).max(5) });
 const riderDocumentRequestTypes = new Set(["identity", "residence_permit", "social_security_number", "bank_certificate", "profile_photo", "driving_license", "insurance", "vehicle_registration", "vehicle_technical_sheet", "scooter_responsible_declaration", "dgt_mvp_homologation", "work_authorization_confirmation", "ppe_and_safety", "other"]);
 const partnerDocumentRequestTypes = new Set(["tax_id", "bank_certificate", "insurance", "activity_license", "food_sanitary_authorization", "identity", "other"]);
@@ -861,7 +863,7 @@ app.get("/api/v1/admin/partner-leads", requireRole("admin", "commercial", "geren
   const rawStatus = typeof req.query.status === "string" ? req.query.status : undefined;
   const parsedStatus = rawStatus && rawStatus !== "all" ? webLeadStatusSchema.safeParse(rawStatus) : null;
   if (parsedStatus && !parsedStatus.success) return res.status(400).json({ error: "INVALID_LEAD_STATUS" });
-  const leads = await PartnerLead.find(parsedStatus?.success ? { status: parsedStatus.data } : {}).sort({ createdAt: -1 }).limit(200).lean().exec();
+  const leads = await PartnerLead.find({ ...await onboardingScope(req), ...(parsedStatus?.success ? { status: parsedStatus.data } : {}) }).sort({ createdAt: -1 }).limit(200).lean().exec();
   return res.json({ leads });
 });
 
@@ -873,7 +875,7 @@ app.patch("/api/v1/admin/partner-leads/:id", requireRole("admin", "commercial", 
   if (!parsed.success) return res.status(400).json({ error: "INVALID_LEAD_REVIEW", details: parsed.error.flatten() });
   if (parsed.data.status === "info_requested" && !parsed.data.notes) return res.status(400).json({ error: "INFO_REQUEST_NOTES_REQUIRED" });
   const actor = req.auth?.employeeId ? objectId(req.auth.employeeId) : null;
-  const lead = await PartnerLead.findByIdAndUpdate(id, { $set: { status: parsed.data.status, notes: parsed.data.notes, reviewedBy: actor, reviewedAt: new Date() }, $push: { history: { status: parsed.data.status, notes: parsed.data.notes, actorEmployeeId: actor, changedAt: new Date() } } }, { new: true }).lean().exec();
+  const lead = await PartnerLead.findOneAndUpdate({ _id: id, ...await onboardingScope(req) }, { $set: { status: parsed.data.status, notes: parsed.data.notes, reviewedBy: actor, reviewedAt: new Date() }, $push: { history: { status: parsed.data.status, notes: parsed.data.notes, actorEmployeeId: actor, changedAt: new Date() } } }, { new: true }).lean().exec();
   if (!lead) return res.status(404).json({ error: "PARTNER_LEAD_NOT_FOUND" });
   return res.json({ lead });
 });
@@ -1319,7 +1321,7 @@ app.get("/api/v1/admin/:kind-leads/:id/documents", requireRole("admin", "commerc
   const Model = leadModel(Array.isArray(req.params.kind) ? req.params.kind[0] : req.params.kind) as any;
   const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
   if (!Model || !id) return res.status(400).json({ error: "INVALID_LEAD_DOCUMENT_TARGET" });
-  const lead = await Model.findById(id).lean().exec() as any;
+  const lead = await Model.findOne({ _id: id, ...await onboardingScope(req) }).lean().exec() as any;
   if (!lead) return res.status(404).json({ error: "LEAD_NOT_FOUND" });
   return res.json({ leadId: lead._id, name: lead.name, email: lead.email, documents: lead.documents || [] });
 });
@@ -1327,7 +1329,7 @@ app.get("/api/v1/admin/:kind-leads/:id/documents/:documentId/content", requireRo
   const Model = leadModel(Array.isArray(req.params.kind) ? req.params.kind[0] : req.params.kind) as any;
   const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
   if (!Model || !id) return res.status(400).json({ error: "INVALID_LEAD_DOCUMENT_TARGET" });
-  const lead = await Model.findOne({ _id: id, "documents._id": req.params.documentId }).select("+documents.contentBase64").lean().exec() as any;
+  const lead = await Model.findOne({ _id: id, ...await onboardingScope(req), "documents._id": req.params.documentId }).select("+documents.contentBase64").lean().exec() as any;
   const document = lead?.documents?.find((item: any) => String(item._id) === req.params.documentId);
   if (!document) return res.status(404).json({ error: "DOCUMENT_NOT_FOUND" });
   return res.json({ fileName: document.fileName, mimeType: document.mimeType, sizeBytes: document.sizeBytes, sha256: document.sha256, contentBase64: document.contentBase64 });
@@ -1338,7 +1340,7 @@ app.patch("/api/v1/admin/:kind-leads/:id/documents/:documentId/status", requireR
   if (!Model || !id) return res.status(400).json({ error: "INVALID_LEAD_DOCUMENT_TARGET" });
   const parsed = z.object({ status: z.enum(["received", "approved", "rejected"]), reviewNotes: z.string().max(1000).default("") }).safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_DOCUMENT_STATUS", details: parsed.error.flatten() });
-  const lead = await Model.findOneAndUpdate({ _id: id, "documents._id": req.params.documentId }, { $set: { "documents.$.status": parsed.data.status, "documents.$.reviewNotes": parsed.data.reviewNotes, "documents.$.reviewedAt": new Date(), "documents.$.reviewedBy": objectId(req.auth!.employeeId!) } }, { new: true }).lean().exec() as any;
+  const lead = await Model.findOneAndUpdate({ _id: id, ...await onboardingScope(req), "documents._id": req.params.documentId }, { $set: { "documents.$.status": parsed.data.status, "documents.$.reviewNotes": parsed.data.reviewNotes, "documents.$.reviewedAt": new Date(), "documents.$.reviewedBy": objectId(req.auth!.employeeId!) } }, { new: true }).lean().exec() as any;
   if (!lead) return res.status(404).json({ error: "DOCUMENT_NOT_FOUND" });
   return res.json({ leadId: lead._id, documents: (lead.documents || []).map(({ contentBase64, ...metadata }: any) => metadata) });
 });
@@ -1346,7 +1348,7 @@ app.get("/api/v1/admin/rider-leads", requireRole("admin", "commercial", "gerente
   const rawStatus = typeof req.query.status === "string" ? req.query.status : undefined;
   const parsedStatus = rawStatus && rawStatus !== "all" ? webLeadStatusSchema.safeParse(rawStatus) : null;
   if (parsedStatus && !parsedStatus.success) return res.status(400).json({ error: "INVALID_LEAD_STATUS" });
-  const leads = await RiderLead.find(parsedStatus?.success ? { status: parsedStatus.data } : {}).sort({ createdAt: -1 }).limit(200).lean().exec();
+  const leads = await RiderLead.find({ ...await onboardingScope(req), ...(parsedStatus?.success ? { status: parsedStatus.data } : {}) }).sort({ createdAt: -1 }).limit(200).lean().exec();
   return res.json({ leads });
 });
 
@@ -1358,7 +1360,7 @@ app.patch("/api/v1/admin/rider-leads/:id", requireRole("admin", "commercial", "g
   if (!parsed.success) return res.status(400).json({ error: "INVALID_LEAD_REVIEW", details: parsed.error.flatten() });
   if (parsed.data.status === "info_requested" && !parsed.data.notes) return res.status(400).json({ error: "INFO_REQUEST_NOTES_REQUIRED" });
   const actor = req.auth?.employeeId ? objectId(req.auth.employeeId) : null;
-  const lead = await RiderLead.findByIdAndUpdate(id, { $set: { status: parsed.data.status, notes: parsed.data.notes, reviewedBy: actor, reviewedAt: new Date() }, $push: { history: { status: parsed.data.status, notes: parsed.data.notes, actorEmployeeId: actor, changedAt: new Date() } } }, { new: true }).lean().exec();
+  const lead = await RiderLead.findOneAndUpdate({ _id: id, ...await onboardingScope(req) }, { $set: { status: parsed.data.status, notes: parsed.data.notes, reviewedBy: actor, reviewedAt: new Date() }, $push: { history: { status: parsed.data.status, notes: parsed.data.notes, actorEmployeeId: actor, changedAt: new Date() } } }, { new: true }).lean().exec();
   if (!lead) return res.status(404).json({ error: "RIDER_LEAD_NOT_FOUND" });
   return res.json({ lead });
 });
@@ -1510,8 +1512,8 @@ app.post("/api/v1/admin/document-requests", requireRole("admin"), async (req, re
   const allowedTypes = parsed.data.subjectType === "rider_application" || parsed.data.subjectType === "rider_lead" ? riderDocumentRequestTypes : partnerDocumentRequestTypes;
   const requestedTypes = parsed.data.requirements.map((item) => item.type);
   if (requestedTypes.some((type) => !allowedTypes.has(type)) || new Set(requestedTypes).size !== requestedTypes.length) return res.status(400).json({ error: "INVALID_DOCUMENT_REQUIREMENTS" });
-  const subject = await documentRequestSubject(parsed.data.subjectType, subjectId, tenantScope(req));
-  if (!subject) return res.status(404).json({ error: "DOCUMENT_REQUEST_SUBJECT_NOT_FOUND" });
+  const subject = await documentRequestSubject(parsed.data.subjectType, subjectId, parsed.data.subjectType.endsWith("_lead") ? await onboardingScope(req) : tenantScope(req));
+  if (!subject) return res.status(404).json({ error: "DOCUMENT_REQUEST_SUBJECT_NOT_FOUND", message: "No se ha encontrado el aspirante dentro de tu ámbito de administración. Actualiza la bandeja y selecciona de nuevo su solicitud." });
   if (!subject.recipientEmail || !z.string().email().safeParse(subject.recipientEmail).success) return res.status(409).json({ error: "SUBJECT_EMAIL_REQUIRED", message: "Añade un correo de contacto válido antes de solicitar documentación." });
   if (parsed.data.subjectType === "restaurant" && !subject.hasProfile) return res.status(409).json({ error: "PARTNER_PROFILE_REQUIRED", message: "Este comercio no tiene expediente de partner para recibir documentación." });
   const token = randomBytes(32).toString("base64url");
@@ -1520,21 +1522,53 @@ app.post("/api/v1/admin/document-requests", requireRole("admin"), async (req, re
   await notifyOnboarding({ channel: "admin", type: "onboarding.document_request.created", entityId: String(request._id), tenantId: (request as any).tenantId, payload: { subjectType: request.subjectType, subjectId: String(subjectId) } });
   const uploadUrl = documentRequestUploadUrl(token);
   const mailtoUrl = `mailto:${encodeURIComponent(subject.recipientEmail)}?subject=${encodeURIComponent("PIKI · Documentación pendiente")}&body=${encodeURIComponent(`Hola ${subject.recipientName},\n\n${parsed.data.message}\n\nPuedes subir la documentación solicitada mediante este enlace seguro (válido hasta ${expiresAt.toLocaleDateString("es-ES")}):\n${uploadUrl}\n\nEquipo PIKI`)}`;
-  const emailSent = await sendDocumentRequestEmail({ requestId: String(request._id), subjectType: request.subjectType, recipientName: subject.recipientName, recipientEmail: subject.recipientEmail, message: parsed.data.message, uploadUrl, expiresAt });
+  const emailSent = parsed.data.sendEmail ? await sendDocumentRequestEmail({ requestId: String(request._id), subjectType: request.subjectType, recipientName: subject.recipientName, recipientEmail: subject.recipientEmail, message: parsed.data.message, uploadUrl, expiresAt }) : false;
+  if (emailSent) await DocumentRequest.updateOne({ _id: request._id }, { $set: { emailSentAt: new Date() } }).exec();
   return res.status(201).json({ request: { id: String(request._id), subjectType: request.subjectType, recipientName: request.recipientName, recipientEmail: request.recipientEmail, status: request.status, dueAt: request.dueAt, expiresAt: request.expiresAt }, delivery: { uploadUrl, mailtoUrl, emailSent } });
+});
+
+app.get("/api/v1/admin/corporate-email/status", requireRole("admin"), (_req, res) => res.json(corporateEmailConfiguration()));
+app.post("/api/v1/admin/:kind-leads/:id/contact-email", requireRole("admin"), async (req, res) => {
+  const kind = String(req.params.kind);
+  const Model = leadModel(kind) as any;
+  const id = objectId(String(req.params.id));
+  const parsed = z.object({ subject: z.string().trim().min(3).max(180), message: z.string().trim().min(10).max(2000), requestKey: z.string().regex(/^[a-zA-Z0-9_-]{8,80}$/) }).safeParse(req.body);
+  if (!Model || !id || !parsed.success) return res.status(400).json({ error: "INVALID_CONTACT_EMAIL", message: "Revisa el asunto y el mensaje antes de enviar." });
+  const lead = await Model.findOne({ _id: id, ...await onboardingScope(req) }).select("name email status").lean().exec();
+  if (!lead) return res.status(404).json({ error: "LEAD_NOT_FOUND", message: "No se ha encontrado esta solicitud de alta en tu ámbito de administración." });
+  if (!z.string().email().safeParse(lead.email).success) return res.status(409).json({ error: "SUBJECT_EMAIL_REQUIRED", message: "La solicitud no tiene un correo válido." });
+  const result = await sendLeadContactEmail({ leadId: String(id), recipientEmail: lead.email, recipientName: lead.name, kind: kind as "rider" | "partner", subject: parsed.data.subject, message: parsed.data.message, key: parsed.data.requestKey });
+  if (!result.sent) return res.status(503).json({ error: result.error, message: result.error === "CORPORATE_EMAIL_NOT_CONFIGURED" ? "El envío corporativo no está configurado en el API. No se ha enviado el correo." : "El proveedor corporativo no ha aceptado el envío. No se ha confirmado la entrega; revisa la configuración del correo." });
+  const actor = req.auth?.employeeId ? objectId(req.auth.employeeId) : null;
+  const updated = await Model.findOneAndUpdate({ _id: id, ...await onboardingScope(req) }, { $set: { status: "info_requested", notes: parsed.data.message.slice(0, 1000), reviewedBy: actor, reviewedAt: new Date() }, $push: { history: { status: "info_requested", notes: `Correo corporativo enviado: ${parsed.data.subject}`, actorEmployeeId: actor, changedAt: new Date() } } }, { new: true }).lean().exec();
+  return res.json({ emailSent: true, recipientEmail: lead.email, providerId: result.providerId, lead: updated });
+});
+app.post("/api/v1/admin/document-requests/:id/send-email", requireRole("admin"), async (req, res) => {
+  const id = objectId(String(req.params.id));
+  const parsed = z.object({ token: z.string().regex(/^[A-Za-z0-9_-]{40,100}$/) }).safeParse(req.body);
+  if (!id || !parsed.success) return res.status(400).json({ error: "INVALID_DOCUMENT_REQUEST_LINK", message: "El enlace documental no es válido." });
+  const request = await DocumentRequest.findOne({ _id: id, ...await onboardingScope(req) }).select("+tokenHash").lean().exec() as any;
+  if (!request || request.tokenHash !== documentRequestTokenHash(parsed.data.token)) return res.status(404).json({ error: "DOCUMENT_REQUEST_NOT_FOUND", message: "El enlace no pertenece a esta solicitud." });
+  if (request.status === "revoked" || new Date(request.expiresAt).getTime() <= Date.now()) return res.status(410).json({ error: "DOCUMENT_REQUEST_UNAVAILABLE", message: "El enlace ha caducado o ha sido revocado. Genera uno nuevo." });
+  if (request.emailSentAt) return res.json({ emailSent: true, recipientEmail: request.recipientEmail, alreadySent: true });
+  if (!corporateEmailConfiguration().configured) return res.status(503).json({ error: "CORPORATE_EMAIL_NOT_CONFIGURED", message: "El envío corporativo no está configurado en el API. El enlace sigue disponible, pero no se ha enviado ningún correo." });
+  const emailSent = await sendDocumentRequestEmail({ requestId: String(request._id), subjectType: request.subjectType, recipientName: request.recipientName, recipientEmail: request.recipientEmail, message: request.message, uploadUrl: documentRequestUploadUrl(parsed.data.token), expiresAt: new Date(request.expiresAt) });
+  if (!emailSent) return res.status(503).json({ error: "CORPORATE_EMAIL_DELIVERY_FAILED", message: "El proveedor de correo no ha aceptado el envío. Conserva el enlace y revisa el remitente corporativo." });
+  await DocumentRequest.updateOne({ _id: request._id }, { $set: { emailSentAt: new Date() } }).exec();
+  return res.json({ emailSent: true, recipientEmail: request.recipientEmail });
 });
 
 app.get("/api/v1/admin/document-requests", requireRole("admin"), async (req, res) => {
   const subjectType = typeof req.query.subjectType === "string" ? documentRequestSubjectSchema.safeParse(req.query.subjectType) : null;
   if (subjectType && !subjectType.success) return res.status(400).json({ error: "INVALID_DOCUMENT_REQUEST_SUBJECT" });
-  const requests = await DocumentRequest.find({ ...tenantScope(req), ...(subjectType?.success ? { subjectType: subjectType.data } : {}) }).sort({ createdAt: -1 }).limit(200).lean().exec();
-  return res.json({ requests: requests.map((request: any) => ({ id: String(request._id), subjectType: request.subjectType, subjectId: String(request.subjectId), recipientName: request.recipientName, recipientEmail: request.recipientEmail, status: request.status, requirements: request.requirements, documents: request.documents, dueAt: request.dueAt, expiresAt: request.expiresAt, createdAt: request.createdAt, submittedAt: request.submittedAt, revokedAt: request.revokedAt })) });
+  const requests = await DocumentRequest.find({ ...await onboardingScope(req), ...(subjectType?.success ? { subjectType: subjectType.data } : {}) }).sort({ createdAt: -1 }).limit(200).lean().exec();
+  return res.json({ requests: requests.map((request: any) => ({ id: String(request._id), subjectType: request.subjectType, subjectId: String(request.subjectId), recipientName: request.recipientName, recipientEmail: request.recipientEmail, status: request.status, requirements: request.requirements, documents: request.documents, dueAt: request.dueAt, expiresAt: request.expiresAt, createdAt: request.createdAt, emailSentAt: request.emailSentAt || null, submittedAt: request.submittedAt, revokedAt: request.revokedAt })) });
 });
 
 app.post("/api/v1/admin/document-requests/:id/revoke", requireRole("admin"), async (req, res) => {
   const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
   if (!id) return res.status(400).json({ error: "INVALID_DOCUMENT_REQUEST_ID" });
-  const request = await DocumentRequest.findOneAndUpdate({ _id: id, ...tenantScope(req), status: { $in: ["open", "partially_submitted", "submitted"] } }, { $set: { status: "revoked", revokedAt: new Date() } }, { new: true }).lean().exec() as any;
+  const request = await DocumentRequest.findOneAndUpdate({ _id: id, ...await onboardingScope(req), status: { $in: ["open", "partially_submitted", "submitted"] } }, { $set: { status: "revoked", revokedAt: new Date() } }, { new: true }).lean().exec() as any;
   if (!request) return res.status(404).json({ error: "DOCUMENT_REQUEST_NOT_FOUND_OR_CLOSED" });
   return res.json({ request: { id: String(request._id), status: request.status, revokedAt: request.revokedAt } });
 });

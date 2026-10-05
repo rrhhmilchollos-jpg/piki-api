@@ -204,6 +204,7 @@ const documentRequestSchema = new Schema({
   expiresAt: { type: Date, required: true, index: true },
   tokenHash: { type: String, required: true, unique: true, select: false, index: true },
   tokenPrefix: { type: String, required: true, maxlength: 12 },
+  emailSentAt: { type: Date, default: null },
   status: { type: String, enum: ["open", "partially_submitted", "submitted", "revoked", "expired"], default: "open", index: true },
   documents: { type: [documentRequestDocumentSchema], default: [] },
   lastAccessedAt: { type: Date, default: null },
