@@ -1018,6 +1018,21 @@ app.put("/api/v1/partners/menu", requireRole("partner"), async (req, res) => {
   if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
   return res.json({ restaurant, menu: restaurant.menu || [] });
 });
+
+app.put("/api/v1/admin/restaurants/:id/menu", requireOwner(), async (req, res) => {
+  const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
+  if (!id) return res.status(400).json({ error: "INVALID_RESTAURANT_ID" });
+  const parsed = z.object({ items: z.array(partnerMenuItemSchema).max(500) }).safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "INVALID_MENU", details: parsed.error.flatten() });
+  const restaurant = await Restaurant.findOneAndUpdate(
+    { _id: id, slug: "kfc-xativa", onboardingStatus: "approved" },
+    { $set: { menu: parsed.data.items } },
+    { new: true },
+  ).select("_id slug name menu").lean().exec() as any;
+  if (!restaurant) return res.status(404).json({ error: "KFC_XATIVA_QA_NOT_FOUND_OR_NOT_APPROVED" });
+  return res.json({ updated: true, restaurant, menu: restaurant.menu || [] });
+});
+
 app.get("/api/v1/partners/kitchen/orders", requireRole("partner"), async (req, res) => {
   const { access, allowed } = await partnerRequestAccess(req, "orders:read");
   if (!allowed) return res.status(403).json({ error: "PARTNER_PERMISSION_DENIED", permission: "orders:read" });
