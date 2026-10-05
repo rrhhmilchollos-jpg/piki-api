@@ -732,7 +732,7 @@ app.get("/api/v1/catalog/restaurants", async (req, res) => {
   const category = typeof req.query.category === "string" ? req.query.category.trim() : "";
   const cacheKey = `${query}|${category}`;
   const cached = catalogCache.get(cacheKey);
-  if (cached && cached.expiresAt > Date.now()) return res.json(cached.body);
+  if (cached && cached.expiresAt > Date.now()) { res.setHeader("Cache-Control", "public, max-age=300, s-maxage=300, stale-while-revalidate=600, stale-if-error=900"); return res.json(cached.body); }
   const shared = await sharedCacheGet<{ restaurants: unknown[] }>(`piki:catalog:${cacheKey}`);
   if (shared) { catalogCache.set(cacheKey, { expiresAt: Date.now() + CATALOG_CACHE_MS, body: shared }); res.setHeader("Cache-Control", "public, max-age=30, s-maxage=30, stale-while-revalidate=60, stale-if-error=120"); return res.json(shared); }
   const filter: Record<string, unknown> = { ...CUSTOMER_CATALOG_RESTAURANT_FILTER };
@@ -755,7 +755,7 @@ app.get("/api/v1/locations/search", async (req, res) => {
   if (query.length < 3) return res.status(400).json({ error: "QUERY_TOO_SHORT" });
   const cacheKey = `search:${query.toLowerCase()}`;
   const cached = geocodeCache.get(cacheKey);
-  if (cached && cached.expiresAt > Date.now()) return res.json(cached.body);
+  if (cached && cached.expiresAt > Date.now()) { res.setHeader("Cache-Control", "public, max-age=300, s-maxage=300, stale-while-revalidate=600, stale-if-error=900"); return res.json(cached.body); }
   const shared = await sharedCacheGet<{ results: unknown[] }>(`piki:geocode:${cacheKey}`);
   if (shared) { geocodeCache.set(cacheKey, { expiresAt: Date.now() + GEOCODE_CACHE_MS, body: shared }); res.setHeader("Cache-Control", "public, max-age=300, s-maxage=300, stale-while-revalidate=600, stale-if-error=900"); return res.json(shared); }
   const url = new URL("https://nominatim.openstreetmap.org/search");
@@ -782,7 +782,7 @@ app.get("/api/v1/locations/reverse", async (req, res) => {
   if (!validateCoordinates(latitude, longitude)) return res.status(400).json({ error: "INVALID_COORDINATES" });
   const cacheKey = `reverse:${latitude.toFixed(5)}:${longitude.toFixed(5)}`;
   const cached = geocodeCache.get(cacheKey);
-  if (cached && cached.expiresAt > Date.now()) return res.json(cached.body);
+  if (cached && cached.expiresAt > Date.now()) { res.setHeader("Cache-Control", "public, max-age=300, s-maxage=300, stale-while-revalidate=600, stale-if-error=900"); return res.json(cached.body); }
   const shared = await sharedCacheGet<{ label: string; latitude: number; longitude: number }>(`piki:geocode:${cacheKey}`);
   if (shared) { geocodeCache.set(cacheKey, { expiresAt: Date.now() + GEOCODE_CACHE_MS, body: shared }); res.setHeader("Cache-Control", "public, max-age=300, s-maxage=300, stale-while-revalidate=600, stale-if-error=900"); return res.json(shared); }
   const url = new URL("https://nominatim.openstreetmap.org/reverse");
