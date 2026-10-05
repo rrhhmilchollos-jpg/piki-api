@@ -104,6 +104,19 @@ async function incrementDistributedRateLimit(key: string, windowMs: number): Pro
     return null;
   }
 }
+async function sharedCacheGet<T>(key: string): Promise<T | null> {
+  if (!upstashRedisUrl || !upstashRedisToken) return null;
+  try {
+    const response = await fetch(`${upstashRedisUrl}/get/${encodeURIComponent(key)}`, { headers: { Authorization: `Bearer ${upstashRedisToken}` }, signal: AbortSignal.timeout(250) });
+    if (!response.ok) return null;
+    const payload = await response.json() as { result?: string | null };
+    return payload.result ? JSON.parse(payload.result) as T : null;
+  } catch { return null; }
+}
+async function sharedCacheSet(key: string, value: unknown, ttlSeconds: number): Promise<void> {
+  if (!upstashRedisUrl || !upstashRedisToken) return;
+  try { await fetch(`${upstashRedisUrl}/set/${encodeURIComponent(key)}/${encodeURIComponent(JSON.stringify(value))}/EX/${ttlSeconds}`, { method: "POST", headers: { Authorization: `Bearer ${upstashRedisToken}` }, signal: AbortSignal.timeout(250) }); } catch { /* local cache fallback */ }
+}
 const rateLimit = (limit: number, windowMs: number, keyPrefix: string) => async (req: express.Request, res: express.Response, next: express.NextFunction) => {
   const surfaceKey = String(req.header("x-piki-surface") || req.query.surface || "-").toLowerCase();
   const clientIp = String(req.ip || "unknown").trim();
@@ -720,6 +733,8 @@ app.get("/api/v1/catalog/restaurants", async (req, res) => {
   const cacheKey = `${query}|${category}`;
   const cached = catalogCache.get(cacheKey);
   if (cached && cached.expiresAt > Date.now()) return res.json(cached.body);
+  const shared = await sharedCacheGet<{ restaurants: unknown[] }>(`piki:catalog:${cacheKey}`);
+  if (shared) { catalogCache.set(cacheKey, { expiresAt: Date.now() + CATALOG_CACHE_MS, body: shared }); res.setHeader("Cache-Control", "public, max-age=30, stale-while-revalidate=60"); return res.json(shared); }
   const filter: Record<string, unknown> = { ...CUSTOMER_CATALOG_RESTAURANT_FILTER };
   if (category && category !== "Todos") filter.category = category;
   if (query) filter.$or = [{ name: { $regex: query, $options: "i" } }, { cuisine: { $regex: query, $options: "i" } }, { category: { $regex: query, $options: "i" } }];
@@ -730,6 +745,8 @@ app.get("/api/v1/catalog/restaurants", async (req, res) => {
     .sort({ promoted: -1, rating: -1, reviews: -1 }).lean().exec();
   const body = { restaurants: restaurants.map((restaurant: any) => presentCustomerCatalogRestaurant(restaurant)) };
   catalogCache.set(cacheKey, { expiresAt: Date.now() + CATALOG_CACHE_MS, body });
+  void sharedCacheSet(`piki:catalog:${cacheKey}`, body, 30);
+  res.setHeader("Cache-Control", "public, max-age=30, stale-while-revalidate=60");
   res.json(body);
 });
 
@@ -739,6 +756,8 @@ app.get("/api/v1/locations/search", async (req, res) => {
   const cacheKey = `search:${query.toLowerCase()}`;
   const cached = geocodeCache.get(cacheKey);
   if (cached && cached.expiresAt > Date.now()) return res.json(cached.body);
+  const shared = await sharedCacheGet<{ results: unknown[] }>(`piki:geocode:${cacheKey}`);
+  if (shared) { geocodeCache.set(cacheKey, { expiresAt: Date.now() + GEOCODE_CACHE_MS, body: shared }); res.setHeader("Cache-Control", "public, max-age=300, stale-while-revalidate=600"); return res.json(shared); }
   const url = new URL("https://nominatim.openstreetmap.org/search");
   url.searchParams.set("q", `${query}, Comunitat Valenciana, España`);
   url.searchParams.set("format", "jsonv2");
@@ -750,6 +769,8 @@ app.get("/api/v1/locations/search", async (req, res) => {
     const rows = await response.json() as Array<{ place_id: number; display_name: string; lat: string; lon: string; type?: string; address?: Record<string, string> }>;
     const body = { results: rows.map((row) => ({ id: row.place_id, label: row.display_name, latitude: Number(row.lat), longitude: Number(row.lon), type: row.type || "address", address: row.address || {} })) };
     geocodeCache.set(cacheKey, { expiresAt: Date.now() + GEOCODE_CACHE_MS, body });
+    void sharedCacheSet(`piki:geocode:${cacheKey}`, body, 300);
+    res.setHeader("Cache-Control", "public, max-age=300, stale-while-revalidate=600");
     return res.json(body);
   } catch {
     return res.json({ results: [], degraded: true, message: "Geocoder temporalmente no disponible" });
@@ -762,6 +783,8 @@ app.get("/api/v1/locations/reverse", async (req, res) => {
   const cacheKey = `reverse:${latitude.toFixed(5)}:${longitude.toFixed(5)}`;
   const cached = geocodeCache.get(cacheKey);
   if (cached && cached.expiresAt > Date.now()) return res.json(cached.body);
+  const shared = await sharedCacheGet<{ label: string; latitude: number; longitude: number }>(`piki:geocode:${cacheKey}`);
+  if (shared) { geocodeCache.set(cacheKey, { expiresAt: Date.now() + GEOCODE_CACHE_MS, body: shared }); res.setHeader("Cache-Control", "public, max-age=300, stale-while-revalidate=600"); return res.json(shared); }
   const url = new URL("https://nominatim.openstreetmap.org/reverse");
   url.searchParams.set("lat", String(latitude)); url.searchParams.set("lon", String(longitude));
   url.searchParams.set("format", "jsonv2"); url.searchParams.set("zoom", "18");
@@ -771,6 +794,8 @@ app.get("/api/v1/locations/reverse", async (req, res) => {
     const row = await response.json() as { display_name?: string };
     const body = { label: String(row.display_name || `Ubicación GPS ${latitude.toFixed(5)}, ${longitude.toFixed(5)}`), latitude, longitude };
     geocodeCache.set(cacheKey, { expiresAt: Date.now() + GEOCODE_CACHE_MS, body });
+    void sharedCacheSet(`piki:geocode:${cacheKey}`, body, 300);
+    res.setHeader("Cache-Control", "public, max-age=300, stale-while-revalidate=600");
     return res.json(body);
   } catch { return res.json({ label: `Ubicación GPS ${latitude.toFixed(5)}, ${longitude.toFixed(5)}`, latitude, longitude, degraded: true }); }
 });
