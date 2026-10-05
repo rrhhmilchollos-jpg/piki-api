@@ -1,13 +1,13 @@
 import "dotenv/config";
 import "express-async-errors";
-import { createHash, createHmac, randomInt } from "node:crypto";
+import { createHash, createHmac, randomBytes, randomInt } from "node:crypto";
 import { MalwareDetectedError, MalwareScannerUnavailableError, scanUploadBuffer } from "./fileSecurity.js";
 import { fileURLToPath } from "node:url";
 import cors from "cors";
 import express from "express";
 import mongoose from "mongoose";
 import { z } from "zod";
-import { CashLedgerEntry, CustomerAccount, DispatchDecision, EmployeeAccount, AccessAuthorization, Fleet, Order, Restaurant, PartnerAsset, PartnerLocalityGroup, Rider, RiderApplication, PartnerLead, RiderLead, RiderIncident, RiderOrderMessage, RiderSlot, SignatureRequest, Zone, PushSubscription, RealtimeEvent, Tenant, TenantMembership, RiderAssignmentReservation, SupportTicket, OnboardingRequest, TrackingSession, LocationSample, ensureIndexes } from "./models.js";
+import { CashLedgerEntry, CustomerAccount, DispatchDecision, DocumentRequest, EmployeeAccount, AccessAuthorization, Fleet, Order, Restaurant, PartnerAsset, PartnerLocalityGroup, Rider, RiderApplication, PartnerLead, RiderLead, RiderIncident, RiderOrderMessage, RiderSlot, SignatureRequest, Zone, PushSubscription, RealtimeEvent, Tenant, TenantMembership, RiderAssignmentReservation, SupportTicket, OnboardingRequest, TrackingSession, LocationSample, ensureIndexes } from "./models.js";
 import { normalizeLeadEmail, partnerLeadSubmissionSchema, riderLeadSubmissionSchema, webLeadReviewSchema, webLeadStatusSchema } from "./webLeads.js";
 import { assertTransition, calculateEtaRange, transitionSchema, validateCoordinates } from "./algorithms/index.js";
 import { configuredAuthRoles, requireOwner, requireRole, resolveRole } from "./auth.js";
@@ -126,6 +126,7 @@ app.use("/api/v1/partners/onboarding", rateLimit(10, 60_000, "partner-onboarding
 app.use("/api/v1/riders/applications", rateLimit(10, 60_000, "rider-onboarding"));
 app.use("/api/v1/public/partner-leads", rateLimit(10, 60_000, "partner-leads"));
 app.use("/api/v1/public/rider-leads", rateLimit(10, 60_000, "rider-leads"));
+app.use("/api/v1/public/document-requests", rateLimit(20, 60_000, "document-requests"));
 app.use("/api/v1/partners/menu/assets", rateLimit(20, 60_000, "partner-assets"));
 app.use("/api/v1/payments/webhook", rateLimit(100, 60_000, "stripe-webhook"));
 app.use("/api/webhooks/stripe", rateLimit(100, 60_000, "stripe-webhook"));
@@ -140,7 +141,7 @@ const stripeWebhookHandler = async (req: express.Request, res: express.Response)
   }
 };
 app.post(["/api/v1/payments/webhook", "/api/webhooks/stripe"], express.raw({ type: "application/json" }), stripeWebhookHandler);
-app.use(express.json({ limit: "12mb" }));
+app.use(express.json({ limit: "20mb" }));
 
 const objectId = (value: string) => mongoose.isValidObjectId(value) ? new mongoose.Types.ObjectId(value) : null;
 function tenantScope(req: express.Request): Record<string, unknown> {
@@ -211,8 +212,14 @@ const riderIncidentSchema = z.object({ reason: z.enum(["late_acceptance", "late_
 const riderSlotSchema = z.object({ zoneSlug: z.string().regex(/^[a-z0-9-]+$/), date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/), startTime: z.string().regex(/^(?:[01]\d|2[0-3]):[0-5]\d$/), endTime: z.string().regex(/^(?:[01]\d|2[0-3]):[0-5]\d$/), status: z.enum(["planned", "active", "completed", "cancelled"]).default("planned"), notes: z.string().max(500).default("") });
 const riderSlotCreateSchema = riderSlotSchema.extend({ riderId: z.string().regex(/^[a-f\d]{24}$/) });
 const riderSlotWeekSchema = riderSlotCreateSchema.extend({ weekdays: z.array(z.number().int().min(0).max(6)).min(1).max(7).default([0, 1, 2, 3, 4, 5, 6]) });
-const riderDocumentInputSchema = z.object({ type: z.enum(["identity", "residence_permit", "social_security_number", "bank_certificate", "driving_license", "insurance", "vehicle_registration", "vehicle_technical_sheet", "scooter_responsible_declaration", "dgt_mvp_homologation", "other"]), fileName: z.string().min(1).max(180), mimeType: z.string().min(1).max(120), sizeBytes: z.number().int().min(1).max(2_500_000), sha256: z.string().regex(/^[a-f0-9]{64}$/i), contentBase64: z.string().min(1).max(3_500_000) });
+const riderDocumentInputSchema = z.object({ type: z.enum(["identity", "residence_permit", "social_security_number", "bank_certificate", "profile_photo", "driving_license", "insurance", "vehicle_registration", "vehicle_technical_sheet", "scooter_responsible_declaration", "dgt_mvp_homologation", "work_authorization_confirmation", "ppe_and_safety", "other"]), fileName: z.string().min(1).max(180), mimeType: z.string().min(1).max(120), sizeBytes: z.number().int().min(1).max(2_500_000), sha256: z.string().regex(/^[a-f0-9]{64}$/i), contentBase64: z.string().min(1).max(3_500_000) });
 const riderApplicationSchema = z.object({ name: z.string().min(2).max(160), email: z.string().email(), phone: z.string().min(6).max(40), city: z.string().min(2).max(120), vehicle: z.enum(["bike", "electric_bike", "electric_scooter", "motorcycle", "scooter", "car"]), availability: z.string().min(2).max(160), socialSecurityNumber: z.string().min(4).max(40), identityVerificationMethod: z.literal("online_scan"), safetyDeclarationAccepted: z.literal(true), documents: z.array(riderDocumentInputSchema).min(3).max(12), website: z.string().max(0).optional() });
+const documentRequestSubjectSchema = z.enum(["rider_application", "restaurant"]);
+const documentRequestRequirementInputSchema = z.object({ type: z.string().regex(/^[a-z0-9_]{2,80}$/), label: z.string().trim().min(2).max(160), description: z.string().trim().max(500).default("") });
+const documentRequestCreateSchema = z.object({ subjectType: documentRequestSubjectSchema, subjectId: z.string().regex(/^[a-f\d]{24}$/), message: z.string().trim().min(10).max(2000), dueAt: z.coerce.date().nullable().optional(), requirements: z.array(documentRequestRequirementInputSchema).min(1).max(12) });
+const publicDocumentUploadSchema = z.object({ documents: z.array(z.object({ type: z.string().regex(/^[a-z0-9_]{2,80}$/), fileName: z.string().trim().min(1).max(180), mimeType: z.enum(["application/pdf", "image/jpeg", "image/png"]), sizeBytes: z.number().int().min(1).max(2_500_000), sha256: z.string().regex(/^[a-f0-9]{64}$/i), contentBase64: z.string().min(1).max(3_500_000) })).min(1).max(5) });
+const riderDocumentRequestTypes = new Set(["identity", "residence_permit", "social_security_number", "bank_certificate", "profile_photo", "driving_license", "insurance", "vehicle_registration", "vehicle_technical_sheet", "scooter_responsible_declaration", "dgt_mvp_homologation", "work_authorization_confirmation", "ppe_and_safety", "other"]);
+const partnerDocumentRequestTypes = new Set(["tax_id", "bank_certificate", "insurance", "activity_license", "food_sanitary_authorization", "identity", "other"]);
 const riderApplicationAttempts = new Map<string, { count: number; resetAt: number }>();
 const ownerEmail = "rrhh.milchollos@gmail.com";
 const MAX_MENU_IMAGE_BYTES = 200 * 1024;
@@ -1355,6 +1362,125 @@ app.patch("/api/v1/rider-applications/:id/status", requireRole("admin"), async (
   }
   const documentReviewPending = (application.documents || []).some((document: any) => document.status !== "approved");
   return res.json({ application, documentReviewPending, warning: documentReviewPending ? "La solicitud se ha gestionado; el expediente documental continúa pendiente de revisión." : undefined });
+});
+
+function documentRequestTokenHash(token: string) { return createHash("sha256").update(token).digest("hex"); }
+function documentRequestUploadUrl(token: string) { return `${String(process.env.ADMIN_APP_URL || "https://admin.pikidelivery.com").replace(/\/$/, "")}/#document-request=${encodeURIComponent(token)}`; }
+function documentRequestMetadata(document: { type: string; fileName: string; mimeType: string; sizeBytes: number; sha256: string }) { return { type: document.type, fileName: document.fileName, mimeType: document.mimeType, sizeBytes: document.sizeBytes, sha256: document.sha256.toLowerCase(), uploadedAt: new Date() }; }
+function normalizeDocumentBytes(contentBase64: string, sizeBytes: number, mimeType: string, sha256: string) {
+  const rawBase64 = contentBase64.replace(/^data:[^;]+;base64,/, "");
+  if (!/^[A-Za-z0-9+/]*={0,2}$/.test(rawBase64) || rawBase64.length % 4 === 1) throw new Error("DOCUMENT_BASE64_INVALID");
+  const bytes = Buffer.from(rawBase64, "base64");
+  if (bytes.length !== sizeBytes) throw new Error("DOCUMENT_SIZE_MISMATCH");
+  if (detectedMenuMime(bytes) !== mimeType) throw new Error("DOCUMENT_CONTENT_TYPE_MISMATCH");
+  const digest = createHash("sha256").update(bytes).digest("hex");
+  if (digest !== sha256.toLowerCase()) throw new Error("DOCUMENT_CHECKSUM_MISMATCH");
+  return { bytes, contentBase64: rawBase64 };
+}
+async function documentRequestSubject(subjectType: "rider_application" | "restaurant", subjectId: mongoose.Types.ObjectId, scope: Record<string, unknown>) {
+  if (subjectType === "rider_application") {
+    const subject = await RiderApplication.findOne({ _id: subjectId, ...scope }).select("name email").lean().exec() as any;
+    return subject ? { id: subject._id as mongoose.Types.ObjectId, recipientName: String(subject.name || "Rider"), recipientEmail: String(subject.email || "").toLowerCase() } : null;
+  }
+  const subject = await Restaurant.findOne({ _id: subjectId, ...scope }).select("name email partnerProfile").lean().exec() as any;
+  return subject ? { id: subject._id as mongoose.Types.ObjectId, recipientName: String(subject.name || "Comercio"), recipientEmail: String(subject.email || "").toLowerCase(), hasProfile: Boolean(subject.partnerProfile) } : null;
+}
+function publicDocumentRequestResponse(request: any) {
+  return { request: { id: String(request._id), recipientName: request.recipientName, message: request.message, requirements: (request.requirements || []).map((item: any) => ({ type: item.type, label: item.label, description: item.description || "" })), dueAt: request.dueAt || null, expiresAt: request.expiresAt, status: request.status, uploadedTypes: [...new Set((request.documents || []).map((item: any) => item.type))] } };
+}
+async function openDocumentRequest(rawToken: string) {
+  if (!/^[A-Za-z0-9_-]{40,100}$/.test(rawToken)) return null;
+  const request = await DocumentRequest.findOne({ tokenHash: documentRequestTokenHash(rawToken) }).lean().exec() as any;
+  if (!request) return null;
+  if (request.status === "revoked") return { request, unavailable: "revoked" as const };
+  if (new Date(request.expiresAt).getTime() <= Date.now()) {
+    if (request.status !== "expired") await DocumentRequest.updateOne({ _id: request._id }, { $set: { status: "expired" } }).exec();
+    return { request: { ...request, status: "expired" }, unavailable: "expired" as const };
+  }
+  return { request, unavailable: null };
+}
+
+app.post("/api/v1/admin/document-requests", requireRole("admin"), async (req, res) => {
+  const parsed = documentRequestCreateSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "INVALID_DOCUMENT_REQUEST", details: parsed.error.flatten() });
+  const subjectId = objectId(parsed.data.subjectId);
+  const createdBy = objectId(String(req.auth?.employeeId || ""));
+  if (!subjectId || !createdBy) return res.status(401).json({ error: "AUTH_REQUIRED" });
+  const allowedTypes = parsed.data.subjectType === "rider_application" ? riderDocumentRequestTypes : partnerDocumentRequestTypes;
+  const requestedTypes = parsed.data.requirements.map((item) => item.type);
+  if (requestedTypes.some((type) => !allowedTypes.has(type)) || new Set(requestedTypes).size !== requestedTypes.length) return res.status(400).json({ error: "INVALID_DOCUMENT_REQUIREMENTS" });
+  const subject = await documentRequestSubject(parsed.data.subjectType, subjectId, tenantScope(req));
+  if (!subject) return res.status(404).json({ error: "DOCUMENT_REQUEST_SUBJECT_NOT_FOUND" });
+  if (!subject.recipientEmail || !z.string().email().safeParse(subject.recipientEmail).success) return res.status(409).json({ error: "SUBJECT_EMAIL_REQUIRED", message: "Añade un correo de contacto válido antes de solicitar documentación." });
+  if (parsed.data.subjectType === "restaurant" && !subject.hasProfile) return res.status(409).json({ error: "PARTNER_PROFILE_REQUIRED", message: "Este comercio no tiene expediente de partner para recibir documentación." });
+  const token = randomBytes(32).toString("base64url");
+  const expiresAt = new Date(Date.now() + 14 * 24 * 60 * 60_000);
+  const request = await DocumentRequest.create({ ...tenantScope(req), subjectType: parsed.data.subjectType, subjectId, recipientName: subject.recipientName, recipientEmail: subject.recipientEmail, createdBy, message: parsed.data.message, requirements: parsed.data.requirements, dueAt: parsed.data.dueAt || null, expiresAt, tokenHash: documentRequestTokenHash(token), tokenPrefix: token.slice(0, 8) });
+  await notifyOnboarding({ channel: "admin", type: "onboarding.document_request.created", entityId: String(request._id), tenantId: (request as any).tenantId, payload: { subjectType: request.subjectType, subjectId: String(subjectId) } });
+  const uploadUrl = documentRequestUploadUrl(token);
+  const mailtoUrl = `mailto:${encodeURIComponent(subject.recipientEmail)}?subject=${encodeURIComponent("PIKI · Documentación pendiente")}&body=${encodeURIComponent(`Hola ${subject.recipientName},\n\n${parsed.data.message}\n\nPuedes subir la documentación solicitada mediante este enlace seguro (válido hasta ${expiresAt.toLocaleDateString("es-ES")}):\n${uploadUrl}\n\nEquipo PIKI`)}`;
+  return res.status(201).json({ request: { id: String(request._id), subjectType: request.subjectType, recipientName: request.recipientName, recipientEmail: request.recipientEmail, status: request.status, dueAt: request.dueAt, expiresAt: request.expiresAt }, delivery: { uploadUrl, mailtoUrl } });
+});
+
+app.get("/api/v1/admin/document-requests", requireRole("admin"), async (req, res) => {
+  const subjectType = typeof req.query.subjectType === "string" ? documentRequestSubjectSchema.safeParse(req.query.subjectType) : null;
+  if (subjectType && !subjectType.success) return res.status(400).json({ error: "INVALID_DOCUMENT_REQUEST_SUBJECT" });
+  const requests = await DocumentRequest.find({ ...tenantScope(req), ...(subjectType?.success ? { subjectType: subjectType.data } : {}) }).sort({ createdAt: -1 }).limit(200).lean().exec();
+  return res.json({ requests: requests.map((request: any) => ({ id: String(request._id), subjectType: request.subjectType, subjectId: String(request.subjectId), recipientName: request.recipientName, recipientEmail: request.recipientEmail, status: request.status, requirements: request.requirements, documents: request.documents, dueAt: request.dueAt, expiresAt: request.expiresAt, createdAt: request.createdAt, submittedAt: request.submittedAt, revokedAt: request.revokedAt })) });
+});
+
+app.post("/api/v1/admin/document-requests/:id/revoke", requireRole("admin"), async (req, res) => {
+  const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
+  if (!id) return res.status(400).json({ error: "INVALID_DOCUMENT_REQUEST_ID" });
+  const request = await DocumentRequest.findOneAndUpdate({ _id: id, ...tenantScope(req), status: { $in: ["open", "partially_submitted", "submitted"] } }, { $set: { status: "revoked", revokedAt: new Date() } }, { new: true }).lean().exec() as any;
+  if (!request) return res.status(404).json({ error: "DOCUMENT_REQUEST_NOT_FOUND_OR_CLOSED" });
+  return res.json({ request: { id: String(request._id), status: request.status, revokedAt: request.revokedAt } });
+});
+
+app.get("/api/v1/public/document-requests/:token", async (req, res) => {
+  const requestState = await openDocumentRequest(String(req.params.token || ""));
+  if (!requestState) return res.status(404).json({ error: "DOCUMENT_REQUEST_NOT_FOUND" });
+  if (requestState.unavailable) return res.status(410).json({ error: requestState.unavailable === "revoked" ? "DOCUMENT_REQUEST_REVOKED" : "DOCUMENT_REQUEST_EXPIRED" });
+  await DocumentRequest.updateOne({ _id: requestState.request._id }, { $set: { lastAccessedAt: new Date() } }).exec();
+  return res.json(publicDocumentRequestResponse(requestState.request));
+});
+
+app.post("/api/v1/public/document-requests/:token/documents", async (req, res) => {
+  const requestState = await openDocumentRequest(String(req.params.token || ""));
+  if (!requestState) return res.status(404).json({ error: "DOCUMENT_REQUEST_NOT_FOUND" });
+  if (requestState.unavailable) return res.status(410).json({ error: requestState.unavailable === "revoked" ? "DOCUMENT_REQUEST_REVOKED" : "DOCUMENT_REQUEST_EXPIRED" });
+  const parsed = publicDocumentUploadSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "INVALID_DOCUMENT_UPLOAD", details: parsed.error.flatten() });
+  const documentTypes = parsed.data.documents.map((document) => document.type);
+  const allowedTypes = new Set((requestState.request.requirements || []).map((item: any) => item.type));
+  if (documentTypes.some((type) => !allowedTypes.has(type)) || new Set(documentTypes).size !== documentTypes.length) return res.status(400).json({ error: "DOCUMENT_TYPE_NOT_REQUESTED" });
+  const uploaded = [] as Array<{ type: string; fileName: string; mimeType: string; sizeBytes: number; sha256: string; contentBase64: string }>;
+  try {
+    for (const document of parsed.data.documents) {
+      const normalized = normalizeDocumentBytes(document.contentBase64, document.sizeBytes, document.mimeType, document.sha256);
+      await scanUploadBuffer(normalized.bytes, document.fileName);
+      uploaded.push({ ...document, sha256: document.sha256.toLowerCase(), contentBase64: normalized.contentBase64 });
+    }
+  } catch (error) {
+    if (error instanceof MalwareDetectedError) return res.status(422).json({ error: "MALWARE_DETECTED", message: "Uno de los archivos ha sido rechazado por seguridad." });
+    if (error instanceof MalwareScannerUnavailableError) return res.status(503).json({ error: "MALWARE_SCANNER_UNAVAILABLE", message: "La carga está temporalmente bloqueada hasta completar el análisis de seguridad." });
+    return res.status(400).json({ error: error instanceof Error ? error.message : "DOCUMENT_VALIDATION_FAILED" });
+  }
+  const subjectDocuments = uploaded.map((document) => ({ ...document, status: "received", reviewNotes: "", reviewedAt: null, reviewedBy: null }));
+  const uploadedTypes = uploaded.map((document) => document.type);
+  if (requestState.request.subjectType === "rider_application") {
+    const result = await RiderApplication.updateOne({ _id: requestState.request.subjectId }, { $pull: { documents: { type: { $in: uploadedTypes } } }, $push: { documents: { $each: subjectDocuments } } } as any).exec();
+    if (!result.matchedCount) return res.status(410).json({ error: "DOCUMENT_REQUEST_SUBJECT_GONE" });
+  } else {
+    const result = await Restaurant.updateOne({ _id: requestState.request.subjectId, "partnerProfile": { $exists: true } }, { $pull: { "partnerProfile.documents": { type: { $in: uploadedTypes } } }, $push: { "partnerProfile.documents": { $each: subjectDocuments } } } as any).exec();
+    if (!result.matchedCount) return res.status(410).json({ error: "DOCUMENT_REQUEST_SUBJECT_GONE" });
+  }
+  const existingMetadata = (requestState.request.documents || []).filter((document: any) => !uploadedTypes.includes(document.type));
+  const metadata = [...existingMetadata, ...uploaded.map(documentRequestMetadata)];
+  const completed = (requestState.request.requirements || []).every((requirement: any) => metadata.some((document: any) => document.type === requirement.type));
+  const updated = await DocumentRequest.findByIdAndUpdate(requestState.request._id, { $set: { documents: metadata, status: completed ? "submitted" : "partially_submitted", submittedAt: new Date(), lastAccessedAt: new Date() } }, { new: true }).lean().exec() as any;
+  await notifyOnboarding({ channel: "admin", type: "onboarding.document_request.uploaded", entityId: String(updated._id), tenantId: updated.tenantId, payload: { subjectType: updated.subjectType, subjectId: String(updated.subjectId), uploadedTypes } });
+  return res.status(201).json({ message: completed ? "Documentación enviada para revisión." : "Documentación parcial recibida. Puedes continuar con los requisitos pendientes.", ...publicDocumentRequestResponse(updated) });
 });
 
 app.get("/api/v1/riders", requireRole("admin", "fleet"), async (req, res) => {

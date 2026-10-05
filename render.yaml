@@ -14,6 +14,8 @@ services:
         sync: false
       - key: MONGODB_DB
         value: piki
+      - key: ADMIN_APP_URL
+        value: https://admin.pikidelivery.com
       - key: CORS_ORIGINS
         sync: false
       - key: UPSTASH_REDIS_REST_URL
