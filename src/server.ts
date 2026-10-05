@@ -734,7 +734,7 @@ app.get("/api/v1/catalog/restaurants", async (req, res) => {
   const cached = catalogCache.get(cacheKey);
   if (cached && cached.expiresAt > Date.now()) return res.json(cached.body);
   const shared = await sharedCacheGet<{ restaurants: unknown[] }>(`piki:catalog:${cacheKey}`);
-  if (shared) { catalogCache.set(cacheKey, { expiresAt: Date.now() + CATALOG_CACHE_MS, body: shared }); res.setHeader("Cache-Control", "public, max-age=30, stale-while-revalidate=60"); return res.json(shared); }
+  if (shared) { catalogCache.set(cacheKey, { expiresAt: Date.now() + CATALOG_CACHE_MS, body: shared }); res.setHeader("Cache-Control", "public, max-age=30, s-maxage=30, stale-while-revalidate=60, stale-if-error=120"); return res.json(shared); }
   const filter: Record<string, unknown> = { ...CUSTOMER_CATALOG_RESTAURANT_FILTER };
   if (category && category !== "Todos") filter.category = category;
   if (query) filter.$or = [{ name: { $regex: query, $options: "i" } }, { cuisine: { $regex: query, $options: "i" } }, { category: { $regex: query, $options: "i" } }];
@@ -746,7 +746,7 @@ app.get("/api/v1/catalog/restaurants", async (req, res) => {
   const body = { restaurants: restaurants.map((restaurant: any) => presentCustomerCatalogRestaurant(restaurant)) };
   catalogCache.set(cacheKey, { expiresAt: Date.now() + CATALOG_CACHE_MS, body });
   void sharedCacheSet(`piki:catalog:${cacheKey}`, body, 30);
-  res.setHeader("Cache-Control", "public, max-age=30, stale-while-revalidate=60");
+  res.setHeader("Cache-Control", "public, max-age=30, s-maxage=30, stale-while-revalidate=60, stale-if-error=120");
   res.json(body);
 });
 
@@ -757,7 +757,7 @@ app.get("/api/v1/locations/search", async (req, res) => {
   const cached = geocodeCache.get(cacheKey);
   if (cached && cached.expiresAt > Date.now()) return res.json(cached.body);
   const shared = await sharedCacheGet<{ results: unknown[] }>(`piki:geocode:${cacheKey}`);
-  if (shared) { geocodeCache.set(cacheKey, { expiresAt: Date.now() + GEOCODE_CACHE_MS, body: shared }); res.setHeader("Cache-Control", "public, max-age=300, stale-while-revalidate=600"); return res.json(shared); }
+  if (shared) { geocodeCache.set(cacheKey, { expiresAt: Date.now() + GEOCODE_CACHE_MS, body: shared }); res.setHeader("Cache-Control", "public, max-age=300, s-maxage=300, stale-while-revalidate=600, stale-if-error=900"); return res.json(shared); }
   const url = new URL("https://nominatim.openstreetmap.org/search");
   url.searchParams.set("q", `${query}, Comunitat Valenciana, España`);
   url.searchParams.set("format", "jsonv2");
@@ -770,7 +770,7 @@ app.get("/api/v1/locations/search", async (req, res) => {
     const body = { results: rows.map((row) => ({ id: row.place_id, label: row.display_name, latitude: Number(row.lat), longitude: Number(row.lon), type: row.type || "address", address: row.address || {} })) };
     geocodeCache.set(cacheKey, { expiresAt: Date.now() + GEOCODE_CACHE_MS, body });
     void sharedCacheSet(`piki:geocode:${cacheKey}`, body, 300);
-    res.setHeader("Cache-Control", "public, max-age=300, stale-while-revalidate=600");
+    res.setHeader("Cache-Control", "public, max-age=300, s-maxage=300, stale-while-revalidate=600, stale-if-error=900");
     return res.json(body);
   } catch {
     return res.json({ results: [], degraded: true, message: "Geocoder temporalmente no disponible" });
@@ -784,7 +784,7 @@ app.get("/api/v1/locations/reverse", async (req, res) => {
   const cached = geocodeCache.get(cacheKey);
   if (cached && cached.expiresAt > Date.now()) return res.json(cached.body);
   const shared = await sharedCacheGet<{ label: string; latitude: number; longitude: number }>(`piki:geocode:${cacheKey}`);
-  if (shared) { geocodeCache.set(cacheKey, { expiresAt: Date.now() + GEOCODE_CACHE_MS, body: shared }); res.setHeader("Cache-Control", "public, max-age=300, stale-while-revalidate=600"); return res.json(shared); }
+  if (shared) { geocodeCache.set(cacheKey, { expiresAt: Date.now() + GEOCODE_CACHE_MS, body: shared }); res.setHeader("Cache-Control", "public, max-age=300, s-maxage=300, stale-while-revalidate=600, stale-if-error=900"); return res.json(shared); }
   const url = new URL("https://nominatim.openstreetmap.org/reverse");
   url.searchParams.set("lat", String(latitude)); url.searchParams.set("lon", String(longitude));
   url.searchParams.set("format", "jsonv2"); url.searchParams.set("zoom", "18");
@@ -795,7 +795,7 @@ app.get("/api/v1/locations/reverse", async (req, res) => {
     const body = { label: String(row.display_name || `Ubicación GPS ${latitude.toFixed(5)}, ${longitude.toFixed(5)}`), latitude, longitude };
     geocodeCache.set(cacheKey, { expiresAt: Date.now() + GEOCODE_CACHE_MS, body });
     void sharedCacheSet(`piki:geocode:${cacheKey}`, body, 300);
-    res.setHeader("Cache-Control", "public, max-age=300, stale-while-revalidate=600");
+    res.setHeader("Cache-Control", "public, max-age=300, s-maxage=300, stale-while-revalidate=600, stale-if-error=900");
     return res.json(body);
   } catch { return res.json({ label: `Ubicación GPS ${latitude.toFixed(5)}, ${longitude.toFixed(5)}`, latitude, longitude, degraded: true }); }
 });
