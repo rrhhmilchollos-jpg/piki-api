@@ -1568,17 +1568,17 @@ app.post("/api/v1/public/document-requests/:token/documents", async (req, res) =
     if (error instanceof MalwareScannerUnavailableError) return res.status(503).json({ error: "MALWARE_SCANNER_UNAVAILABLE", message: "La carga está temporalmente bloqueada hasta completar el análisis de seguridad." });
     return res.status(400).json({ error: error instanceof Error ? error.message : "DOCUMENT_VALIDATION_FAILED" });
   }
-  const subjectDocuments = uploaded.map((document) => ({ ...document, status: "received", reviewNotes: "", reviewedAt: null, reviewedBy: null }));
+  const subjectDocuments = uploaded.map((document) => ({ ...document, _id: new mongoose.Types.ObjectId(), status: "received", reviewNotes: "", reviewedAt: null, reviewedBy: null }));
   const uploadedTypes = uploaded.map((document) => document.type);
   if (requestState.request.subjectType === "rider_application") {
-    const result = await RiderApplication.updateOne({ _id: requestState.request.subjectId }, { $pull: { documents: { type: { $in: uploadedTypes } } }, $push: { documents: { $each: subjectDocuments } } } as any).exec();
+    const result = await RiderApplication.updateOne({ _id: requestState.request.subjectId }, [{ $set: { documents: { $concatArrays: [{ $filter: { input: { $ifNull: ["$documents", []] }, as: "doc", cond: { $not: [{ $in: ["$$doc.type", { $literal: uploadedTypes }] }] } } }, { $literal: subjectDocuments }] } } }] as any).exec();
     if (!result.matchedCount) return res.status(410).json({ error: "DOCUMENT_REQUEST_SUBJECT_GONE" });
   } else if (requestState.request.subjectType === "restaurant") {
-    const result = await Restaurant.updateOne({ _id: requestState.request.subjectId, "partnerProfile": { $exists: true } }, { $pull: { "partnerProfile.documents": { type: { $in: uploadedTypes } } }, $push: { "partnerProfile.documents": { $each: subjectDocuments } } } as any).exec();
+    const result = await Restaurant.updateOne({ _id: requestState.request.subjectId, "partnerProfile": { $exists: true } }, [{ $set: { "partnerProfile.documents": { $concatArrays: [{ $filter: { input: { $ifNull: ["$partnerProfile.documents", []] }, as: "doc", cond: { $not: [{ $in: ["$$doc.type", { $literal: uploadedTypes }] }] } } }, { $literal: subjectDocuments }] } } }] as any).exec();
     if (!result.matchedCount) return res.status(410).json({ error: "DOCUMENT_REQUEST_SUBJECT_GONE" });
   } else {
     const Model = requestState.request.subjectType === "rider_lead" ? RiderLead : PartnerLead;
-    const result = await Model.updateOne({ _id: requestState.request.subjectId }, { $pull: { documents: { type: { $in: uploadedTypes } } }, $push: { documents: { $each: subjectDocuments } } } as any).exec();
+    const result = await Model.updateOne({ _id: requestState.request.subjectId }, [{ $set: { documents: { $concatArrays: [{ $filter: { input: { $ifNull: ["$documents", []] }, as: "doc", cond: { $not: [{ $in: ["$$doc.type", { $literal: uploadedTypes }] }] } } }, { $literal: subjectDocuments }] } } }] as any).exec();
     if (!result.matchedCount) return res.status(410).json({ error: "DOCUMENT_REQUEST_SUBJECT_GONE" });
   }
   const existingMetadata = (requestState.request.documents || []).filter((document: any) => !uploadedTypes.includes(document.type));

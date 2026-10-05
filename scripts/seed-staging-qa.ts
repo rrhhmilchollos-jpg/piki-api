@@ -1,12 +1,13 @@
 import mongoose from "mongoose";
 import "dotenv/config";
-import { Restaurant, Rider } from "../src/models.ts";
+import { Restaurant, Rider } from "../src/models.js";
 
-if (process.env.NODE_ENV === "production") throw new Error("Refusing to seed when NODE_ENV=production");
+if (process.env.NODE_ENV !== "staging") throw new Error("NODE_ENV must be staging");
 if (process.env.ALLOW_QA_SEED !== "true") throw new Error("Set ALLOW_QA_SEED=true explicitly for staging QA seed");
 if (!process.env.MONGODB_URI) throw new Error("MONGODB_URI is required");
 
-const dbName = process.env.MONGODB_DB || "piki-staging";
+const dbName = process.env.MONGODB_DB;
+if (!dbName || !/staging|qa|test/i.test(dbName)) throw new Error("MONGODB_DB must explicitly name a staging/QA/test database");
 const now = new Date();
 const restaurantSlug = "piki-qa-kitchen";
 const riderEmail = "qa-rider@pikidelivery.test";
@@ -48,7 +49,7 @@ try {
         },
         menu: [{
           id: "qa-burger-001", name: "QA Burger", description: "Producto exclusivo para pruebas E2E",
-          price: 899, category: "QA", image: "", allergens: [], modifiers: [], available: true,
+          price: 8.99, category: "QA", image: "", allergens: [], modifiers: [], available: true,
           vegetarian: false, popular: true,
         }],
       },
