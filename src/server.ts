@@ -7,7 +7,7 @@ import cors from "cors";
 import express from "express";
 import mongoose from "mongoose";
 import { z } from "zod";
-import { CashLedgerEntry, CustomerAccount, DispatchDecision, EmployeeAccount, AccessAuthorization, Fleet, Order, Restaurant, PartnerAsset, PartnerLocalityGroup, Rider, RiderApplication, PartnerLead, RiderLead, RiderIncident, RiderOrderMessage, RiderSlot, SignatureRequest, Zone, PushSubscription, RealtimeEvent, Tenant, TenantMembership, RiderAssignmentReservation, SupportTicket, OnboardingRequest, ensureIndexes } from "./models.js";
+import { CashLedgerEntry, CustomerAccount, DispatchDecision, EmployeeAccount, AccessAuthorization, Fleet, Order, Restaurant, PartnerAsset, PartnerLocalityGroup, Rider, RiderApplication, PartnerLead, RiderLead, RiderIncident, RiderOrderMessage, RiderSlot, SignatureRequest, Zone, PushSubscription, RealtimeEvent, Tenant, TenantMembership, RiderAssignmentReservation, SupportTicket, OnboardingRequest, TrackingSession, LocationSample, ensureIndexes } from "./models.js";
 import { normalizeLeadEmail, partnerLeadSubmissionSchema, riderLeadSubmissionSchema, webLeadReviewSchema, webLeadStatusSchema } from "./webLeads.js";
 import { assertTransition, calculateEtaRange, transitionSchema, validateCoordinates } from "./algorithms/index.js";
 import { configuredAuthRoles, requireOwner, requireRole, resolveRole } from "./auth.js";
@@ -174,7 +174,7 @@ async function fleetCanAccessRider(req: express.Request, riderId: mongoose.Types
   const employee = await employeeScope(req);
   return Boolean(employee?.fleetId && await Rider.exists({ _id: riderId, fleetId: employee.fleetId }));
 }
-const locationSchema = z.object({ latitude: z.number().min(-90).max(90), longitude: z.number().min(-180).max(180) });
+const locationSchema = z.object({ latitude: z.number().min(-90).max(90), longitude: z.number().min(-180).max(180), accuracy: z.number().min(0).max(10_000).optional() });
 const customerModifierSelectionSchema = z.object({ groupId: z.string().min(1).max(80), optionIds: z.array(z.string().min(1).max(80)).max(12) });
 const orderItemSchema = z.object({ itemId: z.string().min(1), quantity: z.number().int().min(1).max(20), selections: z.array(customerModifierSelectionSchema).max(12).optional() });
 const createOrderSchema = z.object({ restaurantId: z.string().min(1), deliveryAddress: z.string().min(5).max(280), deliveryLocation: locationSchema, items: z.array(orderItemSchema).min(1).max(50), paymentMethod: z.string().optional().default("cash") });
@@ -202,6 +202,9 @@ const pickupQrIsValid = (orderCode: string, raw: unknown) => {
   try { const url = new URL(value); return url.searchParams.get("order_id") === orderCode && url.searchParams.get("pickup_token") === pickupQrSignature(orderCode); } catch { return false; }
 };
 const riderLocationSchema = locationSchema.extend({ riderId: z.string().min(1) });
+const trackingSessionCreateSchema = z.object({ shiftId: z.string().regex(/^[a-f\d]{24}$/).optional(), platform: z.enum(["ios", "android", "web"]), appVersion: z.string().trim().min(1).max(80).default("unknown"), consentVersion: z.string().trim().min(1).max(80) });
+const trackingSampleSchema = z.object({ sampleId: z.string().trim().min(8).max(160), latitude: z.number().min(-90).max(90), longitude: z.number().min(-180).max(180), accuracyMeters: z.number().min(0).max(10_000), recordedAt: z.coerce.date() });
+const trackingBatchSchema = z.object({ sessionId: z.string().regex(/^[a-f\d]{24}$/), samples: z.array(trackingSampleSchema).min(1).max(100) });
 const zoneSchema = z.object({ name: z.string().min(2).max(120), slug: z.string().regex(/^[a-z0-9-]+$/), serviceFeeCents: z.number().int().min(0).max(10000).default(0), maxEtaMinutes: z.number().int().min(1).max(240).default(60), polygon: z.object({ coordinates: z.array(z.array(z.array(z.number()))).min(1) }) });
 const dispatchSchema = z.object({ preparationMinutes: z.coerce.number().int().min(1).max(180).default(PARTNER_PREPARATION_LIMIT_MINUTES), offerSeconds: z.coerce.number().int().min(15).max(180).default(60), maxCustomerEtaMinutes: z.coerce.number().int().min(10).max(240).default(CUSTOMER_DELIVERY_TARGET_MINUTES) });
 const riderIncidentSchema = z.object({ reason: z.enum(["late_acceptance", "late_delivery", "no_show", "unsafe_driving", "fraud_signal", "customer_complaint", "document_expired", "other"]), evidence: z.array(z.string().url()).max(10).default([]), occurredAt: z.coerce.date().optional() });
@@ -2123,6 +2126,72 @@ app.get("/api/v1/ops/cash-wallets", requireRole("admin", "fleet", "finance"), as
   return res.json({ wallets: rows.map((row: any) => ({ riderId: String(row._id), rider: names.get(String(row._id)) || null, collectedCents: Number(row.collectedCents || 0), handedOverCents: Number(row.handedOverCents || 0), availableCents: Number(row.collectedCents || 0) - Number(row.handedOverCents || 0), entries: Number(row.entries || 0) })) });
 });
 
+app.post("/api/v1/riders/:id/tracking/sessions", requireRole("admin", "rider", "fleet"), async (req, res) => {
+  const riderId = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
+  if (!riderId) return res.status(400).json({ error: "INVALID_RIDER_ID" });
+  if (req.auth?.role === "rider" && !(await riderAccessForRequest(riderId, req))) return res.status(403).json({ error: "RIDER_ACCESS_DENIED" });
+  if (req.auth?.role === "fleet" && !(await fleetCanAccessRider(req, riderId))) return res.status(403).json({ error: "FLEET_RIDER_ACCESS_DENIED" });
+  const parsed = trackingSessionCreateSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "INVALID_TRACKING_SESSION", details: parsed.error.flatten() });
+  const current = await TrackingSession.findOne({ riderId, status: "active" }).sort({ startedAt: -1 }).lean().exec() as any;
+  if (current) return res.status(200).json({ session: current, reused: true });
+  const currentSlot = (await findCurrentRiderSlot(riderId)).slot as any;
+  const session = await TrackingSession.create({ riderId, tenantId: req.auth?.tenantId ? objectId(req.auth.tenantId) : null, shiftId: parsed.data.shiftId ? objectId(parsed.data.shiftId) : currentSlot?._id || null, platform: parsed.data.platform, appVersion: parsed.data.appVersion, consentVersion: parsed.data.consentVersion, status: "active" });
+  return res.status(201).json({ session: session.toObject(), reused: false });
+});
+
+app.patch("/api/v1/riders/:id/tracking/sessions/:sessionId/stop", requireRole("admin", "rider", "fleet"), async (req, res) => {
+  const riderId = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
+  const sessionId = objectId(Array.isArray(req.params.sessionId) ? req.params.sessionId[0] : req.params.sessionId);
+  if (!riderId || !sessionId) return res.status(400).json({ error: "INVALID_TRACKING_SESSION" });
+  if (req.auth?.role === "rider" && !(await riderAccessForRequest(riderId, req))) return res.status(403).json({ error: "RIDER_ACCESS_DENIED" });
+  if (req.auth?.role === "fleet" && !(await fleetCanAccessRider(req, riderId))) return res.status(403).json({ error: "FLEET_RIDER_ACCESS_DENIED" });
+  const session = await TrackingSession.findOneAndUpdate({ _id: sessionId, riderId, status: { $in: ["active", "degraded"] } }, { $set: { status: "stopped", stoppedAt: new Date() } }, { new: true }).lean().exec();
+  if (!session) return res.status(404).json({ error: "TRACKING_SESSION_NOT_FOUND" });
+  return res.json({ session });
+});
+
+app.get("/api/v1/riders/:id/tracking/health", requireRole("admin", "rider", "fleet"), async (req, res) => {
+  const riderId = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
+  if (!riderId) return res.status(400).json({ error: "INVALID_RIDER_ID" });
+  if (req.auth?.role === "rider" && !(await riderAccessForRequest(riderId, req))) return res.status(403).json({ error: "RIDER_ACCESS_DENIED" });
+  const session = await TrackingSession.findOne({ riderId, status: { $in: ["active", "degraded"] } }).sort({ startedAt: -1 }).lean().exec() as any;
+  const rider = await Rider.findById(riderId).select("lastLocationAt status").lean().exec() as any;
+  const ageSeconds = rider?.lastLocationAt ? Math.max(0, Math.round((Date.now() - new Date(rider.lastLocationAt).getTime()) / 1000)) : null;
+  return res.json({ healthy: Boolean(session && ageSeconds !== null && ageSeconds <= 90), session, rider: { status: rider?.status || null, lastLocationAt: rider?.lastLocationAt || null, ageSeconds } });
+});
+
+app.post("/api/v1/riders/:id/location/batch", requireRole("admin", "rider", "fleet"), async (req, res) => {
+  const riderId = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
+  if (!riderId) return res.status(400).json({ error: "INVALID_RIDER_ID" });
+  if (req.auth?.role === "rider" && !(await riderAccessForRequest(riderId, req))) return res.status(403).json({ error: "RIDER_ACCESS_DENIED" });
+  if (req.auth?.role === "fleet" && !(await fleetCanAccessRider(req, riderId))) return res.status(403).json({ error: "FLEET_RIDER_ACCESS_DENIED" });
+  const parsed = trackingBatchSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "INVALID_LOCATION_BATCH", details: parsed.error.flatten() });
+  const session = await TrackingSession.findOne({ _id: objectId(parsed.data.sessionId), riderId, status: { $in: ["active", "degraded"] } }).lean().exec() as any;
+  if (!session) return res.status(409).json({ error: "TRACKING_SESSION_NOT_ACTIVE" });
+  const accepted: string[] = []; const duplicates: string[] = []; const rejected: string[] = [];
+  const sorted = [...parsed.data.samples].sort((a, b) => a.recordedAt.getTime() - b.recordedAt.getTime());
+  for (const sample of sorted) {
+    if (sample.recordedAt.getTime() > Date.now() + 60_000) { rejected.push(sample.sampleId); continue; }
+    try {
+      await LocationSample.create({ sampleId: sample.sampleId, sessionId: session._id, riderId, point: { type: "Point", coordinates: [sample.longitude, sample.latitude] }, accuracyMeters: sample.accuracyMeters, recordedAt: sample.recordedAt });
+      accepted.push(sample.sampleId);
+    } catch (error: any) {
+      if (error?.code === 11000) duplicates.push(sample.sampleId); else throw error;
+    }
+  }
+  const latest = sorted.at(-1);
+  if (latest && accepted.length) {
+    const rider = await Rider.findByIdAndUpdate(riderId, { $set: { location: { type: "Point", coordinates: [latest.longitude, latest.latitude] }, lastLocationAt: latest.recordedAt, ...( (await findCurrentRiderSlot(riderId)).slot as any)?.status === "active" ? { status: "available" } : {} } }, { new: true }).lean().exec() as any;
+    await TrackingSession.updateOne({ _id: session._id }, { $set: { lastSampleAt: latest.recordedAt, lastAckAt: new Date() } });
+    await trackRiderLocationForIncentive(riderId, [latest.longitude, latest.latitude]).catch(() => undefined);
+    const trackedOrders = await Order.find({ riderId, assignmentState: "assigned", status: { $in: ["picked_up", "on_the_way"] } }).select("_id publicCode restaurantId customerId tenantId status assignmentState").lean().exec() as any[];
+    await Promise.all(trackedOrders.map((order) => publishRiderLocationEvents(order, rider))).catch(() => undefined);
+  }
+  return res.status(202).json({ accepted, duplicates, rejected, serverTime: new Date().toISOString(), nextUploadAfterSeconds: 10 });
+});
+
 app.post("/api/v1/riders/:id/location", requireRole("admin", "rider", "fleet"), async (req, res) => {
   const parsed = riderLocationSchema.safeParse({ ...req.body, riderId: req.params.id });
   if (!parsed.success) return res.status(400).json({ error: "INVALID_LOCATION", details: parsed.error.flatten() });
@@ -2133,6 +2202,12 @@ app.post("/api/v1/riders/:id/location", requireRole("admin", "rider", "fleet"), 
   const statusUpdate = activeSlot?.status === "active" ? { status: "available" } : {};
   const rider = await Rider.findByIdAndUpdate(id, { $set: { location: { type: "Point", coordinates: [parsed.data.longitude, parsed.data.latitude] }, lastLocationAt: new Date(), ...statusUpdate } }, { new: true }).lean().exec() as any;
   if (!rider) return res.status(404).json({ error: "RIDER_NOT_FOUND" });
+  const nativeSessionId = objectId(req.header("x-piki-tracking-session") || "");
+  if (nativeSessionId) {
+    const recordedAt = new Date();
+    await LocationSample.create({ sampleId: `native:${nativeSessionId}:${recordedAt.getTime()}:${parsed.data.latitude}:${parsed.data.longitude}`, sessionId: nativeSessionId, riderId: id, point: { type: "Point", coordinates: [parsed.data.longitude, parsed.data.latitude] }, accuracyMeters: parsed.data.accuracy ?? 0, recordedAt }).catch((error: any) => { if (error?.code !== 11000) throw error; });
+    await TrackingSession.updateOne({ _id: nativeSessionId, riderId: id, status: { $in: ["active", "degraded"] } }, { $set: { lastSampleAt: recordedAt, lastAckAt: recordedAt } });
+  }
   await trackRiderLocationForIncentive(id, [parsed.data.longitude, parsed.data.latitude]).catch((error) => console.error("Rider incentive location tracking failed", error instanceof Error ? error.message : error));
   const trackedOrders = await Order.find({ riderId: id, assignmentState: "assigned", status: { $in: ["picked_up", "on_the_way"] } }).select("_id publicCode restaurantId customerId tenantId status assignmentState").lean().exec() as any[];
   await Promise.all(trackedOrders.map((order) => publishRiderLocationEvents(order, rider))).catch((error) => console.warn("Realtime rider location event failed", error instanceof Error ? error.message : error));

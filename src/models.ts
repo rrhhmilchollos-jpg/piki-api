@@ -88,6 +88,31 @@ const realtimeEventSchema = new Schema({
 realtimeEventSchema.index({ channel: 1, audienceKey: 1, _id: 1 });
 realtimeEventSchema.index({ dedupeKey: 1 }, { unique: true, sparse: true });
 realtimeEventSchema.index({ createdAt: 1 }, { expireAfterSeconds: 86_400 });
+const trackingSessionSchema = new Schema({
+  tenantId: { type: Schema.Types.ObjectId, ref: "Tenant", default: null, index: true },
+  riderId: { type: Schema.Types.ObjectId, ref: "Rider", required: true, index: true },
+  shiftId: { type: Schema.Types.ObjectId, ref: "RiderSlot", default: null, index: true },
+  status: { type: String, enum: ["active", "stopped", "degraded"], default: "active", index: true },
+  platform: { type: String, enum: ["ios", "android", "web"], required: true },
+  appVersion: { type: String, default: "unknown", maxlength: 80 },
+  consentVersion: { type: String, required: true, maxlength: 80 },
+  startedAt: { type: Date, default: Date.now, index: true },
+  stoppedAt: { type: Date, default: null },
+  lastSampleAt: { type: Date, default: null },
+  lastAckAt: { type: Date, default: null },
+}, { timestamps: true, collection: "tracking_sessions" });
+trackingSessionSchema.index({ riderId: 1, status: 1, startedAt: -1 });
+const locationSampleSchema = new Schema({
+  sampleId: { type: String, required: true, unique: true, index: true },
+  sessionId: { type: Schema.Types.ObjectId, ref: "TrackingSession", required: true, index: true },
+  riderId: { type: Schema.Types.ObjectId, ref: "Rider", required: true, index: true },
+  point: { type: geoPoint, required: true },
+  accuracyMeters: { type: Number, required: true, min: 0, max: 10_000 },
+  recordedAt: { type: Date, required: true, index: true },
+  receivedAt: { type: Date, default: Date.now },
+}, { timestamps: true, collection: "location_samples" });
+locationSampleSchema.index({ riderId: 1, recordedAt: -1 });
+locationSampleSchema.index({ receivedAt: 1 }, { expireAfterSeconds: 2_592_000 });
 const pushSubscriptionSchema = new Schema({
   tenantId: { type: Schema.Types.ObjectId, ref: "Tenant", default: null, index: true },
   surface: { type: String, enum: ["customer", "partner", "fleet", "admin", "rider"], required: true, index: true },
@@ -257,6 +282,8 @@ export const PushSubscription = mongoose.models.PushSubscription || mongoose.mod
 export const Notification = mongoose.models.Notification || mongoose.model("Notification", notificationSchema);
 export const RealtimeEvent = mongoose.models.RealtimeEvent || mongoose.model("RealtimeEvent", realtimeEventSchema);
 export const RiderAssignmentReservation = mongoose.models.RiderAssignmentReservation || mongoose.model("RiderAssignmentReservation", riderAssignmentReservationSchema);
+export const TrackingSession = mongoose.models.TrackingSession || mongoose.model("TrackingSession", trackingSessionSchema);
+export const LocationSample = mongoose.models.LocationSample || mongoose.model("LocationSample", locationSampleSchema);
 
 export async function ensureIndexes() {
   // Remove unique indexes from older schema versions before initialization.
@@ -266,7 +293,7 @@ export async function ensureIndexes() {
     }
   }
   await Promise.all([PartnerLocalityGroup.syncIndexes(), Fleet.syncIndexes(), Zone.syncIndexes(), RiderSlot.syncIndexes(), RiderReferralProfile.syncIndexes(), RiderShiftIncentiveMetric.syncIndexes(), RiderIncentiveEntry.syncIndexes(), RiderIncentiveBudget.syncIndexes()]);
-  await Promise.all([Tenant.init(), TenantMembership.init(), Restaurant.init(), PartnerAsset.init(), PartnerLocalityGroup.init(), Fleet.init(), Order.init(), Zone.init(), StripeEvent.init(), CashLedgerEntry.init(), DispatchDecision.init(), RiderIncident.init(), RiderOrderMessage.init(), RiderApplication.init(), PartnerLead.init(), RiderLead.init(), CustomerAccount.init(), RiderSlot.init(), SignatureRequest.init(), PasskeyCredential.init(), PushSubscription.init(), Notification.init(), RealtimeEvent.init(), RiderAssignmentReservation.init(), EmployeeAccount.init(), AccessAuthorization.init(), OnboardingRequest.init(), RiderReferralProfile.init(), RiderShiftIncentiveMetric.init(), RiderIncentiveEntry.init(), RiderIncentiveBudget.init()]);
+  await Promise.all([Tenant.init(), TenantMembership.init(), Restaurant.init(), PartnerAsset.init(), PartnerLocalityGroup.init(), Fleet.init(), Order.init(), Zone.init(), StripeEvent.init(), CashLedgerEntry.init(), DispatchDecision.init(), RiderIncident.init(), RiderOrderMessage.init(), RiderApplication.init(), PartnerLead.init(), RiderLead.init(), CustomerAccount.init(), RiderSlot.init(), SignatureRequest.init(), PasskeyCredential.init(), PushSubscription.init(), Notification.init(), RealtimeEvent.init(), RiderAssignmentReservation.init(), TrackingSession.init(), LocationSample.init(), EmployeeAccount.init(), AccessAuthorization.init(), OnboardingRequest.init(), RiderReferralProfile.init(), RiderShiftIncentiveMetric.init(), RiderIncentiveEntry.init(), RiderIncentiveBudget.init()]);
   const ridersWithoutCode = await Rider.find({ $or: [{ riderCode: { $exists: false } }, { riderCode: null }, { riderCode: "" }] }).select("_id").lean().exec();
   for (const rider of ridersWithoutCode) {
     const base = `PIKI-R-${String(rider._id).slice(-6).toUpperCase()}`;
