@@ -10,6 +10,56 @@ export type NotificationPrincipal = {
   tenantId: string | null;
 };
 
+type DocumentUploadEmailInput = {
+  requestId: string;
+  subjectType: "rider_application" | "restaurant";
+  subjectName: string;
+  subjectEmail: string;
+  uploadedTypes: string[];
+  uploadedFiles: string[];
+  completed: boolean;
+};
+
+function escapeEmailHtml(value: string): string {
+  return value.replace(/[&<>"']/g, (character) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[character] || character);
+}
+
+export async function sendDocumentUploadEmail(input: DocumentUploadEmailInput): Promise<void> {
+  const apiKey = String(process.env.RESEND_API_KEY || "").trim();
+  if (!apiKey) {
+    console.warn("Document upload email skipped: RESEND_API_KEY is not configured");
+    return;
+  }
+  const ownerEmail = String(process.env.PIKI_OWNER_EMAIL || "rrhh.milchollos@gmail.com").trim().toLowerCase();
+  const configuredRecipients = String(process.env.PIKI_DOCUMENT_NOTIFICATION_EMAILS || "").split(",").map((email) => email.trim().toLowerCase()).filter(Boolean);
+  const recipients = [...new Set([ownerEmail, ...configuredRecipients])].filter((email) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email));
+  if (!recipients.length) return;
+  const kind = input.subjectType === "restaurant" ? "Partner" : "Rider";
+  const safeName = escapeEmailHtml(input.subjectName || kind);
+  const safeFiles = input.uploadedFiles.map(escapeEmailHtml).join(", ");
+  const status = input.completed ? "El expediente ya tiene todos los documentos solicitados." : "El expediente todavía tiene documentos pendientes.";
+  const from = String(process.env.PIKI_EMAIL_FROM || "PIKI <noreply@pikidelivery.com>").trim();
+  const dedupeKey = `piki-document-upload-${input.requestId}-${input.uploadedTypes.slice().sort().join("-")}-${input.uploadedFiles.slice().sort().join("-")}`.slice(0, 240);
+  try {
+    const response = await fetch("https://api.resend.com/emails", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json", "Idempotency-Key": dedupeKey },
+      body: JSON.stringify({
+        from,
+        to: recipients,
+        subject: `PIKI · Documentación recibida · ${kind} · ${input.subjectName}`,
+        html: `<div style="font-family:Arial,sans-serif;line-height:1.5;color:#172033"><h2>Documentación recibida</h2><p>Se han subido documentos para <strong>${safeName}</strong> (${kind}).</p><p><strong>Archivos:</strong> ${safeFiles || "No indicado"}</p><p>${escapeEmailHtml(status)}</p><p>Accede a PIKI Admin para revisar y validar el expediente.</p></div>`,
+        text: `Documentación recibida para ${input.subjectName} (${kind}). Archivos: ${input.uploadedFiles.join(", ")}. ${status} Accede a PIKI Admin para revisar el expediente.`,
+        headers: { "X-PIKI-Document-Request": input.requestId },
+      }),
+      signal: AbortSignal.timeout(8_000),
+    });
+    if (!response.ok) console.warn("Document upload email failed", response.status, await response.text().catch(() => ""));
+  } catch (error) {
+    console.warn("Document upload email error", error instanceof Error ? error.message : "unknown error");
+  }
+}
+
 type RealtimeNotificationInput = {
   eventId: string;
   channel: "partner" | "fleet" | "admin" | "rider" | "customer";
