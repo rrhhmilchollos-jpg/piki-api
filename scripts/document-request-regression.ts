@@ -3,7 +3,7 @@ import mongoose from "mongoose";
 import nodemailer from "nodemailer";
 import { buildOnboardingScope } from "../src/onboardingScope.js";
 import { DocumentRequest } from "../src/models.js";
-import { sendLeadContactEmail } from "../src/corporateEmail.js";
+import { sendLeadContactEmail, verifyCorporateEmailConnection } from "../src/corporateEmail.js";
 const platformId = "111111111111111111111111";
 const tenantId = "222222222222222222222222";
 assert.deepEqual(buildOnboardingScope(platformId, true), { $or: [{ tenantId: new mongoose.Types.ObjectId(platformId) }, { tenantId: null }] });
@@ -54,9 +54,11 @@ try {
  (nodemailer as any).createTransport = (options: any) => {
   assert.equal(options.port, 465); assert.equal(options.secure, true);
   assert.equal(options.auth.user, "rrhh@pikidelivery.com");
-  return { sendMail: async (mail: any) => { smtpMessages++; assert.equal(mail.to, input.recipientEmail); assert.equal(mail.replyTo, "rrhh@pikidelivery.com"); return { accepted: [input.recipientEmail], messageId: "mock-smtp-message" }; }, close: () => {} };
+  return { verify: async () => true, sendMail: async (mail: any) => { smtpMessages++; assert.equal(mail.to, input.recipientEmail); assert.equal(mail.replyTo, "rrhh@pikidelivery.com"); return { accepted: [input.recipientEmail], messageId: "mock-smtp-message" }; }, close: () => {} };
  };
  assert.deepEqual(await sendLeadContactEmail(input), { sent: true, providerId: "mock-smtp-message" });
+ assert.equal(smtpMessages, 1);
+ assert.deepEqual(await verifyCorporateEmailConnection(), { provider: "smtp", configured: true, authenticated: true });
  assert.equal(smtpMessages, 1);
  console.log("PASS: SMTP autenticado y cifrado, remitente RRHH y destinatario fijo (transporte simulado).");
 } finally {

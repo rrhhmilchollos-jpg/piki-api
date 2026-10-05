@@ -7,6 +7,17 @@ export function corporateEmailConfiguration() {
   const resend = Boolean(process.env.RESEND_API_KEY?.trim());
   return { configured: smtp || resend, provider: smtp ? "smtp" : resend ? "resend" : "none", from: String(process.env.PIKI_EMAIL_FROM || "PIKI · Recursos Humanos <rrhh@pikidelivery.com>").trim(), replyTo: "rrhh@pikidelivery.com" };
 }
+export async function verifyCorporateEmailConnection(): Promise<{ provider: string; configured: boolean; authenticated: boolean; error?: string }> {
+  const configuration = corporateEmailConfiguration();
+  if (!configuration.configured) return { provider: "none", configured: false, authenticated: false, error: "CORPORATE_EMAIL_NOT_CONFIGURED" };
+  if (configuration.provider !== "smtp") return { provider: configuration.provider, configured: true, authenticated: false, error: "VERIFICATION_REQUIRES_SMTP" };
+  const port = Number(process.env.SMTP_PORT || 465);
+  const transport = nodemailer.createTransport({ host: process.env.SMTP_HOST!.trim(), port, secure: port === 465, requireTLS: port !== 465, auth: { user: process.env.SMTP_USER!.trim(), pass: process.env.SMTP_PASSWORD || process.env.SMTP_PASS }, connectionTimeout: 8_000, greetingTimeout: 8_000, socketTimeout: 12_000, tls: { minVersion: "TLSv1.2", rejectUnauthorized: true } });
+  try { await transport.verify(); return { provider: "smtp", configured: true, authenticated: true }; }
+  catch (error) { return { provider: "smtp", configured: true, authenticated: false, error: (error as { code?: string }).code || "SMTP_VERIFICATION_FAILED" }; }
+  finally { transport.close(); }
+}
+
 export function escapeCorporateHtml(value: string) {
   return value.replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c] || c);
 }
