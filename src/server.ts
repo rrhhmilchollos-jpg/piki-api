@@ -214,7 +214,7 @@ const riderSlotCreateSchema = riderSlotSchema.extend({ riderId: z.string().regex
 const riderSlotWeekSchema = riderSlotCreateSchema.extend({ weekdays: z.array(z.number().int().min(0).max(6)).min(1).max(7).default([0, 1, 2, 3, 4, 5, 6]) });
 const riderDocumentInputSchema = z.object({ type: z.enum(["identity", "residence_permit", "social_security_number", "bank_certificate", "profile_photo", "driving_license", "insurance", "vehicle_registration", "vehicle_technical_sheet", "scooter_responsible_declaration", "dgt_mvp_homologation", "work_authorization_confirmation", "ppe_and_safety", "other"]), fileName: z.string().min(1).max(180), mimeType: z.string().min(1).max(120), sizeBytes: z.number().int().min(1).max(2_500_000), sha256: z.string().regex(/^[a-f0-9]{64}$/i), contentBase64: z.string().min(1).max(3_500_000) });
 const riderApplicationSchema = z.object({ name: z.string().min(2).max(160), email: z.string().email(), phone: z.string().min(6).max(40), city: z.string().min(2).max(120), vehicle: z.enum(["bike", "electric_bike", "electric_scooter", "motorcycle", "scooter", "car"]), availability: z.string().min(2).max(160), socialSecurityNumber: z.string().min(4).max(40), identityVerificationMethod: z.literal("online_scan"), safetyDeclarationAccepted: z.literal(true), documents: z.array(riderDocumentInputSchema).min(3).max(12), website: z.string().max(0).optional() });
-const documentRequestSubjectSchema = z.enum(["rider_application", "restaurant"]);
+const documentRequestSubjectSchema = z.enum(["rider_application", "restaurant", "rider_lead", "partner_lead"]);
 const documentRequestRequirementInputSchema = z.object({ type: z.string().regex(/^[a-z0-9_]{2,80}$/), label: z.string().trim().min(2).max(160), description: z.string().trim().max(500).default("") });
 const documentRequestCreateSchema = z.object({ subjectType: documentRequestSubjectSchema, subjectId: z.string().regex(/^[a-f\d]{24}$/), message: z.string().trim().min(10).max(2000), dueAt: z.coerce.date().nullable().optional(), requirements: z.array(documentRequestRequirementInputSchema).min(1).max(12) });
 const publicDocumentUploadSchema = z.object({ documents: z.array(z.object({ type: z.string().regex(/^[a-z0-9_]{2,80}$/), fileName: z.string().trim().min(1).max(180), mimeType: z.enum(["application/pdf", "image/jpeg", "image/png"]), sizeBytes: z.number().int().min(1).max(2_500_000), sha256: z.string().regex(/^[a-f0-9]{64}$/i), contentBase64: z.string().min(1).max(3_500_000) })).min(1).max(5) });
@@ -1427,10 +1427,16 @@ function normalizeDocumentBytes(contentBase64: string, sizeBytes: number, mimeTy
   if (digest !== sha256.toLowerCase()) throw new Error("DOCUMENT_CHECKSUM_MISMATCH");
   return { bytes, contentBase64: rawBase64 };
 }
-async function documentRequestSubject(subjectType: "rider_application" | "restaurant", subjectId: mongoose.Types.ObjectId, scope: Record<string, unknown>) {
+type DocumentRequestSubjectType = "rider_application" | "restaurant" | "rider_lead" | "partner_lead";
+async function documentRequestSubject(subjectType: DocumentRequestSubjectType, subjectId: mongoose.Types.ObjectId, scope: Record<string, unknown>) {
   if (subjectType === "rider_application") {
     const subject = await RiderApplication.findOne({ _id: subjectId, ...scope }).select("name email").lean().exec() as any;
     return subject ? { id: subject._id as mongoose.Types.ObjectId, recipientName: String(subject.name || "Rider"), recipientEmail: String(subject.email || "").toLowerCase() } : null;
+  }
+  if (subjectType === "rider_lead" || subjectType === "partner_lead") {
+    const Model = subjectType === "rider_lead" ? RiderLead : PartnerLead;
+    const subject = await Model.findOne({ _id: subjectId, ...scope }).select("name email").lean().exec() as any;
+    return subject ? { id: subject._id as mongoose.Types.ObjectId, recipientName: String(subject.name || (subjectType === "rider_lead" ? "Rider" : "Partner")), recipientEmail: String(subject.email || "").toLowerCase() } : null;
   }
   const subject = await Restaurant.findOne({ _id: subjectId, ...scope }).select("name email partnerProfile").lean().exec() as any;
   return subject ? { id: subject._id as mongoose.Types.ObjectId, recipientName: String(subject.name || "Comercio"), recipientEmail: String(subject.email || "").toLowerCase(), hasProfile: Boolean(subject.partnerProfile) } : null;
@@ -1456,7 +1462,7 @@ app.post("/api/v1/admin/document-requests", requireRole("admin"), async (req, re
   const subjectId = objectId(parsed.data.subjectId);
   const createdBy = objectId(String(req.auth?.employeeId || ""));
   if (!subjectId || !createdBy) return res.status(401).json({ error: "AUTH_REQUIRED" });
-  const allowedTypes = parsed.data.subjectType === "rider_application" ? riderDocumentRequestTypes : partnerDocumentRequestTypes;
+  const allowedTypes = parsed.data.subjectType === "rider_application" || parsed.data.subjectType === "rider_lead" ? riderDocumentRequestTypes : partnerDocumentRequestTypes;
   const requestedTypes = parsed.data.requirements.map((item) => item.type);
   if (requestedTypes.some((type) => !allowedTypes.has(type)) || new Set(requestedTypes).size !== requestedTypes.length) return res.status(400).json({ error: "INVALID_DOCUMENT_REQUIREMENTS" });
   const subject = await documentRequestSubject(parsed.data.subjectType, subjectId, tenantScope(req));
@@ -1521,8 +1527,12 @@ app.post("/api/v1/public/document-requests/:token/documents", async (req, res) =
   if (requestState.request.subjectType === "rider_application") {
     const result = await RiderApplication.updateOne({ _id: requestState.request.subjectId }, { $pull: { documents: { type: { $in: uploadedTypes } } }, $push: { documents: { $each: subjectDocuments } } } as any).exec();
     if (!result.matchedCount) return res.status(410).json({ error: "DOCUMENT_REQUEST_SUBJECT_GONE" });
-  } else {
+  } else if (requestState.request.subjectType === "restaurant") {
     const result = await Restaurant.updateOne({ _id: requestState.request.subjectId, "partnerProfile": { $exists: true } }, { $pull: { "partnerProfile.documents": { type: { $in: uploadedTypes } } }, $push: { "partnerProfile.documents": { $each: subjectDocuments } } } as any).exec();
+    if (!result.matchedCount) return res.status(410).json({ error: "DOCUMENT_REQUEST_SUBJECT_GONE" });
+  } else {
+    const Model = requestState.request.subjectType === "rider_lead" ? RiderLead : PartnerLead;
+    const result = await Model.updateOne({ _id: requestState.request.subjectId }, { $pull: { documents: { type: { $in: uploadedTypes } } }, $push: { documents: { $each: subjectDocuments } } } as any).exec();
     if (!result.matchedCount) return res.status(410).json({ error: "DOCUMENT_REQUEST_SUBJECT_GONE" });
   }
   const existingMetadata = (requestState.request.documents || []).filter((document: any) => !uploadedTypes.includes(document.type));

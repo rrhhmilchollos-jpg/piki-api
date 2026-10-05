@@ -12,7 +12,7 @@ export type NotificationPrincipal = {
 
 type DocumentUploadEmailInput = {
   requestId: string;
-  subjectType: "rider_application" | "restaurant";
+  subjectType: "rider_application" | "restaurant" | "rider_lead" | "partner_lead";
   subjectName: string;
   subjectEmail: string;
   uploadedTypes: string[];
@@ -34,7 +34,7 @@ export async function sendDocumentUploadEmail(input: DocumentUploadEmailInput): 
   const configuredRecipients = String(process.env.PIKI_DOCUMENT_NOTIFICATION_EMAILS || "").split(",").map((email) => email.trim().toLowerCase()).filter(Boolean);
   const recipients = [...new Set([ownerEmail, ...configuredRecipients])].filter((email) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email));
   if (!recipients.length) return;
-  const kind = input.subjectType === "restaurant" ? "Partner" : "Rider";
+  const kind = input.subjectType === "restaurant" || input.subjectType === "partner_lead" ? "Partner" : "Rider";
   const safeName = escapeEmailHtml(input.subjectName || kind);
   const safeFiles = input.uploadedFiles.map(escapeEmailHtml).join(", ");
   const status = input.completed ? "El expediente ya tiene todos los documentos solicitados." : "El expediente todavía tiene documentos pendientes.";

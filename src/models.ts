@@ -193,7 +193,7 @@ const documentRequestRequirementSchema = new Schema({ type: { type: String, requ
 const documentRequestDocumentSchema = new Schema({ type: { type: String, required: true, trim: true, maxlength: 80 }, fileName: { type: String, required: true, trim: true, maxlength: 180 }, mimeType: { type: String, required: true, trim: true, maxlength: 120 }, sizeBytes: { type: Number, required: true, min: 1, max: 2_500_000 }, sha256: { type: String, required: true, match: /^[a-f0-9]{64}$/i }, uploadedAt: { type: Date, default: Date.now } }, { _id: false });
 const documentRequestSchema = new Schema({
   tenantId: { type: Schema.Types.ObjectId, ref: "Tenant", default: null, index: true },
-  subjectType: { type: String, enum: ["rider_application", "restaurant"], required: true, index: true },
+  subjectType: { type: String, enum: ["rider_application", "restaurant", "rider_lead", "partner_lead"], required: true, index: true },
   subjectId: { type: Schema.Types.ObjectId, required: true, index: true },
   recipientName: { type: String, required: true, trim: true, maxlength: 160 },
   recipientEmail: { type: String, required: true, trim: true, lowercase: true, maxlength: 254 },
