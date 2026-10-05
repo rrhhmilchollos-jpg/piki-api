@@ -1164,6 +1164,21 @@ app.patch("/api/v1/admin/restaurants/:id/status", requireRole("admin"), async (r
   return res.json({ restaurant, partnerAccount: partnerAccount ? { id: String(partnerAccount._id), access: parsed.data.status === "approved" ? "enabled" : "disabled" } : null });
 });
 
+app.patch("/api/v1/admin/restaurants/:id/demo-visibility", requireOwner(), async (req, res) => {
+  const idParam = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+  const id = objectId(idParam);
+  if (!id) return res.status(400).json({ error: "INVALID_RESTAURANT_ID" });
+  const parsed = z.object({ name: z.string().trim().min(2).max(160), isActive: z.boolean() }).safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "INVALID_DEMO_VISIBILITY", details: parsed.error.flatten() });
+  const restaurant = await Restaurant.findOneAndUpdate(
+    { _id: id, slug: "kfc-xativa", onboardingStatus: "approved" },
+    { $set: { name: parsed.data.name, isActive: parsed.data.isActive } },
+    { new: true },
+  ).select("_id slug name isActive onboardingStatus category cuisine locality menu").lean().exec() as any;
+  if (!restaurant) return res.status(404).json({ error: "KFC_XATIVA_QA_NOT_FOUND_OR_NOT_APPROVED" });
+  return res.json({ updated: true, restaurant });
+});
+
 app.get("/api/v1/admin/restaurants/:id/documents", requireRole("admin"), async (req, res) => {
   const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
   if (!id) return res.status(400).json({ error: "INVALID_RESTAURANT_ID" });
