@@ -2518,6 +2518,7 @@ app.get("/api/v1/riders/:id/slots", requireRole("admin", "rider", "fleet"), asyn
   if (req.auth?.role === "rider" && !(await riderAccessForRequest(riderId, req))) return res.status(403).json({ error: "RIDER_ACCESS_DENIED" });
   if (req.auth?.role === "fleet" && !(await fleetCanAccessRider(req, riderId))) return res.status(403).json({ error: "FLEET_RIDER_ACCESS_DENIED" });
   const slots = await RiderSlot.find({ riderId, ...tenantScope(req) }).sort({ date: 1, startTime: 1 }).limit(500).lean().exec();
+  res.setHeader("Cache-Control", "no-store, max-age=0");
   return res.json({ riderId, slots });
 });
 
@@ -2576,6 +2577,7 @@ app.get("/api/v1/riders/:id/shift", requireRole("admin", "rider", "fleet"), asyn
   if (!(await canAccessRiderShift(riderId, req))) return res.status(403).json({ error: "RIDER_ACCESS_DENIED" });
   const { now, slot, selfStartAllowed } = await findCurrentRiderSlot(riderId);
   const visibleSlot = slot || await findNextRiderSlot(riderId, now);
+  res.setHeader("Cache-Control", "no-store, max-age=0");
   return res.json({ rider: { id: rider._id, riderCode: rider.riderCode, status: rider.status }, now, serverClock: now, eligible: Boolean(slot) || selfStartAllowed, selfStartAllowed, shift: visibleSlot });
 });
 
