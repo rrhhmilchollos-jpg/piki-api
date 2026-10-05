@@ -72,6 +72,9 @@ try {
     { upsert: true, new: true, setDefaultsOnInsert: true },
   ).lean();
 
+  if (!restaurant || Array.isArray(restaurant) || !rider || Array.isArray(rider)) {
+    throw new Error("QA seed did not return the expected restaurant and rider");
+  }
   console.log(JSON.stringify({ ok: true, dbName, restaurantId: restaurant._id, restaurantSlug, menuItemId: "qa-burger-001", riderId: rider._id, riderEmail, riderCode: rider.riderCode }, null, 2));
 } finally {
   await mongoose.disconnect();
