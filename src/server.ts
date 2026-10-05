@@ -732,7 +732,7 @@ app.get("/api/v1/catalog/restaurants", async (req, res) => {
   const category = typeof req.query.category === "string" ? req.query.category.trim() : "";
   const cacheKey = `${query}|${category}`;
   const cached = catalogCache.get(cacheKey);
-  if (cached && cached.expiresAt > Date.now()) { res.setHeader("Cache-Control", "public, max-age=300, s-maxage=300, stale-while-revalidate=600, stale-if-error=900"); return res.json(cached.body); }
+  if (cached && cached.expiresAt > Date.now()) { res.setHeader("Cache-Control", "public, max-age=30, s-maxage=30, stale-while-revalidate=60, stale-if-error=120"); return res.json(cached.body); }
   const shared = await sharedCacheGet<{ restaurants: unknown[] }>(`piki:catalog:${cacheKey}`);
   if (shared) { catalogCache.set(cacheKey, { expiresAt: Date.now() + CATALOG_CACHE_MS, body: shared }); res.setHeader("Cache-Control", "public, max-age=30, s-maxage=30, stale-while-revalidate=60, stale-if-error=120"); return res.json(shared); }
   const filter: Record<string, unknown> = { ...CUSTOMER_CATALOG_RESTAURANT_FILTER };
