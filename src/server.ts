@@ -1121,7 +1121,7 @@ app.patch("/api/v1/admin/restaurants/:id/customer-name", requireOwner(), async (
   const idParam = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
   const id = objectId(idParam);
   if (!id) return res.status(400).json({ error: "INVALID_RESTAURANT_ID" });
-  const parsed = z.object({ name: z.literal("PIKI Delivery") }).safeParse(req.body);
+  const parsed = z.object({ name: z.literal("KFC XATIVA QA") }).safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_CUSTOMER_RESTAURANT_NAME", details: parsed.error.flatten() });
   const restaurant = await Restaurant.findOneAndUpdate(
     { _id: id, slug: "kfc-xativa" },
