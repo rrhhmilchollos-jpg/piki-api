@@ -180,6 +180,17 @@ export async function publishRiderOfferEvent(order: any, riderId: string) {
     dedupeKey: `offer:rider:${String(order._id)}:${riderId}:${order.dispatchAttempts || 0}`,
   });
 }
+export async function publishRiderScheduleEvent(input: { riderId: string; tenantId?: string | mongoose.Types.ObjectId | null; action: "updated" | "cancelled" | "weekly_updated" }) {
+  const riderId = String(input.riderId);
+  await publishRealtimeEvent({
+    channel: "rider",
+    audienceKey: `rider:${riderId}`,
+    tenantId: input.tenantId,
+    type: "rider.schedule_updated",
+    payload: { riderId, action: input.action, updatedAt: new Date().toISOString() },
+    dedupeKey: `schedule:rider:${riderId}:${input.action}:${Date.now()}`,
+  });
+}
 
 export async function publishRiderArrivalEvent(order: any, rider: any, distanceMeters: number, source: "rider" | "gps_sweep") {
   const tenantId = validTenantId(order.tenantId);

@@ -15,7 +15,7 @@ import { EmployeeSession, issueEmployeeSession, revokeEmployeeSessions, sessionR
 import { processStripeWebhook, stripeConfigured, createSignaturitSignature, signaturitBaseUrl, signaturitConfigured, signaturitMode, signatureWebhookUrl, webhookDigest, handleCustomerTrpc, currentCustomer, setCustomerOrderDispatcher } from "./integrations/index.js";
 import { getVersionPolicy, isPikiSurface, requiresUpdate, setVersionPolicy, syncVersionPolicy, versionPolicySchema, type PikiSurface } from "./appVersion.js";
 import { publicPushConfig, revokePushSubscription, savePushSubscription } from "./push.js";
-import { publishOrderStatusEvents, publishOrderIntakeEvents, publishRiderOfferEvent, publishRiderArrivalEvent, publishRiderLocationEvents, publishRealtimeEvent, serveRealtimeEvents, startRealtimeRelay, tenantAudienceKey } from "./realtime.js";
+import { publishOrderStatusEvents, publishOrderIntakeEvents, publishRiderOfferEvent, publishRiderArrivalEvent, publishRiderLocationEvents, publishRiderScheduleEvent, publishRealtimeEvent, serveRealtimeEvents, startRealtimeRelay, tenantAudienceKey } from "./realtime.js";
 import { listNotifications, markAllNotificationsRead, markNotificationRead, sendDocumentRequestEmail, sendDocumentUploadEmail, startNotificationWorker, stopNotificationWorker, type NotificationPrincipal } from "./notifications.js";
 import { captureStripePaymentIntent, createCheckoutSession } from "./stripe.js";
 import { rankDispatchCandidates, computeMobilityAdvice, calculateSanctionDecision, defaultSanctionPolicy } from "./algorithms/index.js";
@@ -1690,6 +1690,7 @@ app.post("/api/v1/rider-slots", requireRole("admin", "fleet"), async (req, res) 
   const zone = await Zone.findOne({ ...tenantScope(req), slug: parsed.data.zoneSlug, isActive: true }).lean().exec() as any; if (!zone) return res.status(404).json({ error: "ZONE_NOT_FOUND" });
   const { riderId: _riderId, ...slotData } = parsed.data;
   const slot = await RiderSlot.findOneAndUpdate({ riderId, ...tenantScope(req), date: parsed.data.date, startTime: parsed.data.startTime }, { $set: { ...slotData, ...tenantScope(req), riderId, zoneSlug: zone.slug } }, { upsert: true, new: true }).lean().exec();
+  await publishRiderScheduleEvent({ riderId: String(riderId), tenantId: (slot as any)?.tenantId, action: "updated" });
   return res.status(201).json({ slot });
 });
 app.post("/api/v1/rider-slots/week", requireRole("admin", "fleet"), async (req, res) => {
@@ -1736,6 +1737,7 @@ app.post("/api/v1/rider-slots/week", requireRole("admin", "fleet"), async (req, 
         slots.push(slot);
       }
     });
+    await publishRiderScheduleEvent({ riderId: String(riderId), tenantId: (slots[0] as any)?.tenantId, action: "weekly_updated" });
     return res.status(201).json({ slots, count: slots.length, weekdays: parsed.data.weekdays, message: `${slots.length} turnos semanales guardados.` });
   } catch (error: any) {
     slots.length = 0;
@@ -1759,6 +1761,7 @@ app.patch("/api/v1/rider-slots/:id", requireRole("admin", "fleet"), async (req, 
   if (!zone) return res.status(404).json({ error: "ZONE_NOT_FOUND" });
   try {
     const slot = await RiderSlot.findOneAndUpdate({ _id: slotId, ...tenantScope(req) }, { $set: { ...parsed.data, zoneSlug: zone.slug } }, { new: true }).lean().exec();
+    await publishRiderScheduleEvent({ riderId: String(existing.riderId), tenantId: (slot as any)?.tenantId, action: "updated" });
     return res.json({ slot });
   } catch (error: any) {
     if (error?.code === 11000) return res.status(409).json({ error: "RIDER_SLOT_ALREADY_EXISTS", message: "Ya existe otro turno para ese rider, fecha y hora de inicio." });
@@ -1772,6 +1775,7 @@ app.delete("/api/v1/rider-slots/:id", requireRole("admin", "fleet"), async (req,
   if (!existing) return res.status(404).json({ error: "RIDER_SLOT_NOT_FOUND" });
   if (req.auth?.role === "fleet" && !(await fleetCanAccessRider(req, existing.riderId))) return res.status(403).json({ error: "FLEET_RIDER_ACCESS_DENIED" });
   const slot = await RiderSlot.findOneAndUpdate({ _id: slotId, ...tenantScope(req) }, { $set: { status: "cancelled" } }, { new: true }).lean().exec();
+  await publishRiderScheduleEvent({ riderId: String(existing.riderId), tenantId: (slot as any)?.tenantId, action: "cancelled" });
   return res.json({ slot, message: "Turno eliminado" });
 });
 
