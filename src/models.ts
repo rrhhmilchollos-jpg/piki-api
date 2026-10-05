@@ -223,6 +223,8 @@ const restaurantSchema = new Schema({
 }, { timestamps: true, collection: "restaurants" });
 restaurantSchema.index({ location: "2dsphere" }, { sparse: true });
 restaurantSchema.index({ isActive: 1, category: 1, rating: -1 });
+restaurantSchema.index({ isActive: 1, onboardingStatus: 1, promoted: -1, rating: -1, reviews: -1 });
+restaurantSchema.index({ isActive: 1, cuisine: 1, promoted: -1, rating: -1, reviews: -1 });
 
 const riderSchema = new Schema({
   tenantId: { type: Schema.Types.ObjectId, ref: "Tenant", default: null, index: true }, isTestRider: { type: Boolean, default: false, index: true }, riderCode: { type: String, unique: true, sparse: true, index: true, immutable: true }, name: { type: String, required: true }, email: { type: String, required: true, unique: true }, phone: { type: String, default: "", trim: true, maxlength: 40 }, city: { type: String, default: "", trim: true, maxlength: 120 }, availability: { type: String, default: "", trim: true, maxlength: 160 }, fleetId: { type: Schema.Types.ObjectId, ref: "Fleet", default: null }, zoneSlug: { type: String, default: null, index: true }, status: { type: String, enum: ["offline", "available", "busy", "paused"], default: "offline", index: true }, vehicle: { type: String, enum: ["bike", "electric_bike", "electric_scooter", "motorcycle", "scooter", "car"], default: "electric_scooter" }, location: { type: geoPoint, default: undefined }, lastLocationAt: { type: Date, default: null }, activeOrderId: { type: Schema.Types.ObjectId, ref: "Order", default: null }, reliabilityScore: { type: Number, min: 0, max: 1, default: 0.75 } }, { timestamps: true, collection: "riders" });

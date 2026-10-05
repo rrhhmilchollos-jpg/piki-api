@@ -24,6 +24,42 @@ function escapeEmailHtml(value: string): string {
   return value.replace(/[&<>"']/g, (character) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[character] || character);
 }
 
+type DocumentRequestEmailInput = {
+  requestId: string;
+  subjectType: DocumentUploadEmailInput["subjectType"];
+  recipientName: string;
+  recipientEmail: string;
+  message: string;
+  uploadUrl: string;
+  expiresAt: Date;
+};
+
+function documentKind(subjectType: DocumentUploadEmailInput["subjectType"]): "Rider" | "Partner" {
+  return subjectType === "restaurant" || subjectType === "partner_lead" ? "Partner" : "Rider";
+}
+
+export async function sendDocumentRequestEmail(input: DocumentRequestEmailInput): Promise<boolean> {
+  const apiKey = String(process.env.RESEND_API_KEY || "").trim();
+  if (!apiKey) { console.warn("Document request email skipped: RESEND_API_KEY is not configured"); return false; }
+  const kind = documentKind(input.subjectType);
+  const safeName = escapeEmailHtml(input.recipientName);
+  const safeMessage = escapeEmailHtml(input.message).replace(/\n/g, "<br>");
+  const safeUrl = escapeEmailHtml(input.uploadUrl);
+  const from = String(process.env.PIKI_EMAIL_FROM || "PIKI · Recursos Humanos <rrhh@pikidelivery.com>").trim();
+  const subject = kind === "Rider" ? "PIKI · Completa tu expediente de repartidor" : "PIKI · Completa el expediente de tu negocio";
+  const intro = kind === "Rider" ? "Para continuar con tu proceso de alta como repartidor/a" : "Para continuar con el alta de tu negocio como partner";
+  try {
+    const response = await fetch("https://api.resend.com/emails", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json", "Idempotency-Key": `piki-document-request-${input.requestId}` },
+      body: JSON.stringify({ from, to: [input.recipientEmail], subject, text: `Hola ${input.recipientName},\n\n${intro}.\n\n${input.message}\n\nSube tu documentación aquí: ${input.uploadUrl}\n\nEl enlace caduca el ${input.expiresAt.toLocaleDateString("es-ES")}.\n\nEquipo PIKI`, html: `<div style="background:#f7f3ed;padding:32px;font-family:Arial,sans-serif;color:#171715"><div style="max-width:620px;margin:auto;background:#fff;padding:32px;border-radius:18px"><div style="font-size:26px;font-weight:800">PIKI<span style="color:#dc5c35">.</span></div><p style="color:#dc5c35;font-size:12px;font-weight:700;letter-spacing:2px;text-transform:uppercase">${kind === "Rider" ? "Expediente rider" : "Expediente partner"}</p><h1 style="font-size:28px">Hola ${safeName}</h1><p>${intro} necesitamos que completes la documentación solicitada.</p><div style="background:#fff7d6;padding:18px;border-radius:12px;line-height:1.6">${safeMessage}</div><p style="text-align:center;margin:28px 0"><a href="${safeUrl}" style="background:#171715;color:#fff;text-decoration:none;padding:14px 22px;border-radius:10px;font-weight:700">Subir documentación segura</a></p><p style="font-size:13px;color:#66736a">Este enlace es individual, seguro y caduca el <strong>${input.expiresAt.toLocaleDateString("es-ES")}</strong>. Si tienes dudas, responde a este correo corporativo.</p><hr style="border:0;border-top:1px solid #eadfd3"><p style="font-size:12px;color:#66736a">Equipo PIKI · Pide. Recibe. Disfruta.</p></div></div>` }),
+      signal: AbortSignal.timeout(8_000),
+    });
+    if (!response.ok) { console.warn("Document request email failed", response.status, await response.text().catch(() => "")); return false; }
+    return true;
+  } catch (error) { console.warn("Document request email error", error instanceof Error ? error.message : "unknown error"); return false; }
+}
+
 export async function sendDocumentUploadEmail(input: DocumentUploadEmailInput): Promise<void> {
   const apiKey = String(process.env.RESEND_API_KEY || "").trim();
   if (!apiKey) {
@@ -34,7 +70,7 @@ export async function sendDocumentUploadEmail(input: DocumentUploadEmailInput): 
   const configuredRecipients = String(process.env.PIKI_DOCUMENT_NOTIFICATION_EMAILS || "").split(",").map((email) => email.trim().toLowerCase()).filter(Boolean);
   const recipients = [...new Set([ownerEmail, ...configuredRecipients])].filter((email) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email));
   if (!recipients.length) return;
-  const kind = input.subjectType === "restaurant" || input.subjectType === "partner_lead" ? "Partner" : "Rider";
+  const kind = documentKind(input.subjectType);
   const safeName = escapeEmailHtml(input.subjectName || kind);
   const safeFiles = input.uploadedFiles.map(escapeEmailHtml).join(", ");
   const status = input.completed ? "El expediente ya tiene todos los documentos solicitados." : "El expediente todavía tiene documentos pendientes.";

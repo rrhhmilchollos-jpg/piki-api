@@ -16,7 +16,7 @@ import { processStripeWebhook, stripeConfigured, createSignaturitSignature, sign
 import { getVersionPolicy, isPikiSurface, requiresUpdate, setVersionPolicy, syncVersionPolicy, versionPolicySchema, type PikiSurface } from "./appVersion.js";
 import { publicPushConfig, revokePushSubscription, savePushSubscription } from "./push.js";
 import { publishOrderStatusEvents, publishOrderIntakeEvents, publishRiderOfferEvent, publishRiderArrivalEvent, publishRiderLocationEvents, publishRealtimeEvent, serveRealtimeEvents, startRealtimeRelay, tenantAudienceKey } from "./realtime.js";
-import { listNotifications, markAllNotificationsRead, markNotificationRead, sendDocumentUploadEmail, startNotificationWorker, stopNotificationWorker, type NotificationPrincipal } from "./notifications.js";
+import { listNotifications, markAllNotificationsRead, markNotificationRead, sendDocumentRequestEmail, sendDocumentUploadEmail, startNotificationWorker, stopNotificationWorker, type NotificationPrincipal } from "./notifications.js";
 import { captureStripePaymentIntent, createCheckoutSession } from "./stripe.js";
 import { rankDispatchCandidates, computeMobilityAdvice, calculateSanctionDecision, defaultSanctionPolicy } from "./algorithms/index.js";
 import { createSessionToken, generateTemporaryPassword, hashPassword, hashSessionToken, verifyPassword } from "./employeeAuth.js";
@@ -44,6 +44,11 @@ const isAllowedCorsOrigin = (origin?: string) => !origin || allowedOrigins.has(o
 const corsOptions = { origin: (origin: string | undefined, callback: (error: Error | null, allowed?: boolean) => void) => callback(null, isAllowedCorsOrigin(origin)), credentials: true };
 const databaseName = process.env.MONGODB_DB || "piki";
 let databaseReady = false;
+const catalogCache = new Map<string, { expiresAt: number; body: { restaurants: unknown[] } }>();
+const geocodeCache = new Map<string, { expiresAt: number; body: any }>();
+const CATALOG_CACHE_MS = 30_000;
+const GEOCODE_CACHE_MS = 300_000;
+const boundedFetch = (input: string | URL, init: RequestInit = {}) => fetch(input, { ...init, signal: AbortSignal.timeout(1_200) });
 mongoose.connection.on("connected", () => { databaseReady = true; startRealtimeRelay(); });
 mongoose.connection.on("disconnected", () => { databaseReady = false; console.warn("MongoDB disconnected; API entering not-ready state"); });
 mongoose.connection.on("error", (error) => { databaseReady = false; console.error("MongoDB connection error", error instanceof Error ? error.message : error); });
@@ -712,6 +717,9 @@ app.post("/api/v1/signatures/signaturit/events", rateLimit(100, 60_000, "signatu
 app.get("/api/v1/catalog/restaurants", async (req, res) => {
   const query = typeof req.query.q === "string" ? req.query.q.trim().slice(0, 120).replace(/[.*+?^${}()|[\]\\]/g, "\\$&") : "";
   const category = typeof req.query.category === "string" ? req.query.category.trim() : "";
+  const cacheKey = `${query}|${category}`;
+  const cached = catalogCache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) return res.json(cached.body);
   const filter: Record<string, unknown> = { ...CUSTOMER_CATALOG_RESTAURANT_FILTER };
   if (category && category !== "Todos") filter.category = category;
   if (query) filter.$or = [{ name: { $regex: query, $options: "i" } }, { cuisine: { $regex: query, $options: "i" } }, { category: { $regex: query, $options: "i" } }];
@@ -720,39 +728,51 @@ app.get("/api/v1/catalog/restaurants", async (req, res) => {
     // partnerProfile.documents having select:false nested fields.
     .select("slug name cuisine category locality partnerGroupKey tagline etaMinutes deliveryFeeCents rating reviews promoted image accent phone address location menu isActive onboardingStatus")
     .sort({ promoted: -1, rating: -1, reviews: -1 }).lean().exec();
-  res.json({ restaurants: restaurants.map((restaurant: any) => presentCustomerCatalogRestaurant(restaurant)) });
+  const body = { restaurants: restaurants.map((restaurant: any) => presentCustomerCatalogRestaurant(restaurant)) };
+  catalogCache.set(cacheKey, { expiresAt: Date.now() + CATALOG_CACHE_MS, body });
+  res.json(body);
 });
 
 app.get("/api/v1/locations/search", async (req, res) => {
   const query = typeof req.query.q === "string" ? req.query.q.trim() : "";
   if (query.length < 3) return res.status(400).json({ error: "QUERY_TOO_SHORT" });
+  const cacheKey = `search:${query.toLowerCase()}`;
+  const cached = geocodeCache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) return res.json(cached.body);
   const url = new URL("https://nominatim.openstreetmap.org/search");
   url.searchParams.set("q", `${query}, Comunitat Valenciana, España`);
   url.searchParams.set("format", "jsonv2");
   url.searchParams.set("addressdetails", "1");
   url.searchParams.set("limit", "8");
   try {
-    const response = await fetch(url, { headers: { "User-Agent": "PIKI-Delivery/0.2 (+https://pikidelivery.com)" } });
-    if (!response.ok) return res.status(502).json({ error: "GEOCODER_UNAVAILABLE" });
+    const response = await boundedFetch(url, { headers: { "User-Agent": "PIKI-Delivery/0.2 (+https://pikidelivery.com)" } });
+    if (!response.ok) return res.json({ results: [], degraded: true });
     const rows = await response.json() as Array<{ place_id: number; display_name: string; lat: string; lon: string; type?: string; address?: Record<string, string> }>;
-    return res.json({ results: rows.map((row) => ({ id: row.place_id, label: row.display_name, latitude: Number(row.lat), longitude: Number(row.lon), type: row.type || "address", address: row.address || {} })) });
-  } catch (error) {
-    return res.status(502).json({ error: "GEOCODER_UNAVAILABLE", message: error instanceof Error ? error.message : "Geocoder unavailable" });
+    const body = { results: rows.map((row) => ({ id: row.place_id, label: row.display_name, latitude: Number(row.lat), longitude: Number(row.lon), type: row.type || "address", address: row.address || {} })) };
+    geocodeCache.set(cacheKey, { expiresAt: Date.now() + GEOCODE_CACHE_MS, body });
+    return res.json(body);
+  } catch {
+    return res.json({ results: [], degraded: true, message: "Geocoder temporalmente no disponible" });
   }
 });
 
 app.get("/api/v1/locations/reverse", async (req, res) => {
   const latitude = Number(req.query.latitude); const longitude = Number(req.query.longitude);
   if (!validateCoordinates(latitude, longitude)) return res.status(400).json({ error: "INVALID_COORDINATES" });
+  const cacheKey = `reverse:${latitude.toFixed(5)}:${longitude.toFixed(5)}`;
+  const cached = geocodeCache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) return res.json(cached.body);
   const url = new URL("https://nominatim.openstreetmap.org/reverse");
   url.searchParams.set("lat", String(latitude)); url.searchParams.set("lon", String(longitude));
   url.searchParams.set("format", "jsonv2"); url.searchParams.set("zoom", "18");
   try {
-    const response = await fetch(url, { headers: { "User-Agent": "PIKI-Delivery/0.2 (+https://pikidelivery.com)" } });
-    if (!response.ok) return res.status(502).json({ error: "GEOCODER_UNAVAILABLE" });
+    const response = await boundedFetch(url, { headers: { "User-Agent": "PIKI-Delivery/0.2 (+https://pikidelivery.com)" } });
+    if (!response.ok) return res.json({ label: `Ubicación GPS ${latitude.toFixed(5)}, ${longitude.toFixed(5)}`, latitude, longitude, degraded: true });
     const row = await response.json() as { display_name?: string };
-    return res.json({ label: String(row.display_name || `Ubicación GPS ${latitude.toFixed(5)}, ${longitude.toFixed(5)}`), latitude, longitude });
-  } catch { return res.status(502).json({ error: "GEOCODER_UNAVAILABLE" }); }
+    const body = { label: String(row.display_name || `Ubicación GPS ${latitude.toFixed(5)}, ${longitude.toFixed(5)}`), latitude, longitude };
+    geocodeCache.set(cacheKey, { expiresAt: Date.now() + GEOCODE_CACHE_MS, body });
+    return res.json(body);
+  } catch { return res.json({ label: `Ubicación GPS ${latitude.toFixed(5)}, ${longitude.toFixed(5)}`, latitude, longitude, degraded: true }); }
 });
 
 app.get("/api/v1/coverage", async (req, res) => {
@@ -1475,7 +1495,8 @@ app.post("/api/v1/admin/document-requests", requireRole("admin"), async (req, re
   await notifyOnboarding({ channel: "admin", type: "onboarding.document_request.created", entityId: String(request._id), tenantId: (request as any).tenantId, payload: { subjectType: request.subjectType, subjectId: String(subjectId) } });
   const uploadUrl = documentRequestUploadUrl(token);
   const mailtoUrl = `mailto:${encodeURIComponent(subject.recipientEmail)}?subject=${encodeURIComponent("PIKI · Documentación pendiente")}&body=${encodeURIComponent(`Hola ${subject.recipientName},\n\n${parsed.data.message}\n\nPuedes subir la documentación solicitada mediante este enlace seguro (válido hasta ${expiresAt.toLocaleDateString("es-ES")}):\n${uploadUrl}\n\nEquipo PIKI`)}`;
-  return res.status(201).json({ request: { id: String(request._id), subjectType: request.subjectType, recipientName: request.recipientName, recipientEmail: request.recipientEmail, status: request.status, dueAt: request.dueAt, expiresAt: request.expiresAt }, delivery: { uploadUrl, mailtoUrl } });
+  const emailSent = await sendDocumentRequestEmail({ requestId: String(request._id), subjectType: request.subjectType, recipientName: subject.recipientName, recipientEmail: subject.recipientEmail, message: parsed.data.message, uploadUrl, expiresAt });
+  return res.status(201).json({ request: { id: String(request._id), subjectType: request.subjectType, recipientName: request.recipientName, recipientEmail: request.recipientEmail, status: request.status, dueAt: request.dueAt, expiresAt: request.expiresAt }, delivery: { uploadUrl, mailtoUrl, emailSent } });
 });
 
 app.get("/api/v1/admin/document-requests", requireRole("admin"), async (req, res) => {

@@ -75,13 +75,22 @@ export async function publishRealtimeEvent(input: { channel: RealtimeChannel; au
   };
   // Use Mongo's unique dedupe index as the cross-instance lock. This makes
   // retries safe even when two Render instances publish the same event at once.
-  const document = input.dedupeKey
-    ? await RealtimeEvent.findOneAndUpdate(
+  let document;
+  if (input.dedupeKey) {
+    try {
+      document = await RealtimeEvent.findOneAndUpdate(
         { dedupeKey: input.dedupeKey },
         { $setOnInsert: eventData },
         { upsert: true, new: true, setDefaultsOnInsert: true },
-      ).exec()
-    : await RealtimeEvent.create(eventData);
+      ).exec();
+    } catch (error) {
+      if ((error as any)?.code !== 11000) throw error;
+      document = await RealtimeEvent.findOne({ dedupeKey: input.dedupeKey }).exec();
+    }
+  } else {
+    document = await RealtimeEvent.create(eventData);
+  }
+  if (!document) throw new Error("REALTIME_EVENT_NOT_PERSISTED");
   const event = document.toObject() as PersistedRealtimeEvent;
   emitOnce(event);
   try {
