@@ -9,7 +9,8 @@
     "start": "node dist/server.js",
     "check": "tsc --noEmit",
     "migrate:tenants": "tsx scripts/migrate-tenants.ts",
-    "dispatch:postgis": "node scripts/run-postgis-batch.mjs"
+    "dispatch:postgis": "node scripts/run-postgis-batch.mjs",
+    "seed:staging:qa": "tsx scripts/seed-staging-qa.ts"
   },
   "dependencies": {
     "@simplewebauthn/server": "^13.2.2",
