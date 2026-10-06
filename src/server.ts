@@ -2650,6 +2650,7 @@ app.post("/api/v1/riders/:id/slots", requireRole("admin", "fleet"), async (req, 
   if (overlap) return res.status(409).json({ error: "RIDER_SLOT_OVERLAP", slot: overlap });
   try {
     const slot = await RiderSlot.create({ ...parsed.data, ...tenantScope(req), riderId });
+    await publishRiderScheduleEvent({ riderId: String(riderId), tenantId: (slot as any)?.tenantId, action: "updated" });
     return res.status(201).json({ slot });
   } catch (error: any) {
     if (error?.code === 11000) return res.status(409).json({ error: "RIDER_SLOT_ALREADY_EXISTS", message: "Ya existe un slot para ese rider, fecha y hora de inicio." });
