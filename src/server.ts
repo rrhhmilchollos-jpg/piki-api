@@ -2100,6 +2100,7 @@ app.post("/api/v1/admin/support/tickets/:id/messages", requireRole("admin", "sup
   const ticket = await SupportTicket.findOneAndUpdate({ _id: id, ...tenantScope(req), ...ticketRoleScope(req), $or: [{ assignedTo: null }, { assignedTo: agent._id }] }, { $push: { messages: { senderRole: "support", senderEmployeeId: agent._id, senderName: agentDisplayName, body: parsed.data.body } }, $set: { status: "in_progress", assignedTo: agent._id, agentTypingAt: null } }, { new: true }).populate("assignedTo", "name email").lean().exec() as any;
   const riderId = await riderForSupportTicket(current);
   if (riderId) void publishRealtimeEvent({ channel: "rider", audienceKey: `rider:${riderId}`, tenantId: current.tenantId, type: "support.message", payload: { ticketId: String(id), status: ticket?.status, senderRole: "support" } });
+  void publishRealtimeEvent({ channel: "admin", audienceKey: tenantAudienceKey(current.tenantId, "admin"), tenantId: current.tenantId, type: "support.message", payload: { ticketId: String(id), status: ticket?.status, senderRole: "support" } }).catch(() => undefined);
   return res.json({ ticket });
 });
 app.patch("/api/v1/admin/support/tickets/:id/status", requireRole("admin", "support", "finance"), async (req, res) => {
@@ -2112,6 +2113,7 @@ app.patch("/api/v1/admin/support/tickets/:id/status", requireRole("admin", "supp
   if (current.assignedTo && String(current.assignedTo) !== String(agent._id)) return res.status(409).json({ error: "SUPPORT_TICKET_ASSIGNED", assignedTo: String(current.assignedTo) });
   const ticket = await SupportTicket.findOneAndUpdate({ _id: id, ...tenantScope(req), ...ticketRoleScope(req) }, { $set: { status: parsed.data.status, assignedTo: agent._id, ...(parsed.data.status === "resolved" || parsed.data.status === "closed" ? { resolvedAt: new Date() } : {}) }, $push: { actions: { action: "status_changed", actorEmployeeId, reason: parsed.data.status === "closed" ? `Conversación cerrada por ${String(agent.name || agent.email || "Agente de soporte").trim().split(/\s+/).slice(0, 2).join(" ")}.` : "", metadata: { status: parsed.data.status, agentName: String(agent.name || agent.email || "Agente de soporte").trim().split(/\s+/).slice(0, 2).join(" ") } } } }, { new: true }).populate("assignedTo", "name email").lean().exec();
   if (!ticket) return res.status(404).json({ error: "TICKET_NOT_FOUND" });
+  void publishRealtimeEvent({ channel: "admin", audienceKey: tenantAudienceKey((ticket as any).tenantId, "admin"), tenantId: (ticket as any).tenantId, type: "support.ticket_updated", payload: { ticketId: String(id), status: (ticket as any).status, senderRole: "support" } }).catch(() => undefined);
   return res.json({ ticket });
 });
 app.post("/api/v1/admin/support/orders/:id/cancel", requireRole("admin", "support"), async (req, res) => {
@@ -2155,6 +2157,7 @@ app.post("/api/v1/admin/support/tickets/:id/typing", requireRole("admin", "suppo
   const active = Boolean(req.body?.active);
   const ticket = await SupportTicket.findOneAndUpdate({ _id: req.params.id, ...tenantScope(req), ...ticketRoleScope(req), $or: [{ assignedTo: null }, { assignedTo: agent._id }] }, { $set: { agentTypingAt: active ? new Date() : null, ...(active ? { assignedTo: agent._id, status: "in_progress" } : {}) } }, { new: true }).lean().exec() as any;
   if (!ticket) return res.status(404).json({ error: "TICKET_NOT_FOUND_OR_ASSIGNED" });
+  void publishRealtimeEvent({ channel: "admin", audienceKey: tenantAudienceKey(ticket.tenantId, "admin"), tenantId: ticket.tenantId, type: "support.typing", payload: { ticketId: String(req.params.id), active, senderRole: "support" } }).catch(() => undefined);
   return res.json({ ok: true, agentTypingAt: ticket.agentTypingAt });
 });
 
