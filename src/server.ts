@@ -2429,10 +2429,11 @@ app.post("/api/v1/riders/:riderId/orders/:orderId/confirm-pickup", requireRole("
   if (!order.riderArrivedAt) return res.status(409).json({ error: "PARTNER_ARRIVAL_REQUIRED", message: "Confirma primero tu llegada al Partner con GPS." });
   if (order.status !== "ready_for_pickup") return res.status(409).json({ error: "PARTNER_NOT_READY", message: "El Partner todavía no ha marcado el pedido como listo para recoger." });
   const pickupCode = String(req.body?.pickupQr || req.body?.pickupPin || "").trim();
-  if (pickupCode && !pickupQrIsValid(order.publicCode, pickupCode)) return res.status(422).json({ error: "PICKUP_QR_INVALID", message: "El QR o PIN de recogida no es válido." });
+  if (!pickupCode) return res.status(422).json({ error: "PICKUP_QR_REQUIRED", message: "Escanea el QR o introduce el PIN que proporciona el Partner antes de confirmar la recogida." });
+  if (!pickupQrIsValid(order.publicCode, pickupCode)) return res.status(422).json({ error: "PICKUP_QR_INVALID", message: "El QR o PIN de recogida no es válido." });
   const updated = await Order.findOneAndUpdate(
     { _id: orderId, riderId, assignmentState: "assigned", riderArrivedAt: { $ne: null }, status: "ready_for_pickup", version: order.version },
-    { $set: { status: "picked_up", pickupDeadlineAt: null }, $inc: { version: 1 }, $push: { statusHistory: { status: "picked_up", actorRole: "rider", reason: pickupCode ? "Recogida confirmada por Rider con QR/PIN" : "Recogida confirmada por Rider tras llegada GPS y preparación del Partner" } } },
+    { $set: { status: "picked_up", pickupDeadlineAt: null }, $inc: { version: 1 }, $push: { statusHistory: { status: "picked_up", actorRole: "rider", reason: "Recogida confirmada por Rider con QR/PIN" } } },
     { new: true },
   ).lean().exec() as any;
   if (!updated) return res.status(409).json({ error: "ORDER_CHANGED_RETRY" });
