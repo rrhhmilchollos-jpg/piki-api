@@ -257,8 +257,11 @@ async function resolveAudience(request: Request): Promise<ResolvedAudience | nul
     return employee ? { channel: "fleet", audienceKeys: [tenantAudienceKey(employee.tenantId, "fleet")] } : null;
   }
   if (surface === "partner" && auth.role === "partner") {
-    const employee = await EmployeeAccount.findById(auth.employeeId).select("restaurantId").lean().exec() as any;
-    return employee?.restaurantId ? { channel: "partner", audienceKeys: [`restaurant:${String(employee.restaurantId)}`] } : null;
+    const employee = await EmployeeAccount.findById(auth.employeeId).select("restaurantId restaurantIds").lean().exec() as any;
+    const assignedRestaurantIds = [...new Set([...(Array.isArray(employee?.restaurantIds) ? employee.restaurantIds : []), employee?.restaurantId].filter(Boolean).map(String))];
+    const requestedRestaurantId = String(request.header("x-piki-restaurant-id") || "").trim();
+    const restaurantIds = requestedRestaurantId ? assignedRestaurantIds.filter((id) => id === requestedRestaurantId) : assignedRestaurantIds;
+    return restaurantIds.length ? { channel: "partner", audienceKeys: restaurantIds.map((id) => `restaurant:${id}`) } : null;
   }
   if (surface === "rider" && auth.role === "rider") {
     const employee = await EmployeeAccount.findById(auth.employeeId).select("email").lean().exec() as any;
