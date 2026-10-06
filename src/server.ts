@@ -1968,7 +1968,7 @@ app.post("/api/v1/riders/:id/location", requireRole("admin", "rider", "fleet"), 
   if (!rider) return res.status(404).json({ error: "RIDER_NOT_FOUND" });
   const activeOrder = await Order.findOne({ riderId: id, assignmentState: "assigned", status: { $in: ["picked_up", "on_the_way"] } }).select("_id publicCode tenantId customerId status").lean().exec() as any;
   if (activeOrder?.customerId && mongoose.isValidObjectId(activeOrder.customerId)) {
-    void publishRealtimeEvent({ channel: "customer", audienceKey: `customer:${String(activeOrder.customerId)}`, tenantId: activeOrder.tenantId, type: "order.rider_location", payload: { orderId: String(activeOrder._id), publicCode: activeOrder.publicCode, status: activeOrder.status, latitude: parsed.data.latitude, longitude: parsed.data.longitude, updatedAt: Date.now() } }).catch((error) => console.warn("Realtime rider location event failed", error instanceof Error ? error.message : error));
+    void publishRealtimeEvent({ channel: "customer", audienceKey: `customer:${String(activeOrder.customerId)}`, tenantId: activeOrder.tenantId, type: "order.rider_location", payload: { orderId: String(activeOrder._id), publicCode: activeOrder.publicCode, status: activeOrder.status, refresh: true } }).catch((error) => console.warn("Realtime rider location event failed", error instanceof Error ? error.message : error));
   }
   return res.json({ rider: { id: rider._id, riderCode: rider.riderCode, status: rider.status, location: rider.location, lastLocationAt: rider.lastLocationAt } });
 });
