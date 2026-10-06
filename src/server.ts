@@ -1503,6 +1503,7 @@ app.post("/api/v1/internal/customer-orders/:publicCode/messages", async (req, re
     const body = String(req.body?.body || "").trim();
     if (!body || body.length > 500) return res.status(400).json({ error: "INVALID_MESSAGE" });
     const message = await RiderOrderMessage.create({ orderId: order._id, riderId: order.riderId, senderRole: "customer", body });
+    void publishRealtimeEvent({ channel: "rider", audienceKey: `rider:${String(order.riderId)}`, tenantId: order.tenantId, type: "order.message_created", payload: { orderId: String(order._id), publicCode: order.publicCode } }).catch(() => undefined);
     return res.status(201).json({ id: String(message._id), senderRole: message.senderRole, body: message.body, createdAt: message.createdAt });
   }
   const messages = await RiderOrderMessage.find({ orderId: order._id }).sort({ createdAt: 1 }).limit(100).lean().exec();
@@ -1827,6 +1828,7 @@ app.post("/api/v1/orders/:id/transitions", requireRole("admin", "partner", "ride
     await RiderAssignmentReservation.updateOne({ orderId: order._id, riderId: order.riderId, status: "reserved" }, { $set: { expiresAt: null } }).exec();
   }
   if (["delivered", "cancelled"].includes(parsed.data.status)) await RiderOrderMessage.deleteMany({ orderId: order._id }).exec();
+  if (["delivered", "cancelled"].includes(parsed.data.status) && order.riderId) await Rider.updateOne({ _id: order.riderId }, { $unset: { location: 1, lastLocationAt: 1 }, $set: { activeOrderId: null } }).exec();
   scheduleCustomerOrderPush(updated, parsed.data.status);
   if (["delivered", "cancelled"].includes(parsed.data.status) && order.riderId) {
     await releaseRiderOrderSlot(order._id, order.riderId);
@@ -1868,6 +1870,7 @@ app.post("/api/v1/riders/:riderId/orders/:orderId/messages", requireRole("rider"
   const parsed = riderMessageSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_MESSAGE", details: parsed.error.flatten() });
   const message = await RiderOrderMessage.create({ orderId: order._id, riderId: order.riderId, senderRole: "rider", body: parsed.data.body });
+  if (order.customerId && mongoose.isValidObjectId(order.customerId)) void publishRealtimeEvent({ channel: "customer", audienceKey: `customer:${String(order.customerId)}`, tenantId: order.tenantId, type: "order.message_created", payload: { orderId: String(order._id), publicCode: order.publicCode } }).catch(() => undefined);
   return res.status(201).json({ message });
 });
 app.post("/api/v1/riders/:riderId/orders/:orderId/confirm-pickup", requireRole("rider"), async (req, res) => {
@@ -1914,8 +1917,10 @@ app.post("/api/v1/riders/:riderId/orders/:orderId/confirm-delivery", requireRole
   if (!updated) return res.status(409).json({ error: "ORDER_CHANGED_RETRY" });
   const deliveredOrder = updated as any;
   await RiderOrderMessage.deleteMany({ orderId, riderId }).exec();
+  await Rider.updateOne({ _id: riderId }, { $unset: { location: 1, lastLocationAt: 1 }, $set: { activeOrderId: null } }).exec();
   await releaseRiderOrderSlot(orderId, riderId);
   scheduleCustomerOrderPush(deliveredOrder, "delivered");
+  await publishOrderStatusEvents(deliveredOrder, "delivered");
   return res.json({ message: order.paymentMethod === "cash" ? "Entrega confirmada y efectivo registrado en cartera." : "Entrega confirmada.", chatPurged: true, order: { id: deliveredOrder._id, publicCode: deliveredOrder.publicCode, status: deliveredOrder.status, deliveredAt: deliveredOrder.deliveredAt, paymentMethod: deliveredOrder.paymentMethod, cashCollected: Boolean(deliveredOrder.cashCollectedAt) } });
 });
 
@@ -1961,6 +1966,10 @@ app.post("/api/v1/riders/:id/location", requireRole("admin", "rider", "fleet"), 
   const statusUpdate = activeSlot?.status === "active" ? { status: "available" } : {};
   const rider = await Rider.findByIdAndUpdate(id, { $set: { location: { type: "Point", coordinates: [parsed.data.longitude, parsed.data.latitude] }, lastLocationAt: new Date(), ...statusUpdate } }, { new: true }).lean().exec() as any;
   if (!rider) return res.status(404).json({ error: "RIDER_NOT_FOUND" });
+  const activeOrder = await Order.findOne({ riderId: id, assignmentState: "assigned", status: { $in: ["picked_up", "on_the_way"] } }).select("_id publicCode tenantId customerId status").lean().exec() as any;
+  if (activeOrder?.customerId && mongoose.isValidObjectId(activeOrder.customerId)) {
+    void publishRealtimeEvent({ channel: "customer", audienceKey: `customer:${String(activeOrder.customerId)}`, tenantId: activeOrder.tenantId, type: "order.rider_location", payload: { orderId: String(activeOrder._id), publicCode: activeOrder.publicCode, status: activeOrder.status, latitude: parsed.data.latitude, longitude: parsed.data.longitude, updatedAt: Date.now() } }).catch((error) => console.warn("Realtime rider location event failed", error instanceof Error ? error.message : error));
+  }
   return res.json({ rider: { id: rider._id, riderCode: rider.riderCode, status: rider.status, location: rider.location, lastLocationAt: rider.lastLocationAt } });
 });
 app.patch("/api/v1/riders/:id/status", requireRole("admin", "rider", "fleet"), async (req, res) => {
