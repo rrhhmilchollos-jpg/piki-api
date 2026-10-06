@@ -153,5 +153,5 @@ export function rankDispatchCandidates(candidates: DispatchCandidate[], input: D
   return candidates
     .map((candidate) => scoreDispatchCandidate(candidate, input))
     .filter((decision): decision is DispatchDecision => Boolean(decision))
-    .sort((a, b) => a.score - b.score);
+    .sort((a, b) => a.pickupDistanceKm - b.pickupDistanceKm || a.score - b.score);
 }
