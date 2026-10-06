@@ -1694,7 +1694,7 @@ app.post("/api/v1/riders/:riderId/support/tickets/:ticketId/typing", requireRole
 
 app.post("/api/v1/riders/:riderId/support/tickets/:ticketId/messages", requireRole("rider"), async (req, res) => {
   const parsed = supportMessageInput.safeParse(req.body); if (!parsed.success) return res.status(400).json({ error: "INVALID_SUPPORT_MESSAGE" });
-  const riderId = objectId(String(req.params.riderId)); const ticketId = objectId(String(req.params.ticketId)); if (!riderId || !ticketId || !(await canAccessRiderShift(riderId, req))) return res.status(403).json({ error: "RIDER_ACCESS_DENIED" });
+  const riderId = objectId(String(req.params.riderId)); const ticketId = objectId(String(req.params.ticketId)); if (!riderId || !ticketId) return res.status(400).json({ error: "INVALID_SUPPORT_TICKET_REFERENCE" });
   const rider = await Rider.findOne({ _id: riderId, ...tenantScope(req) }).select("email name").lean().exec() as any; if (!rider) return res.status(404).json({ error: "RIDER_NOT_FOUND" });
   const current = await SupportTicket.findOne({ _id: ticketId, reporterEmail: rider.email, ...tenantScope(req) }).lean().exec() as any; if (!current) return res.status(404).json({ error: "TICKET_NOT_FOUND" });
   if (["resolved", "closed"].includes(current.status)) return res.status(409).json({ error: "SUPPORT_CHAT_CLOSED" });
