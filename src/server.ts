@@ -1644,6 +1644,43 @@ app.get("/api/v1/riders", requireRole("admin", "fleet"), async (req, res) => {
   return res.json({ riders });
 });
 
+const riderLifecycleStatuses = ["pending_documents", "active", "suspended", "terminated"] as const;
+app.get("/api/v1/admin/riders/directory", requireRole("admin", "fleet"), async (req, res) => {
+  const lifecycle = typeof req.query.lifecycleStatus === "string" && riderLifecycleStatuses.includes(req.query.lifecycleStatus as typeof riderLifecycleStatuses[number]) ? req.query.lifecycleStatus : undefined;
+  const riderFilter = { ...(await fleetRiderFilter(req)), isTestRider: { $ne: true }, ...(lifecycle ? { lifecycleStatus: lifecycle } : {}) };
+  const riders = await Rider.find(riderFilter).select("riderCode name email phone city availability fleetId zoneSlug status lifecycleStatus lifecycleReason lifecycleChangedAt vehicle location lastLocationAt activeOrderId reliabilityScore createdAt").sort({ name: 1 }).limit(500).lean().exec() as any[];
+  const riderIds = riders.map((rider) => rider._id);
+  const [orders, incidents] = await Promise.all([
+    Order.find({ riderId: { $in: riderIds }, status: { $in: [...activeOperationalOrderStatuses] } }).select("_id riderId publicCode displayCode status assignmentState deliveryAddress restaurantId").lean().exec(),
+    RiderIncident.find({ riderId: { $in: riderIds }, resolved: { $ne: true } }).sort({ occurredAt: -1 }).lean().exec(),
+  ]);
+  const orderByRider = new Map<string, any>();
+  for (const order of orders as any[]) orderByRider.set(String(order.riderId), order);
+  const incidentsByRider = new Map<string, any[]>();
+  for (const incident of incidents as any[]) { const key = String(incident.riderId); incidentsByRider.set(key, [...(incidentsByRider.get(key) || []), incident]); }
+  const now = Date.now();
+  const result = riders.map((rider) => {
+    const activeIncidents = incidentsByRider.get(String(rider._id)) || [];
+    const sanction = calculateSanctionDecision(activeIncidents.map((item: any) => ({ id: String(item._id), riderId: String(item.riderId), reason: item.reason, occurredAt: item.occurredAt, evidence: item.evidence, acknowledged: item.acknowledged, resolved: item.resolved })), new Date(), defaultSanctionPolicy);
+    const gpsAgeSeconds = rider.lastLocationAt ? Math.max(0, Math.round((now - new Date(rider.lastLocationAt).getTime()) / 1000)) : null;
+    const gpsState = gpsAgeSeconds !== null && gpsAgeSeconds <= 90 && rider.location?.coordinates?.length === 2 ? "fresh" : gpsAgeSeconds !== null && gpsAgeSeconds <= 600 ? "stale" : "missing";
+    const effectiveLifecycleStatus = rider.lifecycleStatus === "active" && ["review", "temporary_restriction"].includes(sanction.severity) ? "suspended" : rider.lifecycleStatus || "active";
+    return { ...rider, id: String(rider._id), activeOrder: orderByRider.get(String(rider._id)) || null, incidentCount: activeIncidents.length, sanction, gpsState, gpsAgeSeconds, effectiveLifecycleStatus };
+  });
+  return res.json({ generatedAt: new Date().toISOString(), total: result.length, statuses: riderLifecycleStatuses.map((status) => ({ status, count: result.filter((rider) => rider.effectiveLifecycleStatus === status).length })), riders: result });
+});
+
+app.patch("/api/v1/admin/riders/:id/lifecycle", requireRole("admin"), async (req, res) => {
+  const id = objectId(String(req.params.id));
+  if (!id) return res.status(400).json({ error: "INVALID_RIDER_ID" });
+  const parsed = z.object({ status: z.enum(riderLifecycleStatuses), reason: z.string().trim().max(500).default("") }).safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "INVALID_RIDER_LIFECYCLE" });
+  const rider = await Rider.findOneAndUpdate({ _id: id, ...(await fleetRiderFilter(req)) }, { $set: { lifecycleStatus: parsed.data.status, lifecycleReason: parsed.data.reason, lifecycleChangedAt: new Date(), lifecycleChangedBy: objectId(String(req.auth?.employeeId || "")), ...(parsed.data.status === "suspended" || parsed.data.status === "terminated" ? { status: "offline", activeOrderId: null } : {}) } }, { new: true }).lean().exec() as any;
+  if (!rider) return res.status(404).json({ error: "RIDER_NOT_FOUND" });
+  await publishRealtimeEvent({ channel: "admin", audienceKey: tenantAudienceKey(rider.tenantId, "admin"), tenantId: rider.tenantId, type: "rider.lifecycle_changed", payload: { riderId: String(rider._id), lifecycleStatus: rider.lifecycleStatus, reason: rider.lifecycleReason }, dedupeKey: `rider:lifecycle:${String(rider._id)}:${String(rider.lifecycleChangedAt)}` });
+  return res.json({ rider });
+});
+
 const riderZoneSchema = z.object({ zoneSlug: z.string().regex(/^[a-z0-9-]+$/).nullable() });
 app.patch("/api/v1/riders/:id/zone", requireRole("admin", "fleet"), async (req, res) => {
   const riderId = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
@@ -2471,6 +2508,7 @@ app.post("/api/v1/riders/:id/location/batch", requireRole("admin", "rider", "fle
     const rider = await Rider.findByIdAndUpdate(riderId, { $set: { location: { type: "Point", coordinates: [latest.longitude, latest.latitude] }, lastLocationAt: latest.recordedAt, ...( (await findCurrentRiderSlot(riderId)).slot as any)?.status === "active" ? { status: "available" } : {} } }, { new: true }).lean().exec() as any;
     await TrackingSession.updateOne({ _id: session._id }, { $set: { lastSampleAt: latest.recordedAt, lastAckAt: new Date() } });
     await trackRiderLocationForIncentive(riderId, [latest.longitude, latest.latitude]).catch(() => undefined);
+    void publishRealtimeEvent({ channel: "admin", audienceKey: tenantAudienceKey(rider.tenantId, "admin"), tenantId: rider.tenantId, type: "rider.location.updated", payload: { riderId: String(rider._id), riderCode: rider.riderCode, location: rider.location, lastLocationAt: rider.lastLocationAt, status: rider.status }, dedupeKey: `rider:location:${String(rider._id)}:${new Date(latest.recordedAt).getTime()}` }).catch(() => undefined);
     const trackedOrders = await Order.find({ riderId, assignmentState: "assigned", status: { $in: ["picked_up", "on_the_way"] } }).select("_id publicCode restaurantId customerId tenantId status assignmentState").lean().exec() as any[];
     await Promise.all(trackedOrders.map((order) => publishRiderLocationEvents(order, rider))).catch(() => undefined);
   }
@@ -2494,6 +2532,7 @@ app.post("/api/v1/riders/:id/location", requireRole("admin", "rider", "fleet"), 
     await TrackingSession.updateOne({ _id: nativeSessionId, riderId: id, status: { $in: ["active", "degraded"] } }, { $set: { lastSampleAt: recordedAt, lastAckAt: recordedAt } });
   }
   await trackRiderLocationForIncentive(id, [parsed.data.longitude, parsed.data.latitude]).catch((error) => console.error("Rider incentive location tracking failed", error instanceof Error ? error.message : error));
+  void publishRealtimeEvent({ channel: "admin", audienceKey: tenantAudienceKey(rider.tenantId, "admin"), tenantId: rider.tenantId, type: "rider.location.updated", payload: { riderId: String(rider._id), riderCode: rider.riderCode, location: rider.location, lastLocationAt: rider.lastLocationAt, status: rider.status }, dedupeKey: `rider:location:${String(rider._id)}:${new Date(rider.lastLocationAt).getTime()}` }).catch(() => undefined);
   const trackedOrders = await Order.find({ riderId: id, assignmentState: "assigned", status: { $in: ["picked_up", "on_the_way"] } }).select("_id publicCode restaurantId customerId tenantId status assignmentState").lean().exec() as any[];
   await Promise.all(trackedOrders.map((order) => publishRiderLocationEvents(order, rider))).catch((error) => console.warn("Realtime rider location event failed", error instanceof Error ? error.message : error));
   return res.json({ rider: { id: rider._id, riderCode: rider.riderCode, status: rider.status, location: rider.location, lastLocationAt: rider.lastLocationAt } });
@@ -3159,13 +3198,14 @@ app.get("/api/v1/admin/operations/health", requireRole("admin", "fleet"), async 
 });
 
 app.get("/api/v1/admin/operations/live", requireRole("admin"), async (_req, res) => {
-  const riders = await Rider.find({ isTestRider: { $ne: true }, location: { $exists: true } }).select("riderCode name email status vehicle location lastLocationAt activeOrderId fleetId").lean().exec() as any[];
-  const activeOrderIds = riders.map((rider) => rider.activeOrderId).filter(Boolean);
-  const orders = await Order.find({ _id: { $in: activeOrderIds } }).select("publicCode displayCode status assignmentState deliveryAddress restaurantId customerId riderId").select("+customerPhone").lean().exec() as any[];
+  const riders = await Rider.find({ isTestRider: { $ne: true } }).select("riderCode name email status lifecycleStatus lifecycleReason vehicle location lastLocationAt activeOrderId fleetId zoneSlug").lean().exec() as any[];
+  const riderIds = riders.map((rider) => rider._id);
+  const orders = await Order.find({ riderId: { $in: riderIds }, status: { $in: [...activeOperationalOrderStatuses] } }).select("publicCode displayCode status assignmentState deliveryAddress restaurantId customerId riderId").select("+customerPhone").lean().exec() as any[];
   const restaurants = await Restaurant.find({ _id: { $in: orders.map((order) => order.restaurantId) } }).select("name address").lean().exec() as any[];
   const restaurantMap = new Map(restaurants.map((restaurant) => [String(restaurant._id), restaurant]));
-  const orderMap = new Map(orders.map((order) => [String(order._id), { ...order, customerPhone: order.customerPhone || null, restaurant: restaurantMap.get(String(order.restaurantId)) || null }]));
-  return res.json({ refreshedAt: new Date().toISOString(), riders: riders.map((rider) => ({ id: rider._id, riderCode: rider.riderCode, name: rider.name, status: rider.status, vehicle: rider.vehicle, location: rider.location, lastLocationAt: rider.lastLocationAt, activeOrder: rider.activeOrderId ? orderMap.get(String(rider.activeOrderId)) || null : null })) });
+  const orderMap = new Map(orders.map((order) => [String(order.riderId), { ...order, customerPhone: order.customerPhone || null, restaurant: restaurantMap.get(String(order.restaurantId)) || null }]));
+  const now = Date.now();
+  return res.json({ refreshedAt: new Date().toISOString(), riders: riders.map((rider) => { const age = rider.lastLocationAt ? Math.max(0, Math.round((now - new Date(rider.lastLocationAt).getTime()) / 1000)) : null; return { id: String(rider._id), riderCode: rider.riderCode, name: rider.name, status: rider.status, lifecycleStatus: rider.lifecycleStatus || "active", lifecycleReason: rider.lifecycleReason || "", vehicle: rider.vehicle, location: rider.location, lastLocationAt: rider.lastLocationAt, gpsState: age !== null && age <= 90 && rider.location?.coordinates?.length === 2 ? "fresh" : age !== null && age <= 600 ? "stale" : "missing", gpsAgeSeconds: age, activeOrder: orderMap.get(String(rider._id)) || null }; }) });
 });
 
 app.get("/api/v1/riders/overview", requireRole("admin", "fleet"), async (_req, res) => {
