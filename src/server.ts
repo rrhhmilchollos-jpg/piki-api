@@ -3060,7 +3060,7 @@ app.get("/api/v1/riders/:id/offers", requireRole("rider"), async (req, res) => {
   const rider = await riderAccessForRequest(riderId, req);
   if (!rider) return res.status(403).json({ error: "RIDER_ACCESS_DENIED" });
   const offers = await Order.find({ riderId, assignmentState: { $in: ["offered", "assigned"] }, status: { $nin: ["delivered", "cancelled"] } })
-    .select("_id publicCode displayCode displayCodeDate restaurantId customerId riderId status paymentState paymentMethod totalCents assignmentState assignmentExpiresAt pickupDeadlineAt partnerPrepDeadlineAt deliveryAddress deliveryLocation items createdAt +customerPhone")
+.select("_id publicCode displayCode displayCodeDate restaurantId customerId riderId status paymentState paymentMethod subtotalCents deliveryFeeCents serviceFeeCents totalCents assignmentState assignmentExpiresAt pickupDeadlineAt partnerPrepDeadlineAt deliveryAddress deliveryLocation items createdAt +customerPhone")
     .sort({ createdAt: -1 }).limit(10).lean().exec() as any[];
   const riderProfile = await Rider.findById(riderId).select("vehicle").lean().exec() as any;
   const restaurantIds = offers.map((offer) => offer.restaurantId).filter(Boolean);
@@ -3085,13 +3085,23 @@ app.get("/api/v1/riders/:id/offers", requireRole("rider"), async (req, res) => {
       status: offer.status,
       paymentState: offer.paymentState,
       paymentMethod: offer.paymentMethod || "stripe",
+      subtotalCents: Number(offer.subtotalCents || 0),
+      deliveryFeeCents: Number(offer.deliveryFeeCents || 0),
+      serviceFeeCents: Number(offer.serviceFeeCents || 0),
       totalCents: Number(offer.totalCents || 0),
       assignmentState: offer.assignmentState,
       assignmentExpiresAt: offer.assignmentExpiresAt,
       pickupDeadlineAt: offer.pickupDeadlineAt,
-      partnerPrepDeadlineAt: offer.partnerPrepDeadlineAt || null,
+partnerPrepDeadlineAt: offer.partnerPrepDeadlineAt || null,
       preparationMinutes: offer.status === "ready_for_pickup" ? 0 : PARTNER_PREPARATION_LIMIT_MINUTES,
-      items: offer.items,
+      items: (offer.items || []).map((item: any) => ({
+        name: item.name || "Producto",
+        quantity: Number(item.quantity || 1),
+        unitPriceCents: Number(item.unitPriceCents ?? item.priceCents ?? 0),
+        priceCents: Number(item.priceCents ?? item.unitPriceCents ?? 0),
+        totalCents: Number(item.totalCents ?? ((item.unitPriceCents ?? item.priceCents ?? 0) * (item.quantity || 1))),
+        modifiers: Array.isArray(item.modifiers) ? item.modifiers : [],
+      })),
       createdAt: offer.createdAt,
       vehicle: riderProfile?.vehicle || "unknown",
       phase: phase[offer.status] || "assigned",
