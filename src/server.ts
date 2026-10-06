@@ -24,7 +24,7 @@ import { evaluateXativaCoverage } from "./coverage/xativaPolicy.js";
 import { quoteDeliveryRoute } from "./coverage/routing.js";
 import { runTenantMigration } from "./tenantMigration.js";
 import { onboardingScope } from "./onboardingScope.js";
-import { corporateEmailConfiguration, sendLeadContactEmail, verifyCorporateEmailConnection } from "./corporateEmail.js";
+import { corporateEmailConfiguration, sendCorporateEmail, sendLeadContactEmail, verifyCorporateEmailConnection } from "./corporateEmail.js";
 import { activeOperationalOrderStatuses, dispatchableOrderStatuses, dispatchablePaymentFilter, isDispatchableOrderStatus } from "./dispatchEligibility.js";
 import { canReceivePartnerLocations, partnerCan, partnerPermissions, partnerRolesForEmployee, permissionsForPartnerRoles, type PartnerPermission } from "./partnerAccess.js";
 import { awardRiderRecruitmentMilestones, claimRiderReferralCode, completeRiderShiftIncentiveTracking, incentiveProgramStatus, loadRiderIncentiveSnapshot, trackRiderLocationForIncentive, trackRiderShiftStart } from "./riderIncentives.js";
@@ -235,9 +235,9 @@ const riderSlotWeekSchema = riderSlotCreateSchema.extend({ weekdays: z.array(z.n
 const riderDocumentInputSchema = z.object({ type: z.enum(["identity", "residence_permit", "social_security_number", "bank_certificate", "profile_photo", "driving_license", "insurance", "vehicle_registration", "vehicle_technical_sheet", "scooter_responsible_declaration", "dgt_mvp_homologation", "work_authorization_confirmation", "ppe_and_safety", "other"]), fileName: z.string().min(1).max(180), mimeType: z.string().min(1).max(120), sizeBytes: z.number().int().min(1).max(2_500_000), sha256: z.string().regex(/^[a-f0-9]{64}$/i), contentBase64: z.string().min(1).max(3_500_000) });
 const riderApplicationSchema = z.object({ name: z.string().min(2).max(160), email: z.string().email(), phone: z.string().min(6).max(40), city: z.string().min(2).max(120), vehicle: z.enum(["bike", "electric_bike", "electric_scooter", "motorcycle", "scooter", "car"]), availability: z.string().min(2).max(160), socialSecurityNumber: z.string().min(4).max(40), identityVerificationMethod: z.literal("online_scan"), safetyDeclarationAccepted: z.literal(true), documents: z.array(riderDocumentInputSchema).min(3).max(12), website: z.string().max(0).optional() });
 const documentRequestSubjectSchema = z.enum(["rider_application", "restaurant", "rider_lead", "partner_lead"]);
-const documentRequestRequirementInputSchema = z.object({ type: z.string().regex(/^[a-z0-9_]{2,80}$/), label: z.string().trim().min(2).max(160), description: z.string().trim().max(500).default("") });
+const documentRequestRequirementInputSchema = z.object({ type: z.string().regex(/^[a-z0-9_]{2,80}$/), inputMode: z.enum(["file", "form"]).default("file"), label: z.string().trim().min(2).max(160), description: z.string().trim().max(500).default("") });
 const documentRequestCreateSchema = z.object({ subjectType: documentRequestSubjectSchema, subjectId: z.string().regex(/^[a-f\d]{24}$/), message: z.string().trim().min(10).max(2000), dueAt: z.coerce.date().nullable().optional(), requirements: z.array(documentRequestRequirementInputSchema).min(1).max(12), sendEmail: z.boolean().default(true) });
-const publicDocumentUploadSchema = z.object({ documents: z.array(z.object({ type: z.string().regex(/^[a-z0-9_]{2,80}$/), fileName: z.string().trim().min(1).max(180), mimeType: z.enum(["application/pdf", "image/jpeg", "image/png"]), sizeBytes: z.number().int().min(1).max(2_500_000), sha256: z.string().regex(/^[a-f0-9]{64}$/i), contentBase64: z.string().min(1).max(3_500_000) })).min(1).max(5) });
+const publicDocumentUploadSchema = z.object({ responses: z.array(z.object({ type: z.string().regex(/^[a-z0-9_]{2,80}$/), value: z.string().trim().min(1).max(500) })).max(12).default([]), documents: z.array(z.object({ type: z.string().regex(/^[a-z0-9_]{2,80}$/), fileName: z.string().trim().min(1).max(180), mimeType: z.enum(["application/pdf", "image/jpeg", "image/png"]), sizeBytes: z.number().int().min(1).max(2_500_000), sha256: z.string().regex(/^[a-f0-9]{64}$/i), contentBase64: z.string().min(1).max(3_500_000) })).min(1).max(5) });
 const riderDocumentRequestTypes = new Set(["identity", "residence_permit", "social_security_number", "bank_certificate", "profile_photo", "driving_license", "insurance", "vehicle_registration", "vehicle_technical_sheet", "scooter_responsible_declaration", "dgt_mvp_homologation", "work_authorization_confirmation", "ppe_and_safety", "other"]);
 const partnerDocumentRequestTypes = new Set(["tax_id", "bank_certificate", "insurance", "activity_license", "food_sanitary_authorization", "identity", "other"]);
 const leadDocumentInputSchema = z.object({ type: z.string().trim().min(2).max(80), fileName: z.string().trim().min(1).max(180), mimeType: z.enum(["application/pdf", "image/jpeg", "image/png"]), sizeBytes: z.number().int().min(1).max(2_500_000), sha256: z.string().regex(/^[a-f0-9]{64}$/i), contentBase64: z.string().min(20).max(3_500_000) });
@@ -1461,6 +1461,43 @@ app.patch("/api/v1/rider-applications/:id/status", requireRole("admin"), async (
   return res.json({ application, documentReviewPending, warning: documentReviewPending ? "La solicitud se ha gestionado; el expediente documental continúa pendiente de revisión." : undefined });
 });
 
+
+function normalizedZoneSlug(value: string) { return String(value || "").trim().toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, ""); }
+const leadRoutingSchema = z.object({ zoneSlug: z.string().regex(/^[a-z0-9-]+$/).optional() });
+app.post("/api/v1/admin/:kind-leads/:id/route", requireRole("admin"), async (req, res) => {
+  const kind = String(req.params.kind) as "rider" | "partner";
+  const Model = leadModel(kind) as any;
+  const id = objectId(String(req.params.id));
+  const parsed = leadRoutingSchema.safeParse(req.body || {});
+  if (!Model || !id || !parsed.success) return res.status(400).json({ error: "INVALID_LEAD_ROUTING" });
+  const scope = await onboardingScope(req);
+  const lead = await Model.findOne({ _id: id, ...scope }).lean().exec() as any;
+  if (!lead) return res.status(404).json({ error: "LEAD_NOT_FOUND" });
+  if (lead.status !== "qualified") return res.status(409).json({ error: "LEAD_MUST_BE_QUALIFIED", message: "Cualifica primero la solicitud antes de derivarla a operaciones." });
+  const zoneSlug = parsed.data.zoneSlug || normalizedZoneSlug(kind === "rider" ? lead.city : lead.city || lead.address);
+  if (!zoneSlug) return res.status(409).json({ error: "LEAD_ZONE_REQUIRED", message: "No se ha podido identificar la zona operativa." });
+  const tenant = tenantScope(req);
+  let target: any = null;
+  if (kind === "rider") {
+    target = await Fleet.findOne({ ...tenant, isActive: true, serviceZones: zoneSlug }).select("_id name managerName contactEmail contactPhone serviceZones").lean().exec();
+    if (!target) return res.status(409).json({ error: "ZONE_FLEET_NOT_FOUND", message: `No hay una Fleet activa configurada para ${zoneSlug}.` });
+  } else {
+    target = await EmployeeAccount.findOne({ ...tenant, active: true, authorizationStatus: "approved", jobRole: "gerente_comercial_zona", zoneSlugs: zoneSlug }).select("_id name email zoneSlugs").lean().exec();
+    if (!target) return res.status(409).json({ error: "ZONE_MANAGER_NOT_FOUND", message: `No hay gerente comercial de zona configurado para ${zoneSlug}.` });
+  }
+  const update: Record<string, unknown> = { assignedZoneSlug: zoneSlug, routedAt: new Date(), routedBy: objectId(String(req.auth?.employeeId || "")) };
+  if (kind === "rider") update.assignedFleetId = target._id;
+  else update.assignedManagerId = target._id;
+  const routed = await Model.findOneAndUpdate({ _id: id, ...scope }, { $set: update, $push: { history: { status: "qualified", notes: kind === "rider" ? `Derivado a Fleet ${target.name} (${zoneSlug}).` : `Derivado al gerente de zona ${target.name} (${zoneSlug}).`, actorEmployeeId: objectId(String(req.auth?.employeeId || "")), changedAt: new Date() } } }, { new: true }).lean().exec();
+  const targetEmail = kind === "rider" ? String(target.contactEmail || "").trim().toLowerCase() : String(target.email || "").trim().toLowerCase();
+  let emailSent = false;
+  if (targetEmail) {
+    const result = await sendCorporateEmail({ recipientEmail: targetEmail, subject: kind === "rider" ? `PIKI · Nuevo rider cualificado · ${lead.name}` : `PIKI · Nuevo Partner Orders cualificado · ${lead.name}`, idempotencyKey: `piki-lead-route-${kind}-${id}-${zoneSlug}`, text: `Hola ${kind === "rider" ? target.managerName || target.name : target.name},\n\nSe ha cualificado una nueva alta para tu zona (${zoneSlug}).\n\nNombre: ${lead.name}\nCorreo: ${lead.email}\nTeléfono: ${lead.phone}\nCiudad: ${lead.city}\n${kind === "rider" ? `Vehículo: ${lead.vehicle}\nDisponibilidad: ${lead.availability}` : `Dirección: ${lead.address || "Pendiente"}`}\n\nAccede a PIKI ${kind === "rider" ? "Fleet" : "Partner Orders"} para continuar con slots, horarios y activación operativa.\n\nEquipo PIKI`, html: `<p>Se ha cualificado una nueva alta para tu zona <strong>${zoneSlug}</strong>.</p><p><strong>${lead.name}</strong> · ${lead.email} · ${lead.phone}</p><p>${kind === "rider" ? `Vehículo: ${lead.vehicle}<br>Disponibilidad: ${lead.availability}` : `Dirección: ${lead.address || "Pendiente"}`}</p><p>Accede a PIKI para continuar con la gestión operativa.</p>` });
+    emailSent = result.sent;
+  }
+  await notifyOnboarding({ channel: kind === "rider" ? "fleet" : "admin", type: kind === "rider" ? "onboarding.rider_lead.routed" : "onboarding.partner_lead.routed", entityId: String(id), tenantId: (routed as any)?.tenantId, payload: { leadId: String(id), zoneSlug, targetId: String(target._id), targetEmail, targetName: target.name, kind } });
+  return res.json({ lead: routed, routing: { kind, zoneSlug, targetId: String(target._id), targetName: kind === "rider" ? target.name : target.name, targetEmail, emailSent } });
+});
 function documentRequestTokenHash(token: string) { return createHash("sha256").update(token).digest("hex"); }
 function documentRequestUploadUrl(token: string) { return `${String(process.env.ADMIN_APP_URL || "https://admin.pikidelivery.com").replace(/\/$/, "")}/#document-request=${encodeURIComponent(token)}`; }
 function documentRequestMetadata(document: { type: string; fileName: string; mimeType: string; sizeBytes: number; sha256: string }) { return { type: document.type, fileName: document.fileName, mimeType: document.mimeType, sizeBytes: document.sizeBytes, sha256: document.sha256.toLowerCase(), uploadedAt: new Date() }; }
@@ -1489,7 +1526,7 @@ async function documentRequestSubject(subjectType: DocumentRequestSubjectType, s
   return subject ? { id: subject._id as mongoose.Types.ObjectId, recipientName: String(subject.name || "Comercio"), recipientEmail: String(subject.email || "").toLowerCase(), hasProfile: Boolean(subject.partnerProfile) } : null;
 }
 function publicDocumentRequestResponse(request: any) {
-  return { request: { id: String(request._id), recipientName: request.recipientName, message: request.message, requirements: (request.requirements || []).map((item: any) => ({ type: item.type, label: item.label, description: item.description || "" })), dueAt: request.dueAt || null, expiresAt: request.expiresAt, status: request.status, uploadedTypes: [...new Set((request.documents || []).map((item: any) => item.type))] } };
+  return { request: { id: String(request._id), recipientName: request.recipientName, message: request.message, requirements: (request.requirements || []).map((item: any) => ({ type: item.type, inputMode: item.inputMode || "file", label: item.label, description: item.description || "" })), dueAt: request.dueAt || null, expiresAt: request.expiresAt, status: request.status, uploadedTypes: [...new Set((request.documents || []).map((item: any) => item.type))] } };
 }
 async function openDocumentRequest(rawToken: string) {
   if (!/^[A-Za-z0-9_-]{40,100}$/.test(rawToken)) return null;
@@ -1602,8 +1639,11 @@ app.post("/api/v1/public/document-requests/:token/documents", async (req, res) =
   const parsed = publicDocumentUploadSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_DOCUMENT_UPLOAD", details: parsed.error.flatten() });
   const documentTypes = parsed.data.documents.map((document) => document.type);
+  const responseTypes = parsed.data.responses.map((response) => response.type);
   const allowedTypes = new Set((requestState.request.requirements || []).map((item: any) => item.type));
-  if (documentTypes.some((type) => !allowedTypes.has(type)) || new Set(documentTypes).size !== documentTypes.length) return res.status(400).json({ error: "DOCUMENT_TYPE_NOT_REQUESTED" });
+  if ([...documentTypes, ...responseTypes].some((type) => !allowedTypes.has(type)) || new Set(documentTypes).size !== documentTypes.length || new Set(responseTypes).size !== responseTypes.length) return res.status(400).json({ error: "DOCUMENT_TYPE_NOT_REQUESTED" });
+  const formRequirements = new Set((requestState.request.requirements || []).filter((item: any) => item.inputMode === "form").map((item: any) => item.type));
+  if (documentTypes.some((type) => formRequirements.has(type)) || responseTypes.some((type) => !formRequirements.has(type))) return res.status(400).json({ error: "DOCUMENT_INPUT_MODE_MISMATCH" });
   const uploaded = [] as Array<{ type: string; fileName: string; mimeType: string; sizeBytes: number; sha256: string; contentBase64: string }>;
   try {
     for (const document of parsed.data.documents) {
@@ -1618,6 +1658,8 @@ app.post("/api/v1/public/document-requests/:token/documents", async (req, res) =
   }
   const subjectDocuments = uploaded.map((document) => ({ ...document, _id: new mongoose.Types.ObjectId(), status: "received", reviewNotes: "", reviewedAt: null, reviewedBy: null }));
   const uploadedTypes = uploaded.map((document) => document.type);
+  const formResponses = parsed.data.responses.map((response) => ({ type: response.type, value: response.value, completedAt: new Date() }));
+  const completedTypes = new Set([...uploadedTypes, ...formResponses.map((response) => response.type)]);
   if (requestState.request.subjectType === "rider_application") {
     const result = await RiderApplication.updateOne({ _id: requestState.request.subjectId }, [{ $set: { documents: { $concatArrays: [{ $filter: { input: { $ifNull: ["$documents", []] }, as: "doc", cond: { $not: [{ $in: ["$$doc.type", { $literal: uploadedTypes }] }] } } }, { $literal: subjectDocuments }] } } }] as any).exec();
     if (!result.matchedCount) return res.status(410).json({ error: "DOCUMENT_REQUEST_SUBJECT_GONE" });
@@ -1631,8 +1673,8 @@ app.post("/api/v1/public/document-requests/:token/documents", async (req, res) =
   }
   const existingMetadata = (requestState.request.documents || []).filter((document: any) => !uploadedTypes.includes(document.type));
   const metadata = [...existingMetadata, ...uploaded.map(documentRequestMetadata)];
-  const completed = (requestState.request.requirements || []).every((requirement: any) => metadata.some((document: any) => document.type === requirement.type));
-  const updated = await DocumentRequest.findByIdAndUpdate(requestState.request._id, { $set: { documents: metadata, status: completed ? "submitted" : "partially_submitted", submittedAt: new Date(), lastAccessedAt: new Date() } }, { new: true }).lean().exec() as any;
+  const completed = (requestState.request.requirements || []).every((requirement: any) => completedTypes.has(requirement.type) || (requestState.request.formResponses || []).some((response: any) => response.type === requirement.type));
+  const updated = await DocumentRequest.findByIdAndUpdate(requestState.request._id, { $set: { documents: metadata, formResponses: [...(requestState.request.formResponses || []).filter((response: any) => !formResponses.some((next: any) => next.type === response.type)), ...formResponses], status: completed ? "submitted" : "partially_submitted", submittedAt: new Date(), lastAccessedAt: new Date() } }, { new: true }).lean().exec() as any;
   await notifyOnboarding({ channel: "admin", type: "onboarding.document_request.uploaded", entityId: String(updated._id), tenantId: updated.tenantId, payload: { subjectType: updated.subjectType, subjectId: String(updated.subjectId), uploadedTypes } });
   await sendDocumentUploadEmail({ requestId: String(updated._id), subjectType: updated.subjectType, subjectName: requestState.request.recipientName, subjectEmail: requestState.request.recipientEmail, uploadedTypes, uploadedFiles: uploaded.map((document) => document.fileName), completed });
   return res.status(201).json({ message: completed ? "Documentación enviada para revisión." : "Documentación parcial recibida. Puedes continuar con los requisitos pendientes.", ...publicDocumentRequestResponse(updated) });
