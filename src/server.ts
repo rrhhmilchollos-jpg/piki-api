@@ -2173,6 +2173,7 @@ app.post("/api/v1/riders/:riderId/support/tickets/:ticketId/messages", requireRo
   const current = await SupportTicket.findOne({ _id: ticketId, reporterEmail: rider.email, ...tenantScope(req) }).lean().exec() as any; if (!current) return res.status(404).json({ error: "TICKET_NOT_FOUND" });
   if (["resolved", "closed"].includes(current.status)) return res.status(409).json({ error: "SUPPORT_CHAT_CLOSED" });
   const ticket = await SupportTicket.findOneAndUpdate({ _id: ticketId, reporterEmail: rider.email, ...tenantScope(req) }, { $push: { messages: { senderRole: "rider", senderName: rider.name, body: parsed.data.body } }, $set: { status: current.assignedTo ? "in_progress" : "open", riderTypingAt: null } }, { new: true }).populate("assignedTo", "name email").lean().exec();
+  void publishRealtimeEvent({ channel: "admin", audienceKey: tenantAudienceKey((rider as any).tenantId, "admin"), tenantId: (rider as any).tenantId, type: "support.message", payload: { ticketId: String(ticketId), status: ticket?.status, senderRole: "rider" } }).catch(() => undefined);
   return res.json({ ticket });
 });
 app.get("/api/v1/orders", requireRole("admin", "partner", "rider", "fleet"), async (req, res) => {
