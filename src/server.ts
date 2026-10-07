@@ -2026,12 +2026,14 @@ app.get("/api/v1/internal/customer-orders/:publicCode/tracking", async (req, res
   if (!requireCustomerSyncSecret(req, res)) return;
   const order = await Order.findOne({ publicCode: String(req.params.publicCode) }).lean().exec() as any;
   if (!order) return res.status(404).json({ error: "ORDER_NOT_FOUND" });
-  const rider = order.riderId ? await Rider.findById(order.riderId).select("name vehicle location lastLocationAt photoUrl").lean().exec() as any : null;
+  const active = order.assignmentState === "assigned" && ["picked_up", "on_the_way"].includes(order.status);
+  // Once delivered/cancelled, do not return rider identity, vehicle or coordinates.
+  // The client cannot rediscover the private delivery relationship from this endpoint.
+  const rider = active && order.riderId ? await Rider.findById(order.riderId).select("name vehicle location lastLocationAt photoUrl").lean().exec() as any : null;
   const coordinates = rider?.location?.coordinates;
   const updatedAt = rider?.lastLocationAt ? new Date(rider.lastLocationAt).getTime() : 0;
-  const fresh = Array.isArray(coordinates) && coordinates.length >= 2 && updatedAt >= Date.now() - 120_000;
-  const active = order.assignmentState === "assigned" && ["picked_up", "on_the_way"].includes(order.status);
-  return res.json({ publicCode: order.publicCode, status: order.status, assignmentState: order.assignmentState, paymentMethod: order.paymentMethod, paymentState: order.paymentState, cashDueAtDelivery: order.paymentMethod === "cash" && order.paymentState !== "paid", riderId: rider?._id ? String(rider._id) : null, riderName: rider?.name || null, riderPhotoUrl: rider?.photoUrl || null, vehicle: rider?.vehicle || "bike", chatAvailable: active, locationAvailable: active && fresh, latitude: fresh ? Number(coordinates[1]) : null, longitude: fresh ? Number(coordinates[0]) : null, updatedAt: fresh ? updatedAt : null });
+  const fresh = active && Array.isArray(coordinates) && coordinates.length >= 2 && updatedAt >= Date.now() - 120_000;
+  return res.json({ publicCode: order.publicCode, status: order.status, assignmentState: order.assignmentState, paymentMethod: order.paymentMethod, paymentState: order.paymentState, cashDueAtDelivery: order.paymentMethod === "cash" && order.paymentState !== "paid", riderId: rider?._id ? String(rider._id) : null, riderName: rider?.name || null, riderPhotoUrl: rider?.photoUrl || null, vehicle: rider?.vehicle || null, chatAvailable: active, locationAvailable: fresh, latitude: fresh ? Number(coordinates[1]) : null, longitude: fresh ? Number(coordinates[0]) : null, updatedAt: fresh ? updatedAt : null });
 });
 app.post("/api/v1/internal/customer-orders/:publicCode/messages", async (req, res) => {
   if (!requireCustomerSyncSecret(req, res)) return;
