@@ -1129,6 +1129,41 @@ app.patch("/api/v1/partners/kitchen/orders/:id/status", requireRole("partner"), 
   scheduleCustomerOrderPush(order, target);
   return res.json({ order });
 });
+const partnerSupportTicketSchema = z.object({ orderId: z.string().optional(), priority: z.enum(["low", "normal", "high", "urgent"]).default("normal"), subject: z.string().trim().min(3).max(180), description: z.string().trim().min(3).max(4000) });
+app.post("/api/v1/partners/support/tickets", requireRole("partner"), async (req, res) => {
+  const parsed = partnerSupportTicketSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "INVALID_PARTNER_SUPPORT_TICKET", details: parsed.error.flatten() });
+  const { access, allowed } = await partnerRequestAccess(req, "orders:read");
+  if (!allowed || !access) return res.status(403).json({ error: "PARTNER_PERMISSION_DENIED", permission: "orders:read" });
+  const restaurantId = await employeeRestaurant(req, access);
+  if (!restaurantId) return res.status(403).json({ error: "PARTNER_RESTAURANT_ACCESS_DENIED" });
+  const employee = access.employee as any;
+  const restaurant = await Restaurant.findById(restaurantId).select("name").lean().exec() as any;
+  if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
+  let order: any = null;
+  if (parsed.data.orderId) {
+    const id = objectId(parsed.data.orderId);
+    if (!id) return res.status(400).json({ error: "INVALID_ORDER_ID" });
+    order = await Order.findOne({ _id: id, restaurantId }).select("_id publicCode displayCode status").lean().exec();
+    if (!order) return res.status(404).json({ error: "PARTNER_ORDER_NOT_FOUND" });
+  }
+  const ticket = await SupportTicket.create({
+    tenantId: employee.tenantId || null,
+    sourceSurface: "partner",
+    sourceRole: "partner",
+    reporterEmail: employee.email,
+    category: "partner",
+    priority: parsed.data.priority,
+    subject: parsed.data.subject,
+    description: `[${restaurant.name}] ${parsed.data.description}`,
+    orderId: order?._id || null,
+    ticketNumber: `SUP-${new Date().toISOString().slice(0, 10).replace(/-/g, "")}-${randomInt(1000, 9999)}`,
+    messages: [{ senderRole: "partner", body: parsed.data.description }],
+    actions: [{ action: "partner_ticket_created", metadata: { restaurantId: String(restaurantId), restaurantName: restaurant.name, employeeId: String(req.auth?.employeeId || ""), orderRef: order?.publicCode || order?.displayCode || null } }],
+  });
+  await publishRealtimeEvent({ channel: "admin", audienceKey: "role:admin", type: "support.ticket_created", payload: { ticketId: String(ticket._id), ticketNumber: ticket.ticketNumber, sourceSurface: "partner", restaurantId: String(restaurantId), orderId: order?._id ? String(order._id) : null, priority: ticket.priority, subject: ticket.subject } });
+  return res.status(201).json({ ticket: { id: String(ticket._id), ticketNumber: ticket.ticketNumber, status: ticket.status, sourceSurface: "partner" } });
+});
 app.get("/api/v1/partners/metrics/overview", requireRole("partner"), async (req, res) => {
   const { access, allowed } = await partnerRequestAccess(req, "metrics:read");
   if (!allowed) return res.status(403).json({ error: "PARTNER_PERMISSION_DENIED", permission: "metrics:read" });
