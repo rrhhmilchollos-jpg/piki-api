@@ -9,7 +9,7 @@ type SubscriptionPayload = {
   keys: { p256dh: string; auth: string };
 };
 
-type PushPayload = { title: string; body: string; url: string; tag?: string; renotify?: boolean };
+type PushPayload = { title: string; body: string; url: string; tag?: string; renotify?: boolean; requireInteraction?: boolean };
 
 const vapid = {
   subject: process.env.WEB_PUSH_VAPID_SUBJECT,

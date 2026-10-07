@@ -171,7 +171,7 @@ async function resolveAudience(request: Request): Promise<ResolvedAudience | nul
   }
   const auth = await resolveRole(request);
   if (!auth?.employeeId) return null;
-  if (surface === "admin" && auth.role === "admin") {
+  if (surface === "admin" && ["admin", "support"].includes(auth.role)) {
     const employee = await EmployeeAccount.findById(auth.employeeId).select("tenantId ownerProtected accessLevel").lean().exec() as any;
     if (!employee) return null;
     if (employee.ownerProtected === true && employee.accessLevel === "superadmin") {
