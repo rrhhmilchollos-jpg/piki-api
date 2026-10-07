@@ -104,3 +104,21 @@ test("shift outside-hours alert is visible only to Fleet and Admin", () => {
   assert.equal(admin?.title, "Intento de jornada fuera de horario");
   assert.equal(buildNoticeCopy(input, principal("rider")), null);
 });
+
+test("support ticket notifications reach the admin/support inbox without rider PII", () => {
+  const input = event("support.ticket_created", { ticketId: "66c5c6634d5bb12ea5500020", ticketNumber: "SUP-20261007-1234", riderName: "Rider de prueba", email: "private@example.com" }, "admin");
+  const notice = buildNoticeCopy(input, principal("admin"));
+  assert.equal(notice?.category, "support");
+  assert.equal(notice?.url, "/?section=Soporte");
+  assert.equal(notice?.entityType, "support_ticket");
+  assert.match(notice?.body || "", /SUP-20261007-1234/);
+  assert.doesNotMatch(`${notice?.title} ${notice?.body}`, /private@example\.com/);
+  assert.equal(buildNoticeCopy(input, principal("rider")), null);
+});
+
+test("support message notifications use a distinct push copy", () => {
+  const input = event("support.message_created", { ticketId: "66c5c6634d5bb12ea5500021", ticketNumber: "SUP-20261007-1235", riderName: "Rider de prueba" }, "admin");
+  const notice = buildNoticeCopy(input, principal("admin"));
+  assert.equal(notice?.title, "Nuevo mensaje de soporte");
+  assert.match(notice?.body || "", /nuevo mensaje/);
+});
