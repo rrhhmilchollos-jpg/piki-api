@@ -1,6 +1,6 @@
 import { distanceKm } from "./workflow.js";
 
-export const DISPATCH_ALGORITHM_VERSION = "piki-jarvis-v1";
+export const DISPATCH_ALGORITHM_VERSION = "piki-jarvis-v2-proximity-rating";
 
 export type DispatchCandidate = {
   id: string;
@@ -10,6 +10,7 @@ export type DispatchCandidate = {
   lastLocationAt?: Date | null;
   activeOrderCount?: number;
   reliabilityScore?: number;
+  ratingScore?: number;
   zoneFit?: number;
   servicePriority?: number;
 };
@@ -35,6 +36,7 @@ export type DispatchWeights = {
   load: number;
   zoneMismatch: number;
   reliability: number;
+  rating: number;
   priority: number;
 };
 
@@ -52,14 +54,15 @@ export type DispatchDecision = {
 };
 
 export const dispatchWeights: DispatchWeights = {
-  riderDistance: 0.22,
-  riderEta: 0.24,
-  customerEta: 0.26,
-  preparationWait: 0.08,
-  load: 0.08,
-  zoneMismatch: 0.04,
-  reliability: 0.05,
-  priority: 0.03,
+  riderDistance: 0.42,
+  riderEta: 0.18,
+  customerEta: 0.15,
+  preparationWait: 0.05,
+  load: 0.06,
+  zoneMismatch: 0.03,
+  reliability: 0.04,
+  rating: 0.05,
+  priority: 0.02,
 };
 
 const speedKmh: Record<DispatchCandidate["vehicle"], number> = {
@@ -108,6 +111,9 @@ export function scoreDispatchCandidate(candidate: DispatchCandidate, input: Disp
   if (activeOrderCount >= maxConcurrentOrders) return null;
   const load = Math.min(1, activeOrderCount / maxConcurrentOrders);
   const reliability = bounded(candidate.reliabilityScore ?? 0.75, 0.75);
+  // Existing riders may not have customer ratings yet. In that case the
+  // operational reliability score is the conservative fallback.
+  const rating = bounded(candidate.ratingScore ?? reliability, reliability);
   const zoneFit = bounded(candidate.zoneFit ?? 1, 1);
   const priority = bounded(candidate.servicePriority ?? 0.5, 0.5);
   const preparationWait = Math.max(0, pickupEtaMinutes - input.preparationMinutes);
@@ -122,6 +128,7 @@ export function scoreDispatchCandidate(candidate: DispatchCandidate, input: Disp
     dispatchWeights.load * load * 20 +
     dispatchWeights.zoneMismatch * (1 - zoneFit) * 20 +
     dispatchWeights.reliability * (1 - reliability) * 20 +
+    dispatchWeights.rating * (1 - rating) * 20 +
     dispatchWeights.priority * (1 - priority) * 20;
 
   return {
@@ -143,6 +150,7 @@ export function scoreDispatchCandidate(candidate: DispatchCandidate, input: Disp
       ...(requiredVehicleClasses.length ? [`vehículo requerido: ${requiredVehicleClasses.join(" o ")}`] : []),
       `espera de preparación ${preparationWait} min`,
       `carga activa ${activeOrderCount}/${maxConcurrentOrders}`,
+      `valoración Rider ${(rating * 5).toFixed(2)}/5`,
       `fiabilidad ${(reliability * 100).toFixed(0)}%`,
       `versión ${DISPATCH_ALGORITHM_VERSION}`,
     ],
