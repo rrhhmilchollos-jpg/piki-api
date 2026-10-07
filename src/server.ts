@@ -32,6 +32,7 @@ import { buildApprovedRiderOperationalProfile } from "./riderApproval.js";
 import { CUSTOMER_CATALOG_RESTAURANT_FILTER, presentCustomerCatalogRestaurant } from "./customerCatalogPolicy.js";
 import { quoteMenuItem, usesReferenceAddOns } from "./menuModifiers.js";
 import { decideLatePickup, pointDistanceMeters } from "./pickupPolicy.js";
+import { buildLegacyRiderSupportTicketFilter, buildRiderSupportTicketFilter } from "./supportTicketScope.js";
 
 export const app = express();
 app.set("trust proxy", 1);
@@ -2130,12 +2131,31 @@ app.post("/api/v1/admin/support/orders/:id/cancel", requireRole("admin", "suppor
   scheduleCustomerOrderPush(updated, "cancelled");
   return res.json({ order: updated, audit: { action: "order_cancelled", reason: parsed.data.reason } });
 });
+
+function riderSupportTicketFilter(req: express.Request, riderId: mongoose.Types.ObjectId, reporterEmail: string, ticketId?: mongoose.Types.ObjectId) {
+  const scope = tenantScope(req);
+  if (req.auth?.tenantId && !("tenantId" in scope)) return { _id: null };
+  if (scope.tenantId) return buildRiderSupportTicketFilter({ tenantId: scope.tenantId, riderId: String(riderId), reporterEmail, ticketId });
+  return { ...scope, ...(ticketId ? { _id: ticketId } : {}), reporterEmail };
+}
+
+async function findOrRepairRiderSupportTicket(req: express.Request, riderId: mongoose.Types.ObjectId, rider: any, ticketId: mongoose.Types.ObjectId) {
+  const current = await SupportTicket.findOne(riderSupportTicketFilter(req, riderId, rider.email, ticketId)).lean().exec() as any;
+  if (!current || current.tenantId || !rider.tenantId) return { ticket: current, repaired: false };
+  const repaired = await SupportTicket.findOneAndUpdate(
+    buildLegacyRiderSupportTicketFilter({ riderId: String(riderId), reporterEmail: rider.email, ticketId }),
+    { $set: { tenantId: rider.tenantId } },
+    { new: true },
+  ).lean().exec() as any;
+  return { ticket: repaired, repaired: Boolean(repaired) };
+}
+
 app.post("/api/v1/riders/:id/support/tickets", requireRole("rider"), async (req, res) => {
   const parsed = z.object({ subject: z.string().trim().min(3).max(180), description: z.string().trim().min(3).max(4000), priority: z.enum(["low", "normal", "high", "urgent"]).default("normal"), orderId: z.string().optional() }).safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_RIDER_SUPPORT_TICKET", details: parsed.error.flatten() });
   const riderId = objectId(String(req.params.id)); if (!riderId) return res.status(400).json({ error: "INVALID_RIDER_ID" });
   if (!(await canAccessRiderShift(riderId, req))) return res.status(403).json({ error: "RIDER_ACCESS_DENIED" });
-  const rider = await Rider.findOne({ _id: riderId, ...tenantScope(req) }).select("email name").lean().exec() as any;
+  const rider = await Rider.findOne({ _id: riderId, ...tenantScope(req) }).select("email name tenantId").lean().exec() as any;
   if (!rider) return res.status(404).json({ error: "RIDER_NOT_FOUND" });
   let orderId: mongoose.Types.ObjectId | null = null;
   if (parsed.data.orderId) {
@@ -2148,8 +2168,8 @@ app.post("/api/v1/riders/:id/support/tickets", requireRole("rider"), async (req,
 });
 app.get("/api/v1/riders/:riderId/support/tickets", requireRole("rider"), async (req, res) => {
   const riderId = objectId(String(req.params.riderId)); if (!riderId || !(await canAccessRiderShift(riderId, req))) return res.status(403).json({ error: "RIDER_ACCESS_DENIED" });
-  const rider = await Rider.findOne({ _id: riderId, ...tenantScope(req) }).select("email").lean().exec() as any; if (!rider) return res.status(404).json({ error: "RIDER_NOT_FOUND" });
-  const tickets = await SupportTicket.find({ ...tenantScope(req), reporterEmail: rider.email }).sort({ updatedAt: -1 }).limit(50).populate("assignedTo", "name email").lean().exec();
+  const rider = await Rider.findOne({ _id: riderId, ...tenantScope(req) }).select("email tenantId").lean().exec() as any; if (!rider) return res.status(404).json({ error: "RIDER_NOT_FOUND" });
+  const tickets = await SupportTicket.find(riderSupportTicketFilter(req, riderId, rider.email)).sort({ updatedAt: -1 }).limit(50).populate("assignedTo", "name email").lean().exec();
   return res.json({ tickets });
 });
 app.post("/api/v1/admin/support/tickets/:id/typing", requireRole("admin", "support", "finance"), async (req, res) => {
@@ -2162,10 +2182,14 @@ app.post("/api/v1/admin/support/tickets/:id/typing", requireRole("admin", "suppo
 });
 
 app.post("/api/v1/riders/:riderId/support/tickets/:ticketId/typing", requireRole("rider"), async (req, res) => {
-  const rider = await Rider.findById(req.params.riderId).lean().exec() as any; if (!rider) return res.status(404).json({ error: "RIDER_NOT_FOUND" });
+  const riderId = objectId(String(req.params.riderId)); const ticketId = objectId(String(req.params.ticketId));
+  if (!riderId || !ticketId || !(await canAccessRiderShift(riderId, req))) return res.status(403).json({ error: "RIDER_ACCESS_DENIED" });
+  const rider = await Rider.findOne({ _id: riderId, ...tenantScope(req) }).select("email tenantId").lean().exec() as any; if (!rider) return res.status(404).json({ error: "RIDER_NOT_FOUND" });
+  const { ticket: current, repaired } = await findOrRepairRiderSupportTicket(req, riderId, rider, ticketId); if (!current) return res.status(404).json({ error: "TICKET_NOT_FOUND" });
   const active = Boolean(req.body?.active);
-  const ticket = await SupportTicket.findOneAndUpdate({ _id: req.params.ticketId, reporterEmail: rider.email, ...tenantScope(req), status: { $nin: ["resolved", "closed"] } }, { $set: { riderTypingAt: active ? new Date() : null } }, { new: true }).lean().exec() as any;
+  const ticket = await SupportTicket.findOneAndUpdate({ ...riderSupportTicketFilter(req, riderId, rider.email, ticketId), status: { $nin: ["resolved", "closed"] } }, { $set: { riderTypingAt: active ? new Date() : null } }, { new: true }).lean().exec() as any;
   if (!ticket) return res.status(404).json({ error: "TICKET_NOT_FOUND" });
+  if (repaired) void publishRealtimeEvent({ channel: "admin", audienceKey: tenantAudienceKey(rider.tenantId, "admin"), tenantId: rider.tenantId, type: "support.ticket_created", payload: { ticketId: String(ticket._id), priority: ticket.priority, orderId: ticket.orderId ? String(ticket.orderId) : null } }).catch(() => undefined);
   return res.json({ ok: true, riderTypingAt: ticket.riderTypingAt });
 });
 
@@ -2173,9 +2197,11 @@ app.post("/api/v1/riders/:riderId/support/tickets/:ticketId/messages", requireRo
   const parsed = supportMessageInput.safeParse(req.body); if (!parsed.success) return res.status(400).json({ error: "INVALID_SUPPORT_MESSAGE" });
   const riderId = objectId(String(req.params.riderId)); const ticketId = objectId(String(req.params.ticketId)); if (!riderId || !ticketId || !(await canAccessRiderShift(riderId, req))) return res.status(403).json({ error: "RIDER_ACCESS_DENIED" });
   const rider = await Rider.findOne({ _id: riderId, ...tenantScope(req) }).select("email name tenantId").lean().exec() as any; if (!rider) return res.status(404).json({ error: "RIDER_NOT_FOUND" });
-  const current = await SupportTicket.findOne({ _id: ticketId, reporterEmail: rider.email, ...tenantScope(req) }).lean().exec() as any; if (!current) return res.status(404).json({ error: "TICKET_NOT_FOUND" });
+  const { ticket: current, repaired } = await findOrRepairRiderSupportTicket(req, riderId, rider, ticketId); if (!current) return res.status(404).json({ error: "TICKET_NOT_FOUND" });
   if (["resolved", "closed"].includes(current.status)) return res.status(409).json({ error: "SUPPORT_CHAT_CLOSED" });
-  const ticket = await SupportTicket.findOneAndUpdate({ _id: ticketId, reporterEmail: rider.email, ...tenantScope(req) }, { $push: { messages: { senderRole: "rider", senderName: rider.name, body: parsed.data.body } }, $set: { status: current.assignedTo ? "in_progress" : "open", riderTypingAt: null } }, { new: true }).populate("assignedTo", "name email").lean().exec();
+  const ticket = await SupportTicket.findOneAndUpdate(riderSupportTicketFilter(req, riderId, rider.email, ticketId), { $push: { messages: { senderRole: "rider", senderName: rider.name, body: parsed.data.body } }, $set: { status: current.assignedTo ? "in_progress" : "open", riderTypingAt: null } }, { new: true }).populate("assignedTo", "name email").lean().exec() as any;
+  if (!ticket) return res.status(404).json({ error: "TICKET_NOT_FOUND" });
+  if (repaired) void publishRealtimeEvent({ channel: "admin", audienceKey: tenantAudienceKey(rider.tenantId, "admin"), tenantId: rider.tenantId, type: "support.ticket_created", payload: { ticketId: String(ticket._id), priority: ticket.priority, orderId: ticket.orderId ? String(ticket.orderId) : null } }).catch(() => undefined);
   void publishRealtimeEvent({ channel: "admin", audienceKey: tenantAudienceKey((rider as any).tenantId, "admin"), tenantId: (rider as any).tenantId, type: "support.message", payload: { ticketId: String(ticketId), status: (ticket as any)?.status, senderRole: "rider" } }).catch(() => undefined);
   return res.json({ ticket });
 });
