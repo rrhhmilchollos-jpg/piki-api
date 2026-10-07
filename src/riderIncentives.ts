@@ -1,8 +1,8 @@
 import { randomBytes } from "node:crypto";
 import mongoose from "mongoose";
 import { DispatchDecision, Order, Rider, RiderSlot, Zone } from "./models.js";
-import { calculateHourlyGuaranteeTopUp, calculateSettlement, getRecruitmentAwards, isAcceptanceRateEligible, RIDER_INCENTIVE_POLICY } from "./settlements.js";
-import { RiderIncentiveBudget, RiderIncentiveEntry, RiderReferralProfile, RiderShiftIncentiveMetric } from "./riderIncentivesModels.js";
+import { calculateSettlement, getRecruitmentAwards, isAcceptanceRateEligible, RIDER_INCENTIVE_POLICY } from "./settlements.js";
+import { RiderIncentiveBudget, RiderIncentiveEntry, RiderReferralProfile, RiderShiftGuaranteeReservation, RiderShiftIncentiveMetric } from "./riderIncentivesModels.js";
 
 const enabled = (key: string) => String(process.env[key] || "").trim().toLowerCase() === "true";
 const monthlyCapCents = () => {
@@ -17,8 +17,10 @@ const campaignStartAt = () => {
 const referralEnabled = () => enabled("PIKI_RIDER_REFERRALS_ENABLED") && monthlyCapCents() > 0 && campaignStartAt() !== null;
 const guaranteeEnabled = () => enabled("PIKI_HOURLY_GUARANTEE_ENABLED") && monthlyCapCents() > 0;
 const tenantFilter = (tenantId: mongoose.Types.ObjectId | null) => ({ tenantId: tenantId || null });
-const monthKey = (date = new Date()) => `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, "0")}`;
-const asObjectId = (value: unknown) => value && mongoose.isValidObjectId(value) ? new mongoose.Types.ObjectId(String(value)) : null;
+const monthKey = (date = new Date()) => {
+  const parts = Object.fromEntries(new Intl.DateTimeFormat("en-GB", { timeZone: "Europe/Madrid", year: "numeric", month: "2-digit" }).formatToParts(date).filter((part) => part.type !== "literal").map((part) => [part.type, part.value]));
+  return `${parts.year}-${parts.month}`;
+};
 
 export function incentiveProgramStatus() {
   const capCents = monthlyCapCents();
@@ -62,10 +64,10 @@ async function awardIncentive(input: {
     await session.withTransaction(async () => {
       if (await RiderIncentiveEntry.findOne({ sourceKey: input.sourceKey }).session(session).lean().exec()) return;
       const scope = tenantFilter(null);
-      await RiderIncentiveBudget.updateOne({ ...scope, monthKey: keyMonth }, { $setOnInsert: { ...scope, monthKey: keyMonth, capCents, committedCents: 0 } }, { upsert: true, session }).exec();
+      await RiderIncentiveBudget.updateOne({ ...scope, monthKey: keyMonth }, { $setOnInsert: { ...scope, monthKey: keyMonth, capCents, committedCents: 0, reservedCents: 0 } }, { upsert: true, session }).exec();
       const budget = await RiderIncentiveBudget.findOneAndUpdate(
-        { ...scope, monthKey: keyMonth, committedCents: { $lte: capCents - input.amountCents } },
-        { $inc: { committedCents: input.amountCents } },
+        { ...scope, monthKey: keyMonth, $expr: { $lte: [{ $add: [{ $ifNull: ["$committedCents", 0] }, { $ifNull: ["$reservedCents", 0] }] }, capCents - input.amountCents] } },
+        { $inc: { committedCents: input.amountCents }, $set: { capCents } },
         { new: true, session },
       ).lean().exec();
       if (!budget) return;
@@ -119,8 +121,8 @@ async function awardReferralPair(input: { tenantId: mongoose.Types.ObjectId | nu
       const amountCents = entries.reduce((sum, entry) => sum + entry.amountCents, 0);
       const capCents = monthlyCapCents();
       if (capCents < amountCents) return;
-      await RiderIncentiveBudget.updateOne({ ...tenantFilter(null), monthKey: keyMonth }, { $setOnInsert: { ...tenantFilter(null), monthKey: keyMonth, capCents, committedCents: 0 } }, { upsert: true, session }).exec();
-      const budget = await RiderIncentiveBudget.findOneAndUpdate({ ...tenantFilter(null), monthKey: keyMonth, committedCents: { $lte: capCents - amountCents } }, { $inc: { committedCents: amountCents } }, { new: true, session }).lean().exec();
+      await RiderIncentiveBudget.updateOne({ ...tenantFilter(null), monthKey: keyMonth }, { $setOnInsert: { ...tenantFilter(null), monthKey: keyMonth, capCents, committedCents: 0, reservedCents: 0 } }, { upsert: true, session }).exec();
+      const budget = await RiderIncentiveBudget.findOneAndUpdate({ ...tenantFilter(null), monthKey: keyMonth, $expr: { $lte: [{ $add: [{ $ifNull: ["$committedCents", 0] }, { $ifNull: ["$reservedCents", 0] }] }, capCents - amountCents] } }, { $inc: { committedCents: amountCents }, $set: { capCents } }, { new: true, session }).lean().exec();
       if (!budget) return;
       await RiderIncentiveEntry.create(entries, { session });
       awarded = true;
@@ -181,8 +183,127 @@ export async function claimRiderReferralCode(rider: any, rawCode: string) {
   return { ok: true as const };
 }
 
+function monthKeyForSlot(date: unknown) {
+  const match = typeof date === "string" ? /^(\d{4})-(\d{2})-\d{2}$/.exec(date) : null;
+  return match ? `${match[1]}-${match[2]}` : null;
+}
+
+function isFourHourCentralSlot(slot: any) {
+  const start = String(slot?.startTime || "");
+  const end = String(slot?.endTime || "");
+  if (!/^\d{2}:\d{2}$/.test(start) || !/^\d{2}:\d{2}$/.test(end)) return false;
+  const startMinute = Number(start.slice(0, 2)) * 60 + Number(start.slice(3, 5));
+  const endMinute = Number(end.slice(0, 2)) * 60 + Number(end.slice(3, 5));
+  return endMinute - startMinute === RIDER_INCENTIVE_POLICY.requiredShiftHours * 60
+    && String(slot?.zoneSlug || "").toLowerCase() === guaranteeZoneSlug();
+}
+
+function sameReservedSlot(reservation: any, slot: any, monthKeyValue: string) {
+  return String(reservation.monthKey) === monthKeyValue
+    && String(reservation.riderId) === String(slot.riderId)
+    && String(reservation.slotDate) === String(slot.date)
+    && String(reservation.startTime) === String(slot.startTime)
+    && String(reservation.endTime) === String(slot.endTime)
+    && String(reservation.zoneSlug) === String(slot.zoneSlug);
+}
+
+export async function prepareGuaranteedShiftBudgets(slots: any[]) {
+  if (!guaranteeEnabled()) return;
+  const capCents = monthlyCapCents();
+  if (capCents < 1) return;
+  const months = new Set(slots
+    .filter((slot) => slot?.status === "planned" && isFourHourCentralSlot(slot))
+    .map((slot) => monthKeyForSlot(slot?.date))
+    .filter((value): value is string => Boolean(value)));
+  for (const keyMonth of months) {
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      try {
+        await RiderIncentiveBudget.updateOne(
+          { ...tenantFilter(null), monthKey: keyMonth },
+          { $setOnInsert: { ...tenantFilter(null), monthKey: keyMonth, capCents, committedCents: 0, reservedCents: 0 } },
+          { upsert: true },
+        ).exec();
+        break;
+      } catch (error: any) {
+        if (error?.code !== 11000 || attempt === 3) throw error;
+        await new Promise((resolve) => setTimeout(resolve, 20 * (attempt + 1)));
+      }
+    }
+  }
+}
+
+export async function releaseGuaranteedShiftFunds(slotId: mongoose.Types.ObjectId, session: mongoose.ClientSession) {
+  const reservation = await RiderShiftGuaranteeReservation.findOne({ slotId }).session(session).lean().exec() as any;
+  if (!reservation) return null;
+  if (reservation.status === "settled") throw new Error("GUARANTEE_SLOT_ALREADY_SETTLED");
+  if (reservation.status !== "reserved") return reservation;
+  const changed = await RiderShiftGuaranteeReservation.updateOne(
+    { _id: reservation._id, status: "reserved" },
+    { $set: { status: "released", payoutCents: 0, releasedAt: new Date() } },
+    { session },
+  ).exec();
+  if (changed.modifiedCount !== 1) return null;
+  const budget = await RiderIncentiveBudget.updateOne(
+    { ...tenantFilter(null), monthKey: reservation.monthKey, reservedCents: { $gte: reservation.amountCents } },
+    { $inc: { reservedCents: -reservation.amountCents } },
+    { session },
+  ).exec();
+  if (budget.matchedCount !== 1) throw new Error("GUARANTEE_BUDGET_RESERVATION_INVARIANT");
+  return reservation;
+}
+
+export async function reserveGuaranteedShiftFunds(slot: any, session: mongoose.ClientSession) {
+  if (!slot?._id || !slot?.riderId) throw new Error("GUARANTEE_SLOT_ID_REQUIRED");
+  const reservation = await RiderShiftGuaranteeReservation.findOne({ slotId: slot._id }).session(session).lean().exec() as any;
+  if (reservation?.status === "settled") throw new Error("GUARANTEE_SLOT_ALREADY_SETTLED");
+  if (slot.status === "cancelled") {
+    await releaseGuaranteedShiftFunds(slot._id, session);
+    return { status: "released" as const };
+  }
+  if (slot.status === "completed") {
+    if (reservation?.status === "reserved") throw new Error("GUARANTEE_SLOT_MUST_SETTLE");
+    return { status: "not_required" as const };
+  }
+
+  const month = monthKeyForSlot(slot.date);
+  const eligibleSchedule = Boolean(month && isFourHourCentralSlot(slot));
+  const rider = await Rider.findById(slot.riderId).select("isTestRider").session(session).lean().exec() as any;
+  const eligible = eligibleSchedule && !rider?.isTestRider;
+  const unchangedHold = reservation?.status === "reserved" && month && sameReservedSlot(reservation, slot, month);
+  if (unchangedHold) return { status: "reserved" as const, amountCents: Number(reservation.amountCents) };
+
+  if (reservation?.status === "reserved") {
+    if (slot.status === "active") throw new Error("GUARANTEE_ACTIVE_SLOT_CANNOT_CHANGE");
+    await releaseGuaranteedShiftFunds(slot._id, session);
+  }
+  if (!guaranteeEnabled() || !eligible) return { status: "not_required" as const };
+  if (slot.status === "active") throw new Error("GUARANTEE_RESERVATION_REQUIRED_BEFORE_START");
+  if (slot.status !== "planned") return { status: "not_required" as const };
+
+  const capCents = monthlyCapCents();
+  const amountCents = RIDER_INCENTIVE_POLICY.hourlyRateCents * RIDER_INCENTIVE_POLICY.requiredShiftHours;
+  const keyMonth = month!;
+  const bucket = await RiderIncentiveBudget.findOne({ ...tenantFilter(null), monthKey: keyMonth }).session(session).lean().exec();
+  if (!bucket) throw new Error("GUARANTEE_BUDGET_BUCKET_MISSING");
+  const budget = await RiderIncentiveBudget.findOneAndUpdate(
+    { ...tenantFilter(null), monthKey: keyMonth, $expr: { $lte: [{ $add: [{ $ifNull: ["$committedCents", 0] }, { $ifNull: ["$reservedCents", 0] }] }, capCents - amountCents] } },
+    { $inc: { reservedCents: amountCents }, $set: { capCents } },
+    { new: true, session },
+  ).lean().exec();
+  if (!budget) throw new Error("GUARANTEE_BUDGET_EXHAUSTED");
+
+  await RiderShiftGuaranteeReservation.findOneAndUpdate(
+    { slotId: slot._id },
+    { $set: { tenantId: slot.tenantId || null, riderId: slot.riderId, slotId: slot._id, monthKey: keyMonth, slotDate: slot.date, startTime: slot.startTime, endTime: slot.endTime, zoneSlug: slot.zoneSlug, amountCents, guaranteedFloorCents: amountCents, payoutCents: 0, status: "reserved", reservedAt: new Date(), releasedAt: null, settledAt: null } },
+    { upsert: true, new: true, setDefaultsOnInsert: true, session },
+  ).lean().exec();
+  return { status: "reserved" as const, amountCents };
+}
+
 export async function trackRiderShiftStart(slot: any, rider: any, startedAt = new Date()) {
-  if (!guaranteeEnabled() || !slot?._id || !rider?._id || rider.isTestRider) return;
+  if (!slot?._id || !rider?._id || rider.isTestRider) return;
+  const hasReservedFunds = Boolean(await RiderShiftGuaranteeReservation.exists({ slotId: slot._id, status: "reserved" }));
+  if (!guaranteeEnabled() && !hasReservedFunds) return;
   await RiderShiftIncentiveMetric.updateOne(
     { slotId: slot._id },
     { $setOnInsert: { tenantId: rider.tenantId || null, riderId: rider._id, slotId: slot._id, startedAt, completedAt: null, lastSampleAt: null, trackedSeconds: 0, sampleCount: 0, centralZoneViolation: false, maxGapSeconds: 0 } },
@@ -191,9 +312,10 @@ export async function trackRiderShiftStart(slot: any, rider: any, startedAt = ne
 }
 
 export async function trackRiderLocationForIncentive(riderId: mongoose.Types.ObjectId, coordinates: [number, number]) {
-  if (!guaranteeEnabled()) return;
   const slot = await RiderSlot.findOne({ riderId, status: "active" }).sort({ updatedAt: -1 }).lean().exec() as any;
   if (!slot) return;
+  const hasReservedFunds = Boolean(await RiderShiftGuaranteeReservation.exists({ slotId: slot._id, status: "reserved" }));
+  if (!guaranteeEnabled() && !hasReservedFunds) return;
   const metric = await RiderShiftIncentiveMetric.findOne({ slotId: slot._id }).lean().exec() as any;
   if (!metric || metric.completedAt) return;
   const now = new Date();
@@ -226,14 +348,29 @@ function madridLocalToUtc(date: string, time: string) {
   return new Date(guess);
 }
 
+async function releaseCompletedGuarantee(slotId: mongoose.Types.ObjectId) {
+  const session = await mongoose.startSession();
+  try {
+    await session.withTransaction(async () => { await releaseGuaranteedShiftFunds(slotId, session); });
+  } finally {
+    await session.endSession();
+  }
+}
+
 export async function settleHourlyGuarantee(slot: any, completedAt = new Date()) {
-  if (!guaranteeEnabled() || !slot?._id) return { awardedCents: 0, status: "disabled" as const };
+  if (!slot?._id) return { awardedCents: 0, status: "slot_missing" as const };
+  const reservation = await RiderShiftGuaranteeReservation.findOne({ slotId: slot._id, status: "reserved" }).lean().exec() as any;
+  if (!reservation) return { awardedCents: 0, status: guaranteeEnabled() ? "reservation_missing" as const : "disabled" as const };
+  const releaseAndReturn = async (status: string, details: Record<string, unknown> = {}) => {
+    await releaseCompletedGuarantee(slot._id);
+    return { awardedCents: 0, status, ...details };
+  };
   const metric = await RiderShiftIncentiveMetric.findOne({ slotId: slot._id }).lean().exec() as any;
-  if (!metric || !metric.startedAt) return { awardedCents: 0, status: "tracking_missing" as const };
+  if (!metric || !metric.startedAt) return releaseAndReturn("tracking_missing");
   const startMinute = Number(slot.startTime?.slice(0, 2)) * 60 + Number(slot.startTime?.slice(3, 5));
   const endMinute = Number(slot.endTime?.slice(0, 2)) * 60 + Number(slot.endTime?.slice(3, 5));
   const scheduledMinutes = endMinute - startMinute;
-  if (scheduledMinutes !== RIDER_INCENTIVE_POLICY.requiredShiftHours * 60) return { awardedCents: 0, status: "not_a_four_hour_shift" as const };
+  if (scheduledMinutes !== RIDER_INCENTIVE_POLICY.requiredShiftHours * 60) return releaseAndReturn("not_a_four_hour_shift");
   const scheduledStart = madridLocalToUtc(slot.date, slot.startTime);
   const scheduledEnd = madridLocalToUtc(slot.date, slot.endTime);
   const durationSeconds = Math.floor((scheduledEnd.getTime() - scheduledStart.getTime()) / 1000);
@@ -254,7 +391,7 @@ export async function settleHourlyGuarantee(slot: any, completedAt = new Date())
   const accepted = relevantDecisions.filter((decision) => decision.outcome === "accepted" && decision.actorRole === "rider").length;
   const totalOffers = relevantDecisions.length;
   const eligible = Boolean(fullAttendance && !metric.centralZoneViolation && isAcceptanceRateEligible(accepted, totalOffers));
-  if (!eligible) return { awardedCents: 0, status: "requirements_not_met" as const, acceptedOffers: accepted, totalOffers, centralZoneOk: !metric.centralZoneViolation, fullAttendance: Boolean(fullAttendance) };
+  if (!eligible) return releaseAndReturn("requirements_not_met", { acceptedOffers: accepted, totalOffers, centralZoneOk: !metric.centralZoneViolation, fullAttendance: Boolean(fullAttendance) });
   const orders = await Order.find({ riderId: slot.riderId, ...tenantFilter(slot.tenantId || null), status: "delivered", isTestOrder: { $ne: true }, deliveredAt: { $gte: new Date(metric.startedAt), $lte: completedAt } }).select("publicCode subtotalCents deliveryFeeCents serviceFeeCents routeDistanceKm").lean().exec() as any[];
   const deliveryEarningsCents = calculateSettlement(orders.map((order) => ({
     publicCode: String(order.publicCode || order._id),
@@ -263,11 +400,56 @@ export async function settleHourlyGuarantee(slot: any, completedAt = new Date())
     serviceFeeCents: Number(order.serviceFeeCents || 0),
     distanceKm: Number(order.routeDistanceKm || 0),
   }))).totals.riderTotalCents;
-  const topUpCents = calculateHourlyGuaranteeTopUp({ eligible: true, scheduledHours: RIDER_INCENTIVE_POLICY.requiredShiftHours, completedHours: RIDER_INCENTIVE_POLICY.requiredShiftHours, deliveryEarningsCents });
-  if (!topUpCents) return { awardedCents: 0, status: "delivery_earnings_met_floor" as const, deliveryEarningsCents };
-  const tenantId = asObjectId(slot.tenantId);
-  const issued = await awardIncentive({ tenantId, riderId: new mongoose.Types.ObjectId(String(slot.riderId)), entryType: "hourly_guarantee", amountCents: topUpCents, sourceKey: `hourly-guarantee:${slot._id}:policy-1`, metadata: { slotId: String(slot._id), deliveryEarningsCents, guaranteedFloorCents: RIDER_INCENTIVE_POLICY.hourlyRateCents * RIDER_INCENTIVE_POLICY.requiredShiftHours, acceptedOffers: accepted, totalOffers, formulaVersion: "piki-phase1-2026-09" }, earnedAt: completedAt });
-  return { awardedCents: issued ? topUpCents : 0, status: issued ? "earned" as const : "budget_limit_or_already_earned" as const, deliveryEarningsCents };
+  const topUpCents = Math.max(0, Number(reservation.guaranteedFloorCents) - deliveryEarningsCents);
+  if (!topUpCents) return releaseAndReturn("delivery_earnings_met_floor", { deliveryEarningsCents });
+  if (topUpCents > Number(reservation.amountCents)) throw new Error("GUARANTEE_PAYOUT_EXCEEDS_RESERVED_AMOUNT");
+
+  const sourceKey = `hourly-guarantee:${slot._id}:policy-1`;
+  const session = await mongoose.startSession();
+  let awarded = false;
+  let alreadyRecorded = false;
+  try {
+    await session.withTransaction(async () => {
+      const current = await RiderShiftGuaranteeReservation.findOne({ slotId: slot._id, status: "reserved" }).session(session).lean().exec() as any;
+      if (!current) { alreadyRecorded = true; return; }
+      const existingEntry = await RiderIncentiveEntry.findOne({ sourceKey }).session(session).lean().exec();
+      if (existingEntry) {
+        await releaseGuaranteedShiftFunds(slot._id, session);
+        alreadyRecorded = true;
+        return;
+      }
+      if (topUpCents > Number(current.amountCents)) throw new Error("GUARANTEE_PAYOUT_EXCEEDS_RESERVED_AMOUNT");
+      const capCents = monthlyCapCents();
+      const budget = await RiderIncentiveBudget.findOneAndUpdate(
+        { ...tenantFilter(null), monthKey: current.monthKey, reservedCents: { $gte: current.amountCents } },
+        { $inc: { reservedCents: -Number(current.amountCents), committedCents: topUpCents }, $set: { capCents } },
+        { new: true, session },
+      ).lean().exec();
+      if (!budget) throw new Error("GUARANTEE_BUDGET_RESERVATION_INVARIANT");
+      const changed = await RiderShiftGuaranteeReservation.updateOne(
+        { _id: current._id, status: "reserved" },
+        { $set: { status: "settled", payoutCents: topUpCents, settledAt: completedAt } },
+        { session },
+      ).exec();
+      if (changed.modifiedCount !== 1) throw new Error("GUARANTEE_RESERVATION_STATE_CONFLICT");
+      await RiderIncentiveEntry.create([{
+        tenantId: slot.tenantId || null,
+        riderId: new mongoose.Types.ObjectId(String(slot.riderId)),
+        entryType: "hourly_guarantee",
+        amountCents: topUpCents,
+        sourceKey,
+        relatedRiderId: null,
+        monthKey: current.monthKey,
+        status: "earned",
+        metadata: { slotId: String(slot._id), deliveryEarningsCents, guaranteedFloorCents: current.guaranteedFloorCents, reservedCents: current.amountCents, acceptedOffers: accepted, totalOffers, formulaVersion: "piki-phase1-2026-09" },
+        createdAt: completedAt,
+      }], { session });
+      awarded = true;
+    });
+  } finally {
+    await session.endSession();
+  }
+  return { awardedCents: awarded ? topUpCents : 0, status: awarded ? "earned" as const : alreadyRecorded ? "already_recorded" as const : "reservation_missing" as const, deliveryEarningsCents };
 }
 
 export async function completeRiderShiftIncentiveTracking(slot: any, completedAt = new Date()) {
@@ -321,7 +503,7 @@ export async function loadRiderIncentiveSnapshot(rider: any) {
     currentShift = { date: currentSlot.date, startTime: currentSlot.startTime, endTime: currentSlot.endTime, zoneSlug: currentSlot.zoneSlug, sampleCount: Number(metric?.sampleCount || 0), trackedSeconds: Number(metric?.trackedSeconds || 0), centralZoneOk: metric && Number(metric.sampleCount || 0) > 0 ? !metric.centralZoneViolation : null };
   }
   return {
-    program: { ...program, budgetCommittedCents: Number((budget as any)?.committedCents || 0), budgetRemainingCents: Math.max(0, program.monthlyCapCents - Number((budget as any)?.committedCents || 0)) },
+    program: { ...program, budgetCommittedCents: Number((budget as any)?.committedCents || 0), budgetReservedCents: Number((budget as any)?.reservedCents || 0), budgetRemainingCents: Math.max(0, program.monthlyCapCents - Number((budget as any)?.committedCents || 0) - Number((budget as any)?.reservedCents || 0)) },
     referral: {
       code: referralProfile?.code || null,
       referredBy: referralProfile?.referredByRiderId ? "claimed" : null,

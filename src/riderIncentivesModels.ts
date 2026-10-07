@@ -41,10 +41,31 @@ const riderIncentiveBudgetSchema = new Schema({
   monthKey: { type: String, required: true },
   capCents: { type: Number, required: true, min: 1 },
   committedCents: { type: Number, required: true, min: 0, default: 0 },
+  reservedCents: { type: Number, required: true, min: 0, default: 0 },
 }, { timestamps: true, collection: "rider_incentive_budgets" });
 riderIncentiveBudgetSchema.index({ tenantId: 1, monthKey: 1 }, { unique: true });
+
+const riderShiftGuaranteeReservationSchema = new Schema({
+  tenantId: { type: Schema.Types.ObjectId, ref: "Tenant", default: null, index: true },
+  riderId: { type: Schema.Types.ObjectId, ref: "Rider", required: true, index: true },
+  slotId: { type: Schema.Types.ObjectId, ref: "RiderSlot", required: true, unique: true, index: true },
+  monthKey: { type: String, required: true, index: true },
+  slotDate: { type: String, required: true },
+  startTime: { type: String, required: true },
+  endTime: { type: String, required: true },
+  zoneSlug: { type: String, required: true },
+  amountCents: { type: Number, required: true, min: 1 },
+  guaranteedFloorCents: { type: Number, required: true, min: 1 },
+  payoutCents: { type: Number, default: 0, min: 0 },
+  status: { type: String, enum: ["reserved", "released", "settled"], required: true, default: "reserved", index: true },
+  reservedAt: { type: Date, default: Date.now },
+  releasedAt: { type: Date, default: null },
+  settledAt: { type: Date, default: null },
+}, { timestamps: true, collection: "rider_shift_guarantee_reservations" });
+riderShiftGuaranteeReservationSchema.index({ monthKey: 1, status: 1, createdAt: -1 });
 
 export const RiderReferralProfile = mongoose.models.RiderReferralProfile || mongoose.model("RiderReferralProfile", riderReferralProfileSchema);
 export const RiderShiftIncentiveMetric = mongoose.models.RiderShiftIncentiveMetric || mongoose.model("RiderShiftIncentiveMetric", riderShiftIncentiveMetricSchema);
 export const RiderIncentiveEntry = mongoose.models.RiderIncentiveEntry || mongoose.model("RiderIncentiveEntry", riderIncentiveEntrySchema);
 export const RiderIncentiveBudget = mongoose.models.RiderIncentiveBudget || mongoose.model("RiderIncentiveBudget", riderIncentiveBudgetSchema);
+export const RiderShiftGuaranteeReservation = mongoose.models.RiderShiftGuaranteeReservation || mongoose.model("RiderShiftGuaranteeReservation", riderShiftGuaranteeReservationSchema);

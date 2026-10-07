@@ -27,7 +27,7 @@ import { onboardingScope } from "./onboardingScope.js";
 import { corporateEmailConfiguration, sendLeadContactEmail, verifyCorporateEmailConnection } from "./corporateEmail.js";
 import { activeOperationalOrderStatuses, dispatchableOrderStatuses, dispatchablePaymentFilter, isDispatchableOrderStatus } from "./dispatchEligibility.js";
 import { canReceivePartnerLocations, partnerCan, partnerPermissions, partnerRolesForEmployee, permissionsForPartnerRoles, type PartnerPermission } from "./partnerAccess.js";
-import { awardRiderRecruitmentMilestones, claimRiderReferralCode, completeRiderShiftIncentiveTracking, incentiveProgramStatus, loadRiderIncentiveSnapshot, trackRiderLocationForIncentive, trackRiderShiftStart } from "./riderIncentives.js";
+import { awardRiderRecruitmentMilestones, claimRiderReferralCode, completeRiderShiftIncentiveTracking, incentiveProgramStatus, loadRiderIncentiveSnapshot, prepareGuaranteedShiftBudgets, releaseGuaranteedShiftFunds, reserveGuaranteedShiftFunds, trackRiderLocationForIncentive, trackRiderShiftStart } from "./riderIncentives.js";
 import { buildApprovedRiderOperationalProfile } from "./riderApproval.js";
 import { CUSTOMER_CATALOG_RESTAURANT_FILTER, presentCustomerCatalogRestaurant } from "./customerCatalogPolicy.js";
 import { quoteMenuItem, usesReferenceAddOns } from "./menuModifiers.js";
@@ -231,13 +231,38 @@ const dispatchSchema = z.object({ preparationMinutes: z.coerce.number().int().mi
 const riderIncidentSchema = z.object({ reason: z.enum(["late_acceptance", "late_delivery", "no_show", "unsafe_driving", "fraud_signal", "customer_complaint", "document_expired", "other"]), evidence: z.array(z.string().url()).max(10).default([]), occurredAt: z.coerce.date().optional() });
 const riderSlotSchema = z.object({ zoneSlug: z.string().regex(/^[a-z0-9-]+$/), date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/), startTime: z.string().regex(/^(?:[01]\d|2[0-3]):[0-5]\d$/), endTime: z.string().regex(/^(?:[01]\d|2[0-3]):[0-5]\d$/), status: z.enum(["planned", "active", "completed", "cancelled"]).default("planned"), notes: z.string().max(500).default("") });
 const riderSlotCreateSchema = riderSlotSchema.extend({ riderId: z.string().regex(/^[a-f\d]{24}$/) });
-const riderSlotWeekSchema = riderSlotCreateSchema.extend({ weekdays: z.array(z.number().int().min(0).max(6)).min(1).max(7).default([0, 1, 2, 3, 4, 5, 6]) });
+const riderSlotWeekSchema = riderSlotCreateSchema.extend({ weekdays: z.array(z.number().int().min(0).max(6)).min(1).max(7).default([0, 1, 2, 3, 4, 5, 6]) }).superRefine((value, context) => {
+  if (new Set(value.weekdays).size !== value.weekdays.length) context.addIssue({ code: z.ZodIssueCode.custom, path: ["weekdays"], message: "Los días de la semana no pueden repetirse." });
+});
 const riderDocumentInputSchema = z.object({ type: z.enum(["identity", "residence_permit", "social_security_number", "bank_certificate", "profile_photo", "driving_license", "insurance", "vehicle_registration", "vehicle_technical_sheet", "scooter_responsible_declaration", "dgt_mvp_homologation", "work_authorization_confirmation", "ppe_and_safety", "other"]), fileName: z.string().min(1).max(180), mimeType: z.string().min(1).max(120), sizeBytes: z.number().int().min(1).max(2_500_000), sha256: z.string().regex(/^[a-f0-9]{64}$/i), contentBase64: z.string().min(1).max(3_500_000) });
 const riderApplicationSchema = z.object({ name: z.string().min(2).max(160), email: z.string().email(), phone: z.string().min(6).max(40), city: z.string().min(2).max(120), vehicle: z.enum(["bike", "electric_bike", "electric_scooter", "motorcycle", "scooter", "car"]), availability: z.string().min(2).max(160), socialSecurityNumber: z.string().min(4).max(40), identityVerificationMethod: z.literal("online_scan"), safetyDeclarationAccepted: z.literal(true), documents: z.array(riderDocumentInputSchema).min(3).max(12), website: z.string().max(0).optional() });
 const documentRequestSubjectSchema = z.enum(["rider_application", "restaurant", "rider_lead", "partner_lead"]);
 const documentRequestRequirementInputSchema = z.object({ type: z.string().regex(/^[a-z0-9_]{2,80}$/), label: z.string().trim().min(2).max(160), description: z.string().trim().max(500).default("") });
 const documentRequestCreateSchema = z.object({ subjectType: documentRequestSubjectSchema, subjectId: z.string().regex(/^[a-f\d]{24}$/), message: z.string().trim().min(10).max(2000), dueAt: z.coerce.date().nullable().optional(), requirements: z.array(documentRequestRequirementInputSchema).min(1).max(12), sendEmail: z.boolean().default(true) });
 const publicDocumentUploadSchema = z.object({ documents: z.array(z.object({ type: z.string().regex(/^[a-z0-9_]{2,80}$/), fileName: z.string().trim().min(1).max(180), mimeType: z.enum(["application/pdf", "image/jpeg", "image/png"]), sizeBytes: z.number().int().min(1).max(2_500_000), sha256: z.string().regex(/^[a-f0-9]{64}$/i), contentBase64: z.string().min(1).max(3_500_000) })).min(1).max(5) });
+
+function riderSlotFinancialError(error: any) {
+  const message = String(error?.message || "");
+  if (message === "GUARANTEE_BUDGET_EXHAUSTED") return { status: 409, body: { error: "RIDER_INCENTIVE_BUDGET_EXHAUSTED", message: "No hay presupuesto global disponible para reservar el máximo de esta garantía. No se modificó el turno." } };
+  if (message === "GUARANTEE_RESERVATION_REQUIRED_BEFORE_START") return { status: 409, body: { error: "GUARANTEE_RESERVATION_REQUIRED", message: "No se puede iniciar el turno porque no se pudo reservar antes su garantía horaria." } };
+  if (message === "GUARANTEE_SLOT_ALREADY_SETTLED") return { status: 409, body: { error: "RIDER_SLOT_ALREADY_SETTLED", message: "Un turno liquidado no se puede reasignar ni modificar." } };
+  if (message === "GUARANTEE_ACTIVE_SLOT_CANNOT_CHANGE") return { status: 409, body: { error: "ACTIVE_GUARANTEE_SLOT_CANNOT_CHANGE", message: "No se puede cambiar un turno garantizado después de iniciarlo." } };
+  if (message === "GUARANTEE_SLOT_MUST_SETTLE") return { status: 409, body: { error: "GUARANTEE_SLOT_MUST_SETTLE", message: "Finaliza el turno desde la app Rider para liquidar o liberar la reserva." } };
+  if (["GUARANTEE_BUDGET_BUCKET_MISSING", "GUARANTEE_BUDGET_RESERVATION_INVARIANT", "GUARANTEE_PAYOUT_EXCEEDS_RESERVED_AMOUNT", "GUARANTEE_RESERVATION_STATE_CONFLICT"].includes(message)) return { status: 500, body: { error: "GUARANTEE_RESERVATION_INVARIANT", message: "No se pudo validar el ledger de reservas. Operaciones debe revisar el presupuesto antes de reintentar." } };
+  return null;
+}
+
+async function notifyRiderScheduleUpdated(riderId: unknown, slots: any[], action: "assigned" | "updated" | "cancelled" | "weekly_assigned") {
+  const slot = slots.find((item) => item?._id);
+  if (!slot) return false;
+  try {
+    await publishRiderScheduleEvent({ riderId: String(riderId), tenantId: slot.tenantId, action: action === "cancelled" ? "cancelled" : action === "weekly_assigned" ? "weekly_updated" : "updated" });
+    return true;
+  } catch (error) {
+    console.error("Rider schedule realtime event failed", error instanceof Error ? error.message : error);
+    return false;
+  }
+}
 const riderDocumentRequestTypes = new Set(["identity", "residence_permit", "social_security_number", "bank_certificate", "profile_photo", "driving_license", "insurance", "vehicle_registration", "vehicle_technical_sheet", "scooter_responsible_declaration", "dgt_mvp_homologation", "work_authorization_confirmation", "ppe_and_safety", "other"]);
 const partnerDocumentRequestTypes = new Set(["tax_id", "bank_certificate", "insurance", "activity_license", "food_sanitary_authorization", "identity", "other"]);
 const leadDocumentInputSchema = z.object({ type: z.string().trim().min(2).max(80), fileName: z.string().trim().min(1).max(180), mimeType: z.enum(["application/pdf", "image/jpeg", "image/png"]), sizeBytes: z.number().int().min(1).max(2_500_000), sha256: z.string().regex(/^[a-f0-9]{64}$/i), contentBase64: z.string().min(20).max(3_500_000) });
@@ -1679,23 +1704,53 @@ app.get("/api/v1/rider-slots", requireRole("admin", "fleet", "rider"), async (re
 app.post("/api/v1/rider-slots", requireRole("admin", "fleet"), async (req, res) => {
   const parsed = riderSlotCreateSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_RIDER_SLOT", details: parsed.error.flatten() });
+  if (parsed.data.status !== "planned") return res.status(400).json({ error: "INVALID_RIDER_SLOT_STATUS", message: "Los turnos se asignan como planificados; el inicio y cierre se controlan desde Rider." });
   const riderId = objectId(parsed.data.riderId); if (!riderId) return res.status(400).json({ error: "INVALID_RIDER_ID" });
   const rider = await Rider.findOne({ _id: riderId, ...tenantScope(req) }).lean().exec() as any; if (!rider) return res.status(404).json({ error: "RIDER_NOT_FOUND" });
+  let fleetEmployee: any = null;
   if (req.auth?.role === "fleet") {
-    const employee = await employeeScope(req);
-    if (!employee?.fleetId) return res.status(403).json({ error: "FLEET_NOT_ASSIGNED", message: "Esta cuenta Fleet no está vinculada a una flota activa. Un superadmin debe asignarle una flota en PIKI Admin → Equipo." });
-    if (rider.fleetId && String(rider.fleetId) !== String(employee.fleetId)) return res.status(403).json({ error: "FLEET_RIDER_ACCESS_DENIED" });
-    if (!rider.fleetId) await Rider.updateOne({ _id: riderId, fleetId: null }, { $set: { fleetId: employee.fleetId } }).exec();
+    fleetEmployee = await employeeScope(req);
+    if (!fleetEmployee?.fleetId) return res.status(403).json({ error: "FLEET_NOT_ASSIGNED", message: "Esta cuenta Fleet no está vinculada a una flota activa. Un superadmin debe asignarle una flota en PIKI Admin → Equipo." });
+    if (rider.fleetId && String(rider.fleetId) !== String(fleetEmployee.fleetId)) return res.status(403).json({ error: "FLEET_RIDER_ACCESS_DENIED" });
   }
   const zone = await Zone.findOne({ ...tenantScope(req), slug: parsed.data.zoneSlug, isActive: true }).lean().exec() as any; if (!zone) return res.status(404).json({ error: "ZONE_NOT_FOUND" });
+  if (fleetEmployee) {
+    const fleet = await Fleet.findById(fleetEmployee.fleetId).select("serviceZones").lean().exec() as any;
+    const allowedZones = Array.isArray(fleetEmployee.zoneSlugs) && fleetEmployee.zoneSlugs.length ? fleetEmployee.zoneSlugs : fleet?.serviceZones || [];
+    if (allowedZones.length && !allowedZones.includes(zone.slug)) return res.status(403).json({ error: "ZONE_ACCESS_DENIED", message: "La flota no tiene habilitada la zona seleccionada." });
+  }
   const { riderId: _riderId, ...slotData } = parsed.data;
-  const slot = await RiderSlot.findOneAndUpdate({ riderId, ...tenantScope(req), date: parsed.data.date, startTime: parsed.data.startTime }, { $set: { ...slotData, ...tenantScope(req), riderId, zoneSlug: zone.slug } }, { upsert: true, new: true }).lean().exec();
-  await publishRiderScheduleEvent({ riderId: String(riderId), tenantId: (slot as any)?.tenantId, action: "updated" });
-  return res.status(201).json({ slot });
+  await prepareGuaranteedShiftBudgets([{ ...slotData, ...tenantScope(req), riderId, zoneSlug: zone.slug }]);
+  const session = await mongoose.startSession();
+  let slot: any = null;
+  try {
+    await session.withTransaction(async () => {
+      if (fleetEmployee) {
+        const assigned = await Rider.findOneAndUpdate({ _id: riderId, ...tenantScope(req), $or: [{ fleetId: fleetEmployee.fleetId }, { fleetId: null }, { fleetId: { $exists: false } }] }, { $set: { fleetId: fleetEmployee.fleetId } }, { new: true, session }).select("_id").lean().exec();
+        if (!assigned) throw new Error("FLEET_RIDER_ACCESS_DENIED");
+      }
+      const existingSlot = await RiderSlot.findOne({ riderId, ...tenantScope(req), date: parsed.data.date, startTime: parsed.data.startTime }).session(session).lean().exec() as any;
+      if (existingSlot && ["active", "completed"].includes(existingSlot.status)) throw new Error("RIDER_SLOT_STATE_LOCKED");
+      slot = await RiderSlot.findOneAndUpdate({ riderId, ...tenantScope(req), date: parsed.data.date, startTime: parsed.data.startTime }, { $set: { ...slotData, ...tenantScope(req), riderId, zoneSlug: zone.slug } }, { upsert: true, new: true, setDefaultsOnInsert: true, session }).lean().exec();
+      await reserveGuaranteedShiftFunds(slot, session);
+    });
+    const riderNotified = await notifyRiderScheduleUpdated(riderId, [slot], "assigned");
+    return res.status(201).json({ slot, riderNotified });
+  } catch (error: any) {
+    if (error?.message === "FLEET_RIDER_ACCESS_DENIED") return res.status(403).json({ error: "FLEET_RIDER_ACCESS_DENIED" });
+    const financialError = riderSlotFinancialError(error);
+    if (financialError) return res.status(financialError.status).json(financialError.body);
+    if (error?.message === "RIDER_SLOT_STATE_LOCKED") return res.status(409).json({ error: "RIDER_SLOT_STATE_LOCKED", message: "No se puede sobrescribir un turno ya iniciado o completado." });
+    if (error?.code === 11000) return res.status(409).json({ error: "RIDER_SLOT_ALREADY_EXISTS", message: "Ya existe un turno con esa fecha y hora de inicio." });
+    throw error;
+  } finally {
+    await session.endSession();
+  }
 });
 app.post("/api/v1/rider-slots/week", requireRole("admin", "fleet"), async (req, res) => {
   const parsed = riderSlotWeekSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_RIDER_SLOT", details: parsed.error.flatten() });
+  if (parsed.data.status !== "planned") return res.status(400).json({ error: "INVALID_RIDER_SLOT_STATUS", message: "Los turnos se asignan como planificados; el inicio y cierre se controlan desde Rider." });
   if (parsed.data.startTime === parsed.data.endTime) return res.status(400).json({ error: "INVALID_SLOT_TIME_RANGE" });
   const riderId = objectId(parsed.data.riderId); if (!riderId) return res.status(400).json({ error: "INVALID_RIDER_ID" });
   const rider = await Rider.findOne({ _id: riderId, ...tenantScope(req) }).lean().exec() as any;
@@ -1713,11 +1768,18 @@ app.post("/api/v1/rider-slots/week", requireRole("admin", "fleet"), async (req, 
     const allowedZones = Array.isArray(fleetEmployee.zoneSlugs) && fleetEmployee.zoneSlugs.length ? fleetEmployee.zoneSlugs : fleet?.serviceZones || [];
     if (allowedZones.length && !allowedZones.includes(zone.slug)) return res.status(403).json({ error: "ZONE_ACCESS_DENIED", message: "La flota no tiene habilitada la zona seleccionada." });
   }
+  if (parsed.data.date < madridNow().date) return res.status(400).json({ error: "INVALID_WEEK_START_DATE", message: "La fecha de referencia de la semana no puede estar en el pasado." });
   const start = new Date(`${parsed.data.date}T12:00:00Z`);
+  const plannedSlots = parsed.data.weekdays.map((day) => {
+    const date = new Date(start); date.setUTCDate(start.getUTCDate() + day);
+    return { ...parsed.data, ...tenantScope(req), riderId, date: date.toISOString().slice(0, 10), zoneSlug: zone.slug };
+  });
+  await prepareGuaranteedShiftBudgets(plannedSlots);
   const session = await mongoose.startSession();
   const slots: any[] = [];
   try {
     await session.withTransaction(async () => {
+      slots.length = 0;
       if (fleetEmployee) {
         const assigned = await Rider.findOneAndUpdate(
           { _id: riderId, ...tenantScope(req), $or: [{ fleetId: fleetEmployee.fleetId }, { fleetId: null }, { fleetId: { $exists: false } }] },
@@ -1729,19 +1791,25 @@ app.post("/api/v1/rider-slots/week", requireRole("admin", "fleet"), async (req, 
       for (const day of parsed.data.weekdays) {
         const date = new Date(start); date.setUTCDate(start.getUTCDate() + day);
         const dateString = date.toISOString().slice(0, 10);
+        const existingSlot = await RiderSlot.findOne({ riderId, ...tenantScope(req), date: dateString, startTime: parsed.data.startTime }).session(session).lean().exec() as any;
+        if (existingSlot && ["active", "completed"].includes(existingSlot.status)) throw new Error("RIDER_SLOT_STATE_LOCKED");
         const slot = await RiderSlot.findOneAndUpdate(
           { riderId, ...tenantScope(req), date: dateString, startTime: parsed.data.startTime },
           { $set: { zoneSlug: zone.slug, date: dateString, startTime: parsed.data.startTime, endTime: parsed.data.endTime, status: parsed.data.status, notes: parsed.data.notes, ...tenantScope(req), riderId } },
           { upsert: true, new: true, setDefaultsOnInsert: true, session },
         ).lean().exec();
+        await reserveGuaranteedShiftFunds(slot, session);
         slots.push(slot);
       }
     });
-    await publishRiderScheduleEvent({ riderId: String(riderId), tenantId: (slots[0] as any)?.tenantId, action: "weekly_updated" });
-    return res.status(201).json({ slots, count: slots.length, weekdays: parsed.data.weekdays, message: `${slots.length} turnos semanales guardados.` });
+    const riderNotified = await notifyRiderScheduleUpdated(riderId, slots, "weekly_assigned");
+    return res.status(201).json({ slots, count: slots.length, weekdays: parsed.data.weekdays, riderNotified, message: riderNotified ? `${slots.length} turnos semanales guardados y Rider notificado.` : `${slots.length} turnos guardados; Rider verá la agenda al abrir la app.` });
   } catch (error: any) {
     slots.length = 0;
     if (error?.message === "FLEET_RIDER_ACCESS_DENIED") return res.status(403).json({ error: "FLEET_RIDER_ACCESS_DENIED" });
+    if (error?.message === "RIDER_SLOT_STATE_LOCKED") return res.status(409).json({ error: "RIDER_SLOT_STATE_LOCKED", message: "No se puede sobrescribir con una plantilla un turno ya iniciado o completado. No se guardó ningún día de la semana." });
+    const financialError = riderSlotFinancialError(error);
+    if (financialError) return res.status(financialError.status).json({ ...financialError.body, message: `${financialError.body.message} No se guardó ningún día de la semana.` });
     if (error?.code === 11000) return res.status(409).json({ error: "RIDER_SLOT_ALREADY_EXISTS", message: "Ya existe un turno con esa fecha y hora de inicio." });
     throw error;
   } finally {
@@ -1754,18 +1822,42 @@ app.patch("/api/v1/rider-slots/:id", requireRole("admin", "fleet"), async (req, 
   const parsed = riderSlotSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_RIDER_SLOT", details: parsed.error.flatten() });
   if (parsed.data.startTime === parsed.data.endTime) return res.status(400).json({ error: "INVALID_SLOT_TIME_RANGE" });
+  if (["active", "completed"].includes(parsed.data.status)) return res.status(400).json({ error: "INVALID_RIDER_SLOT_STATUS", message: "El inicio y cierre del turno se controlan desde Rider." });
   const existing = await RiderSlot.findOne({ _id: slotId, ...tenantScope(req) }).lean().exec() as any;
   if (!existing) return res.status(404).json({ error: "RIDER_SLOT_NOT_FOUND" });
-  if (req.auth?.role === "fleet" && !(await fleetCanAccessRider(req, existing.riderId))) return res.status(403).json({ error: "FLEET_RIDER_ACCESS_DENIED" });
+  let fleetEmployee: any = null;
+  if (req.auth?.role === "fleet") {
+    fleetEmployee = await employeeScope(req);
+    if (!fleetEmployee?.fleetId) return res.status(403).json({ error: "FLEET_NOT_ASSIGNED", message: "Esta cuenta Fleet no está vinculada a una flota activa. Un superadmin debe asignarle una flota en PIKI Admin → Equipo." });
+    if (!(await fleetCanAccessRider(req, existing.riderId))) return res.status(403).json({ error: "FLEET_RIDER_ACCESS_DENIED" });
+  }
+  if (["active", "completed"].includes(existing.status)) return res.status(409).json({ error: "RIDER_SLOT_STATE_LOCKED", message: "No se puede modificar un turno ya iniciado o completado." });
   const zone = await Zone.findOne({ ...tenantScope(req), slug: parsed.data.zoneSlug, isActive: true }).select("slug").lean().exec() as any;
   if (!zone) return res.status(404).json({ error: "ZONE_NOT_FOUND" });
+  if (fleetEmployee) {
+    const fleet = await Fleet.findById(fleetEmployee.fleetId).select("serviceZones").lean().exec() as any;
+    const allowedZones = Array.isArray(fleetEmployee.zoneSlugs) && fleetEmployee.zoneSlugs.length ? fleetEmployee.zoneSlugs : fleet?.serviceZones || [];
+    if (allowedZones.length && !allowedZones.includes(zone.slug)) return res.status(403).json({ error: "ZONE_ACCESS_DENIED", message: "La flota no tiene habilitada la zona seleccionada." });
+  }
+  await prepareGuaranteedShiftBudgets([{ ...parsed.data, ...tenantScope(req), riderId: existing.riderId, _id: slotId, zoneSlug: zone.slug }]);
+  const session = await mongoose.startSession();
+  let slot: any = null;
   try {
-    const slot = await RiderSlot.findOneAndUpdate({ _id: slotId, ...tenantScope(req) }, { $set: { ...parsed.data, zoneSlug: zone.slug } }, { new: true }).lean().exec();
-    await publishRiderScheduleEvent({ riderId: String(existing.riderId), tenantId: (slot as any)?.tenantId, action: "updated" });
-    return res.json({ slot });
+    await session.withTransaction(async () => {
+      slot = await RiderSlot.findOneAndUpdate({ _id: slotId, ...tenantScope(req), status: { $nin: ["active", "completed"] } }, { $set: { ...parsed.data, zoneSlug: zone.slug } }, { new: true, session }).lean().exec();
+      if (!slot) throw new Error("RIDER_SLOT_STATE_LOCKED");
+      await reserveGuaranteedShiftFunds(slot, session);
+    });
+    const riderNotified = await notifyRiderScheduleUpdated(existing.riderId, [slot], parsed.data.status === "cancelled" ? "cancelled" : "updated");
+    return res.json({ slot, riderNotified });
   } catch (error: any) {
+    const financialError = riderSlotFinancialError(error);
+    if (financialError) return res.status(financialError.status).json(financialError.body);
+    if (error?.message === "RIDER_SLOT_STATE_LOCKED") return res.status(409).json({ error: "RIDER_SLOT_STATE_LOCKED", message: "No se puede modificar un turno ya iniciado o completado." });
     if (error?.code === 11000) return res.status(409).json({ error: "RIDER_SLOT_ALREADY_EXISTS", message: "Ya existe otro turno para ese rider, fecha y hora de inicio." });
     throw error;
+  } finally {
+    await session.endSession();
   }
 });
 app.delete("/api/v1/rider-slots/:id", requireRole("admin", "fleet"), async (req, res) => {
@@ -1774,9 +1866,25 @@ app.delete("/api/v1/rider-slots/:id", requireRole("admin", "fleet"), async (req,
   const existing = await RiderSlot.findOne({ _id: slotId, ...tenantScope(req) }).lean().exec() as any;
   if (!existing) return res.status(404).json({ error: "RIDER_SLOT_NOT_FOUND" });
   if (req.auth?.role === "fleet" && !(await fleetCanAccessRider(req, existing.riderId))) return res.status(403).json({ error: "FLEET_RIDER_ACCESS_DENIED" });
-  const slot = await RiderSlot.findOneAndUpdate({ _id: slotId, ...tenantScope(req) }, { $set: { status: "cancelled" } }, { new: true }).lean().exec();
-  await publishRiderScheduleEvent({ riderId: String(existing.riderId), tenantId: (slot as any)?.tenantId, action: "cancelled" });
-  return res.json({ slot, message: "Turno eliminado" });
+  if (["active", "completed"].includes(existing.status)) return res.status(409).json({ error: "RIDER_SLOT_STATE_LOCKED", message: "No se puede cancelar un turno ya iniciado o completado." });
+  const session = await mongoose.startSession();
+  let slot: any = null;
+  try {
+    await session.withTransaction(async () => {
+      slot = await RiderSlot.findOneAndUpdate({ _id: slotId, ...tenantScope(req), status: { $nin: ["active", "completed"] } }, { $set: { status: "cancelled" } }, { new: true, session }).lean().exec();
+      if (!slot) throw new Error("RIDER_SLOT_STATE_LOCKED");
+      await releaseGuaranteedShiftFunds(slotId, session);
+    });
+    const riderNotified = await notifyRiderScheduleUpdated(existing.riderId, [slot], "cancelled");
+    return res.json({ slot, riderNotified, message: riderNotified ? "Turno eliminado y Rider notificado" : "Turno eliminado; Rider sincronizará la agenda al abrir la app." });
+  } catch (error: any) {
+    const financialError = riderSlotFinancialError(error);
+    if (financialError) return res.status(financialError.status).json(financialError.body);
+    if (error?.message === "RIDER_SLOT_STATE_LOCKED") return res.status(409).json({ error: "RIDER_SLOT_STATE_LOCKED", message: "No se puede cancelar un turno ya iniciado o completado." });
+    throw error;
+  } finally {
+    await session.endSession();
+  }
 });
 
 app.post("/api/v1/orders", rateLimit(20, 60_000, "orders-create"), async (req, res) => {
@@ -2040,19 +2148,19 @@ app.post("/api/v1/admin/support/orders/:id/cancel", requireRole("admin", "suppor
   return res.json({ order: updated, audit: { action: "order_cancelled", reason: parsed.data.reason } });
 });
 app.post("/api/v1/riders/:id/support/tickets", requireRole("rider"), async (req, res) => {
-  const parsed = z.object({ subject: z.string().trim().min(3).max(180), description: z.string().trim().min(3).max(4000), priority: z.enum(["low", "normal", "high", "urgent"]).default("normal"), orderId: z.string().optional() }).safeParse(req.body);
+  const parsed = z.object({ subject: z.string().trim().min(3).max(180), description: z.string().trim().min(3).max(4000), priority: z.enum(["low", "normal", "high", "urgent"]).default("normal"), orderId: z.string().trim().min(1).max(80) }).safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_RIDER_SUPPORT_TICKET", details: parsed.error.flatten() });
   const riderId = objectId(String(req.params.id)); if (!riderId) return res.status(400).json({ error: "INVALID_RIDER_ID" });
   if (!(await canAccessRiderShift(riderId, req))) return res.status(403).json({ error: "RIDER_ACCESS_DENIED" });
-  const rider = await Rider.findOne({ _id: riderId, ...tenantScope(req) }).select("email name").lean().exec() as any;
+  const rider = await Rider.findOne({ _id: riderId, ...tenantScope(req) }).select("email name status").lean().exec() as any;
   if (!rider) return res.status(404).json({ error: "RIDER_NOT_FOUND" });
-  let orderId: mongoose.Types.ObjectId | null = null;
-  if (parsed.data.orderId) {
-    orderId = objectId(parsed.data.orderId);
-    if (!orderId || !(await Order.exists({ _id: orderId, riderId, ...tenantScope(req) }))) return res.status(404).json({ error: "RIDER_ORDER_NOT_FOUND" });
-  }
-  const ticket = await SupportTicket.create({ tenantId: (rider as any).tenantId || null, orderId, reporterEmail: rider.email, sourceSurface: "rider", sourceRole: "rider", category: "rider", priority: parsed.data.priority, subject: parsed.data.subject, description: parsed.data.description, ticketNumber: `SUP-${new Date().toISOString().slice(0, 10).replace(/-/g, "")}-${randomInt(1000, 9999)}`, messages: [{ senderRole: "rider", senderName: rider.name, body: parsed.data.description }], actions: [{ action: "rider_ticket_created", metadata: { riderId: String(riderId) } }] });
-  void publishRealtimeEvent({ channel: "admin", audienceKey: tenantAudienceKey((rider as any).tenantId, "admin"), tenantId: (rider as any).tenantId, type: "support.ticket_created", payload: { ticketId: String(ticket._id), priority: ticket.priority, orderId: orderId ? String(orderId) : null } });
+  if (!("available busy".split(" ").includes(rider.status))) return res.status(403).json({ error: "RIDER_SUPPORT_REQUIRES_ONLINE", message: "La asistencia por incidencias solo está disponible durante un turno online." });
+  const orderId = objectId(parsed.data.orderId);
+  if (!orderId) return res.status(400).json({ error: "INVALID_RIDER_ORDER_ID" });
+  const activeOrder = await Order.findOne({ _id: orderId, riderId, ...tenantScope(req), assignmentState: "assigned", status: { $in: ["pending", "accepted", "preparing", "ready_for_pickup", "picked_up", "on_the_way"] } }).select("_id").lean().exec();
+  if (!activeOrder) return res.status(403).json({ error: "RIDER_SUPPORT_REQUIRES_ACTIVE_ORDER", message: "Solo puedes abrir una incidencia mientras tengas un pedido activo asignado." });
+  const ticket = await SupportTicket.create({ tenantId: (rider as any).tenantId || null, orderId, reporterEmail: rider.email, sourceSurface: "rider", sourceRole: "rider", category: "rider", priority: parsed.data.priority, subject: parsed.data.subject, description: parsed.data.description, ticketNumber: `SUP-${new Date().toISOString().slice(0, 10).replace(/-/g, "")}-${randomInt(1000, 9999)}`, messages: [{ senderRole: "rider", senderName: rider.name, body: parsed.data.description }], actions: [{ action: "rider_ticket_created", metadata: { riderId: String(riderId), orderId: String(orderId) } }] });
+  void publishRealtimeEvent({ channel: "admin", audienceKey: tenantAudienceKey((rider as any).tenantId, "admin"), tenantId: (rider as any).tenantId, type: "support.ticket_created", payload: { ticketId: String(ticket._id), priority: ticket.priority, orderId: String(orderId) } });
   return res.status(201).json({ ticket: { id: ticket._id, ticketNumber: ticket.ticketNumber, status: ticket.status, messages: ticket.messages } });
 });
 app.get("/api/v1/riders/:riderId/support/tickets", requireRole("rider"), async (req, res) => {
@@ -2070,8 +2178,16 @@ app.post("/api/v1/admin/support/tickets/:id/typing", requireRole("admin", "suppo
 });
 
 app.post("/api/v1/riders/:riderId/support/tickets/:ticketId/typing", requireRole("rider"), async (req, res) => {
-  const rider = await Rider.findById(req.params.riderId).lean().exec() as any; if (!rider) return res.status(404).json({ error: "RIDER_NOT_FOUND" });
+  const riderId = objectId(String(req.params.riderId)); if (!riderId || !(await canAccessRiderShift(riderId, req))) return res.status(403).json({ error: "RIDER_ACCESS_DENIED" });
+  const rider = await Rider.findOne({ _id: riderId, ...tenantScope(req) }).lean().exec() as any; if (!rider) return res.status(404).json({ error: "RIDER_NOT_FOUND" });
   const active = Boolean(req.body?.active);
+  if (active) {
+    if (!["available", "busy"].includes(rider.status)) return res.status(403).json({ error: "RIDER_SUPPORT_REQUIRES_ONLINE", message: "La asistencia por chat solo está disponible durante un turno online." });
+    const ticketForTyping = await SupportTicket.findOne({ _id: req.params.ticketId, reporterEmail: rider.email, ...tenantScope(req) }).select("orderId").lean().exec() as any;
+    if (!ticketForTyping) return res.status(404).json({ error: "TICKET_NOT_FOUND" });
+    const activeOrder = ticketForTyping.orderId && await Order.exists({ _id: ticketForTyping.orderId, riderId, ...tenantScope(req), assignmentState: "assigned", status: { $in: ["pending", "accepted", "preparing", "ready_for_pickup", "picked_up", "on_the_way"] } });
+    if (!activeOrder) return res.status(403).json({ error: "RIDER_SUPPORT_REQUIRES_ACTIVE_ORDER", message: "Solo puedes usar el chat mientras el pedido vinculado siga activo y asignado." });
+  }
   const ticket = await SupportTicket.findOneAndUpdate({ _id: req.params.ticketId, reporterEmail: rider.email, ...tenantScope(req), status: { $nin: ["resolved", "closed"] } }, { $set: { riderTypingAt: active ? new Date() : null } }, { new: true }).lean().exec() as any;
   if (!ticket) return res.status(404).json({ error: "TICKET_NOT_FOUND" });
   return res.json({ ok: true, riderTypingAt: ticket.riderTypingAt });
@@ -2080,9 +2196,12 @@ app.post("/api/v1/riders/:riderId/support/tickets/:ticketId/typing", requireRole
 app.post("/api/v1/riders/:riderId/support/tickets/:ticketId/messages", requireRole("rider"), async (req, res) => {
   const parsed = supportMessageInput.safeParse(req.body); if (!parsed.success) return res.status(400).json({ error: "INVALID_SUPPORT_MESSAGE" });
   const riderId = objectId(String(req.params.riderId)); const ticketId = objectId(String(req.params.ticketId)); if (!riderId || !ticketId || !(await canAccessRiderShift(riderId, req))) return res.status(403).json({ error: "RIDER_ACCESS_DENIED" });
-  const rider = await Rider.findOne({ _id: riderId, ...tenantScope(req) }).select("email name").lean().exec() as any; if (!rider) return res.status(404).json({ error: "RIDER_NOT_FOUND" });
+  const rider = await Rider.findOne({ _id: riderId, ...tenantScope(req) }).select("email name status").lean().exec() as any; if (!rider) return res.status(404).json({ error: "RIDER_NOT_FOUND" });
   const current = await SupportTicket.findOne({ _id: ticketId, reporterEmail: rider.email, ...tenantScope(req) }).lean().exec() as any; if (!current) return res.status(404).json({ error: "TICKET_NOT_FOUND" });
   if (["resolved", "closed"].includes(current.status)) return res.status(409).json({ error: "SUPPORT_CHAT_CLOSED" });
+  if (!["available", "busy"].includes(rider.status)) return res.status(403).json({ error: "RIDER_SUPPORT_REQUIRES_ONLINE", message: "La asistencia por chat solo está disponible durante un turno online." });
+  const activeOrder = current.orderId && await Order.exists({ _id: current.orderId, riderId, ...tenantScope(req), assignmentState: "assigned", status: { $in: ["pending", "accepted", "preparing", "ready_for_pickup", "picked_up", "on_the_way"] } });
+  if (!activeOrder) return res.status(403).json({ error: "RIDER_SUPPORT_REQUIRES_ACTIVE_ORDER", message: "Solo puedes escribir a Soporte mientras el pedido vinculado siga activo y asignado." });
   const ticket = await SupportTicket.findOneAndUpdate({ _id: ticketId, reporterEmail: rider.email, ...tenantScope(req) }, { $push: { messages: { senderRole: "rider", senderName: rider.name, body: parsed.data.body } }, $set: { status: current.assignedTo ? "in_progress" : "open", riderTypingAt: null } }, { new: true }).populate("assignedTo", "name email").lean().exec();
   return res.json({ ticket });
 });
@@ -2563,8 +2682,13 @@ app.get("/api/v1/riders/session", requireRole("rider"), async (req, res) => {
   const rider = employee ? await Rider.findOne({ email: employee.email }).lean().exec() as any : null;
   if (!rider) return res.status(404).json({ error: "RIDER_ACCOUNT_NOT_LINKED" });
   const { now, slot } = await findCurrentRiderSlot(rider._id);
-  // A previous browser session must never keep a rider online after its slot ended.
-  await RiderSlot.updateMany({ riderId: rider._id, status: "active", date: { $lt: now.date } }, { $set: { status: "completed" } }).exec();
+  // Close expired slots one by one so each guarantee hold is settled or released.
+  const expiredSlots = await RiderSlot.find({ riderId: rider._id, status: "active", date: { $lt: now.date } }).lean().exec() as any[];
+  for (const expiredSlot of expiredSlots) {
+    const completedAt = new Date();
+    const completedSlot = await RiderSlot.findOneAndUpdate({ _id: expiredSlot._id, status: "active" }, { $set: { status: "completed" } }, { new: true }).lean().exec();
+    if (completedSlot) await completeRiderShiftIncentiveTracking(completedSlot, completedAt).catch((error) => console.error("Expired rider shift guarantee settlement failed", error instanceof Error ? error.message : error));
+  }
   const hasActiveOrder = Boolean(await Order.exists({ riderId: rider._id, status: { $nin: ["delivered", "cancelled"] }, assignmentState: { $in: ["offered", "assigned"] } }));
   const effectiveStatus = hasActiveOrder ? "busy" : (slot as any)?.status === "active" ? rider.status : "offline";
   const update: Record<string, unknown> = { status: effectiveStatus };
@@ -2605,7 +2729,27 @@ if (!slot) {
     return res.status(409).json({ error: "SHIFT_OUTSIDE_SCHEDULE", message: `Jornada bloqueada: solo puedes iniciar en la fecha y franja asignadas. Hora oficial: ${now.date} ${now.time} (${now.timeZone}).`, now, serverClock: now });
   }
   const currentSlot = slot as any;
-  const updatedSlot = await RiderSlot.findOneAndUpdate({ _id: currentSlot._id, status: { $in: ["planned", "active"] } }, { $set: { status: "active" } }, { new: true }).lean().exec();
+  let updatedSlot: any = null;
+  if (incentiveProgramStatus().hourlyGuaranteeEnabled) {
+    await prepareGuaranteedShiftBudgets([currentSlot]);
+    const session = await mongoose.startSession();
+    try {
+      await session.withTransaction(async () => {
+        const freshSlot = await RiderSlot.findOne({ _id: currentSlot._id, status: { $in: ["planned", "active"] } }).session(session).lean().exec() as any;
+        if (!freshSlot) throw new Error("RIDER_SLOT_NOT_FOUND");
+        if (freshSlot.status === "planned") await reserveGuaranteedShiftFunds(freshSlot, session);
+        updatedSlot = await RiderSlot.findOneAndUpdate({ _id: currentSlot._id, status: { $in: ["planned", "active"] } }, { $set: { status: "active" } }, { new: true, session }).lean().exec();
+      });
+    } catch (error: any) {
+      const financialError = riderSlotFinancialError(error);
+      if (financialError) return res.status(financialError.status).json(financialError.body);
+      throw error;
+    } finally {
+      await session.endSession();
+    }
+  } else {
+    updatedSlot = await RiderSlot.findOneAndUpdate({ _id: currentSlot._id, status: { $in: ["planned", "active"] } }, { $set: { status: "active" } }, { new: true }).lean().exec();
+  }
   await trackRiderShiftStart(updatedSlot || currentSlot, rider).catch((error) => console.error("Rider incentive shift tracking start failed", error instanceof Error ? error.message : error));
   const hasOrders = await Order.exists({ riderId, status: { $nin: ["delivered", "cancelled"] }, assignmentState: { $in: ["offered", "assigned"] } });
   const hasFreshLocation = Boolean(rider.lastLocationAt && new Date(rider.lastLocationAt).getTime() >= Date.now() - 90_000);
@@ -2635,10 +2779,22 @@ app.post("/api/v1/riders/:id/slots", requireRole("admin", "fleet"), async (req, 
   const riderIdParam = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
   const riderId = objectId(riderIdParam); if (!riderId) return res.status(400).json({ error: "INVALID_RIDER_ID" });
   const parsed = riderSlotSchema.safeParse(req.body); if (!parsed.success) return res.status(400).json({ error: "INVALID_RIDER_SLOT", details: parsed.error.flatten() });
+  if (parsed.data.status !== "planned") return res.status(400).json({ error: "INVALID_RIDER_SLOT_STATUS", message: "Los turnos se asignan como planificados; el inicio y cierre se controlan desde Rider." });
   if (parsed.data.endTime <= parsed.data.startTime) return res.status(400).json({ error: "INVALID_SLOT_TIME_RANGE" });
   const rider = await Rider.findOne({ _id: riderId, ...tenantScope(req) }).lean().exec(); if (!rider) return res.status(404).json({ error: "RIDER_NOT_FOUND" });
-  const zone = await Zone.findOne({ ...tenantScope(req), slug: parsed.data.zoneSlug, isActive: true }).select("slug").lean().exec();
+  let fleetEmployee: any = null;
+  if (req.auth?.role === "fleet") {
+    fleetEmployee = await employeeScope(req);
+    if (!fleetEmployee?.fleetId) return res.status(403).json({ error: "FLEET_NOT_ASSIGNED", message: "Esta cuenta Fleet no está vinculada a una flota activa. Un superadmin debe asignarle una flota en PIKI Admin → Equipo." });
+    if ((rider as any).fleetId && String((rider as any).fleetId) !== String(fleetEmployee.fleetId)) return res.status(403).json({ error: "FLEET_RIDER_ACCESS_DENIED" });
+  }
+  const zone = await Zone.findOne({ ...tenantScope(req), slug: parsed.data.zoneSlug, isActive: true }).select("slug").lean().exec() as any;
   if (!zone) return res.status(404).json({ error: "ZONE_NOT_FOUND" });
+  if (fleetEmployee) {
+    const fleet = await Fleet.findById(fleetEmployee.fleetId).select("serviceZones").lean().exec() as any;
+    const allowedZones = Array.isArray(fleetEmployee.zoneSlugs) && fleetEmployee.zoneSlugs.length ? fleetEmployee.zoneSlugs : fleet?.serviceZones || [];
+    if (allowedZones.length && !allowedZones.includes(zone.slug)) return res.status(403).json({ error: "ZONE_ACCESS_DENIED", message: "La flota no tiene habilitada la zona seleccionada." });
+  }
   const limits = await tenantLimits(req);
   const [dailyForRider, dailyForTenant] = await Promise.all([
     RiderSlot.countDocuments({ riderId, ...tenantScope(req), date: parsed.data.date, status: { $nin: ["cancelled", "completed"] } }),
@@ -2648,12 +2804,29 @@ app.post("/api/v1/riders/:id/slots", requireRole("admin", "fleet"), async (req, 
   if (dailyForTenant >= limits.maxDailySlots) return res.status(409).json({ error: "TENANT_DAILY_SLOT_CAPACITY_REACHED", limit: limits.maxDailySlots });
   const overlap = await RiderSlot.findOne({ riderId, ...tenantScope(req), date: parsed.data.date, status: { $nin: ["cancelled", "completed"] }, $or: [{ startTime: { $lt: parsed.data.endTime }, endTime: { $gt: parsed.data.startTime } }] }).lean().exec();
   if (overlap) return res.status(409).json({ error: "RIDER_SLOT_OVERLAP", slot: overlap });
+  await prepareGuaranteedShiftBudgets([{ ...parsed.data, ...tenantScope(req), riderId, zoneSlug: zone.slug }]);
+  const session = await mongoose.startSession();
+  let slot: any = null;
   try {
-    const slot = await RiderSlot.create({ ...parsed.data, ...tenantScope(req), riderId });
-    return res.status(201).json({ slot });
+    await session.withTransaction(async () => {
+      if (fleetEmployee) {
+        const assigned = await Rider.findOneAndUpdate({ _id: riderId, ...tenantScope(req), $or: [{ fleetId: fleetEmployee.fleetId }, { fleetId: null }, { fleetId: { $exists: false } }] }, { $set: { fleetId: fleetEmployee.fleetId } }, { new: true, session }).select("_id").lean().exec();
+        if (!assigned) throw new Error("FLEET_RIDER_ACCESS_DENIED");
+      }
+      const [created] = await RiderSlot.create([{ ...parsed.data, ...tenantScope(req), riderId, zoneSlug: zone.slug }], { session });
+      slot = created;
+      await reserveGuaranteedShiftFunds(slot, session);
+    });
+    const riderNotified = await notifyRiderScheduleUpdated(riderId, [slot], "assigned");
+    return res.status(201).json({ slot, riderNotified });
   } catch (error: any) {
+    if (error?.message === "FLEET_RIDER_ACCESS_DENIED") return res.status(403).json({ error: "FLEET_RIDER_ACCESS_DENIED" });
+    const financialError = riderSlotFinancialError(error);
+    if (financialError) return res.status(financialError.status).json(financialError.body);
     if (error?.code === 11000) return res.status(409).json({ error: "RIDER_SLOT_ALREADY_EXISTS", message: "Ya existe un slot para ese rider, fecha y hora de inicio." });
     throw error;
+  } finally {
+    await session.endSession();
   }
 });
 
