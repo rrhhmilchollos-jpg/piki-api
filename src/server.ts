@@ -3008,7 +3008,9 @@ function dispatchScope(req: express.Request, order: any) {
   return tenantScope(req);
 }
 async function findDispatchRestaurant(order: any, req: express.Request, scope: Record<string, unknown>) {
-  const scoped = await Restaurant.findOne({ _id: order.restaurantId, ...scope }).lean().exec() as any;
+  // Never apply Rider-only filters (such as isTestRider) to the Partner restaurant.
+  const { isTestRider: _riderOnlyFilter, ...restaurantScope } = scope;
+  const scoped = await Restaurant.findOne({ _id: order.restaurantId, ...restaurantScope }).lean().exec() as any;
   return scoped;
 }
 app.get("/api/v1/dispatch/orders/:id/preview", requireRole("admin", "fleet"), async (req, res) => {
