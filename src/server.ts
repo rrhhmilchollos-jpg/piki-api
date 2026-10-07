@@ -3001,8 +3001,11 @@ async function runAutomaticDispatchSweep() {
 }
 async function findDispatchOrder(orderId: mongoose.Types.ObjectId, req: express.Request) {
   const scoped = await Order.findOne({ _id: orderId, ...tenantScope(req) }).lean().exec() as any;
-  if (scoped || req.auth?.role !== "fleet") return scoped;
-  return null;
+  if (scoped || req.auth?.role !== "admin") return scoped;
+  // Customer compatibility orders created before tenant propagation may have a
+  // null tenantId. Let superadmin dispatch that legacy order, but never use
+  // this fallback for fleet or partner accounts.
+  return await Order.findOne({ _id: orderId, tenantId: null }).lean().exec() as any;
 }
 function dispatchScope(req: express.Request, order: any) {
   return tenantScope(req);
@@ -3010,7 +3013,7 @@ function dispatchScope(req: express.Request, order: any) {
 async function findDispatchRestaurant(order: any, req: express.Request, scope: Record<string, unknown>) {
   // Never apply Rider-only filters (such as isTestRider) to the Partner restaurant.
   const { isTestRider: _riderOnlyFilter, ...restaurantScope } = scope;
-  const scoped = await Restaurant.findOne({ _id: order.restaurantId, ...restaurantScope }).lean().exec() as any;
+  const scoped = await Restaurant.findOne({ _id: order.restaurantId, ...(order.tenantId == null ? {} : restaurantScope) }).lean().exec() as any;
   return scoped;
 }
 app.get("/api/v1/dispatch/orders/:id/preview", requireRole("admin", "fleet"), async (req, res) => {
