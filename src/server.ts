@@ -2711,8 +2711,20 @@ function madridNow(instant = new Date()) {
 function previousCalendarDate(date: string) { const value = new Date(`${date}T12:00:00Z`); value.setUTCDate(value.getUTCDate() - 1); return value.toISOString().slice(0, 10); }
 function slotContainsTime(slot: { startTime: string; endTime: string }, time: string) { return slot.startTime < slot.endTime ? slot.startTime <= time && time < slot.endTime : time >= slot.startTime || time < slot.endTime; }
 
+async function expireRiderSlots(riderId: mongoose.Types.ObjectId, now: ReturnType<typeof madridNow>) {
+  const candidates = await RiderSlot.find({ riderId, date: { $in: [now.date, previousCalendarDate(now.date)] }, status: "active" }).select("_id date startTime endTime").lean().exec() as any[];
+  const expired = candidates.filter((slot) => {
+    if (slot.date === now.date) return slot.startTime < slot.endTime && now.time >= slot.endTime;
+    return slot.startTime < slot.endTime || now.time >= slot.endTime;
+  });
+  if (!expired.length) return false;
+  await RiderSlot.updateMany({ _id: { $in: expired.map((slot) => slot._id) }, status: "active" }, { $set: { status: "completed" } }).exec();
+  await Rider.findOneAndUpdate({ _id: riderId, activeOrderId: null }, { $set: { status: "offline" } }).exec();
+  return true;
+}
 async function findCurrentRiderSlot(riderId: mongoose.Types.ObjectId) {
   const now = madridNow();
+  await expireRiderSlots(riderId, now);
   const candidates = await RiderSlot.find({ riderId, date: { $in: [now.date, previousCalendarDate(now.date)] }, status: { $in: ["planned", "active"] } }).sort({ date: 1, startTime: 1 }).lean().exec();
   const slot = candidates.find((candidate: any) => slotContainsTime(candidate, now.time) && (candidate.date === now.date || candidate.startTime >= candidate.endTime));
   return { now, slot, selfStartAllowed: false };
