@@ -1105,7 +1105,19 @@ app.get("/api/v1/partners/kitchen/orders", requireRole("partner"), async (req, r
   const [restaurantRecord, customers] = await Promise.all([Restaurant.findOne({ _id: restaurantId, ...tenantScope(req) }).select("name address phone cuisine").lean().exec(), CustomerAccount.find({ _id: { $in: orders.map((order) => order.customerId).filter(Boolean) }, ...tenantScope(req) }).select("name email").lean().exec()]);
   const restaurant = restaurantRecord as any;
   const customerMap = new Map(customers.map((customer: any) => [String(customer._id), customer]));
-  return res.json({ orders: orders.map((order: any) => ({ ...order, restaurant: restaurant ? { name: restaurant.name, address: restaurant.address || "", phone: restaurant.phone || "", cuisine: restaurant.cuisine || "" } : null, customer: order.customerId ? customerMap.get(String(order.customerId)) || null : null, pickupQrUrl: order.status === "ready_for_pickup" ? pickupQrUrl(order.publicCode) : null, pickupPin: order.status === "ready_for_pickup" ? pickupQrPin(order.publicCode) : null, partnerPrepDeadlineAt: order.partnerPrepDeadlineAt || null, partnerPrepOverdue: Boolean(order.partnerPrepDeadlineAt && new Date(order.partnerPrepDeadlineAt).getTime() < Date.now()) })) });
+  return res.json({ orders: orders.map((order: any) => {
+    const linkedCustomer = order.customerId ? customerMap.get(String(order.customerId)) : null;
+    const customerName = String(linkedCustomer?.name || order.customerName || "").trim();
+    return {
+      ...order,
+      restaurant: restaurant ? { name: restaurant.name, address: restaurant.address || "", phone: restaurant.phone || "", cuisine: restaurant.cuisine || "" } : null,
+      customer: customerName ? { name: customerName, email: linkedCustomer?.email || "" } : null,
+      pickupQrUrl: order.status === "ready_for_pickup" ? pickupQrUrl(order.publicCode) : null,
+      pickupPin: order.status === "ready_for_pickup" ? pickupQrPin(order.publicCode) : null,
+      partnerPrepDeadlineAt: order.partnerPrepDeadlineAt || null,
+      partnerPrepOverdue: Boolean(order.partnerPrepDeadlineAt && new Date(order.partnerPrepDeadlineAt).getTime() < Date.now()),
+    };
+  }) });
 });
 app.get("/api/v1/partners/kitchen/orders/archive", requireRole("partner"), async (req, res) => {
   const { access, allowed } = await partnerRequestAccess(req, "orders:read");
@@ -1963,7 +1975,7 @@ app.post("/api/v1/orders", rateLimit(20, 60_000, "orders-create"), async (req, r
   const publicCode = `PIKI-${Date.now().toString(36).toUpperCase()}`;
   const dailyCode = await createDailyDisplayCode();
   const authenticatedCustomer = await currentCustomer(req) as any;
-  const order = await Order.create({ tenantId: restaurant.tenantId || null, publicCode, ...dailyCode, restaurantId: restaurant._id, customerId: authenticatedCustomer?._id || null, items: normalizedItems, deliveryAddress: parsed.data.deliveryAddress, deliveryNote: parsed.data.deliveryNote, deliveryLocation: { type: "Point", coordinates: deliveryPoint }, coveragePolicySlug: coverage.policySlug, coveragePolicyVersion: coverage.policyVersion, coverageDecision: coverage.reason, straightLineDistanceKm: coverage.straightLineDistanceKm, withinMunicipality: coverage.withinMunicipality, deliveryBaseFeeCents: coverage.deliveryBaseFeeCents, outsideMunicipalitySurchargeCents: coverage.outsideMunicipalitySurchargeCents, routeDistanceKm: route.routeDistanceKm, routeDurationMinutes: route.routeDurationMinutes, routeProvider: route.routeProvider, routingDegraded: route.routingDegraded, requiredVehicleClasses: route.requiredVehicleClasses, subtotalCents, deliveryFeeCents, serviceFeeCents, totalCents, paymentMethod: parsed.data.paymentMethod, paymentState: "pending", statusHistory: [{ status: "pending", actorRole: "customer", reason: parsed.data.paymentMethod === "cash" ? "Pedido a contrarreembolso; cobro pendiente hasta la entrega" : "Pedido creado con política de cobertura Xàtiva" }] });
+  const order = await Order.create({ tenantId: restaurant.tenantId || null, publicCode, ...dailyCode, restaurantId: restaurant._id, customerId: authenticatedCustomer?._id || null, customerName: String(authenticatedCustomer?.name || "").trim(), items: normalizedItems, deliveryAddress: parsed.data.deliveryAddress, deliveryNote: parsed.data.deliveryNote, deliveryLocation: { type: "Point", coordinates: deliveryPoint }, coveragePolicySlug: coverage.policySlug, coveragePolicyVersion: coverage.policyVersion, coverageDecision: coverage.reason, straightLineDistanceKm: coverage.straightLineDistanceKm, withinMunicipality: coverage.withinMunicipality, deliveryBaseFeeCents: coverage.deliveryBaseFeeCents, outsideMunicipalitySurchargeCents: coverage.outsideMunicipalitySurchargeCents, routeDistanceKm: route.routeDistanceKm, routeDurationMinutes: route.routeDurationMinutes, routeProvider: route.routeProvider, routingDegraded: route.routingDegraded, requiredVehicleClasses: route.requiredVehicleClasses, subtotalCents, deliveryFeeCents, serviceFeeCents, totalCents, paymentMethod: parsed.data.paymentMethod, paymentState: "pending", statusHistory: [{ status: "pending", actorRole: "customer", reason: parsed.data.paymentMethod === "cash" ? "Pedido a contrarreembolso; cobro pendiente hasta la entrega" : "Pedido creado con política de cobertura Xàtiva" }] });
   if (parsed.data.paymentMethod === "cash") {
     const dispatch = queueAutomaticDispatch(order._id as mongoose.Types.ObjectId).catch((error) => console.warn("Immediate cash-order dispatch failed", error instanceof Error ? error.message : error));
     await Promise.all([dispatch, publishOrderIntakeEvents(order, { settlement: "cash_due", message: "Contrarreembolso: el Rider cobrará en efectivo al entregar." })]);
@@ -1971,7 +1983,7 @@ app.post("/api/v1/orders", rateLimit(20, 60_000, "orders-create"), async (req, r
   res.status(201).json({ order: { id: order.id, publicCode, displayCode: order.displayCode, displayCodeDate: order.displayCodeDate, status: order.status, paymentState: parsed.data.paymentMethod === "cash" ? "pending_cash_collection" : order.paymentState, paymentMethod: parsed.data.paymentMethod, cashDueAtDelivery: parsed.data.paymentMethod === "cash", deliveryQrUrl: deliveryQrUrl(publicCode), subtotalCents, deliveryFeeCents, serviceFeeCents, totalCents, coverage, route, partnerPreparationLimitMinutes: PARTNER_PREPARATION_LIMIT_MINUTES, customerDeliveryTargetMinutes: CUSTOMER_DELIVERY_TARGET_MINUTES, etaMinutes: calculateEtaRange([PARTNER_PREPARATION_LIMIT_MINUTES, PARTNER_PREPARATION_LIMIT_MINUTES], [5, 15]) } });
 });
 
-const customerOrderSyncSchema = z.object({ publicCode: z.string().trim().min(6).max(64), restaurantSlug: z.string().trim().min(1).max(120), customerId: z.string().nullable().optional(), deliveryAddress: z.string().trim().min(5).max(1000), deliveryNote: z.string().trim().max(500).default(""), deliveryLocation: z.object({ latitude: z.number().finite(), longitude: z.number().finite() }).nullable().optional(), items: z.array(z.object({ itemId: z.string().min(1), name: z.string().min(1), quantity: z.number().int().min(1).max(20), unitPriceCents: z.number().int().min(0), totalCents: z.number().int().min(0).optional() })).min(1), subtotalCents: z.number().int().min(0), deliveryFeeCents: z.number().int().min(0), serviceFeeCents: z.number().int().min(0), totalCents: z.number().int().min(0), paymentMethod: z.enum(["stripe", "cash"]).default("stripe"), paymentState: z.enum(["pending", "authorized", "paid", "failed", "refunded"]).default("pending"), stripeCheckoutSessionId: z.string().nullable().optional(), stripePaymentIntentId: z.string().nullable().optional() });
+const customerOrderSyncSchema = z.object({ publicCode: z.string().trim().min(6).max(64), restaurantSlug: z.string().trim().min(1).max(120), customerId: z.string().nullable().optional(), customerName: z.string().trim().max(160).nullable().optional(), deliveryAddress: z.string().trim().min(5).max(1000), deliveryNote: z.string().trim().max(500).default(""), deliveryLocation: z.object({ latitude: z.number().finite(), longitude: z.number().finite() }).nullable().optional(), items: z.array(z.object({ itemId: z.string().min(1), name: z.string().min(1), quantity: z.number().int().min(1).max(20), unitPriceCents: z.number().int().min(0), totalCents: z.number().int().min(0).optional() })).min(1), subtotalCents: z.number().int().min(0), deliveryFeeCents: z.number().int().min(0), serviceFeeCents: z.number().int().min(0), totalCents: z.number().int().min(0), paymentMethod: z.enum(["stripe", "cash"]).default("stripe"), paymentState: z.enum(["pending", "authorized", "paid", "failed", "refunded"]).default("pending"), stripeCheckoutSessionId: z.string().nullable().optional(), stripePaymentIntentId: z.string().nullable().optional() });
 app.post("/api/v1/internal/customer-orders/sync", async (req, res) => {
   const expected = process.env.PIKI_CUSTOMER_SYNC_SECRET;
   if (!expected || req.header("x-piki-customer-sync-secret") !== expected) return res.status(401).json({ error: "INVALID_SYNC_AUTH" });
@@ -1987,7 +1999,7 @@ app.post("/api/v1/internal/customer-orders/sync", async (req, res) => {
   // Customer is the source of truth: never rebuild lines from a second menu copy.
   // This prevents price/name drift between Customer, Partner and Rider screens.
   const canonicalItems = input.items.map(({ itemId, name, quantity, unitPriceCents, totalCents }) => ({ itemId, name, quantity, unitPriceCents, ...(totalCents == null ? {} : { totalCents }) }));
-  const order = await Order.findOneAndUpdate({ publicCode: input.publicCode }, { $set: { tenantId: restaurant.tenantId || null, restaurantId: restaurant._id, customerId: input.customerId || null, items: canonicalItems, deliveryAddress: input.deliveryAddress, deliveryNote: input.deliveryNote, deliveryLocation: location, subtotalCents: input.subtotalCents, deliveryFeeCents: input.deliveryFeeCents, serviceFeeCents: input.serviceFeeCents, totalCents: input.totalCents, paymentMethod: input.paymentMethod, paymentState: input.paymentState, ...(input.stripeCheckoutSessionId !== undefined ? { stripeCheckoutSessionId: input.stripeCheckoutSessionId } : {}), ...(input.stripePaymentIntentId !== undefined ? { stripePaymentIntentId: input.stripePaymentIntentId } : {}), ...(["authorized", "paid"].includes(input.paymentState) && !["authorized", "paid"].includes(existing?.paymentState || "") ? { status: "pending", assignmentState: "unassigned" } : {}) }, $setOnInsert: { publicCode: input.publicCode, status: "pending", assignmentState: "unassigned", statusHistory: [{ status: "pending", actorRole: "system", reason: "Pedido sincronizado desde PIKI Customer" }] } }, { upsert: true, new: true, setDefaultsOnInsert: true }).lean().exec() as any;
+  const order = await Order.findOneAndUpdate({ publicCode: input.publicCode }, { $set: { tenantId: restaurant.tenantId || null, restaurantId: restaurant._id, customerId: input.customerId || null, ...(input.customerName !== undefined ? { customerName: input.customerName || "" } : {}), items: canonicalItems, deliveryAddress: input.deliveryAddress, deliveryNote: input.deliveryNote, deliveryLocation: location, subtotalCents: input.subtotalCents, deliveryFeeCents: input.deliveryFeeCents, serviceFeeCents: input.serviceFeeCents, totalCents: input.totalCents, paymentMethod: input.paymentMethod, paymentState: input.paymentState, ...(input.stripeCheckoutSessionId !== undefined ? { stripeCheckoutSessionId: input.stripeCheckoutSessionId } : {}), ...(input.stripePaymentIntentId !== undefined ? { stripePaymentIntentId: input.stripePaymentIntentId } : {}), ...(["authorized", "paid"].includes(input.paymentState) && !["authorized", "paid"].includes(existing?.paymentState || "") ? { status: "pending", assignmentState: "unassigned" } : {}) }, $setOnInsert: { publicCode: input.publicCode, status: "pending", assignmentState: "unassigned", statusHistory: [{ status: "pending", actorRole: "system", reason: "Pedido sincronizado desde PIKI Customer" }] } }, { upsert: true, new: true, setDefaultsOnInsert: true }).lean().exec() as any;
   const newlyPaid = ["authorized", "paid"].includes(input.paymentState) && !["authorized", "paid"].includes(existing?.paymentState || "");
   const newCashOrder = input.paymentMethod === "cash" && !existing;
   if (newlyPaid || newCashOrder) {
@@ -2110,7 +2122,7 @@ async function enrichSupportTickets(tickets: any[]) {
   const customerIds = orders.map((order) => order.customerId).filter((id) => mongoose.isValidObjectId(String(id))).map((id) => new mongoose.Types.ObjectId(String(id)));
   const customers = customerIds.length ? await CustomerAccount.find({ _id: { $in: customerIds } }).select("name email deliveryAddress").lean().exec() as any[] : [];
   const customerMap = new Map(customers.map((customer) => [String(customer._id), customer]));
-  const orderMap = new Map(orders.map((order) => [String(order._id), { ...order, customer: order.customerId ? customerMap.get(String(order.customerId)) || null : null, customerPhone: order.customerPhone || null }]));
+  const orderMap = new Map(orders.map((order) => { const linkedCustomer = order.customerId ? customerMap.get(String(order.customerId)) : null; const customerName = String(linkedCustomer?.name || order.customerName || "").trim(); return [String(order._id), { ...order, customer: customerName ? { name: customerName, email: linkedCustomer?.email || "" } : null, customerPhone: order.customerPhone || null }]; }));
   return tickets.map((ticket) => { const orderId = ticket.orderId?._id || ticket.orderId; const order = orderMap.get(String(orderId)); return order ? { ...ticket, orderId: order } : ticket; });
 }
 const supportRoles = ["admin", "partner", "rider", "fleet", "commercial", "gerente_comercial_zona", "support"] as const;
@@ -2166,12 +2178,17 @@ app.post("/api/v1/admin/support/tickets/:id/messages", requireRole("support", "f
   const parsed = supportMessageInput.safeParse(req.body); if (!parsed.success) return res.status(400).json({ error: "INVALID_SUPPORT_MESSAGE" });
   const id = objectId(String(req.params.id)); if (!id) return res.status(400).json({ error: "INVALID_TICKET_ID" });
   const agent = await supportAgent(req); if (!agent) return res.status(403).json({ error: "SUPPORT_AGENT_NOT_FOUND" });
-  const agentDisplayName = String(agent.name || agent.email || "Agente de soporte").trim().split(/\s+/).slice(0, 2).join(" ");
+  const agentDisplayName = String(agent.name || agent.email || "Agente de soporte").trim().slice(0, 160);
   const current = await SupportTicket.findOne({ _id: id, ...tenantScope(req), ...ticketRoleScope(req) }).lean().exec() as any;
   if (!current) return res.status(404).json({ error: "TICKET_NOT_FOUND" });
   if (["resolved", "closed"].includes(current.status)) return res.status(409).json({ error: "SUPPORT_CHAT_CLOSED" });
   if (current.assignedTo && String(current.assignedTo) !== String(agent._id)) return res.status(409).json({ error: "SUPPORT_TICKET_ASSIGNED", assignedTo: String(current.assignedTo) });
-  const ticket = await SupportTicket.findOneAndUpdate({ _id: id, ...tenantScope(req), ...ticketRoleScope(req), $or: [{ assignedTo: null }, { assignedTo: agent._id }] }, { $push: { messages: { senderRole: "support", senderEmployeeId: agent._id, senderName: agentDisplayName, body: parsed.data.body } }, $set: { status: "in_progress", assignedTo: agent._id, agentTypingAt: null } }, { new: true }).populate("assignedTo", "name email").lean().exec() as any;
+  const hasSupportReply = Array.isArray(current.messages) && current.messages.some((message: any) => message?.senderRole === "support");
+  const messages = [
+    ...(hasSupportReply ? [] : [{ senderRole: "support", senderEmployeeId: agent._id, senderName: agentDisplayName, body: `¡Hola!\n\nSoy ${agentDisplayName}, la persona que te ayudará hoy.` }]),
+    { senderRole: "support", senderEmployeeId: agent._id, senderName: agentDisplayName, body: parsed.data.body },
+  ];
+  const ticket = await SupportTicket.findOneAndUpdate({ _id: id, ...tenantScope(req), ...ticketRoleScope(req), $or: [{ assignedTo: null }, { assignedTo: agent._id }] }, { $push: { messages: { $each: messages } }, $set: { status: "in_progress", assignedTo: agent._id, agentTypingAt: null } }, { new: true }).populate("assignedTo", "name email").lean().exec() as any;
   const riderId = await riderForSupportTicket(current);
   if (riderId) void publishRealtimeEvent({ channel: "rider", audienceKey: `rider:${riderId}`, tenantId: current.tenantId, type: "support.message", payload: { ticketId: String(id), status: ticket?.status, senderRole: "support" } });
   void publishRealtimeEvent({ channel: "admin", audienceKey: tenantAudienceKey(current.tenantId, "admin"), tenantId: current.tenantId, type: "support.message", payload: { ticketId: String(id), status: ticket?.status, senderRole: "support" } }).catch(() => undefined);
@@ -3098,6 +3115,7 @@ app.post("/api/v1/admin/qa/dispatch-orders", requireRole("admin"), async (req, r
     publicCode,
     ...dailyCode,
     restaurantId: restaurant._id,
+    customerName: "Cliente QA",
     items: [{ itemId: String(menuItem?._id || "qa-dispatch"), name: itemName, quantity: 1, unitPriceCents }],
     deliveryAddress: "SIMULACIÓN QA · No realizar entrega",
     deliveryNote: "Pedido de prueba aislado. Se elimina al finalizar la comprobación.",
@@ -3351,7 +3369,7 @@ partnerPrepDeadlineAt: offer.partnerPrepDeadlineAt || null,
       phase: phase[offer.status] || "assigned",
       etaMinutes: offer.assignmentExpiresAt ? Math.max(0, Math.ceil((new Date(offer.assignmentExpiresAt).getTime() - now) / 60000)) : null,
       restaurant: restaurant ? { name: restaurant.name, address: restaurant.address || "", phone: restaurant.phone || "", cuisine: restaurant.cuisine || "", etaMinutes: restaurant.etaMinutes || [] } : null,
-      customerName: customerPhase ? customer?.name || "Cliente" : null,
+      customerName: customerPhase ? customer?.name || offer.customerName || "Cliente" : null,
       deliveryAddress: customerPhase ? offer.deliveryAddress || "" : null,
       deliveryNote: customerPhase ? offer.deliveryNote || null : null,
       deliveryLocation: customerPhase ? offer.deliveryLocation || null : null,
