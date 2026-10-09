@@ -3384,6 +3384,23 @@ app.get("/api/v1/admin/operations/live", requireRole("admin"), async (_req, res)
   return res.json({ refreshedAt: new Date().toISOString(), riders: riders.map((rider) => { const age = rider.lastLocationAt ? Math.max(0, Math.round((now - new Date(rider.lastLocationAt).getTime()) / 1000)) : null; return { id: String(rider._id), riderCode: rider.riderCode, name: rider.name, status: rider.status, lifecycleStatus: rider.lifecycleStatus || "active", lifecycleReason: rider.lifecycleReason || "", vehicle: rider.vehicle, location: rider.location, lastLocationAt: rider.lastLocationAt, gpsState: age !== null && age <= 90 && rider.location?.coordinates?.length === 2 ? "fresh" : age !== null && age <= 600 ? "stale" : "missing", gpsAgeSeconds: age, activeOrder: orderMap.get(String(rider._id)) || null }; }) });
 });
 
+/**
+ * Fleet sees only operationally valid positions: an active shift, a live GPS
+ * heartbeat (<=90 seconds) and an available/busy Rider state. Historical or
+ * offline coordinates never reach this response, so the map cannot present a
+ * stale position as live.
+ */
+app.get("/api/v1/fleet/operations/live", requireRole("admin", "fleet"), async (_req, res) => {
+  const now = madridNow();
+  const freshSince = new Date(Date.now() - 90_000);
+  const activeRiderIds = await RiderSlot.distinct("riderId", { date: now.date, status: "active", startTime: { $lte: now.time }, endTime: { $gt: now.time } });
+  const riders = await Rider.find({ _id: { $in: activeRiderIds }, status: { $in: ["available", "busy"] }, lastLocationAt: { $gte: freshSince }, location: { $exists: true } }).select("riderCode name status vehicle location lastLocationAt activeOrderId").lean().exec() as any[];
+  const activeOrderIds = riders.map((rider) => rider.activeOrderId).filter(Boolean);
+  const orders = await Order.find({ _id: { $in: activeOrderIds } }).select("publicCode displayCode status assignmentState").lean().exec() as any[];
+  const orderMap = new Map(orders.map((order) => [String(order._id), order]));
+  return res.json({ refreshedAt: new Date().toISOString(), freshnessSeconds: 90, riders: riders.map((rider) => ({ _id: rider._id, id: rider._id, riderCode: rider.riderCode, name: rider.name, status: rider.status, vehicle: rider.vehicle, location: rider.location, lastLocationAt: rider.lastLocationAt, activeOrder: rider.activeOrderId ? orderMap.get(String(rider.activeOrderId)) || null : null })) });
+});
+
 app.get("/api/v1/riders/overview", requireRole("admin", "fleet"), async (_req, res) => {
   const startOfDay = new Date(); startOfDay.setHours(0, 0, 0, 0);
   const [registered, unassigned, active, completed] = await Promise.all([Rider.countDocuments(), Order.countDocuments({ riderId: null, ...dispatchablePaymentFilter, status: { $in: [...dispatchableOrderStatuses] } }), Order.countDocuments({ riderId: { $ne: null }, status: { $in: ["picked_up", "on_the_way"] } }), Order.countDocuments({ riderId: { $ne: null }, status: "delivered", deliveredAt: { $gte: startOfDay } })]);
