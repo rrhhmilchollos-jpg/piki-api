@@ -2101,6 +2101,7 @@ const supportTicketInput = z.object({ orderRef: z.string().trim().max(120).optio
 const supportMessageInput = z.object({ body: z.string().trim().min(1).max(2000) });
 const supportStatusInput = z.object({ status: z.enum(["open", "in_progress", "waiting", "resolved", "closed"]) });
 const supportCancelInput = z.object({ reason: z.string().trim().min(10).max(500), ticketId: z.string().optional() });
+const supportReassignInput = z.object({ reason: z.string().trim().min(10).max(500), ticketId: z.string().optional() });
 function supportOrderFilter(ref: string): Record<string, unknown> { const id = objectId(ref); return id ? { _id: id } : { $or: [{ publicCode: ref }, { displayCode: ref }] }; }
 async function enrichSupportTickets(tickets: any[]) {
   const orderIds = tickets.map((ticket) => ticket.orderId?._id || ticket.orderId).filter((id) => id && mongoose.isValidObjectId(id));
@@ -2202,6 +2203,34 @@ app.post("/api/v1/admin/support/orders/:id/cancel", requireRole("support"), asyn
   if (parsed.data.ticketId) await SupportTicket.updateOne({ _id: objectId(parsed.data.ticketId), ...tenantScope(req) }, { $push: { actions: { action: "order_cancelled", actorEmployeeId, reason: parsed.data.reason, metadata: { orderId: String(orderId) } } } }).exec();
   scheduleCustomerOrderPush(updated, "cancelled");
   return res.json({ order: updated, audit: { action: "order_cancelled", reason: parsed.data.reason } });
+});
+app.post("/api/v1/admin/support/orders/:id/reassign", requireRole("support"), async (req, res) => {
+  const parsed = supportReassignInput.safeParse(req.body); if (!parsed.success) return res.status(400).json({ error: "INVALID_SUPPORT_REASSIGNMENT", details: parsed.error.flatten() });
+  const orderId = objectId(String(req.params.id)); if (!orderId) return res.status(400).json({ error: "INVALID_ORDER_ID" });
+  const order = await Order.findOne({ _id: orderId, ...tenantScope(req) }).lean().exec() as any;
+  if (!order) return res.status(404).json({ error: "ORDER_NOT_FOUND" });
+  if (!order.riderId || !["offered", "assigned"].includes(order.assignmentState)) return res.status(409).json({ error: "ORDER_NOT_ASSIGNED", assignmentState: order.assignmentState });
+  if (!["pending", "accepted", "preparing", "ready_for_pickup"].includes(order.status) || order.riderArrivedAt) {
+    return res.status(409).json({ error: "SUPPORT_REASSIGNMENT_NOT_ALLOWED", message: "La reasignación solo puede hacerse antes de que el Rider llegue al establecimiento." });
+  }
+  const previousRiderId = order.riderId as mongoose.Types.ObjectId;
+  const released = await Order.findOneAndUpdate(
+    { _id: orderId, ...tenantScope(req), riderId: previousRiderId, assignmentState: order.assignmentState, version: order.version },
+    {
+      $set: { riderId: null, assignmentState: "expired", assignmentExpiresAt: null, pickupDeadlineAt: null },
+      $inc: { dispatchAttempts: 1, version: 1 },
+      $push: { statusHistory: { status: order.status, actorRole: "support", reason: parsed.data.reason } },
+    },
+    { new: false },
+  ).lean().exec() as any;
+  if (!released?.riderId) return res.status(409).json({ error: "ORDER_CHANGED_RETRY" });
+  await releaseRiderOrderSlot(orderId, previousRiderId);
+  await DispatchDecision.updateMany({ orderId, riderId: previousRiderId, outcome: { $in: ["accepted", "offered"] } }, { $set: { outcome: "expired", actorRole: "support" } }).exec();
+  const actorEmployeeId = objectId(String(req.auth?.employeeId || ""));
+  if (parsed.data.ticketId) await SupportTicket.updateOne({ _id: objectId(parsed.data.ticketId), ...tenantScope(req) }, { $push: { actions: { action: "order_reassigned", actorEmployeeId, reason: parsed.data.reason, metadata: { orderId: String(orderId), previousRiderId: String(previousRiderId) } } } }).exec();
+  await publishOrderStatusEvents(released, released.status);
+  const assignment = await queueAutomaticDispatch(orderId);
+  return res.json({ assignment, audit: { action: "order_reassigned", reason: parsed.data.reason, previousRiderId: String(previousRiderId) } });
 });
 
 function riderSupportTicketFilter(req: express.Request, riderId: mongoose.Types.ObjectId, reporterEmail: string, ticketId?: mongoose.Types.ObjectId) {
