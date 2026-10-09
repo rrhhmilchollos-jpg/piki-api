@@ -1088,11 +1088,11 @@ app.put("/api/v1/admin/restaurants/:id/menu", requireOwner(), async (req, res) =
   const parsed = z.object({ items: z.array(partnerMenuItemSchema).max(500) }).safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_MENU", details: parsed.error.flatten() });
   const restaurant = await Restaurant.findOneAndUpdate(
-    { _id: id, slug: "kfc-xativa", onboardingStatus: "approved" },
+    { _id: id, slug: "piki-prueba", onboardingStatus: "approved" },
     { $set: { menu: parsed.data.items } },
     { new: true },
   ).select("_id slug name menu").lean().exec() as any;
-  if (!restaurant) return res.status(404).json({ error: "KFC_XATIVA_QA_NOT_FOUND_OR_NOT_APPROVED" });
+  if (!restaurant) return res.status(404).json({ error: "PIKI_PRUEBA_NOT_FOUND_OR_NOT_APPROVED" });
   return res.json({ updated: true, restaurant, menu: restaurant.menu || [] });
 });
 
@@ -1252,10 +1252,10 @@ app.patch("/api/v1/admin/restaurants/:id/customer-name", requireOwner(), async (
   const idParam = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
   const id = objectId(idParam);
   if (!id) return res.status(400).json({ error: "INVALID_RESTAURANT_ID" });
-  const parsed = z.object({ name: z.literal("KFC XATIVA QA") }).safeParse(req.body);
+  const parsed = z.object({ name: z.literal("PIKI-PRUEBA") }).safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_CUSTOMER_RESTAURANT_NAME", details: parsed.error.flatten() });
   const restaurant = await Restaurant.findOneAndUpdate(
-    { _id: id, slug: "kfc-xativa" },
+    { _id: id, slug: "piki-prueba" },
     { $set: { name: parsed.data.name } },
     { new: true },
   ).select("_id slug name").lean().exec() as any;
@@ -1302,11 +1302,11 @@ app.patch("/api/v1/admin/restaurants/:id/demo-visibility", requireOwner(), async
   const parsed = z.object({ name: z.string().trim().min(2).max(160), isActive: z.boolean() }).safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_DEMO_VISIBILITY", details: parsed.error.flatten() });
   const restaurant = await Restaurant.findOneAndUpdate(
-    { _id: id, slug: "kfc-xativa", onboardingStatus: "approved" },
+    { _id: id, slug: "piki-prueba", onboardingStatus: "approved" },
     { $set: { name: parsed.data.name, isActive: parsed.data.isActive } },
     { new: true },
   ).select("_id slug name isActive onboardingStatus category cuisine locality menu").lean().exec() as any;
-  if (!restaurant) return res.status(404).json({ error: "KFC_XATIVA_QA_NOT_FOUND_OR_NOT_APPROVED" });
+  if (!restaurant) return res.status(404).json({ error: "PIKI_PRUEBA_NOT_FOUND_OR_NOT_APPROVED" });
   return res.json({ updated: true, restaurant });
 });
 
@@ -1929,7 +1929,7 @@ app.delete("/api/v1/rider-slots/:id", requireRole("admin", "fleet"), async (req,
 app.post("/api/v1/orders", rateLimit(20, 60_000, "orders-create"), async (req, res) => {
   const parsed = createOrderSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_ORDER", details: parsed.error.flatten() });
-  if (parsed.data.paymentMethod !== "cash") return res.status(409).json({ error: "PAYMENT_METHOD_UNAVAILABLE", message: "Tarjeta y Bizum todavía no están disponibles. Selecciona efectivo al recibir." });
+  if (!["cash", "stripe"].includes(parsed.data.paymentMethod)) return res.status(409).json({ error: "PAYMENT_METHOD_UNAVAILABLE", message: "Método de pago no disponible." });
   const restaurantObjectId = objectId(parsed.data.restaurantId);
   if (!restaurantObjectId) return res.status(400).json({ error: "INVALID_RESTAURANT_ID" });
   const restaurant = await Restaurant.findOne({ _id: restaurantObjectId, isActive: true, onboardingStatus: "approved" }).lean().exec() as any;
