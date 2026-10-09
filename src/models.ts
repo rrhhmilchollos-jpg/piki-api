@@ -66,7 +66,7 @@ const cashLedgerEntrySchema = new Schema({
 }, { timestamps: true, collection: "cash_ledger_entries" });
 cashLedgerEntrySchema.index({ riderId: 1, createdAt: -1 });
 
-const stripeEventSchema = new Schema({ stripeEventId: { type: String, required: true, unique: true, index: true }, type: { type: String, required: true }, orderCode: { type: String, default: null }, receivedAt: { type: Date, default: Date.now } }, { timestamps: true, collection: "stripe_events" });
+const stripeEventSchema = new Schema({ stripeEventId: { type: String, required: true, unique: true, index: true }, type: { type: String, required: true }, orderCode: { type: String, default: null }, receivedAt: { type: Date, default: Date.now }, processingStatus: { type: String, enum: ["processing", "processed", "failed"], default: "processed", index: true }, processingStartedAt: { type: Date, default: null, index: true }, processedAt: { type: Date, default: null }, failedAt: { type: Date, default: null }, lastError: { type: String, default: null, maxlength: 120 } }, { timestamps: true, collection: "stripe_events" });
 const passkeyCredentialSchema = new Schema({
   ownerType: { type: String, enum: ["customer", "employee"], required: true, index: true },
   ownerId: { type: Schema.Types.ObjectId, required: true, index: true },

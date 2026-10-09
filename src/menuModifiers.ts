@@ -155,5 +155,5 @@ export function quoteMenuItem(item: unknown, rawSelections: unknown, useReferenc
 
 /** Temporary reference configuration for the four operational Xàtiva test products. */
 export function usesReferenceAddOns(restaurant: { slug?: unknown } | null | undefined) {
-  return restaurant?.slug === "kfc-xativa";
+  return restaurant?.slug === "piki-prueba";
 }
