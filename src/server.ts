@@ -2248,10 +2248,13 @@ app.post("/api/v1/admin/support/orders/:id/reassign", requireRole(...supportOper
   await releaseRiderOrderSlot(orderId, previousRiderId);
   await DispatchDecision.updateMany({ orderId, riderId: previousRiderId, outcome: { $in: ["accepted", "offered"] } }, { $set: { outcome: "expired", actorRole: "support" } }).exec();
   const actorEmployeeId = objectId(String(req.auth?.employeeId || ""));
-  if (parsed.data.ticketId) await SupportTicket.updateOne({ _id: objectId(parsed.data.ticketId), ...tenantScope(req) }, { $push: { actions: { action: "order_reassigned", actorEmployeeId, reason: parsed.data.reason, metadata: { orderId: String(orderId), previousRiderId: String(previousRiderId) } } } }).exec();
+  if (parsed.data.ticketId) await SupportTicket.updateOne({ _id: objectId(parsed.data.ticketId), ...tenantScope(req) }, { $push: { actions: { action: "order_reassigned", actorEmployeeId, reason: parsed.data.reason, metadata: { orderId: String(orderId), previousRiderId: String(previousRiderId), qaScenario: Boolean(order.isTestOrder) } } } }).exec();
   await publishOrderStatusEvents(released, released.status);
-  const assignment = await queueAutomaticDispatch(orderId);
-  return res.json({ assignment, audit: { action: "order_reassigned", reason: parsed.data.reason, previousRiderId: String(previousRiderId) } });
+  // A QA order must never fall back to the live candidate pool. Reuse only its
+  // dedicated test rider, preserving the non-commercial boundary of this scenario.
+  const preferredQaRiderId = order.isTestOrder && order.qaRiderId ? objectId(String(order.qaRiderId)) || undefined : undefined;
+  const assignment = await queueAutomaticDispatch(orderId, preferredQaRiderId);
+  return res.json({ assignment, audit: { action: "order_reassigned", reason: parsed.data.reason, previousRiderId: String(previousRiderId), qaScenario: Boolean(order.isTestOrder) } });
 });
 
 function riderSupportTicketFilter(req: express.Request, riderId: mongoose.Types.ObjectId, reporterEmail: string, ticketId?: mongoose.Types.ObjectId) {
