@@ -2167,7 +2167,7 @@ app.post("/api/v1/admin/support/tickets", requireRole(...supportInboxRoles), asy
   const order = parsed.data.orderRef ? await Order.findOne({ ...tenantScope(req), ...supportOrderFilter(parsed.data.orderRef) }).select("_id").lean().exec() as any : null;
   if (parsed.data.orderRef && !order) return res.status(404).json({ error: "ORDER_NOT_FOUND" });
   const actorEmployeeId = objectId(String(req.auth?.employeeId || ""));
-  const ticket = await SupportTicket.create({ ...parsed.data, orderId: order?._id || null, ticketNumber: `SUP-${new Date().toISOString().slice(0, 10).replace(/-/g, "")}-${randomInt(1000, 9999)}`, createdBy: actorEmployeeId, actions: [{ action: "ticket_created", actorEmployeeId, metadata: { orderRef: parsed.data.orderRef || null } }] });
+  const ticket = await SupportTicket.create({ ...parsed.data, sourceSurface: "support", sourceRole: req.auth?.role || "support", orderId: order?._id || null, ticketNumber: `SUP-${new Date().toISOString().slice(0, 10).replace(/-/g, "")}-${randomInt(1000, 9999)}`, createdBy: actorEmployeeId, actions: [{ action: "ticket_created", actorEmployeeId, metadata: { orderRef: parsed.data.orderRef || null, sourceSurface: "support" } }] });
   return res.status(201).json({ ticket });
 });
 async function supportAgent(req: express.Request) {
