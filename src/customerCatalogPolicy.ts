@@ -6,7 +6,7 @@ export const CUSTOMER_CATALOG_RESTAURANT_FILTER = {
   $or: [{ slug: CUSTOMER_CATALOG_RESTAURANT_SLUG }, { slug: "kfc-xativa" }],
   isActive: true,
   onboardingStatus: "approved",
-} as const;
+};
 
 export function customerCatalogRestaurantName(restaurant: { name: string; slug?: string }) {
   return restaurant.slug === CUSTOMER_CATALOG_RESTAURANT_SLUG || restaurant.slug === "kfc-xativa"
