@@ -174,6 +174,13 @@ function tenantScope(req: express.Request): Record<string, unknown> {
   const tenantId = objectId(req.auth.tenantId);
   return tenantId ? { tenantId } : { _id: null };
 }
+
+// PIKI Support is the central operational surface. Its support/admin operators
+// must be able to attend Rider, Customer and Partner incidents across tenants;
+// finance keeps the normal tenant boundary through tenantScope().
+function supportTenantScope(req: express.Request): Record<string, unknown> {
+  return req.auth?.role === "support" || req.auth?.role === "admin" ? {} : tenantScope(req);
+}
 async function tenantLimits(req: express.Request) {
   if (!req.auth?.tenantId) return { maxRiders: 100000, maxDailySlots: 100000, maxSlotsPerRiderPerDay: 3 };
   const tenantId = objectId(req.auth.tenantId);
@@ -2136,7 +2143,7 @@ const ticketRoleScope = (req: express.Request): Record<string, unknown> => req.a
 app.post("/api/v1/support/tickets", requireRole(...supportRoles), async (req, res) => {
   const parsed = supportTicketInput.safeParse(req.body); if (!parsed.success) return res.status(400).json({ error: "INVALID_SUPPORT_TICKET", details: parsed.error.flatten() });
   if (req.auth?.role === "support" && isFinanceTicketCategory(parsed.data.category)) return res.status(403).json({ error: "SUPPORT_TICKET_CATEGORY_RESTRICTED" });
-  const order = parsed.data.orderRef ? await Order.findOne({ ...tenantScope(req), ...supportOrderFilter(parsed.data.orderRef) }).select("_id").lean().exec() as any : null;
+  const order = parsed.data.orderRef ? await Order.findOne({ ...supportTenantScope(req), ...supportOrderFilter(parsed.data.orderRef) }).select("_id").lean().exec() as any : null;
   if (parsed.data.orderRef && !order) return res.status(404).json({ error: "ORDER_NOT_FOUND" });
   const actorEmployeeId = objectId(String(req.auth?.employeeId || ""));
   const sourceSurface = String(req.header("x-piki-surface") || "admin").toLowerCase();
@@ -2144,17 +2151,17 @@ app.post("/api/v1/support/tickets", requireRole(...supportRoles), async (req, re
   return res.status(201).json({ ticket });
 });
 app.get("/api/v1/support/tickets/mine", requireRole(...supportRoles), async (req, res) => {
-  const tickets = await SupportTicket.find({ ...tenantScope(req), ...ticketRoleScope(req), $or: [{ createdBy: objectId(String(req.auth?.employeeId || "")) }, { reporterEmail: String(req.query.email || "").toLowerCase() }] }).sort({ updatedAt: -1 }).limit(100).lean().exec();
+  const tickets = await SupportTicket.find({ ...supportTenantScope(req), ...ticketRoleScope(req), $or: [{ createdBy: objectId(String(req.auth?.employeeId || "")) }, { reporterEmail: String(req.query.email || "").toLowerCase() }] }).sort({ updatedAt: -1 }).limit(100).lean().exec();
   return res.json({ tickets });
 });
 app.get("/api/v1/admin/support/orders/search", requireRole(...supportOperatorRoles), async (req, res) => {
   const q = typeof req.query.q === "string" ? req.query.q.trim() : "";
   if (q.length < 2) return res.json({ orders: [] });
-  const orders = await Order.find({ ...tenantScope(req), ...supportOrderFilter(q) }).sort({ createdAt: -1 }).limit(25).select("_id publicCode displayCode status paymentState paymentMethod riderId restaurantId customerId totalCents createdAt statusHistory").populate("riderId", "name riderCode email").populate("restaurantId", "name").lean().exec();
+  const orders = await Order.find({ ...supportTenantScope(req), ...supportOrderFilter(q) }).sort({ createdAt: -1 }).limit(25).select("_id publicCode displayCode status paymentState paymentMethod riderId restaurantId customerId totalCents createdAt statusHistory").populate("riderId", "name riderCode email").populate("restaurantId", "name").lean().exec();
   return res.json({ orders });
 });
 app.get("/api/v1/admin/support/tickets", requireRole(...supportInboxRoles), async (req, res) => {
-  const filter: Record<string, unknown> = { ...tenantScope(req), ...ticketRoleScope(req) };
+  const filter: Record<string, unknown> = { ...supportTenantScope(req), ...ticketRoleScope(req) };
   if (typeof req.query.status === "string" && req.query.status !== "all") filter.status = req.query.status;
   if (typeof req.query.q === "string" && req.query.q.trim()) { const q = req.query.q.trim(); filter.$or = [{ ticketNumber: q }, { reporterEmail: { $regex: q, $options: "i" } }, { subject: { $regex: q, $options: "i" } }]; }
   const tickets = await SupportTicket.find(filter).sort({ updatedAt: -1 }).limit(500).populate("assignedTo", "name email").lean().exec();
@@ -2164,7 +2171,7 @@ app.post("/api/v1/admin/support/tickets", requireRole(...supportInboxRoles), asy
   const parsed = supportTicketInput.safeParse(req.body); if (!parsed.success) return res.status(400).json({ error: "INVALID_SUPPORT_TICKET", details: parsed.error.flatten() });
   if (req.auth?.role === "finance" && !isFinanceTicketCategory(parsed.data.category)) return res.status(403).json({ error: "FINANCE_TICKET_CATEGORY_REQUIRED" });
   if (req.auth?.role === "support" && isFinanceTicketCategory(parsed.data.category)) return res.status(403).json({ error: "SUPPORT_TICKET_CATEGORY_RESTRICTED" });
-  const order = parsed.data.orderRef ? await Order.findOne({ ...tenantScope(req), ...supportOrderFilter(parsed.data.orderRef) }).select("_id").lean().exec() as any : null;
+  const order = parsed.data.orderRef ? await Order.findOne({ ...supportTenantScope(req), ...supportOrderFilter(parsed.data.orderRef) }).select("_id").lean().exec() as any : null;
   if (parsed.data.orderRef && !order) return res.status(404).json({ error: "ORDER_NOT_FOUND" });
   const actorEmployeeId = objectId(String(req.auth?.employeeId || ""));
   const ticket = await SupportTicket.create({ ...parsed.data, sourceSurface: "support", sourceRole: req.auth?.role || "support", orderId: order?._id || null, ticketNumber: `SUP-${new Date().toISOString().slice(0, 10).replace(/-/g, "")}-${randomInt(1000, 9999)}`, createdBy: actorEmployeeId, actions: [{ action: "ticket_created", actorEmployeeId, metadata: { orderRef: parsed.data.orderRef || null, sourceSurface: "support" } }] });
@@ -2183,7 +2190,7 @@ app.post("/api/v1/admin/support/tickets/:id/messages", requireRole(...supportInb
   const id = objectId(String(req.params.id)); if (!id) return res.status(400).json({ error: "INVALID_TICKET_ID" });
   const agent = await supportAgent(req); if (!agent) return res.status(403).json({ error: "SUPPORT_AGENT_NOT_FOUND" });
   const agentDisplayName = String(agent.name || agent.email || "Agente de soporte").trim().slice(0, 160);
-  const current = await SupportTicket.findOne({ _id: id, ...tenantScope(req), ...ticketRoleScope(req) }).lean().exec() as any;
+  const current = await SupportTicket.findOne({ _id: id, ...supportTenantScope(req), ...ticketRoleScope(req) }).lean().exec() as any;
   if (!current) return res.status(404).json({ error: "TICKET_NOT_FOUND" });
   if (["resolved", "closed"].includes(current.status)) return res.status(409).json({ error: "SUPPORT_CHAT_CLOSED" });
   if (current.assignedTo && String(current.assignedTo) !== String(agent._id)) return res.status(409).json({ error: "SUPPORT_TICKET_ASSIGNED", assignedTo: String(current.assignedTo) });
@@ -2192,7 +2199,7 @@ app.post("/api/v1/admin/support/tickets/:id/messages", requireRole(...supportInb
     ...(hasSupportReply ? [] : [{ senderRole: "support", senderEmployeeId: agent._id, senderName: agentDisplayName, body: `¡Hola!\n\nSoy ${agentDisplayName}, la persona que te ayudará hoy.` }]),
     { senderRole: "support", senderEmployeeId: agent._id, senderName: agentDisplayName, body: parsed.data.body },
   ];
-  const ticket = await SupportTicket.findOneAndUpdate({ _id: id, ...tenantScope(req), ...ticketRoleScope(req), $or: [{ assignedTo: null }, { assignedTo: agent._id }] }, { $push: { messages: { $each: messages } }, $set: { status: "in_progress", assignedTo: agent._id, agentTypingAt: null } }, { new: true }).populate("assignedTo", "name email").lean().exec() as any;
+  const ticket = await SupportTicket.findOneAndUpdate({ _id: id, ...supportTenantScope(req), ...ticketRoleScope(req), $or: [{ assignedTo: null }, { assignedTo: agent._id }] }, { $push: { messages: { $each: messages } }, $set: { status: "in_progress", assignedTo: agent._id, agentTypingAt: null } }, { new: true }).populate("assignedTo", "name email").lean().exec() as any;
   const riderId = await riderForSupportTicket(current);
   if (riderId) void publishRealtimeEvent({ channel: "rider", audienceKey: `rider:${riderId}`, tenantId: current.tenantId, type: "support.message", payload: { ticketId: String(id), status: ticket?.status, senderRole: "support" } });
   void publishRealtimeEvent({ channel: "admin", audienceKey: tenantAudienceKey(current.tenantId, "admin"), tenantId: current.tenantId, type: "support.message", payload: { ticketId: String(id), status: ticket?.status, senderRole: "support" } }).catch(() => undefined);
@@ -2203,10 +2210,10 @@ app.patch("/api/v1/admin/support/tickets/:id/status", requireRole(...supportInbo
   const id = objectId(String(req.params.id)); if (!id) return res.status(400).json({ error: "INVALID_TICKET_ID" });
   const actorEmployeeId = objectId(String(req.auth?.employeeId || ""));
   const agent = await supportAgent(req); if (!agent) return res.status(403).json({ error: "SUPPORT_AGENT_NOT_FOUND" });
-  const current = await SupportTicket.findOne({ _id: id, ...tenantScope(req), ...ticketRoleScope(req) }).select("assignedTo category").lean().exec() as any;
+  const current = await SupportTicket.findOne({ _id: id, ...supportTenantScope(req), ...ticketRoleScope(req) }).select("assignedTo category").lean().exec() as any;
   if (!current) return res.status(404).json({ error: "TICKET_NOT_FOUND" });
   if (current.assignedTo && String(current.assignedTo) !== String(agent._id)) return res.status(409).json({ error: "SUPPORT_TICKET_ASSIGNED", assignedTo: String(current.assignedTo) });
-  const ticket = await SupportTicket.findOneAndUpdate({ _id: id, ...tenantScope(req), ...ticketRoleScope(req) }, { $set: { status: parsed.data.status, assignedTo: agent._id, ...(parsed.data.status === "resolved" || parsed.data.status === "closed" ? { resolvedAt: new Date() } : {}) }, $push: { actions: { action: "status_changed", actorEmployeeId, reason: parsed.data.status === "closed" ? `Conversación cerrada por ${String(agent.name || agent.email || "Agente de soporte").trim().split(/\s+/).slice(0, 2).join(" ")}.` : "", metadata: { status: parsed.data.status, agentName: String(agent.name || agent.email || "Agente de soporte").trim().split(/\s+/).slice(0, 2).join(" ") } } } }, { new: true }).populate("assignedTo", "name email").lean().exec();
+  const ticket = await SupportTicket.findOneAndUpdate({ _id: id, ...supportTenantScope(req), ...ticketRoleScope(req) }, { $set: { status: parsed.data.status, assignedTo: agent._id, ...(parsed.data.status === "resolved" || parsed.data.status === "closed" ? { resolvedAt: new Date() } : {}) }, $push: { actions: { action: "status_changed", actorEmployeeId, reason: parsed.data.status === "closed" ? `Conversación cerrada por ${String(agent.name || agent.email || "Agente de soporte").trim().split(/\s+/).slice(0, 2).join(" ")}.` : "", metadata: { status: parsed.data.status, agentName: String(agent.name || agent.email || "Agente de soporte").trim().split(/\s+/).slice(0, 2).join(" ") } } } }, { new: true }).populate("assignedTo", "name email").lean().exec();
   if (!ticket) return res.status(404).json({ error: "TICKET_NOT_FOUND" });
   void publishRealtimeEvent({ channel: "admin", audienceKey: tenantAudienceKey((ticket as any).tenantId, "admin"), tenantId: (ticket as any).tenantId, type: "support.ticket_updated", payload: { ticketId: String(id), status: (ticket as any).status, senderRole: "support" } }).catch(() => undefined);
   return res.json({ ticket });
@@ -2214,21 +2221,21 @@ app.patch("/api/v1/admin/support/tickets/:id/status", requireRole(...supportInbo
 app.post("/api/v1/admin/support/orders/:id/cancel", requireRole(...supportOperatorRoles), async (req, res) => {
   const parsed = supportCancelInput.safeParse(req.body); if (!parsed.success) return res.status(400).json({ error: "INVALID_SUPPORT_CANCELLATION", details: parsed.error.flatten() });
   const orderId = objectId(String(req.params.id)); if (!orderId) return res.status(400).json({ error: "INVALID_ORDER_ID" });
-  const order = await Order.findOne({ _id: orderId, ...tenantScope(req) }).lean().exec() as any;
+  const order = await Order.findOne({ _id: orderId, ...supportTenantScope(req) }).lean().exec() as any;
   if (!order) return res.status(404).json({ error: "ORDER_NOT_FOUND" });
   if (["delivered", "cancelled"].includes(order.status)) return res.status(409).json({ error: "ORDER_ALREADY_CLOSED", status: order.status });
   const updated = await Order.findOneAndUpdate({ _id: orderId, status: order.status, version: order.version }, { $set: { status: "cancelled", cancelledAt: new Date() }, $inc: { version: 1 }, $push: { statusHistory: { status: "cancelled", actorRole: "admin", reason: parsed.data.reason } } }, { new: true }).lean().exec();
   if (!updated) return res.status(409).json({ error: "ORDER_CHANGED_RETRY" });
   await releaseRiderOrderSlot(orderId, order.riderId);
   const actorEmployeeId = objectId(String(req.auth?.employeeId || ""));
-  if (parsed.data.ticketId) await SupportTicket.updateOne({ _id: objectId(parsed.data.ticketId), ...tenantScope(req) }, { $push: { actions: { action: "order_cancelled", actorEmployeeId, reason: parsed.data.reason, metadata: { orderId: String(orderId) } } } }).exec();
+  if (parsed.data.ticketId) await SupportTicket.updateOne({ _id: objectId(parsed.data.ticketId), ...supportTenantScope(req) }, { $push: { actions: { action: "order_cancelled", actorEmployeeId, reason: parsed.data.reason, metadata: { orderId: String(orderId) } } } }).exec();
   scheduleCustomerOrderPush(updated, "cancelled");
   return res.json({ order: updated, audit: { action: "order_cancelled", reason: parsed.data.reason } });
 });
 app.post("/api/v1/admin/support/orders/:id/reassign", requireRole(...supportOperatorRoles), async (req, res) => {
   const parsed = supportReassignInput.safeParse(req.body); if (!parsed.success) return res.status(400).json({ error: "INVALID_SUPPORT_REASSIGNMENT", details: parsed.error.flatten() });
   const orderId = objectId(String(req.params.id)); if (!orderId) return res.status(400).json({ error: "INVALID_ORDER_ID" });
-  const order = await Order.findOne({ _id: orderId, ...tenantScope(req) }).lean().exec() as any;
+  const order = await Order.findOne({ _id: orderId, ...supportTenantScope(req) }).lean().exec() as any;
   if (!order) return res.status(404).json({ error: "ORDER_NOT_FOUND" });
   if (!order.riderId || !["offered", "assigned"].includes(order.assignmentState)) return res.status(409).json({ error: "ORDER_NOT_ASSIGNED", assignmentState: order.assignmentState });
   if (!["pending", "accepted", "preparing", "ready_for_pickup"].includes(order.status) || order.riderArrivedAt) {
@@ -2236,7 +2243,7 @@ app.post("/api/v1/admin/support/orders/:id/reassign", requireRole(...supportOper
   }
   const previousRiderId = order.riderId as mongoose.Types.ObjectId;
   const released = await Order.findOneAndUpdate(
-    { _id: orderId, ...tenantScope(req), riderId: previousRiderId, assignmentState: order.assignmentState, version: order.version },
+    { _id: orderId, ...supportTenantScope(req), riderId: previousRiderId, assignmentState: order.assignmentState, version: order.version },
     {
       $set: { riderId: null, assignmentState: "expired", assignmentExpiresAt: null, pickupDeadlineAt: null },
       $inc: { dispatchAttempts: 1, version: 1 },
@@ -2248,7 +2255,7 @@ app.post("/api/v1/admin/support/orders/:id/reassign", requireRole(...supportOper
   await releaseRiderOrderSlot(orderId, previousRiderId);
   await DispatchDecision.updateMany({ orderId, riderId: previousRiderId, outcome: { $in: ["accepted", "offered"] } }, { $set: { outcome: "expired", actorRole: "support" } }).exec();
   const actorEmployeeId = objectId(String(req.auth?.employeeId || ""));
-  if (parsed.data.ticketId) await SupportTicket.updateOne({ _id: objectId(parsed.data.ticketId), ...tenantScope(req) }, { $push: { actions: { action: "order_reassigned", actorEmployeeId, reason: parsed.data.reason, metadata: { orderId: String(orderId), previousRiderId: String(previousRiderId), qaScenario: Boolean(order.isTestOrder) } } } }).exec();
+  if (parsed.data.ticketId) await SupportTicket.updateOne({ _id: objectId(parsed.data.ticketId), ...supportTenantScope(req) }, { $push: { actions: { action: "order_reassigned", actorEmployeeId, reason: parsed.data.reason, metadata: { orderId: String(orderId), previousRiderId: String(previousRiderId), qaScenario: Boolean(order.isTestOrder) } } } }).exec();
   await publishOrderStatusEvents(released, released.status);
   // A QA order must never fall back to the live candidate pool. Reuse only its
   // dedicated test rider, preserving the non-commercial boundary of this scenario.
