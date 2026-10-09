@@ -3086,7 +3086,9 @@ app.post("/api/v1/admin/qa/dispatch-orders", requireRole("admin"), async (req, r
   const scope = tenantScope(req);
   const requestedRestaurantSlug = typeof req.body?.restaurantSlug === "string" ? req.body.restaurantSlug.trim().toLowerCase() : "";
   if (requestedRestaurantSlug && !/^[a-z0-9][a-z0-9-]{1,118}$/.test(requestedRestaurantSlug)) return res.status(400).json({ error: "INVALID_QA_RESTAURANT_SLUG" });
-  const restaurant = await Restaurant.findOne({ ...scope, ...(requestedRestaurantSlug ? { slug: requestedRestaurantSlug } : {}), isActive: true, onboardingStatus: "approved" })
+  const requestedRestaurantName = requestedRestaurantSlug.replace(/-/g, " ");
+  const selectedRestaurant = requestedRestaurantSlug ? { $or: [{ slug: requestedRestaurantSlug }, { name: new RegExp(`^${requestedRestaurantName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, "i") }] } : {};
+  const restaurant = await Restaurant.findOne({ ...scope, ...selectedRestaurant, isActive: true, onboardingStatus: "approved" })
     .select("_id tenantId name location menu").lean().exec() as any;
   const coordinates = Array.isArray(restaurant?.location?.coordinates) && restaurant.location.coordinates.length >= 2
     ? restaurant.location.coordinates
