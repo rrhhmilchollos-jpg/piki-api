@@ -2050,6 +2050,17 @@ app.post("/api/v1/internal/customer-orders/:publicCode/messages", async (req, re
     const body = String(req.body?.body || "").trim();
     if (!body || body.length > 500) return res.status(400).json({ error: "INVALID_MESSAGE" });
     const message = await RiderOrderMessage.create({ orderId: order._id, riderId: order.riderId, senderRole: "customer", body });
+    // The Rider receives an encrypted device push (when enabled) and a durable
+    // realtime signal. The notification deliberately excludes message text and
+    // contact details; the authenticated order chat remains the only place to read it.
+    void publishRealtimeEvent({
+      channel: "rider",
+      audienceKey: `rider:${String(order.riderId)}`,
+      tenantId: order.tenantId || null,
+      type: "order.message",
+      payload: { orderId: String(order._id), publicCode: order.publicCode, status: order.status, senderRole: "customer" },
+      dedupeKey: `order:message:customer:${String(message._id)}`,
+    }).catch((error) => console.warn("Customer-to-rider message notification failed", error instanceof Error ? error.message : "unknown error"));
     return res.status(201).json({ id: String(message._id), senderRole: message.senderRole, body: message.body, createdAt: message.createdAt });
   }
   const messages = await RiderOrderMessage.find({ orderId: order._id }).sort({ createdAt: 1 }).limit(100).lean().exec();
@@ -2119,20 +2130,20 @@ app.get("/api/v1/support/tickets/mine", requireRole(...supportRoles), async (req
   const tickets = await SupportTicket.find({ ...tenantScope(req), ...ticketRoleScope(req), $or: [{ createdBy: objectId(String(req.auth?.employeeId || "")) }, { reporterEmail: String(req.query.email || "").toLowerCase() }] }).sort({ updatedAt: -1 }).limit(100).lean().exec();
   return res.json({ tickets });
 });
-app.get("/api/v1/admin/support/orders/search", requireRole("admin", "support"), async (req, res) => {
+app.get("/api/v1/admin/support/orders/search", requireRole("support"), async (req, res) => {
   const q = typeof req.query.q === "string" ? req.query.q.trim() : "";
   if (q.length < 2) return res.json({ orders: [] });
   const orders = await Order.find({ ...tenantScope(req), ...supportOrderFilter(q) }).sort({ createdAt: -1 }).limit(25).select("_id publicCode displayCode status paymentState paymentMethod riderId restaurantId customerId totalCents createdAt statusHistory").populate("riderId", "name riderCode email").populate("restaurantId", "name").lean().exec();
   return res.json({ orders });
 });
-app.get("/api/v1/admin/support/tickets", requireRole("admin", "support", "finance"), async (req, res) => {
+app.get("/api/v1/admin/support/tickets", requireRole("support", "finance"), async (req, res) => {
   const filter: Record<string, unknown> = { ...tenantScope(req), ...ticketRoleScope(req) };
   if (typeof req.query.status === "string" && req.query.status !== "all") filter.status = req.query.status;
   if (typeof req.query.q === "string" && req.query.q.trim()) { const q = req.query.q.trim(); filter.$or = [{ ticketNumber: q }, { reporterEmail: { $regex: q, $options: "i" } }, { subject: { $regex: q, $options: "i" } }]; }
   const tickets = await SupportTicket.find(filter).sort({ updatedAt: -1 }).limit(500).populate("assignedTo", "name email").lean().exec();
   return res.json({ tickets: await enrichSupportTickets(tickets) });
 });
-app.post("/api/v1/admin/support/tickets", requireRole("admin", "support", "finance"), async (req, res) => {
+app.post("/api/v1/admin/support/tickets", requireRole("support", "finance"), async (req, res) => {
   const parsed = supportTicketInput.safeParse(req.body); if (!parsed.success) return res.status(400).json({ error: "INVALID_SUPPORT_TICKET", details: parsed.error.flatten() });
   if (req.auth?.role === "finance" && !isFinanceTicketCategory(parsed.data.category)) return res.status(403).json({ error: "FINANCE_TICKET_CATEGORY_REQUIRED" });
   if (req.auth?.role === "support" && isFinanceTicketCategory(parsed.data.category)) return res.status(403).json({ error: "SUPPORT_TICKET_CATEGORY_RESTRICTED" });
@@ -2150,7 +2161,7 @@ async function riderForSupportTicket(ticket: any) {
   const rider = ticket.reporterEmail ? await Rider.findOne({ email: ticket.reporterEmail }).select("_id").lean().exec() as any : null;
   return rider ? String(rider._id) : null;
 }
-app.post("/api/v1/admin/support/tickets/:id/messages", requireRole("admin", "support", "finance"), async (req, res) => {
+app.post("/api/v1/admin/support/tickets/:id/messages", requireRole("support", "finance"), async (req, res) => {
   const parsed = supportMessageInput.safeParse(req.body); if (!parsed.success) return res.status(400).json({ error: "INVALID_SUPPORT_MESSAGE" });
   const id = objectId(String(req.params.id)); if (!id) return res.status(400).json({ error: "INVALID_TICKET_ID" });
   const agent = await supportAgent(req); if (!agent) return res.status(403).json({ error: "SUPPORT_AGENT_NOT_FOUND" });
@@ -2165,7 +2176,7 @@ app.post("/api/v1/admin/support/tickets/:id/messages", requireRole("admin", "sup
   void publishRealtimeEvent({ channel: "admin", audienceKey: tenantAudienceKey(current.tenantId, "admin"), tenantId: current.tenantId, type: "support.message", payload: { ticketId: String(id), status: ticket?.status, senderRole: "support" } }).catch(() => undefined);
   return res.json({ ticket });
 });
-app.patch("/api/v1/admin/support/tickets/:id/status", requireRole("admin", "support", "finance"), async (req, res) => {
+app.patch("/api/v1/admin/support/tickets/:id/status", requireRole("support", "finance"), async (req, res) => {
   const parsed = supportStatusInput.safeParse(req.body); if (!parsed.success) return res.status(400).json({ error: "INVALID_SUPPORT_STATUS" });
   const id = objectId(String(req.params.id)); if (!id) return res.status(400).json({ error: "INVALID_TICKET_ID" });
   const actorEmployeeId = objectId(String(req.auth?.employeeId || ""));
@@ -2178,7 +2189,7 @@ app.patch("/api/v1/admin/support/tickets/:id/status", requireRole("admin", "supp
   void publishRealtimeEvent({ channel: "admin", audienceKey: tenantAudienceKey((ticket as any).tenantId, "admin"), tenantId: (ticket as any).tenantId, type: "support.ticket_updated", payload: { ticketId: String(id), status: (ticket as any).status, senderRole: "support" } }).catch(() => undefined);
   return res.json({ ticket });
 });
-app.post("/api/v1/admin/support/orders/:id/cancel", requireRole("admin", "support"), async (req, res) => {
+app.post("/api/v1/admin/support/orders/:id/cancel", requireRole("support"), async (req, res) => {
   const parsed = supportCancelInput.safeParse(req.body); if (!parsed.success) return res.status(400).json({ error: "INVALID_SUPPORT_CANCELLATION", details: parsed.error.flatten() });
   const orderId = objectId(String(req.params.id)); if (!orderId) return res.status(400).json({ error: "INVALID_ORDER_ID" });
   const order = await Order.findOne({ _id: orderId, ...tenantScope(req) }).lean().exec() as any;
@@ -2233,7 +2244,7 @@ app.get("/api/v1/riders/:riderId/support/tickets", requireRole("rider"), async (
   const tickets = await SupportTicket.find(riderSupportTicketFilter(req, riderId, rider.email)).sort({ updatedAt: -1 }).limit(50).populate("assignedTo", "name email").lean().exec();
   return res.json({ tickets });
 });
-app.post("/api/v1/admin/support/tickets/:id/typing", requireRole("admin", "support", "finance"), async (req, res) => {
+app.post("/api/v1/admin/support/tickets/:id/typing", requireRole("support", "finance"), async (req, res) => {
   const agent = await supportAgent(req); if (!agent) return res.status(403).json({ error: "SUPPORT_AGENT_NOT_FOUND" });
   const active = Boolean(req.body?.active);
   const ticket = await SupportTicket.findOneAndUpdate({ _id: req.params.id, ...tenantScope(req), ...ticketRoleScope(req), $or: [{ assignedTo: null }, { assignedTo: agent._id }] }, { $set: { agentTypingAt: active ? new Date() : null, ...(active ? { assignedTo: agent._id, status: "in_progress" } : {}) } }, { new: true }).lean().exec() as any;
