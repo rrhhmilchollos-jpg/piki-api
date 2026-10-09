@@ -3084,10 +3084,12 @@ setCustomerOrderDispatcher(async (orderId) => {
 app.post("/api/v1/admin/qa/dispatch-orders", requireRole("admin"), async (req, res) => {
   const employee = await employeeScope(req);
   const scope = tenantScope(req);
-  const restaurant = await Restaurant.findOne({ ...scope, isActive: true, onboardingStatus: "approved", location: { $exists: true } })
+  const requestedRestaurantSlug = typeof req.body?.restaurantSlug === "string" ? req.body.restaurantSlug.trim().toLowerCase() : "";
+  if (requestedRestaurantSlug && !/^[a-z0-9][a-z0-9-]{1,118}$/.test(requestedRestaurantSlug)) return res.status(400).json({ error: "INVALID_QA_RESTAURANT_SLUG" });
+  const restaurant = await Restaurant.findOne({ ...scope, ...(requestedRestaurantSlug ? { slug: requestedRestaurantSlug } : {}), isActive: true, onboardingStatus: "approved", location: { $exists: true } })
     .select("_id tenantId name location menu").lean().exec() as any;
   const coordinates = restaurant?.location?.coordinates;
-  if (!restaurant || !Array.isArray(coordinates) || coordinates.length < 2) return res.status(409).json({ error: "QA_RESTAURANT_LOCATION_UNAVAILABLE" });
+  if (!restaurant || !Array.isArray(coordinates) || coordinates.length < 2) return res.status(409).json({ error: requestedRestaurantSlug ? "QA_REQUESTED_RESTAURANT_UNAVAILABLE" : "QA_RESTAURANT_LOCATION_UNAVAILABLE" });
 
   const now = madridNow();
   const expiresAt = new Date(Date.now() + 30 * 60_000);
