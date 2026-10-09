@@ -2965,7 +2965,15 @@ async function assignOrderAutomatically(orderId: mongoose.Types.ObjectId, prefer
     const policy = await dispatchLoadPolicy();
     const freshness = new Date(Date.now() - 90_000);
     const currentRiderIds = await currentSlotRiderIds(tenantFilter);
-    const riderFilter: Record<string, unknown> = { ...tenantFilter, isTestRider: { $ne: true }, _id: { $in: currentRiderIds }, status: { $in: ["available", "busy"] }, lastLocationAt: { $gte: freshness }, location: { $exists: true } };
+    const useQaRider = Boolean(order.isTestOrder && preferredRiderId);
+    const riderFilter: Record<string, unknown> = {
+      ...tenantFilter,
+      isTestRider: useQaRider ? true : { $ne: true },
+      _id: { $in: currentRiderIds },
+      status: { $in: ["available", "busy"] },
+      lastLocationAt: { $gte: freshness },
+      location: { $exists: true },
+    };
     if (preferredRiderId) riderFilter._id = { $in: currentRiderIds.filter((id) => String(id) === String(preferredRiderId)) };
     const riders = await Rider.find(riderFilter).limit(100).lean().exec() as any[];
     const counts = await activeOrderCounts(riders.map((rider) => rider._id));
@@ -3002,6 +3010,89 @@ async function queueAutomaticDispatch(orderId: mongoose.Types.ObjectId, preferre
 setCustomerOrderDispatcher(async (orderId) => {
   if (!mongoose.Types.ObjectId.isValid(orderId)) return { state: "invalid_order_id" as const };
   return queueAutomaticDispatch(new mongoose.Types.ObjectId(orderId));
+});
+
+/**
+ * Creates a short-lived, non-commercial dispatch scenario.  It can only target
+ * a dedicated QA rider and is removed through the paired DELETE route, so test
+ * traffic never reaches a real rider, partner settlement, or customer history.
+ */
+app.post("/api/v1/admin/qa/dispatch-orders", requireRole("admin"), async (req, res) => {
+  const employee = await employeeScope(req);
+  const scope = tenantScope(req);
+  const restaurant = await Restaurant.findOne({ ...scope, isActive: true, onboardingStatus: "approved", location: { $exists: true } })
+    .select("_id tenantId name location menu").lean().exec() as any;
+  const coordinates = restaurant?.location?.coordinates;
+  if (!restaurant || !Array.isArray(coordinates) || coordinates.length < 2) return res.status(409).json({ error: "QA_RESTAURANT_LOCATION_UNAVAILABLE" });
+
+  const now = madridNow();
+  const expiresAt = new Date(Date.now() + 30 * 60_000);
+  const qaEmail = `dispatch-qa-${Date.now()}@qa.invalid`;
+  const qaRider = await Rider.create({
+    tenantId: restaurant.tenantId || null,
+    isTestRider: true,
+    riderCode: `QA-${Date.now().toString(36).toUpperCase()}`,
+    name: "PIKI Rider QA automático",
+    email: qaEmail,
+    city: "Xàtiva",
+    availability: "Simulación aislada",
+    status: "available",
+    lifecycleStatus: "active",
+    vehicle: "electric_bike",
+    location: { type: "Point", coordinates: [Number(coordinates[0]) + 0.0015, Number(coordinates[1]) + 0.0015] },
+    lastLocationAt: new Date(),
+    reliabilityScore: 0.95,
+    ratingScore: 0.95,
+  });
+  await RiderSlot.create({ tenantId: restaurant.tenantId || null, riderId: qaRider._id, zoneSlug: "qa-dispatch", date: now.date, startTime: now.time, endTime: "23:59", status: "active", notes: "PIKI QA dispatch automatico" });
+
+  const publicCode = `PIKI-QA-${Date.now().toString(36).toUpperCase()}`;
+  const dailyCode = await createDailyDisplayCode();
+  const menuItem = Array.isArray(restaurant.menu) && restaurant.menu[0] ? restaurant.menu[0] : null;
+  const itemName = String(menuItem?.name || "Pedido de simulación QA");
+  const unitPriceCents = Math.max(0, Number(menuItem?.priceCents || 0));
+  const order = await Order.create({
+    tenantId: restaurant.tenantId || null,
+    qaRiderId: qaRider._id,
+    isTestOrder: true,
+    publicCode,
+    ...dailyCode,
+    restaurantId: restaurant._id,
+    items: [{ itemId: String(menuItem?._id || "qa-dispatch"), name: itemName, quantity: 1, unitPriceCents }],
+    deliveryAddress: "SIMULACIÓN QA · No realizar entrega",
+    deliveryNote: "Pedido de prueba aislado. Se elimina al finalizar la comprobación.",
+    deliveryLocation: { type: "Point", coordinates: [Number(coordinates[0]) + 0.004, Number(coordinates[1]) + 0.004] },
+    subtotalCents: unitPriceCents,
+    deliveryFeeCents: 0,
+    serviceFeeCents: 0,
+    totalCents: unitPriceCents,
+    paymentMethod: "cash",
+    paymentState: "pending",
+    status: "ready_for_pickup",
+    assignmentState: "unassigned",
+    statusHistory: [{ status: "ready_for_pickup", actorRole: "system", reason: `Simulación QA solicitada por ${employee?.email || "admin"}. Sin cobro ni entrega real.` }],
+  });
+  const dispatch = await queueAutomaticDispatch(order._id as mongoose.Types.ObjectId, qaRider._id as mongoose.Types.ObjectId);
+  const current = await Order.findById(order._id).lean().exec();
+  return res.status(201).json({ order: current, qa: { riderId: String(qaRider._id), expiresAt: expiresAt.toISOString(), dispatch } });
+});
+
+app.delete("/api/v1/admin/qa/dispatch-orders/:id", requireRole("admin"), async (req, res) => {
+  const orderId = objectId(String(req.params.id));
+  if (!orderId) return res.status(400).json({ error: "INVALID_ORDER_ID" });
+  const order = await Order.findOne({ _id: orderId, ...tenantScope(req), isTestOrder: true }).lean().exec() as any;
+  if (!order) return res.status(404).json({ error: "QA_ORDER_NOT_FOUND" });
+  if (order.riderId) await releaseRiderOrderSlot(order._id, order.riderId);
+  await Promise.all([
+    DispatchDecision.deleteMany({ orderId: order._id }),
+    RiderAssignmentReservation.deleteMany({ orderId: order._id }),
+    Order.deleteOne({ _id: order._id, isTestOrder: true }),
+  ]);
+  if (order.qaRiderId) {
+    await RiderSlot.deleteMany({ riderId: order.qaRiderId, notes: "PIKI QA dispatch automatico" });
+    await Rider.deleteOne({ _id: order.qaRiderId, isTestRider: true });
+  }
+  return res.status(204).end();
 });
 
 async function expireStaleOffers() {
