@@ -3135,8 +3135,22 @@ app.post("/api/v1/admin/qa/dispatch-orders", requireRole("admin"), async (req, r
     statusHistory: [{ status: "ready_for_pickup", actorRole: "system", reason: `Simulación QA solicitada por ${employee?.email || "admin"}. Sin cobro ni entrega real.` }],
   });
   const dispatch = await queueAutomaticDispatch(order._id as mongoose.Types.ObjectId, qaRider._id as mongoose.Types.ObjectId);
+  const supportTicket = await SupportTicket.create({
+    tenantId: restaurant.tenantId || null,
+    orderId: order._id,
+    reporterEmail: qaEmail,
+    sourceSurface: "support",
+    sourceRole: "qa",
+    category: "rider",
+    priority: "normal",
+    subject: "QA · Reasignación automática de Rider",
+    description: "Caso aislado creado para comprobar la reasignación de un pedido QA desde PIKI Support. No intervienen pedidos, Riders ni cobros comerciales.",
+    ticketNumber: `SUP-QA-${Date.now().toString(36).toUpperCase()}`,
+    messages: [{ senderRole: "rider", senderName: qaRider.name, body: "Prueba QA: solicito reasignación del pedido de simulación." }],
+    actions: [{ action: "qa_ticket_created", metadata: { qaScenario: true, orderId: String(order._id), riderId: String(qaRider._id) } }],
+  });
   const current = await Order.findById(order._id).lean().exec();
-  return res.status(201).json({ order: current, qa: { riderId: String(qaRider._id), expiresAt: expiresAt.toISOString(), dispatch } });
+  return res.status(201).json({ order: current, qa: { riderId: String(qaRider._id), ticketId: String(supportTicket._id), ticketNumber: supportTicket.ticketNumber, expiresAt: expiresAt.toISOString(), dispatch } });
 });
 
 app.delete("/api/v1/admin/qa/dispatch-orders/:id", requireRole("admin"), async (req, res) => {
@@ -3148,6 +3162,7 @@ app.delete("/api/v1/admin/qa/dispatch-orders/:id", requireRole("admin"), async (
   await Promise.all([
     DispatchDecision.deleteMany({ orderId: order._id }),
     RiderAssignmentReservation.deleteMany({ orderId: order._id }),
+    SupportTicket.deleteMany({ orderId: order._id }),
     Order.deleteOne({ _id: order._id, isTestOrder: true }),
   ]);
   if (order.qaRiderId) {
