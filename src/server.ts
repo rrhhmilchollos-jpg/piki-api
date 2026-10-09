@@ -287,6 +287,13 @@ async function createDailyDisplayCode() {
   }
   throw new Error("DAILY_ORDER_CODE_CAPACITY_REACHED");
 }
+async function createRandomOrderCode() {
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    const publicCode = String(randomInt(10_000_000, 100_000_000));
+    if (!(await Order.exists({ publicCode }))) return publicCode;
+  }
+  throw new Error("ORDER_CODE_CAPACITY_REACHED");
+}
 
 async function dispatchLoadPolicy() {
   const [queuedOrders, activeRiders] = await Promise.all([
@@ -1198,6 +1205,7 @@ app.post("/api/v1/partners/support/tickets", requireRole("partner"), async (req,
     subject: parsed.data.subject,
     description: `[${restaurant.name}] ${parsed.data.description}`,
     orderId: order?._id || null,
+    orderReference: order?.publicCode || "",
     ticketNumber: `SUP-${new Date().toISOString().slice(0, 10).replace(/-/g, "")}-${randomInt(1000, 9999)}`,
     messages: [{ senderRole: "partner", body: parsed.data.description }],
     actions: [{ action: "partner_ticket_created", metadata: { restaurantId: String(restaurantId), restaurantName: restaurant.name, employeeId: String(req.auth?.employeeId || ""), orderRef: order?.publicCode || order?.displayCode || null } }],
@@ -1979,7 +1987,7 @@ app.post("/api/v1/orders", rateLimit(20, 60_000, "orders-create"), async (req, r
   const serviceFeeCents = coverage.serviceFeeCents;
   const totalCents = subtotalCents + deliveryFeeCents + serviceFeeCents;
   if (!isCashOrderWithinLimit(parsed.data.paymentMethod, totalCents)) return res.status(422).json(cashOrderLimitError(totalCents));
-  const publicCode = `PIKI-${Date.now().toString(36).toUpperCase()}`;
+  const publicCode = await createRandomOrderCode();
   const dailyCode = await createDailyDisplayCode();
   const authenticatedCustomer = await currentCustomer(req) as any;
   const order = await Order.create({ tenantId: restaurant.tenantId || null, publicCode, ...dailyCode, restaurantId: restaurant._id, customerId: authenticatedCustomer?._id || null, customerName: String(authenticatedCustomer?.name || "").trim(), items: normalizedItems, deliveryAddress: parsed.data.deliveryAddress, deliveryNote: parsed.data.deliveryNote, deliveryLocation: { type: "Point", coordinates: deliveryPoint }, coveragePolicySlug: coverage.policySlug, coveragePolicyVersion: coverage.policyVersion, coverageDecision: coverage.reason, straightLineDistanceKm: coverage.straightLineDistanceKm, withinMunicipality: coverage.withinMunicipality, deliveryBaseFeeCents: coverage.deliveryBaseFeeCents, outsideMunicipalitySurchargeCents: coverage.outsideMunicipalitySurchargeCents, routeDistanceKm: route.routeDistanceKm, routeDurationMinutes: route.routeDurationMinutes, routeProvider: route.routeProvider, routingDegraded: route.routingDegraded, requiredVehicleClasses: route.requiredVehicleClasses, subtotalCents, deliveryFeeCents, serviceFeeCents, totalCents, paymentMethod: parsed.data.paymentMethod, paymentState: "pending", statusHistory: [{ status: "pending", actorRole: "customer", reason: parsed.data.paymentMethod === "cash" ? "Pedido a contrarreembolso; cobro pendiente hasta la entrega" : "Pedido creado con política de cobertura Xàtiva" }] });
@@ -2033,11 +2041,12 @@ app.post("/api/v1/internal/customer-support/tickets", async (req, res) => {
   const input = parsed.data;
   let orderId: mongoose.Types.ObjectId | null = null;
   if (input.orderRef) {
-    const order = await Order.findOne({ ...supportOrderFilter(input.orderRef), customerId: input.customerId }).select("_id").lean().exec() as any;
+    const order = await Order.findOne({ ...supportOrderFilter(input.orderRef), customerId: input.customerId }).select("_id publicCode").lean().exec() as any;
     if (!order) return res.status(404).json({ error: "CUSTOMER_ORDER_NOT_FOUND" });
     orderId = order._id;
   }
-  const ticket = await SupportTicket.create({ customerId: input.customerId, reporterEmail: input.customerEmail, sourceSurface: "customer", sourceRole: "customer", category: input.category, priority: input.priority, subject: input.subject, description: input.description, orderId, ticketNumber: `SUP-${new Date().toISOString().slice(0, 10).replace(/-/g, "")}-${randomInt(1000, 9999)}`, actions: [{ action: "ticket_created", metadata: { sourceSurface: "customer", customerId: input.customerId, customerName: input.customerName, orderRef: input.orderRef || null } }] });
+  const linkedOrder = orderId ? await Order.findById(orderId).select("publicCode").lean().exec() as any : null;
+  const ticket = await SupportTicket.create({ customerId: input.customerId, reporterEmail: input.customerEmail, sourceSurface: "customer", sourceRole: "customer", category: input.category, priority: input.priority, subject: input.subject, description: input.description, orderId, orderReference: linkedOrder?.publicCode || "", ticketNumber: `SUP-${new Date().toISOString().slice(0, 10).replace(/-/g, "")}-${randomInt(1000, 9999)}`, actions: [{ action: "ticket_created", metadata: { sourceSurface: "customer", customerId: input.customerId, customerName: input.customerName, orderRef: linkedOrder?.publicCode || input.orderRef || null } }] });
   return res.status(201).json({ ticket: { _id: ticket._id, ticketNumber: ticket.ticketNumber, subject: ticket.subject, description: ticket.description, category: ticket.category, priority: ticket.priority, status: ticket.status, reporterEmail: ticket.reporterEmail, messages: ticket.messages, createdAt: ticket.createdAt, updatedAt: ticket.updatedAt } });
 });
 app.post("/api/v1/internal/customer-support/tickets/list", async (req, res) => {
@@ -2147,7 +2156,7 @@ app.post("/api/v1/support/tickets", requireRole(...supportRoles), async (req, re
   if (parsed.data.orderRef && !order) return res.status(404).json({ error: "ORDER_NOT_FOUND" });
   const actorEmployeeId = objectId(String(req.auth?.employeeId || ""));
   const sourceSurface = String(req.header("x-piki-surface") || "admin").toLowerCase();
-  const ticket = await SupportTicket.create({ ...parsed.data, reporterEmail: parsed.data.reporterEmail || "", sourceSurface, sourceRole: req.auth?.role || "", orderId: order?._id || null, ticketNumber: `SUP-${new Date().toISOString().slice(0, 10).replace(/-/g, "")}-${randomInt(1000, 9999)}`, createdBy: actorEmployeeId, actions: [{ action: "ticket_created", actorEmployeeId, metadata: { orderRef: parsed.data.orderRef || null, sourceSurface, sourceRole: req.auth?.role || null } }] });
+  const ticket = await SupportTicket.create({ ...parsed.data, reporterEmail: parsed.data.reporterEmail || "", sourceSurface, sourceRole: req.auth?.role || "", orderId: order?._id || null, orderReference: order?.publicCode || parsed.data.orderRef || "", ticketNumber: `SUP-${new Date().toISOString().slice(0, 10).replace(/-/g, "")}-${randomInt(1000, 9999)}`, createdBy: actorEmployeeId, actions: [{ action: "ticket_created", actorEmployeeId, metadata: { orderRef: order?.publicCode || parsed.data.orderRef || null, sourceSurface, sourceRole: req.auth?.role || null } }] });
   return res.status(201).json({ ticket });
 });
 app.get("/api/v1/support/tickets/mine", requireRole(...supportRoles), async (req, res) => {
@@ -2174,7 +2183,7 @@ app.post("/api/v1/admin/support/tickets", requireRole(...supportInboxRoles), asy
   const order = parsed.data.orderRef ? await Order.findOne({ ...supportTenantScope(req), ...supportOrderFilter(parsed.data.orderRef) }).select("_id").lean().exec() as any : null;
   if (parsed.data.orderRef && !order) return res.status(404).json({ error: "ORDER_NOT_FOUND" });
   const actorEmployeeId = objectId(String(req.auth?.employeeId || ""));
-  const ticket = await SupportTicket.create({ ...parsed.data, sourceSurface: "support", sourceRole: req.auth?.role || "support", orderId: order?._id || null, ticketNumber: `SUP-${new Date().toISOString().slice(0, 10).replace(/-/g, "")}-${randomInt(1000, 9999)}`, createdBy: actorEmployeeId, actions: [{ action: "ticket_created", actorEmployeeId, metadata: { orderRef: parsed.data.orderRef || null, sourceSurface: "support" } }] });
+  const ticket = await SupportTicket.create({ ...parsed.data, sourceSurface: "support", sourceRole: req.auth?.role || "support", orderId: order?._id || null, orderReference: order?.publicCode || parsed.data.orderRef || "", ticketNumber: `SUP-${new Date().toISOString().slice(0, 10).replace(/-/g, "")}-${randomInt(1000, 9999)}`, createdBy: actorEmployeeId, actions: [{ action: "ticket_created", actorEmployeeId, metadata: { orderRef: order?.publicCode || parsed.data.orderRef || null, sourceSurface: "support" } }] });
   return res.status(201).json({ ticket });
 });
 async function supportAgent(req: express.Request) {
@@ -2294,7 +2303,8 @@ app.post("/api/v1/riders/:id/support/tickets", requireRole("rider"), async (req,
     orderId = objectId(parsed.data.orderId);
     if (!orderId || !(await Order.exists({ _id: orderId, riderId, ...tenantScope(req) }))) return res.status(404).json({ error: "RIDER_ORDER_NOT_FOUND" });
   }
-  const ticket = await SupportTicket.create({ tenantId: (rider as any).tenantId || null, orderId, reporterEmail: rider.email, sourceSurface: "rider", sourceRole: "rider", category: "rider", priority: parsed.data.priority, subject: parsed.data.subject, description: parsed.data.description, ticketNumber: `SUP-${new Date().toISOString().slice(0, 10).replace(/-/g, "")}-${randomInt(1000, 9999)}`, messages: [{ senderRole: "rider", senderName: rider.name, body: parsed.data.description }, { senderRole: "system", senderName: "PIKI Soporte", body: `Hemos recibido tu incidencia${orderId ? " vinculada al pedido" : ""}. Un agente de Soporte PIKI revisará el caso y te responderá por este chat. Si existe riesgo para tu seguridad, detén el reparto en un lugar seguro y contacta con emergencias.` }], actions: [{ action: "rider_ticket_created", metadata: { riderId: String(riderId) } }] });
+  const linkedOrder = orderId ? await Order.findById(orderId).select("publicCode").lean().exec() as any : null;
+  const ticket = await SupportTicket.create({ tenantId: (rider as any).tenantId || null, orderId, orderReference: linkedOrder?.publicCode || "", reporterEmail: rider.email, sourceSurface: "rider", sourceRole: "rider", category: "rider", priority: parsed.data.priority, subject: parsed.data.subject, description: parsed.data.description, ticketNumber: `SUP-${new Date().toISOString().slice(0, 10).replace(/-/g, "")}-${randomInt(1000, 9999)}`, messages: [{ senderRole: "rider", senderName: rider.name, body: parsed.data.description }, { senderRole: "system", senderName: "PIKI Soporte", body: `Hemos recibido tu incidencia${orderId ? " vinculada al pedido" : ""}. Un agente de Soporte PIKI revisará el caso y te responderá por este chat. Si existe riesgo para tu seguridad, detén el reparto en un lugar seguro y contacta con emergencias.` }], actions: [{ action: "rider_ticket_created", metadata: { riderId: String(riderId) } }] });
   void publishRealtimeEvent({ channel: "admin", audienceKey: tenantAudienceKey((rider as any).tenantId, "admin"), tenantId: (rider as any).tenantId, type: "support.ticket_created", payload: { ticketId: String(ticket._id), priority: ticket.priority, orderId: orderId ? String(orderId) : null } });
   return res.status(201).json({ ticket: { id: ticket._id, ticketNumber: ticket.ticketNumber, status: ticket.status, messages: ticket.messages } });
 });
@@ -3123,7 +3133,7 @@ app.post("/api/v1/admin/qa/dispatch-orders", requireRole("admin"), async (req, r
   });
   await RiderSlot.create({ tenantId: restaurant.tenantId || null, riderId: qaRider._id, zoneSlug: "qa-dispatch", date: now.date, startTime: now.time, endTime: "23:59", status: "active", notes: "PIKI QA dispatch automatico" });
 
-  const publicCode = `PIKI-QA-${Date.now().toString(36).toUpperCase()}`;
+  const publicCode = await createRandomOrderCode();
   const dailyCode = await createDailyDisplayCode();
   const menuItem = Array.isArray(restaurant.menu) && restaurant.menu[0] ? restaurant.menu[0] : null;
   const itemName = String(menuItem?.name || "Pedido de simulación QA");
@@ -3154,6 +3164,7 @@ app.post("/api/v1/admin/qa/dispatch-orders", requireRole("admin"), async (req, r
   const supportTicket = await SupportTicket.create({
     tenantId: restaurant.tenantId || null,
     orderId: order._id,
+    orderReference: order.publicCode,
     reporterEmail: qaEmail,
     sourceSurface: "support",
     sourceRole: "qa",
