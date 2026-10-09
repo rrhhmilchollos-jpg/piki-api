@@ -6,6 +6,7 @@ import { evaluateXativaCoverage } from "./coverage/xativaPolicy.js";
 import { quoteDeliveryRoute } from "./coverage/routing.js";
 import { CUSTOMER_CATALOG_RESTAURANT_FILTER, customerCatalogRestaurantName } from "./customerCatalogPolicy.js";
 import { modifierGroupsForItem, quoteMenuItem, usesReferenceAddOns } from "./menuModifiers.js";
+import { cashOrderLimitError, isCashOrderWithinLimit } from "./paymentPolicy.js";
 
 const COOKIE = "piki_customer_session";
 let dispatchCustomerOrder: ((orderId: string) => Promise<unknown>) | null = null;
@@ -192,6 +193,7 @@ export async function handleCustomerTrpc(req: Request, res: Response) {
       const route = await quoteDeliveryRoute([Number(restaurantPoint[0]), Number(restaurantPoint[1])], deliveryPoint);
       const subtotalCents = normalized.reduce((sum, item) => sum + item.unitPriceCents * item.quantity, 0);
       const deliveryCents = coverage.deliveryFeeCents; const serviceCents = coverage.serviceFeeCents; const totalCents = subtotalCents + deliveryCents + serviceCents;
+      if (!isCashOrderWithinLimit(paymentMethod, totalCents)) return res.status(422).json(cashOrderLimitError(totalCents));
       const code = `PIKI-${Date.now().toString(36).toUpperCase()}`;
       const order = await Order.create({ publicCode: code, restaurantId: restaurant._id, customerId: String(user._id), items: normalized, deliveryAddress: String(input.address || "").trim(), deliveryLocation: { type: "Point", coordinates: deliveryPoint }, coveragePolicySlug: coverage.policySlug, coveragePolicyVersion: coverage.policyVersion, coverageDecision: coverage.reason, straightLineDistanceKm: coverage.straightLineDistanceKm, withinMunicipality: coverage.withinMunicipality, deliveryBaseFeeCents: coverage.deliveryBaseFeeCents, outsideMunicipalitySurchargeCents: coverage.outsideMunicipalitySurchargeCents, routeDistanceKm: route.routeDistanceKm, routeDurationMinutes: route.routeDurationMinutes, routeProvider: route.routeProvider, routingDegraded: route.routingDegraded, requiredVehicleClasses: route.requiredVehicleClasses, subtotalCents, deliveryFeeCents: deliveryCents, serviceFeeCents: serviceCents, totalCents, paymentMethod, paymentState: "pending", statusHistory: [{ status: "pending", actorRole: "customer", reason: "Pedido a contrarreembolso; cobro pendiente hasta la entrega" }] });
       const dispatch = dispatchCustomerOrder
