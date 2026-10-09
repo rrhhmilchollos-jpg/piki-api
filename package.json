@@ -8,6 +8,7 @@
     "build": "esbuild src/server.ts --platform=node --packages=external --bundle --format=esm --outdir=dist",
     "start": "node dist/server.js",
     "check": "tsc --noEmit",
+    "test": "tsx --test src/*.test.ts",
     "migrate:tenants": "tsx scripts/migrate-tenants.ts",
     "dispatch:postgis": "node scripts/run-postgis-batch.mjs"
   },

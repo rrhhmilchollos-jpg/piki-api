@@ -12,7 +12,7 @@ import { normalizeLeadEmail, partnerLeadSubmissionSchema, riderLeadSubmissionSch
 import { assertTransition, calculateEtaRange, transitionSchema, validateCoordinates } from "./algorithms/index.js";
 import { configuredAuthRoles, requireOwner, requireRole, resolveRole } from "./auth.js";
 import { EmployeeSession, issueEmployeeSession, revokeEmployeeSessions, sessionRole } from "./employeeSessions.js";
-import { processStripeWebhook, stripeConfigured, createSignaturitSignature, signaturitBaseUrl, signaturitConfigured, signaturitMode, signatureWebhookUrl, webhookDigest, handleCustomerTrpc, currentCustomer, setCustomerOrderDispatcher } from "./integrations/index.js";
+import { isStripeSignatureError, processStripeWebhook, stripeConfigured, createSignaturitSignature, signaturitBaseUrl, signaturitConfigured, signaturitMode, signatureWebhookUrl, webhookDigest, handleCustomerTrpc, currentCustomer, setCustomerOrderDispatcher } from "./integrations/index.js";
 import { getVersionPolicy, isPikiSurface, requiresUpdate, setVersionPolicy, syncVersionPolicy, versionPolicySchema, type PikiSurface } from "./appVersion.js";
 import { publicPushConfig, revokePushSubscription, savePushSubscription } from "./push.js";
 import { publishOrderStatusEvents, publishOrderIntakeEvents, publishRiderOfferEvent, publishRiderArrivalEvent, publishRiderLocationEvents, publishRealtimeEvent, serveRealtimeEvents, startRealtimeRelay, tenantAudienceKey } from "./realtime.js";
@@ -23,13 +23,17 @@ import { createSessionToken, generateTemporaryPassword, hashPassword, hashSessio
 import { evaluateXativaCoverage } from "./coverage/xativaPolicy.js";
 import { quoteDeliveryRoute } from "./coverage/routing.js";
 import { runTenantMigration } from "./tenantMigration.js";
-import { activeOperationalOrderStatuses, dispatchableOrderStatuses, dispatchablePaymentFilter, isDispatchableOrderStatus } from "./dispatchEligibility.js";
+import { onboardingScope } from "./onboardingScope.js";
+import { corporateEmailConfiguration, sendCorporateEmail, sendLeadContactEmail, verifyCorporateEmailConnection } from "./corporateEmail.js";
+import { activeOperationalOrderStatuses, dispatchableOrderStatuses, dispatchablePaymentFilter, isDispatchableOrderStatus, isDispatchablePayment } from "./dispatchEligibility.js"
 import { canReceivePartnerLocations, partnerCan, partnerPermissions, partnerRolesForEmployee, permissionsForPartnerRoles, type PartnerPermission } from "./partnerAccess.js";
 import { awardRiderRecruitmentMilestones, claimRiderReferralCode, completeRiderShiftIncentiveTracking, incentiveProgramStatus, loadRiderIncentiveSnapshot, trackRiderLocationForIncentive, trackRiderShiftStart } from "./riderIncentives.js";
 import { buildApprovedRiderOperationalProfile } from "./riderApproval.js";
 import { CUSTOMER_CATALOG_RESTAURANT_FILTER, presentCustomerCatalogRestaurant } from "./customerCatalogPolicy.js";
 import { quoteMenuItem, usesReferenceAddOns } from "./menuModifiers.js";
 import { decideLatePickup, pointDistanceMeters } from "./pickupPolicy.js";
+import { buildLegacyRiderSupportTicketFilter, buildRiderSupportTicketFilter } from "./supportTicketScope.js";
+import { cashOrderLimitError, isCashOrderWithinLimit } from "./paymentPolicy.js"
 
 export const app = express();
 app.set("trust proxy", 1);
@@ -140,7 +144,10 @@ const stripeWebhookHandler = async (req: express.Request, res: express.Response)
     const result = await processStripeWebhook(req.body as Buffer, signature);
     return res.status(200).json({ received: true, ...result });
   } catch (error) {
-    return res.status(400).json({ error: "INVALID_STRIPE_WEBHOOK", message: error instanceof Error ? error.message : "Webhook rejected" });
+    // Invalid signatures are terminal client errors; processing/outbox failures
+    // must remain non-2xx so Stripe retries the same event id.
+    if (isStripeSignatureError(error)) return res.status(400).json({ error: "INVALID_STRIPE_WEBHOOK" });
+    return res.status(500).json({ error: "STRIPE_WEBHOOK_PROCESSING_FAILED" });
   }
 };
 app.post(["/api/v1/payments/webhook", "/api/webhooks/stripe"], express.raw({ type: "application/json" }), stripeWebhookHandler);
@@ -1486,6 +1493,7 @@ app.post("/api/v1/orders", rateLimit(20, 60_000, "orders-create"), async (req, r
   const deliveryFeeCents = coverage.deliveryFeeCents;
   const serviceFeeCents = coverage.serviceFeeCents;
   const totalCents = subtotalCents + deliveryFeeCents + serviceFeeCents;
+  if (!isCashOrderWithinLimit(parsed.data.paymentMethod, totalCents)) return res.status(422).json(cashOrderLimitError(totalCents));
   const publicCode = `PIKI-${Date.now().toString(36).toUpperCase()}`;
   const dailyCode = await createDailyDisplayCode();
   const authenticatedCustomer = await currentCustomer(req) as any;
@@ -1509,6 +1517,7 @@ app.post("/api/v1/internal/customer-orders/sync", async (req, res) => {
   const existing = await Order.findOne({ publicCode: input.publicCode }).lean().exec() as any;
   const location = input.deliveryLocation ? { type: "Point", coordinates: [input.deliveryLocation.longitude, input.deliveryLocation.latitude] } : restaurant.location;
   if (!location?.coordinates?.length) return res.status(409).json({ error: "DELIVERY_LOCATION_REQUIRED" });
+  if (!isCashOrderWithinLimit(input.paymentMethod, input.totalCents)) return res.status(422).json(cashOrderLimitError(input.totalCents));
   // Customer is the source of truth: never rebuild lines from a second menu copy.
   // This prevents price/name drift between Customer, Partner and Rider screens.
   const canonicalItems = input.items.map(({ itemId, name, quantity, unitPriceCents, totalCents }) => ({ itemId, name, quantity, unitPriceCents, ...(totalCents == null ? {} : { totalCents }) }));
@@ -2043,7 +2052,9 @@ app.post("/api/v1/riders/:riderId/orders/:orderId/confirm-delivery", requireRole
     const cashEntry = await recordCashCollection(order, riderId, "rider");
     if (cashEntry) await publishCashWalletEvent({ riderId, amountCents: Number(order.totalCents || 0), type: "cash.wallet_changed", reference: String(order.publicCode || "") });
   }
-  const updated = await Order.findOneAndUpdate({ _id: orderId, riderId, status: "on_the_way", version: order.version }, { $set: { status: "delivered", deliveredAt: new Date(), ...(order.paymentMethod === "stripe" ? { paymentState: "paid" } : {}) }, $inc: { version: 1 }, $push: { statusHistory: { status: "delivered", actorRole: "rider", reason: order.paymentMethod === "cash" ? "Entrega confirmada y cobro en efectivo registrado" : "Entrega confirmada por el Rider" } } }, { new: true }).lean().exec();
+  // Stripe may emit payment_intent.succeeded between capture() and this write.
+  // The status/rider/assignment predicates remain the concurrency guard.
+  const updated = await Order.findOneAndUpdate({ _id: orderId, riderId, assignmentState: "assigned", status: "on_the_way", ...(order.paymentMethod === "stripe" ? { paymentState: { $in: ["authorized", "paid"] } } : {}) }, { $set: { status: "delivered", deliveredAt: new Date(), archivedAt: new Date(), ...(order.paymentMethod === "stripe" ? { paymentState: "paid" } : {}) }, $inc: { version: 1 }, $push: { statusHistory: { status: "delivered", actorRole: "rider", reason: order.paymentMethod === "cash" ? "Entrega confirmada y cobro en efectivo registrado" : "Entrega confirmada por el Rider" } } }, { new: true }).lean().exec();
   if (!updated) return res.status(409).json({ error: "ORDER_CHANGED_RETRY" });
   const deliveredOrder = updated as any;
   await RiderOrderMessage.deleteMany({ orderId, riderId }).exec();
@@ -2357,7 +2368,7 @@ async function assignOrderAutomatically(orderId: mongoose.Types.ObjectId, prefer
     const order = await Order.findById(orderId).lean().exec() as any;
     if (!order) return { state: "not_found" as const };
     const tenantFilter: Record<string, unknown> = order.tenantId ? { tenantId: order.tenantId } : {};
-    if (!(order.paymentState === "authorized" || order.paymentState === "paid" || order.paymentMethod === "cash") || !isDispatchableOrderStatus(order.status)) return { state: "not_dispatchable" as const };
+    if (!isDispatchablePayment(order.paymentState, order.paymentMethod, Number(order.totalCents)) || !isDispatchableOrderStatus(order.status)) return { state: "not_dispatchable" as const };
     if (order.riderId || order.assignmentState === "assigned" || order.assignmentState === "offered") return { state: "already_assigned" as const, riderId: order.riderId };
     const restaurant = await Restaurant.findOne({ _id: order.restaurantId, ...tenantFilter }).lean().exec() as any;
     if (!restaurant?.location?.coordinates || !order.deliveryLocation?.coordinates) return { state: "missing_geolocation" as const };

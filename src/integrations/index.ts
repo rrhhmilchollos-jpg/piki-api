@@ -4,6 +4,7 @@
  */
 export {
   createCheckoutSession,
+  isStripeSignatureError,
   processStripeWebhook,
   stripeConfigured,
 } from "../stripe.js";
