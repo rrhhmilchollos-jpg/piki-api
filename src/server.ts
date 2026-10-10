@@ -20,11 +20,12 @@ import { listNotifications, markAllNotificationsRead, markNotificationRead, send
 import { captureStripePaymentIntent, createCheckoutSession } from "./stripe.js";
 import { rankDispatchCandidates, computeMobilityAdvice, calculateSanctionDecision, defaultSanctionPolicy } from "./algorithms/index.js";
 import { createSessionToken, generateTemporaryPassword, hashPassword, hashSessionToken, verifyPassword } from "./employeeAuth.js";
+import { EmployeePasswordReset } from "./passwordReset.js";
 import { evaluateXativaCoverage } from "./coverage/xativaPolicy.js";
 import { quoteDeliveryRoute } from "./coverage/routing.js";
 import { runTenantMigration } from "./tenantMigration.js";
 import { onboardingScope } from "./onboardingScope.js";
-import { corporateEmailConfiguration, sendCorporateEmail, sendLeadContactEmail, verifyCorporateEmailConnection } from "./corporateEmail.js";
+import { corporateEmailConfiguration, escapeCorporateHtml, sendCorporateEmail, sendLeadContactEmail, verifyCorporateEmailConnection } from "./corporateEmail.js";
 import { activeOperationalOrderStatuses, dispatchableOrderStatuses, dispatchablePaymentFilter, isDispatchableOrderStatus, isDispatchablePayment } from "./dispatchEligibility.js";
 import { canReceivePartnerLocations, partnerCan, partnerPermissions, partnerRolesForEmployee, permissionsForPartnerRoles, type PartnerPermission } from "./partnerAccess.js";
 import { awardRiderRecruitmentMilestones, claimRiderReferralCode, completeRiderShiftIncentiveTracking, incentiveProgramStatus, loadRiderIncentiveSnapshot, trackRiderLocationForIncentive, trackRiderShiftStart } from "./riderIncentives.js";
@@ -496,6 +497,47 @@ app.get("/api/v1/auth/status", (_req, res) => res.json({ authentication: "bearer
 const employeeSessionRoles = ["admin", "partner", "rider", "fleet", "commercial", "gerente_comercial_zona", "finance", "support"] as const;
 const partnerOperationalRoles = ["partner_admin", "area_manager", "zone_manager", "store_manager", "manager", "cashier", "cajero", "kitchen", "cocina", "cook", "catalog", "catalogue", "menu_manager", "viewer", "read_only", "solo_lectura"] as const;
 const employeeLoginSchema = z.object({ email: z.string().email(), password: z.string().min(8).max(200), role: z.enum(employeeSessionRoles).optional() });
+const employeePasswordResetRequestSchema = z.object({ email: z.string().email().max(254) });
+const employeePasswordResetConfirmSchema = z.object({ token: z.string().min(40).max(200), newPassword: z.string().min(12).max(200).regex(/[A-Z]/).regex(/[a-z]/).regex(/[0-9]/) });
+const passwordResetMessage = "Si el correo corresponde a una cuenta Partner activa, recibirás un enlace para crear una contraseña nueva.";
+app.post("/api/v1/auth/employee/password-reset/request", rateLimit(3, 15 * 60_000, "employee-password-reset"), async (req, res) => {
+  const parsed = employeePasswordResetRequestSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(202).json({ message: passwordResetMessage });
+  const email = parsed.data.email.trim().toLowerCase();
+  const employee = await EmployeeAccount.findOne({ email, active: true, authorizationStatus: "approved", $or: [{ apiRole: "partner" }, { roles: "partner" }] }).select("_id email name").lean().exec() as any;
+  if (employee) {
+    const rawToken = randomBytes(32).toString("hex");
+    const tokenHash = createHash("sha256").update(rawToken).digest("hex");
+    const expiresAt = new Date(Date.now() + 30 * 60_000);
+    await EmployeePasswordReset.updateMany({ employeeId: employee._id, usedAt: null }, { $set: { usedAt: new Date() } }).exec();
+    await EmployeePasswordReset.create({ employeeId: employee._id, email, tokenHash, expiresAt });
+    const appUrl = String(process.env.PARTNER_APP_URL || "https://partners.pikidelivery.com").replace(/\/$/, "");
+    const resetUrl = `${appUrl}/?reset=${encodeURIComponent(rawToken)}`;
+    const safeName = escapeCorporateHtml(String(employee.name || "equipo Partner"));
+    const delivery = await sendCorporateEmail({
+      recipientEmail: email,
+      subject: "PIKI Partner · Recupera tu contraseña",
+      idempotencyKey: `piki-employee-password-reset-${tokenHash}`,
+      text: `Hola ${employee.name || "equipo Partner"},\n\nPuedes crear una contraseña nueva en este enlace: ${resetUrl}\n\nEl enlace caduca en 30 minutos y solo puede utilizarse una vez. Si no solicitaste este cambio, ignora este mensaje.\n\nEquipo PIKI`,
+      html: `<div style="font-family:Arial,sans-serif;line-height:1.6;color:#171717"><h2>Recuperación de acceso PIKI Partner</h2><p>Hola ${safeName}:</p><p>Hemos recibido una solicitud para crear una contraseña nueva.</p><p><a href="${resetUrl}" style="display:inline-block;padding:13px 20px;border-radius:10px;background:#ffd400;color:#171717;text-decoration:none;font-weight:700">Crear contraseña nueva</a></p><p style="font-size:13px;color:#666">El enlace caduca en 30 minutos y solo puede utilizarse una vez. Si no solicitaste este cambio, ignora este mensaje.</p></div>`,
+    });
+    if (!delivery.sent) console.warn("Employee password reset email was not delivered", { error: delivery.error });
+  }
+  return res.status(202).json({ message: passwordResetMessage });
+});
+app.post("/api/v1/auth/employee/password-reset/confirm", rateLimit(8, 15 * 60_000, "employee-password-reset-confirm"), async (req, res) => {
+  const parsed = employeePasswordResetConfirmSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "INVALID_PASSWORD_CHANGE", message: "La nueva contraseña debe tener 12 caracteres e incluir mayúscula, minúscula y número." });
+  const tokenHash = createHash("sha256").update(parsed.data.token).digest("hex");
+  const reset = await EmployeePasswordReset.findOne({ tokenHash, usedAt: null, expiresAt: { $gt: new Date() } }).exec() as any;
+  if (!reset) return res.status(400).json({ error: "PASSWORD_RESET_INVALID", message: "El enlace no es válido o ya ha caducado. Solicita otro enlace." });
+  const employee = await EmployeeAccount.findOne({ _id: reset.employeeId, active: true, authorizationStatus: "approved", $or: [{ apiRole: "partner" }, { roles: "partner" }] }).select("+passwordHash").exec() as any;
+  if (!employee) return res.status(400).json({ error: "PASSWORD_RESET_INVALID", message: "El enlace no es válido o ya ha caducado. Solicita otro enlace." });
+  employee.passwordHash = hashPassword(parsed.data.newPassword); employee.mustChangePassword = false; employee.passwordChangedAt = new Date(); employee.sessionHash = null; await employee.save();
+  await EmployeeSession.deleteMany({ employeeId: employee._id }).exec();
+  reset.usedAt = new Date(); await reset.save();
+  return res.json({ changed: true });
+});
 app.post("/api/v1/auth/employee/login", async (req, res) => {
   const parsed = employeeLoginSchema.safeParse(req.body); if (!parsed.success) return res.status(400).json({ error: "INVALID_LOGIN" });
   if (String(req.headers["x-piki-surface"] || "").toLowerCase() === "admin" && parsed.data.email.toLowerCase() !== ownerEmail) { /* subadmins are allowed; destructive operations remain superadmin-only */ }
@@ -3745,6 +3787,7 @@ async function start() {
   const uri = process.env.MONGODB_URI;
   if (uri) { await mongoose.connect(uri, { dbName: databaseName, serverSelectionTimeoutMS: 10_000, socketTimeoutMS: 45_000, maxPoolSize: 20, minPoolSize: 2, retryWrites: true }); await EmployeeAccount.updateMany({ authorizationStatus: { $exists: false } }, { $set: { authorizationStatus: "approved", accessLevel: "subadmin" } }).exec(); await EmployeeAccount.updateOne({ email: ownerEmail }, { $set: { accessLevel: "superadmin", authorizationStatus: "approved", ownerProtected: true, active: true } }).exec(); const owner = await EmployeeAccount.findOne({ email: ownerEmail }).select("_id").lean().exec() as any; const legacyApproved = await EmployeeAccount.find({ email: { $ne: ownerEmail }, authorizationStatus: "approved", authorizedAt: null }).select("_id apiRole accessLevel createdAt").lean().exec() as any[]; for (const employee of legacyApproved) { const authorizedAt = employee.createdAt || new Date(); await EmployeeAccount.updateOne({ _id: employee._id, authorizedAt: null }, { $set: { authorizedAt, authorizedBy: owner?._id || null, authorizationReason: "Migración de autorización aprobada existente." } }).exec(); if (owner?._id && !(await AccessAuthorization.exists({ employeeId: employee._id }))) await AccessAuthorization.create({ employeeId: employee._id, action: "created", previousStatus: null, nextStatus: "approved", previousRole: null, nextRole: employee.apiRole, accessLevel: employee.accessLevel || "subadmin", actorEmployeeId: owner._id, reason: "Migración de autorización aprobada existente." }); } await ensureIndexes(); startRealtimeRelay(); startNotificationWorker(); if (process.env.REPAIR_PARTNER_EMAIL) await repairConfiguredPartnerAccess(); databaseReady = true; if (process.env.RUN_TENANT_MIGRATION === "true") { if (process.env.ALLOW_TENANT_MIGRATION !== "true") throw new Error("RUN_TENANT_MIGRATION requires ALLOW_TENANT_MIGRATION=true"); console.log(JSON.stringify({ event: "tenant_migration_started" })); console.log(JSON.stringify({ event: "tenant_migration_completed", ...(await runTenantMigration()) })); } } else console.warn("MONGODB_URI is not configured; /ready will remain unavailable.");
   await EmployeeSession.init();
+  await EmployeePasswordReset.init();
   const server = app.listen(port, "0.0.0.0", () => console.log(`PIKI API listening on port ${port}`));
   void verifyCorporateEmailConnection().then(result => console.log(JSON.stringify({ event: "corporate_email_transport_probe", ...result }))).catch(() => console.warn("Corporate email probe failed without exposing credentials"));
   const sweepTimer = setInterval(() => { void runAutomaticDispatchSweep().catch((error) => console.error("Automatic dispatch sweep crashed", error)); }, 5_000).unref();
