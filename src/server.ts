@@ -3825,29 +3825,52 @@ app.use((error: any, req: express.Request, res: express.Response, next: express.
 async function repairConfiguredPartnerAccess() {
   const email = String(process.env.REPAIR_PARTNER_EMAIL || "").trim().toLowerCase();
   if (!email) return;
-  const account = await EmployeeAccount.findOne({ email }).select("_id email restaurantId apiRole jobRole roles primaryRole active authorizationStatus").lean().exec() as any;
+  const account = await EmployeeAccount.findOne({ email }).select("_id email tenantId restaurantId restaurantIds apiRole jobRole roles primaryRole active authorizationStatus ownerProtected").lean().exec() as any;
   if (!account) { console.log(JSON.stringify({ event: "partner_access_repair", email, result: "account_not_found" })); return; }
-  let restaurant = account.restaurantId
-    ? await Restaurant.findById(account.restaurantId).select("_id email onboardingStatus isActive").lean().exec() as any
-    : await Restaurant.findOne({ $or: [{ email }, { slug: "kfc-xativa-test" }, { name: "KFC XATIVA TEST" }] }).select("_id email slug name onboardingStatus isActive").lean().exec() as any;
-  if (!restaurant && process.env.REPAIR_PARTNER_CREATE_TEST === "true") {
+
+  const createOrUseTestRestaurant = process.env.REPAIR_PARTNER_CREATE_TEST === "true";
+  let restaurant: any = null;
+  if (createOrUseTestRestaurant) {
+    // The exact test slug is unique; adopting a legacy record also ensures it
+    // lives in the same tenant as the account that will operate it.
     restaurant = await Restaurant.findOneAndUpdate(
       { slug: "kfc-xativa-test" },
-      { $setOnInsert: { slug: "kfc-xativa-test", name: "KFC XATIVA TEST", cuisine: "Americana", category: "Americana", locality: "Xàtiva", partnerGroupKey: "xativa", tagline: "Partner de prueba PIKI", onboardingStatus: "approved", isActive: true, email, phone: "", address: "Xàtiva" } },
+      {
+        $set: { tenantId: account.tenantId || null, email, onboardingStatus: "approved", isActive: true },
+        $setOnInsert: { slug: "kfc-xativa-test", name: "KFC XATIVA TEST", cuisine: "Americana", category: "Americana", locality: "Xàtiva", partnerGroupKey: "xativa", tagline: "Partner de prueba PIKI", phone: "", address: "Xàtiva" },
+      },
       { upsert: true, new: true, setDefaultsOnInsert: true },
-    ).select("_id email slug name onboardingStatus isActive").lean().exec() as any;
-    console.log(JSON.stringify({ event: "partner_access_repair", email, result: "test_restaurant_created_or_reused", restaurantId: String(restaurant._id), restaurantName: restaurant.name }));
+    ).select("_id email slug name tenantId onboardingStatus isActive").lean().exec();
+    console.log(JSON.stringify({ event: "partner_access_repair", email, result: "test_restaurant_created_or_reused", restaurantId: String(restaurant._id), restaurantName: restaurant.name, tenantId: restaurant.tenantId ? String(restaurant.tenantId) : null }));
+  } else {
+    const tenantFilter = account.tenantId ? { tenantId: account.tenantId } : { tenantId: null };
+    restaurant = account.restaurantId
+      ? await Restaurant.findOne({ _id: account.restaurantId, ...tenantFilter }).select("_id email slug name tenantId onboardingStatus isActive").lean().exec()
+      : await Restaurant.findOne({ email, ...tenantFilter }).select("_id email slug name tenantId onboardingStatus isActive").lean().exec();
   }
   if (!restaurant) { console.log(JSON.stringify({ event: "partner_access_repair", email, result: "restaurant_not_found", accountId: String(account._id) })); return; }
-  if (restaurant.onboardingStatus !== "approved" || restaurant.isActive !== true) {
-    console.log(JSON.stringify({ event: "partner_access_repair", email, result: "restaurant_not_approved", restaurantId: String(restaurant._id), onboardingStatus: restaurant.onboardingStatus, isActive: restaurant.isActive })); return;
-  }
-  const roles = [...new Set([...(Array.isArray(account.roles) ? account.roles : []), "partner", "rider"])];
-  await EmployeeAccount.updateOne({ _id: account._id }, { $set: { restaurantId: restaurant._id, restaurantIds: [restaurant._id], apiRole: "partner", jobRole: "partner", roles, primaryRole: "partner", active: true, authorizationStatus: "approved", authorizedAt: new Date(), authorizationReason: "Reparación de acceso Partner + Rider solicitada por PIKI para pruebas operativas." } }).exec();
-  const rider = await Rider.findOneAndUpdate({ email }, { $set: { email, name: account.email, status: "offline" }, $setOnInsert: { riderCode: await nextRiderCode() } }, { upsert: true, new: true, setDefaultsOnInsert: true }).select("_id email status").lean().exec() as any;
-  console.log(JSON.stringify({ event: "partner_rider_access_repair", email, result: "repaired", restaurantId: String(restaurant._id), riderId: rider?._id ? String(rider._id) : null, previous: { active: account.active, authorizationStatus: account.authorizationStatus, apiRole: account.apiRole, jobRole: account.jobRole, roles: account.roles || [], restaurantId: account.restaurantId ? String(account.restaurantId) : null } }));
-}
 
+  const isProtectedOwner = Boolean(account.ownerProtected && email === ownerEmail);
+  const roles = [...new Set([...(Array.isArray(account.roles) ? account.roles : []), "partner", ...(isProtectedOwner ? ["admin"] : [])])];
+  await EmployeeAccount.updateOne(
+    { _id: account._id },
+    {
+      $set: {
+        restaurantId: restaurant._id,
+        restaurantIds: [restaurant._id],
+        apiRole: isProtectedOwner ? "admin" : "partner",
+        jobRole: isProtectedOwner ? "admin" : "partner",
+        roles,
+        primaryRole: isProtectedOwner ? "admin" : "partner",
+        active: true,
+        authorizationStatus: "approved",
+        authorizedAt: new Date(),
+        authorizationReason: "Asignación de KFC XATIVA TEST para pruebas Partner.",
+      },
+    },
+  ).exec();
+  console.log(JSON.stringify({ event: "partner_access_repair", email, result: "repaired", restaurantId: String(restaurant._id), restaurantName: restaurant.name, ownerPreserved: isProtectedOwner }));
+}
 async function start() {
   const uri = process.env.MONGODB_URI;
   if (uri) { await mongoose.connect(uri, { dbName: databaseName, serverSelectionTimeoutMS: 10_000, socketTimeoutMS: 45_000, maxPoolSize: 20, minPoolSize: 2, retryWrites: true }); await EmployeeAccount.updateMany({ authorizationStatus: { $exists: false } }, { $set: { authorizationStatus: "approved", accessLevel: "subadmin" } }).exec(); await EmployeeAccount.updateOne({ email: ownerEmail }, { $set: { accessLevel: "superadmin", authorizationStatus: "approved", ownerProtected: true, active: true } }).exec(); const owner = await EmployeeAccount.findOne({ email: ownerEmail }).select("_id").lean().exec() as any; const legacyApproved = await EmployeeAccount.find({ email: { $ne: ownerEmail }, authorizationStatus: "approved", authorizedAt: null }).select("_id apiRole accessLevel createdAt").lean().exec() as any[]; for (const employee of legacyApproved) { const authorizedAt = employee.createdAt || new Date(); await EmployeeAccount.updateOne({ _id: employee._id, authorizedAt: null }, { $set: { authorizedAt, authorizedBy: owner?._id || null, authorizationReason: "Migración de autorización aprobada existente." } }).exec(); if (owner?._id && !(await AccessAuthorization.exists({ employeeId: employee._id }))) await AccessAuthorization.create({ employeeId: employee._id, action: "created", previousStatus: null, nextStatus: "approved", previousRole: null, nextRole: employee.apiRole, accessLevel: employee.accessLevel || "subadmin", actorEmployeeId: owner._id, reason: "Migración de autorización aprobada existente." }); } await ensureExpiresAtTtlIndex("employee_sessions"); await ensureExpiresAtTtlIndex("employee_password_resets"); await ensureIndexes(); startRealtimeRelay(); startNotificationWorker(); if (process.env.REPAIR_PARTNER_EMAIL) await repairConfiguredPartnerAccess(); await purgeTestDataIfEnabled(); databaseReady = true; if (process.env.RUN_TENANT_MIGRATION === "true") { if (process.env.ALLOW_TENANT_MIGRATION !== "true") throw new Error("RUN_TENANT_MIGRATION requires ALLOW_TENANT_MIGRATION=true"); console.log(JSON.stringify({ event: "tenant_migration_started" })); console.log(JSON.stringify({ event: "tenant_migration_completed", ...(await runTenantMigration()) })); } } else console.warn("MONGODB_URI is not configured; /ready will remain unavailable.");
