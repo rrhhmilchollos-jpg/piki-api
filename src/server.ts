@@ -7,7 +7,7 @@ import cors from "cors";
 import express from "express";
 import mongoose from "mongoose";
 import { z } from "zod";
-import { CashLedgerEntry, CustomerAccount, DispatchDecision, DocumentRequest, EmployeeAccount, AccessAuthorization, Fleet, Order, Restaurant, PartnerAsset, PartnerLocalityGroup, Rider, RiderApplication, PartnerLead, RiderLead, RiderIncident, RiderOrderMessage, RiderSlot, SignatureRequest, Zone, PushSubscription, RealtimeEvent, Tenant, TenantMembership, RiderAssignmentReservation, SupportTicket, OnboardingRequest, TrackingSession, LocationSample, ensureIndexes } from "./models.js";
+import { CashLedgerEntry, CustomerAccount, DispatchDecision, DocumentRequest, EmployeeAccount, AccessAuthorization, Fleet, Order, Restaurant, PartnerAsset, PartnerLocalityGroup, MenuImportDraft, Rider, RiderApplication, PartnerLead, RiderLead, RiderIncident, RiderOrderMessage, RiderSlot, SignatureRequest, Zone, PushSubscription, RealtimeEvent, Tenant, TenantMembership, RiderAssignmentReservation, SupportTicket, OnboardingRequest, TrackingSession, LocationSample, ensureIndexes } from "./models.js";
 import { normalizeLeadEmail, partnerLeadSubmissionSchema, riderLeadSubmissionSchema, webLeadReviewSchema, webLeadStatusSchema } from "./webLeads.js";
 import { assertTransition, calculateEtaRange, transitionSchema, validateCoordinates } from "./algorithms/index.js";
 import { configuredAuthRoles, requireOwner, requireRole, resolveRole } from "./auth.js";
@@ -34,6 +34,7 @@ import { quoteMenuItem, usesReferenceAddOns } from "./menuModifiers.js";
 import { decideLatePickup, pointDistanceMeters } from "./pickupPolicy.js";
 import { buildLegacyRiderSupportTicketFilter, buildRiderSupportTicketFilter } from "./supportTicketScope.js";
 import { cashOrderLimitError, isCashOrderWithinLimit } from "./paymentPolicy.js";
+import { extractAndParseMenu, readAssetBytes } from "./menuImport.js";
 
 export const app = express();
 app.set("trust proxy", 1);
@@ -1046,6 +1047,93 @@ app.post("/api/v1/partners/menu/assets", requireRole("partner"), async (req, res
   const groupKey = localityKey(locality);
   await PartnerLocalityGroup.findOneAndUpdate({ localityKey: groupKey }, { $set: { localityName: locality, province: "Valencia", isActive: true }, $addToSet: { restaurantIds: objectId(restaurantId) } }, { upsert: true, new: true });
   return res.status(201).json({ asset: assetResponse(asset) });
+});
+function menuImportResponse(draft: any) {
+  return {
+    id: String(draft._id),
+    sourceAssetId: String(draft.sourceAssetId),
+    sourceFileName: draft.sourceFileName,
+    extractionMethod: draft.extractionMethod,
+    extractedLines: draft.extractedLines,
+    warnings: draft.warnings || [],
+    textPreview: draft.textPreview || "",
+    items: draft.items || [],
+    status: draft.status,
+    createdAt: draft.createdAt,
+    publishedAt: draft.publishedAt || null,
+  };
+}
+const importedMenuItemsSchema = z.array(partnerMenuItemSchema).max(500);
+app.post("/api/v1/partners/menu/imports", requireRole("partner"), async (req, res) => {
+  const { access, allowed } = await partnerRequestAccess(req, "menu:write");
+  if (!allowed) return res.status(403).json({ error: "PARTNER_PERMISSION_DENIED", permission: "menu:write" });
+  const restaurantId = await employeeRestaurant(req, access);
+  const parsed = z.object({ assetId: z.string().min(1) }).safeParse(req.body);
+  const assetId = parsed.success ? objectId(parsed.data.assetId) : null;
+  const createdBy = objectId(String(req.auth?.employeeId || ""));
+  if (!parsed.success || !assetId || !createdBy) return res.status(400).json({ error: "INVALID_MENU_IMPORT" });
+  if (!restaurantId) return res.status(403).json({ error: "PARTNER_RESTAURANT_NOT_ASSIGNED" });
+  const asset = await PartnerAsset.findOne({ _id: assetId, restaurantId: objectId(restaurantId), kind: { $in: MENU_ASSET_KINDS }, scanStatus: "clean" }).select("+contentBase64 fileName mimeType sizeBytes").lean().exec() as any;
+  if (!asset) return res.status(404).json({ error: "MENU_ASSET_NOT_FOUND" });
+  try {
+    const parsedMenu = await extractAndParseMenu(readAssetBytes(asset.contentBase64), asset.mimeType);
+    const draft = await MenuImportDraft.create({ restaurantId: objectId(restaurantId), sourceAssetId: asset._id, sourceFileName: asset.fileName, extractionMethod: parsedMenu.extractionMethod, extractedLines: parsedMenu.extractedLines, warnings: parsedMenu.warnings, textPreview: parsedMenu.textPreview, items: parsedMenu.items, createdBy, status: "draft" });
+    return res.status(201).json({ draft: menuImportResponse(draft) });
+  } catch (error) {
+    console.error("Menu import extraction failed", error instanceof Error ? error.message : error);
+    return res.status(422).json({ error: "MENU_EXTRACTION_FAILED", message: "No se ha podido extraer texto de la carta. Comprueba que el PDF sea legible o que el OCR esté disponible." });
+  }
+});
+app.get("/api/v1/partners/menu/imports/:id", requireRole("partner"), async (req, res) => {
+  const { access, allowed } = await partnerRequestAccess(req, "menu:read");
+  if (!allowed) return res.status(403).json({ error: "PARTNER_PERMISSION_DENIED", permission: "menu:read" });
+  const restaurantId = await employeeRestaurant(req, access);
+  const id = objectId(String(req.params.id));
+  if (!restaurantId || !id) return res.status(400).json({ error: "INVALID_MENU_IMPORT_ID" });
+  const draft = await MenuImportDraft.findOne({ _id: id, restaurantId: objectId(restaurantId) }).lean().exec();
+  if (!draft) return res.status(404).json({ error: "MENU_IMPORT_NOT_FOUND" });
+  return res.json({ draft: menuImportResponse(draft) });
+});
+app.put("/api/v1/partners/menu/imports/:id", requireRole("partner"), async (req, res) => {
+  const { access, allowed } = await partnerRequestAccess(req, "menu:write");
+  if (!allowed) return res.status(403).json({ error: "PARTNER_PERMISSION_DENIED", permission: "menu:write" });
+  const restaurantId = await employeeRestaurant(req, access);
+  const id = objectId(String(req.params.id));
+  const parsed = z.object({ items: importedMenuItemsSchema }).safeParse(req.body);
+  if (!restaurantId || !id || !parsed.success) return res.status(400).json({ error: "INVALID_MENU_IMPORT_ITEMS", details: parsed.success ? undefined : parsed.error.flatten() });
+  const draft = await MenuImportDraft.findOneAndUpdate({ _id: id, restaurantId: objectId(restaurantId), status: "draft" }, { $set: { items: parsed.data.items, reviewedBy: objectId(String(req.auth?.employeeId || "")) } }, { new: true }).lean().exec();
+  if (!draft) return res.status(404).json({ error: "MENU_IMPORT_NOT_FOUND_OR_CLOSED" });
+  return res.json({ draft: menuImportResponse(draft) });
+});
+app.post("/api/v1/partners/menu/imports/:id/publish", requireRole("partner"), async (req, res) => {
+  const { access, allowed } = await partnerRequestAccess(req, "menu:write");
+  if (!allowed) return res.status(403).json({ error: "PARTNER_PERMISSION_DENIED", permission: "menu:write" });
+  const restaurantId = await employeeRestaurant(req, access);
+  const id = objectId(String(req.params.id));
+  if (!restaurantId || !id) return res.status(400).json({ error: "INVALID_MENU_IMPORT_ID" });
+  const draft = await MenuImportDraft.findOne({ _id: id, restaurantId: objectId(restaurantId), status: "draft" }).lean().exec() as any;
+  if (!draft) return res.status(404).json({ error: "MENU_IMPORT_NOT_FOUND_OR_CLOSED" });
+  if (!Array.isArray(draft.items) || !draft.items.length) return res.status(409).json({ error: "MENU_IMPORT_EMPTY", message: "Añade al menos un producto antes de publicar." });
+  const session = await mongoose.startSession();
+  try {
+    let restaurant: any = null;
+    let published: any = null;
+    await session.withTransaction(async () => {
+      restaurant = await Restaurant.findOneAndUpdate({ _id: objectId(restaurantId), onboardingStatus: "approved" }, { $set: { menu: draft.items } }, { new: true, session }).select("name menu").lean().exec() as any;
+      if (!restaurant) throw new Error("RESTAURANT_NOT_APPROVED");
+      published = await MenuImportDraft.findOneAndUpdate({ _id: id, restaurantId: objectId(restaurantId), status: "draft" }, { $set: { status: "published", publishedAt: new Date(), reviewedBy: objectId(String(req.auth?.employeeId || "")) } }, { new: true, session }).lean().exec();
+      if (!published) throw new Error("MENU_IMPORT_NOT_FOUND_OR_CLOSED");
+    });
+    return res.json({ published: true, restaurant, draft: menuImportResponse(published) });
+  } catch (error) {
+    const code = error instanceof Error ? error.message : "MENU_IMPORT_PUBLISH_FAILED";
+    if (code === "RESTAURANT_NOT_APPROVED") return res.status(409).json({ error: code });
+    if (code === "MENU_IMPORT_NOT_FOUND_OR_CLOSED") return res.status(404).json({ error: code });
+    console.error("Menu import publish transaction failed", code);
+    return res.status(503).json({ error: "MENU_IMPORT_PUBLISH_FAILED", message: "No se pudo publicar la carta; no se han aplicado cambios parciales." });
+  } finally {
+    await session.endSession();
+  }
 });
 app.delete("/api/v1/partners/menu/assets/:id", requireRole("partner"), async (req, res) => {
   const restaurantId = await employeeRestaurant(req);

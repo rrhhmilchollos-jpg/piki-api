@@ -45,6 +45,22 @@ const partnerLocalityGroupSchema = new Schema({
   restaurantIds: { type: [Schema.Types.ObjectId], ref: "Restaurant", default: [] },
   isActive: { type: Boolean, default: true, index: true },
 }, { timestamps: true, collection: "partner_locality_groups" });
+const menuImportDraftSchema = new Schema({
+  tenantId: { type: Schema.Types.ObjectId, ref: "Tenant", default: null, index: true },
+  restaurantId: { type: Schema.Types.ObjectId, ref: "Restaurant", required: true, index: true },
+  sourceAssetId: { type: Schema.Types.ObjectId, ref: "PartnerAsset", required: true, index: true },
+  sourceFileName: { type: String, required: true, maxlength: 180 },
+  extractionMethod: { type: String, enum: ["pdf-text", "ocr"], required: true },
+  extractedLines: { type: Number, default: 0, min: 0 },
+  warnings: { type: [String], default: [] },
+  textPreview: { type: String, default: "", maxlength: 6000 },
+  items: { type: [Schema.Types.Mixed], default: [] },
+  status: { type: String, enum: ["draft", "published", "rejected"], default: "draft", index: true },
+  createdBy: { type: Schema.Types.ObjectId, ref: "EmployeeAccount", required: true },
+  reviewedBy: { type: Schema.Types.ObjectId, ref: "EmployeeAccount", default: null },
+  publishedAt: { type: Date, default: null },
+}, { timestamps: true, collection: "menu_import_drafts" });
+menuImportDraftSchema.index({ restaurantId: 1, createdAt: -1 });
 
 const partnerDocument = new Schema({ type: { type: String, enum: ["tax_id", "bank_certificate", "insurance", "activity_license", "food_sanitary_authorization", "identity", "other"], required: true }, fileName: { type: String, required: true }, mimeType: { type: String, required: true }, sizeBytes: { type: Number, required: true, max: 2_500_000 }, sha256: { type: String, required: true }, contentBase64: { type: String, required: true, select: false }, status: { type: String, enum: ["received", "approved", "rejected"], default: "received" }, reviewNotes: { type: String, default: "" }, reviewedAt: { type: Date, default: null }, reviewedBy: { type: Schema.Types.ObjectId, ref: "EmployeeAccount", default: null } }, { _id: true });
 const partnerProfile = new Schema({ legalName: { type: String, required: true, trim: true }, taxId: { type: String, required: true, uppercase: true, trim: true, index: true }, legalForm: { type: String, enum: ["autonomo", "sl", "sa", "cooperativa", "otra"], required: true }, representativeName: { type: String, required: true, trim: true }, representativeRole: { type: String, required: true, trim: true }, representativeDocument: { type: String, required: true, trim: true }, fiscalAddress: { type: String, required: true, trim: true }, operatingAddress: { type: String, required: true, trim: true }, postalCode: { type: String, required: true, trim: true }, city: { type: String, required: true, trim: true }, province: { type: String, required: true, trim: true }, iban: { type: String, required: true, uppercase: true, trim: true }, bankAccountHolder: { type: String, required: true, trim: true }, cuisine: { type: String, required: true, trim: true }, vatRate: { type: Number, enum: [4, 10, 21], required: true }, commissionAccepted: { type: Boolean, required: true }, termsAcceptedAt: { type: Date, required: true }, contractAcceptedAt: { type: Date, required: true }, privacyAcceptedAt: { type: Date, required: true }, dataProcessingAcceptedAt: { type: Date, required: true }, pdaUnits: { type: Number, required: true, min: 1, max: 50 }, pdaUnitCostCents: { type: Number, required: true, enum: [30000] }, pdaCostAcceptedAt: { type: Date, required: true }, openingHours: { type: Schema.Types.Mixed, required: true }, documents: { type: [partnerDocument], default: [] } }, { _id: false });
@@ -288,6 +304,7 @@ export const TenantMembership = mongoose.models.TenantMembership || mongoose.mod
 export const Restaurant = mongoose.models.Restaurant || mongoose.model("Restaurant", restaurantSchema);
 export const PartnerAsset = mongoose.models.PartnerAsset || mongoose.model("PartnerAsset", partnerAssetSchema);
 export const PartnerLocalityGroup = mongoose.models.PartnerLocalityGroup || mongoose.model("PartnerLocalityGroup", partnerLocalityGroupSchema);
+export const MenuImportDraft = mongoose.models.MenuImportDraft || mongoose.model("MenuImportDraft", menuImportDraftSchema);
 export const Rider = mongoose.models.Rider || mongoose.model("Rider", riderSchema);
 export const Fleet = mongoose.models.Fleet || mongoose.model("Fleet", fleetSchema);
 export const Order = mongoose.models.Order || mongoose.model("Order", orderSchema);
@@ -324,7 +341,7 @@ export async function ensureIndexes() {
     }
   }
   await Promise.all([PartnerLocalityGroup.syncIndexes(), Fleet.syncIndexes(), Zone.syncIndexes(), RiderSlot.syncIndexes(), RiderReferralProfile.syncIndexes(), RiderShiftIncentiveMetric.syncIndexes(), RiderIncentiveEntry.syncIndexes(), RiderIncentiveBudget.syncIndexes()]);
-  await Promise.all([Tenant.init(), TenantMembership.init(), Restaurant.init(), PartnerAsset.init(), PartnerLocalityGroup.init(), Fleet.init(), Order.init(), Zone.init(), StripeEvent.init(), CashLedgerEntry.init(), DispatchDecision.init(), RiderIncident.init(), RiderOrderMessage.init(), RiderApplication.init(), PartnerLead.init(), RiderLead.init(), DocumentRequest.init(), CustomerAccount.init(), RiderSlot.init(), SignatureRequest.init(), PasskeyCredential.init(), PushSubscription.init(), Notification.init(), RealtimeEvent.init(), RiderAssignmentReservation.init(), TrackingSession.init(), LocationSample.init(), EmployeeAccount.init(), AccessAuthorization.init(), OnboardingRequest.init(), RiderReferralProfile.init(), RiderShiftIncentiveMetric.init(), RiderIncentiveEntry.init(), RiderIncentiveBudget.init()]);
+  await Promise.all([Tenant.init(), TenantMembership.init(), Restaurant.init(), PartnerAsset.init(), PartnerLocalityGroup.init(), MenuImportDraft.init(), Fleet.init(), Order.init(), Zone.init(), StripeEvent.init(), CashLedgerEntry.init(), DispatchDecision.init(), RiderIncident.init(), RiderOrderMessage.init(), RiderApplication.init(), PartnerLead.init(), RiderLead.init(), DocumentRequest.init(), CustomerAccount.init(), RiderSlot.init(), SignatureRequest.init(), PasskeyCredential.init(), PushSubscription.init(), Notification.init(), RealtimeEvent.init(), RiderAssignmentReservation.init(), TrackingSession.init(), LocationSample.init(), EmployeeAccount.init(), AccessAuthorization.init(), OnboardingRequest.init(), RiderReferralProfile.init(), RiderShiftIncentiveMetric.init(), RiderIncentiveEntry.init(), RiderIncentiveBudget.init()]);
   const ridersWithoutCode = await Rider.find({ $or: [{ riderCode: { $exists: false } }, { riderCode: null }, { riderCode: "" }] }).select("_id").lean().exec();
   for (const rider of ridersWithoutCode) {
     const base = `PIKI-R-${String(rider._id).slice(-6).toUpperCase()}`;
