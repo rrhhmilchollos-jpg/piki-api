@@ -7,7 +7,7 @@ import cors from "cors";
 import express from "express";
 import mongoose from "mongoose";
 import { z } from "zod";
-import { CashLedgerEntry, CustomerAccount, DispatchDecision, DocumentRequest, EmployeeAccount, AccessAuthorization, Fleet, Order, Restaurant, PartnerAsset, PartnerLocalityGroup, MenuImportDraft, Rider, RiderApplication, PartnerLead, RiderLead, RiderIncident, RiderOrderMessage, RiderSlot, SignatureRequest, Zone, PushSubscription, RealtimeEvent, Tenant, TenantMembership, RiderAssignmentReservation, SupportTicket, OnboardingRequest, TrackingSession, LocationSample, ensureIndexes } from "./models.js";
+import { CashLedgerEntry, CustomerAccount, DispatchDecision, DocumentRequest, EmployeeAccount, AccessAuthorization, Fleet, Order, Restaurant, PartnerAsset, PartnerLocalityGroup, MenuImportDraft, Rider, RiderApplication, PartnerLead, RiderLead, RiderIncident, RiderOrderMessage, RiderSlot, SignatureRequest, Zone, PushSubscription, RealtimeEvent, Notification, Tenant, TenantMembership, RiderAssignmentReservation, SupportTicket, OnboardingRequest, TrackingSession, LocationSample, ensureIndexes } from "./models.js";
 import { normalizeLeadEmail, partnerLeadSubmissionSchema, riderLeadSubmissionSchema, webLeadReviewSchema, webLeadStatusSchema } from "./webLeads.js";
 import { assertTransition, calculateEtaRange, transitionSchema, validateCoordinates } from "./algorithms/index.js";
 import { configuredAuthRoles, requireOwner, requireRole, resolveRole } from "./auth.js";
@@ -15,7 +15,7 @@ import { EmployeeSession, issueEmployeeSession, revokeEmployeeSessions, sessionR
 import { isStripeSignatureError, processStripeWebhook, stripeConfigured, createSignaturitSignature, signaturitBaseUrl, signaturitConfigured, signaturitMode, signatureWebhookUrl, webhookDigest, handleCustomerTrpc, currentCustomer, setCustomerOrderDispatcher } from "./integrations/index.js";
 import { getVersionPolicy, isPikiSurface, requiresUpdate, setVersionPolicy, syncVersionPolicy, versionPolicySchema, type PikiSurface } from "./appVersion.js";
 import { publicPushConfig, revokePushSubscription, savePushSubscription } from "./push.js";
-import { publishOrderStatusEvents, publishOrderIntakeEvents, publishRiderOfferEvent, publishRiderArrivalEvent, publishRiderLocationEvents, publishRiderScheduleEvent, publishRealtimeEvent, serveRealtimeEvents, startRealtimeRelay, tenantAudienceKey } from "./realtime.js";
+import { publishOrderStatusEvents, publishOrderIntakeEvents, publishRiderOfferEvent, publishRiderArrivalEvent, publishRiderLocationEvents, publishRiderScheduleEvent, publishRiderCustomerMessageEvent, publishRealtimeEvent, serveRealtimeEvents, startRealtimeRelay, tenantAudienceKey } from "./realtime.js";
 import { listNotifications, markAllNotificationsRead, markNotificationRead, sendDocumentRequestEmail, sendDocumentUploadEmail, startNotificationWorker, stopNotificationWorker, type NotificationPrincipal } from "./notifications.js";
 import { captureStripePaymentIntent, createCheckoutSession } from "./stripe.js";
 import { rankDispatchCandidates, computeMobilityAdvice, calculateSanctionDecision, defaultSanctionPolicy } from "./algorithms/index.js";
@@ -2477,6 +2477,23 @@ app.post("/api/v1/riders/:riderId/support/tickets/:ticketId/messages", requireRo
   void publishRealtimeEvent({ channel: "admin", audienceKey: tenantAudienceKey((rider as any).tenantId, "admin"), tenantId: (rider as any).tenantId, type: "support.message", payload: { ticketId: String(ticketId), status: (ticket as any)?.status, senderRole: "rider" } }).catch(() => undefined);
   return res.json({ ticket });
 });
+app.post("/api/v1/admin/orders/cleanup-test-data", requireOwner(), async (_req, res) => {
+  const testOrders = await Order.find({ isTestOrder: true }).select("_id publicCode displayCode").lean().exec() as any[];
+  const orderIds = testOrders.map((order) => order._id);
+  if (!orderIds.length) return res.json({ deleted: false, message: "No quedan pedidos de prueba en producción.", counts: { orders: 0, messages: 0, dispatchDecisions: 0, reservations: 0, supportTickets: 0, cashEntries: 0, realtimeEvents: 0, notifications: 0 } });
+  const orderIdFilter = { orderId: { $in: orderIds } };
+  const [messages, dispatchDecisions, reservations, supportTickets, cashEntries, realtimeEvents, notifications, orders] = await Promise.all([
+    RiderOrderMessage.deleteMany(orderIdFilter).exec(),
+    DispatchDecision.deleteMany(orderIdFilter).exec(),
+    RiderAssignmentReservation.deleteMany(orderIdFilter).exec(),
+    SupportTicket.deleteMany(orderIdFilter).exec(),
+    CashLedgerEntry.deleteMany(orderIdFilter).exec(),
+    RealtimeEvent.deleteMany({ "payload.orderId": { $in: orderIds.map(String) } }).exec(),
+    Notification.deleteMany({ entityType: "order", entityId: { $in: orderIds.map(String) } }).exec(),
+    Order.deleteMany({ _id: { $in: orderIds }, isTestOrder: true }).exec(),
+  ]);
+  return res.json({ deleted: true, orderCodes: testOrders.map((order) => order.displayCode || order.publicCode), counts: { orders: orders.deletedCount, messages: messages.deletedCount, dispatchDecisions: dispatchDecisions.deletedCount, reservations: reservations.deletedCount, supportTickets: supportTickets.deletedCount, cashEntries: cashEntries.deletedCount, realtimeEvents: realtimeEvents.deletedCount, notifications: notifications.deletedCount } });
+});
 app.get("/api/v1/orders", requireRole("admin", "partner", "rider", "fleet"), async (req, res) => {
   const filter: Record<string, unknown> = { ...tenantScope(req) };
   const employee = await employeeScope(req);
@@ -2655,7 +2672,7 @@ async function riderOrderAccess(riderIdParam: string, orderIdParam: string, req:
   if (!riderId || !orderId) return null;
   const rider = await riderAccessForRequest(riderId, req);
   if (!rider) return null;
-  return await Order.findOne({ _id: orderId, riderId, assignmentState: "assigned", status: { $nin: ["delivered", "cancelled"] } }).select("_id riderId status").lean().exec() as any;
+  return await Order.findOne({ _id: orderId, riderId, assignmentState: "assigned", status: { $nin: ["delivered", "cancelled"] } }).select("_id riderId customerId tenantId publicCode status").lean().exec() as any;
 }
 app.get("/api/v1/riders/:riderId/orders/:orderId/messages", requireRole("rider"), async (req, res) => {
   const order = await riderOrderAccess(String(req.params.riderId), String(req.params.orderId), req);
@@ -2669,6 +2686,7 @@ app.post("/api/v1/riders/:riderId/orders/:orderId/messages", requireRole("rider"
   const parsed = riderMessageSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_MESSAGE", details: parsed.error.flatten() });
   const message = await RiderOrderMessage.create({ orderId: order._id, riderId: order.riderId, senderRole: "rider", body: parsed.data.body });
+  await publishRiderCustomerMessageEvent(order, message).catch((error) => console.warn("Rider customer message notification failed", error instanceof Error ? error.message : error));
   return res.status(201).json({ message });
 });
 app.post("/api/v1/riders/:riderId/orders/:orderId/accept-offer", requireRole("rider"), async (req, res) => {
