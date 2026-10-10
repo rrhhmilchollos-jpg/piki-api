@@ -76,3 +76,21 @@ export async function scanUploadBuffer(buffer: Buffer, originalName: string): Pr
     finally { await rm(directory, { recursive: true, force: true }).catch(() => undefined); }
   });
 }
+
+export async function scanUploadBuffers(files: Array<{ buffer: Buffer; originalName: string }>): Promise<MalwareScanResult> {
+  const limit = await containerMemoryLimit();
+  if (!scannerMemorySufficient(limit)) {
+    console.warn(JSON.stringify({ event: "document_scanner_insufficient_memory", limitBytes: limit, requiredBytes: MIN_SCANNER_MEMORY_BYTES }));
+    throw new MalwareScannerUnavailableError("MALWARE_SCANNER_INSUFFICIENT_MEMORY");
+  }
+  return queuedScan(async () => {
+    const directory = await mkdtemp(join(tmpdir(), "piki-upload-batch-"));
+    try {
+      await Promise.all(files.map(async ({ buffer, originalName }, index) => {
+        const safeName = `${String(index).padStart(2, "0")}-${randomBytes(12).toString("hex")}-${String(originalName || "upload").replace(/[^a-zA-Z0-9._-]/g, "_").slice(-120)}`;
+        await writeFile(join(directory, safeName), buffer, { mode: 0o600 });
+      }));
+      return await runScanner(directory);
+    } finally { await rm(directory, { recursive: true, force: true }).catch(() => undefined); }
+  });
+}

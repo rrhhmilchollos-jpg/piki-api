@@ -1,7 +1,7 @@
 import "dotenv/config";
 import "express-async-errors";
 import { createHash, createHmac, randomBytes, randomInt } from "node:crypto";
-import { MalwareDetectedError, MalwareScannerUnavailableError, scanUploadBuffer } from "./fileSecurity.js";
+import { MalwareDetectedError, MalwareScannerUnavailableError, scanUploadBuffer, scanUploadBuffers } from "./fileSecurity.js";
 import { fileURLToPath } from "node:url";
 import cors from "cors";
 import express from "express";
@@ -1888,9 +1888,9 @@ app.post("/api/v1/public/document-requests/:token/documents", async (req, res) =
   if (documentTypes.some((type) => formRequirements.has(type)) || responseTypes.some((type) => !formRequirements.has(type))) return res.status(400).json({ error: "DOCUMENT_INPUT_MODE_MISMATCH" });
   const uploaded = [] as Array<{ type: string; fileName: string; mimeType: string; sizeBytes: number; sha256: string; contentBase64: string }>;
   try {
-    for (const document of parsed.data.documents) {
-      const normalized = normalizeDocumentBytes(document.contentBase64, document.sizeBytes, document.mimeType, document.sha256);
-      await scanUploadBuffer(normalized.bytes, document.fileName);
+    const normalizedDocuments = parsed.data.documents.map((document) => ({ document, normalized: normalizeDocumentBytes(document.contentBase64, document.sizeBytes, document.mimeType, document.sha256) }));
+    await scanUploadBuffers(normalizedDocuments.map(({ document, normalized }) => ({ buffer: normalized.bytes, originalName: document.fileName })));
+    for (const { document, normalized } of normalizedDocuments) {
       uploaded.push({ ...document, sha256: document.sha256.toLowerCase(), contentBase64: normalized.contentBase64 });
     }
   } catch (error) {
@@ -1917,8 +1917,10 @@ app.post("/api/v1/public/document-requests/:token/documents", async (req, res) =
   const metadata = [...existingMetadata, ...uploaded.map(documentRequestMetadata)];
   const completed = (requestState.request.requirements || []).every((requirement: any) => completedTypes.has(requirement.type) || (requestState.request.formResponses || []).some((response: any) => response.type === requirement.type));
   const updated = await DocumentRequest.findByIdAndUpdate(requestState.request._id, { $set: { documents: metadata, formResponses: [...(requestState.request.formResponses || []).filter((response: any) => !formResponses.some((next: any) => next.type === response.type)), ...formResponses], status: completed ? "submitted" : "partially_submitted", submittedAt: new Date(), lastAccessedAt: new Date() } }, { new: true }).lean().exec() as any;
-  await notifyOnboarding({ channel: "admin", type: "onboarding.document_request.uploaded", entityId: String(updated._id), tenantId: updated.tenantId, payload: { subjectType: updated.subjectType, subjectId: String(updated.subjectId), uploadedTypes } });
-  await sendDocumentUploadEmail({ requestId: String(updated._id), subjectType: updated.subjectType, subjectName: requestState.request.recipientName, subjectEmail: requestState.request.recipientEmail, uploadedTypes, uploadedFiles: uploaded.map((document) => document.fileName), completed });
+  void Promise.allSettled([
+    notifyOnboarding({ channel: "admin", type: "onboarding.document_request.uploaded", entityId: String(updated._id), tenantId: updated.tenantId, payload: { subjectType: updated.subjectType, subjectId: String(updated.subjectId), uploadedTypes } }),
+    sendDocumentUploadEmail({ requestId: String(updated._id), subjectType: updated.subjectType, subjectName: requestState.request.recipientName, subjectEmail: requestState.request.recipientEmail, uploadedTypes, uploadedFiles: uploaded.map((document) => document.fileName), completed }),
+  ]);
   return res.status(201).json({ message: completed ? "Documentación enviada para revisión." : "Documentación parcial recibida. Puedes continuar con los requisitos pendientes.", ...publicDocumentRequestResponse(updated) });
 });
 
