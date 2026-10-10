@@ -1002,10 +1002,20 @@ function assignedRestaurantIds(employee: any): string[] {
 
 async function partnerLocationsFor(employee: any, roles = partnerRolesForEmployee(employee), permissions = [...permissionsForPartnerRoles(roles)]) {
   const ids = assignedRestaurantIds(employee);
-  if (!ids.length) return [];
-  const restaurants = await Restaurant.find({ _id: { $in: ids }, ...(employee?.tenantId ? { tenantId: employee.tenantId } : {}) }).select("_id name address isActive onboardingStatus").lean().exec() as any[];
+  const tenantFilter = employee?.tenantId ? { tenantId: employee.tenantId } : {};
+  let restaurants = ids.length
+    ? await Restaurant.find({ _id: { $in: ids }, ...tenantFilter }).select("_id name address email isActive onboardingStatus").lean().exec() as any[]
+    : [];
+  // Compatibilidad con cuentas de prueba/legacy creadas antes de guardar restaurantIds.
+  // Solo se acepta una coincidencia exacta de correo entre la cuenta y el comercio.
+  if (!restaurants.length && employee?.email) {
+    const email = String(employee.email).trim().toLowerCase();
+    if (email) restaurants = await Restaurant.find({ email, ...tenantFilter }).select("_id name address email isActive onboardingStatus").limit(10).lean().exec() as any[];
+  }
+  if (!restaurants.length) return [];
   const byId = new Map(restaurants.map((restaurant) => [String(restaurant._id), restaurant]));
-  return ids.map((id) => byId.get(id)).filter(Boolean).map((restaurant: any) => ({
+  const ordered = ids.length ? ids.map((id) => byId.get(id)).filter(Boolean) : restaurants;
+  return ordered.map((restaurant: any) => ({
     id: String(restaurant._id),
     name: restaurant.name,
     address: restaurant.address || "",
