@@ -180,6 +180,18 @@ export async function publishRiderOfferEvent(order: any, riderId: string) {
     dedupeKey: `offer:rider:${String(order._id)}:${riderId}:${order.dispatchAttempts || 0}`,
   });
 }
+export async function publishRiderCustomerMessageEvent(order: any, message: any) {
+  if (!order.customerId || !mongoose.isValidObjectId(order.customerId)) return;
+  const messageId = String(message._id || `${order._id}:${message.createdAt || Date.now()}`);
+  await publishRealtimeEvent({
+    channel: "customer",
+    audienceKey: `customer:${String(order.customerId)}`,
+    tenantId: validTenantId(order.tenantId),
+    type: "order.rider_message",
+    payload: { orderId: String(order._id), publicCode: order.publicCode, riderId: order.riderId ? String(order.riderId) : null, messageId, message: String(message.body || "").slice(0, 240), senderRole: "rider" },
+    dedupeKey: `message:customer:${messageId}`,
+  });
+}
 export async function publishRiderScheduleEvent(input: { riderId: string; tenantId?: string | mongoose.Types.ObjectId | null; action: "updated" | "cancelled" | "weekly_updated" }) {
   const riderId = String(input.riderId);
   await publishRealtimeEvent({

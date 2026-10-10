@@ -237,6 +237,11 @@ export function buildNoticeCopy(input: RealtimeNotificationInput, recipient: Rec
       : `${orderRef} está ${label}.`;
     return { category: "order", title: status === "cancelled" ? "Pedido cancelado" : "Actualización de pedido", body, url, entityType: "order", entityId: orderId };
   }
+  if (input.type === "order.rider_message") {
+    if (recipient.surface !== "customer") return null;
+    const message = String(input.payload.message || "El Rider te ha enviado un mensaje.").slice(0, 240);
+    return { category: "order", title: `Mensaje de tu Rider · ${orderRef}`, body: message, url, entityType: "order", entityId: orderId };
+  }
   if (input.type === "cash.wallet_changed" || input.type === "cash.handover_recorded") {
     if (!["rider", "fleet", "admin"].includes(recipient.surface)) return null;
     const cents = Number(input.payload.amountCents || 0);
