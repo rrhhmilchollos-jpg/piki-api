@@ -74,16 +74,30 @@ app.options("*", cors(corsOptions));
 
 const requestBuckets = new Map<string, { startedAt: number; count: number }>();
 let mongoRateLimitIndexReady = false;
+let mongoRateLimitIndexPromise: Promise<void> | null = null;
+async function ensureMongoRateLimitIndex() {
+  if (mongoRateLimitIndexReady) return;
+  if (mongoRateLimitIndexPromise) return mongoRateLimitIndexPromise;
+  mongoRateLimitIndexPromise = (async () => {
+    const collection = mongoose.connection.collection("piki_rate_limit_buckets") as any;
+    const indexes = await collection.listIndexes().toArray();
+    const expiresIndexes = indexes.filter((index: any) => index.key?.expiresAt === 1);
+    const hasTtlIndex = expiresIndexes.some((index: any) => Number(index.expireAfterSeconds) === 0);
+    if (!hasTtlIndex) {
+      // This collection is ephemeral rate-limit state. Replacing a legacy
+      // non-TTL index is safe and prevents MongoDB IndexOptionsConflict.
+      for (const index of expiresIndexes) await collection.dropIndex(index.name).catch(() => undefined);
+      await collection.createIndex({ expiresAt: 1 }, { name: "expiresAt_ttl", expireAfterSeconds: 0 });
+    }
+    mongoRateLimitIndexReady = true;
+  })().finally(() => { mongoRateLimitIndexPromise = null; });
+  return mongoRateLimitIndexPromise;
+}
 async function incrementMongoRateLimit(key: string, windowMs: number): Promise<number | null> {
   if (!databaseReady || mongoose.connection.readyState !== 1) return null;
   try {
     const collection = mongoose.connection.collection("piki_rate_limit_buckets") as any;
-    if (!mongoRateLimitIndexReady) {
-      // Production already has a legacy non-TTL expiresAt_1 index. Use a
-      // distinct name so startup can add the TTL policy without IndexOptionsConflict.
-      await collection.createIndex({ expiresAt: 1 }, { name: "expiresAt_ttl", expireAfterSeconds: 0 });
-      mongoRateLimitIndexReady = true;
-    }
+    await ensureMongoRateLimitIndex();
     const windowStart = Math.floor(Date.now() / windowMs) * windowMs;
     const bucketId = `${key}:${windowStart}`;
     const expiresAt = new Date(windowStart + windowMs + 60_000);
