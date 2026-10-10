@@ -3817,9 +3817,17 @@ async function repairConfiguredPartnerAccess() {
   if (!email) return;
   const account = await EmployeeAccount.findOne({ email }).select("_id email restaurantId apiRole jobRole roles primaryRole active authorizationStatus").lean().exec() as any;
   if (!account) { console.log(JSON.stringify({ event: "partner_access_repair", email, result: "account_not_found" })); return; }
-  const restaurant = account.restaurantId
+  let restaurant = account.restaurantId
     ? await Restaurant.findById(account.restaurantId).select("_id email onboardingStatus isActive").lean().exec() as any
-    : await Restaurant.findOne({ email }).select("_id email onboardingStatus isActive").lean().exec() as any;
+    : await Restaurant.findOne({ $or: [{ email }, { slug: "kfc-xativa-test" }, { name: "KFC XATIVA TEST" }] }).select("_id email slug name onboardingStatus isActive").lean().exec() as any;
+  if (!restaurant && process.env.REPAIR_PARTNER_CREATE_TEST === "true") {
+    restaurant = await Restaurant.findOneAndUpdate(
+      { slug: "kfc-xativa-test" },
+      { $setOnInsert: { slug: "kfc-xativa-test", name: "KFC XATIVA TEST", cuisine: "Americana", category: "Americana", locality: "Xàtiva", partnerGroupKey: "xativa", tagline: "Partner de prueba PIKI", onboardingStatus: "approved", isActive: true, email, phone: "", address: "Xàtiva" } },
+      { upsert: true, new: true, setDefaultsOnInsert: true },
+    ).select("_id email slug name onboardingStatus isActive").lean().exec() as any;
+    console.log(JSON.stringify({ event: "partner_access_repair", email, result: "test_restaurant_created_or_reused", restaurantId: String(restaurant._id), restaurantName: restaurant.name }));
+  }
   if (!restaurant) { console.log(JSON.stringify({ event: "partner_access_repair", email, result: "restaurant_not_found", accountId: String(account._id) })); return; }
   if (restaurant.onboardingStatus !== "approved" || restaurant.isActive !== true) {
     console.log(JSON.stringify({ event: "partner_access_repair", email, result: "restaurant_not_approved", restaurantId: String(restaurant._id), onboardingStatus: restaurant.onboardingStatus, isActive: restaurant.isActive })); return;
