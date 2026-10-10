@@ -78,7 +78,9 @@ async function incrementMongoRateLimit(key: string, windowMs: number): Promise<n
   try {
     const collection = mongoose.connection.collection("piki_rate_limit_buckets") as any;
     if (!mongoRateLimitIndexReady) {
-      await collection.createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 });
+      // Production already has a legacy non-TTL expiresAt_1 index. Use a
+      // distinct name so startup can add the TTL policy without IndexOptionsConflict.
+      await collection.createIndex({ expiresAt: 1 }, { name: "expiresAt_ttl", expireAfterSeconds: 0 });
       mongoRateLimitIndexReady = true;
     }
     const windowStart = Math.floor(Date.now() / windowMs) * windowMs;
