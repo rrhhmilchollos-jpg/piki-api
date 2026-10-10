@@ -35,6 +35,8 @@ import { decideLatePickup, pointDistanceMeters } from "./pickupPolicy.js";
 import { buildLegacyRiderSupportTicketFilter, buildRiderSupportTicketFilter } from "./supportTicketScope.js";
 import { cashOrderLimitError, isCashOrderWithinLimit } from "./paymentPolicy.js";
 import { extractAndParseMenu, readAssetBytes } from "./menuImport.js";
+import { OwnerRecoveryUse } from "./models.js";
+import { generateOwnerRecoveryTemporaryPassword, hashOwnerRecoveryToken, ownerRecoveryTokenMatches, ownerRecoveryWindowIsOpen } from "./ownerRecovery.js";
 
 export const app = express();
 app.set("trust proxy", 1);
@@ -495,6 +497,40 @@ app.all("/api/trpc/:procedure", handleCustomerTrpc);
 app.get("/api/v1/auth/status", (_req, res) => res.json({ authentication: "bearer" }));
 const employeeSessionRoles = ["admin", "partner", "rider", "fleet", "commercial", "gerente_comercial_zona", "finance", "support"] as const;
 const partnerOperationalRoles = ["partner_admin", "area_manager", "zone_manager", "store_manager", "manager", "cashier", "cajero", "kitchen", "cocina", "cook", "catalog", "catalogue", "menu_manager", "viewer", "read_only", "solo_lectura"] as const;
+app.post("/api/v1/auth/owner/recover", rateLimit(3, 60_000, "owner-recovery"), async (req, res) => {
+  res.setHeader("Cache-Control", "no-store, max-age=0");
+  res.setHeader("Pragma", "no-cache");
+  if (req.get("origin") !== "https://admin.pikidelivery.com") return res.status(403).json({ error: "OWNER_RECOVERY_ORIGIN_DENIED" });
+  const expectedToken = String(process.env.PIKI_OWNER_RECOVERY_TOKEN || "");
+  const suppliedToken = String(req.get("x-piki-owner-recovery-token") || "");
+  if (!expectedToken || Buffer.byteLength(expectedToken, "utf8") < 32 || !ownerRecoveryWindowIsOpen(process.env.PIKI_OWNER_RECOVERY_EXPIRES_AT)) return res.status(503).json({ error: "OWNER_RECOVERY_UNAVAILABLE" });
+  if (!ownerRecoveryTokenMatches(suppliedToken, expectedToken)) return res.status(401).json({ error: "INVALID_RECOVERY_TOKEN" });
+  if (req.body?.confirm !== true) return res.status(400).json({ error: "OWNER_RECOVERY_CONFIRMATION_REQUIRED" });
+
+  const recoveryKey = hashOwnerRecoveryToken(expectedToken);
+  try {
+    await OwnerRecoveryUse.create({ _id: recoveryKey, consumedAt: new Date() });
+  } catch (error) {
+    if ((error as { code?: number })?.code === 11000) return res.status(409).json({ error: "OWNER_RECOVERY_ALREADY_USED" });
+    throw error;
+  }
+
+  const temporaryPassword = generateOwnerRecoveryTemporaryPassword();
+  const now = new Date();
+  const owner = await EmployeeAccount.findOneAndUpdate(
+    { email: ownerEmail },
+    {
+      $set: { jobRole: "admin", apiRole: "admin", roles: ["admin"], primaryRole: "admin", accessLevel: "superadmin", authorizationStatus: "approved", authorizedAt: now, passwordHash: hashPassword(temporaryPassword), active: true, ownerProtected: true, hiddenFromAdmin: true, mustChangePassword: true, passwordChangedAt: now, sessionHash: null },
+      $setOnInsert: { name: "Propietario y CEO de PIKI", portfolioId: "owner_piki_ceo" },
+    },
+    { upsert: true, new: true, setDefaultsOnInsert: true },
+  ).select("_id").lean().exec() as any;
+  if (!owner?._id) throw new Error("Owner recovery account update returned no record");
+  try { await revokeEmployeeSessions(owner._id); } catch { console.error("Owner recovery completed; session record cleanup failed"); }
+  delete process.env.PIKI_OWNER_RECOVERY_TOKEN;
+  delete process.env.PIKI_OWNER_RECOVERY_EXPIRES_AT;
+  return res.json({ recovered: true, temporaryPassword, mustChangePassword: true });
+});
 const employeeLoginSchema = z.object({ email: z.string().email(), password: z.string().min(8).max(200), role: z.enum(employeeSessionRoles).optional() });
 app.post("/api/v1/auth/employee/login", async (req, res) => {
   const parsed = employeeLoginSchema.safeParse(req.body); if (!parsed.success) return res.status(400).json({ error: "INVALID_LOGIN" });
