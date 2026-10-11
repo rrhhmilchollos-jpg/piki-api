@@ -291,13 +291,13 @@ const documentRequestRequirementInputSchema = z.object({ type: z.string().regex(
 const documentRequestCreateSchema = z.object({ subjectType: documentRequestSubjectSchema, subjectId: z.string().regex(/^[a-f\d]{24}$/), message: z.string().trim().min(10).max(2000), dueAt: z.coerce.date().nullable().optional(), requirements: z.array(documentRequestRequirementInputSchema).min(1).max(12), sendEmail: z.boolean().default(true) });
 const publicDocumentUploadSchema = z.object({
   responses: z.array(z.object({ type: z.string().regex(/^[a-z0-9_]{2,80}$/), value: z.string().trim().min(1).max(500) })).max(12).default([]),
-  documents: z.array(z.object({ type: z.string().regex(/^[a-z0-9_]{2,80}$/), fileName: z.string().trim().min(1).max(180), mimeType: z.enum(["application/pdf", "image/jpeg", "image/png"]), sizeBytes: z.number().int().min(1).max(2_500_000), sha256: z.string().regex(/^[a-f0-9]{64}$/i), contentBase64: z.string().min(1).max(3_500_000) })).max(5).default([]),
+  documents: z.array(z.object({ type: z.string().regex(/^[a-z0-9_]{2,80}$/), fileName: z.string().trim().min(1).max(180), mimeType: z.literal("application/pdf"), sizeBytes: z.number().int().min(1).max(2_500_000), sha256: z.string().regex(/^[a-f0-9]{64}$/i), contentBase64: z.string().min(1).max(3_500_000) })).max(5).default([]),
 }).superRefine((value, ctx) => {
   if (!value.documents.length && !value.responses.length) ctx.addIssue({ code: "custom", path: ["documents"], message: "documents_or_responses_required" });
 });
 const riderDocumentRequestTypes = new Set(["identity", "residence_permit", "social_security_number", "bank_certificate", "profile_photo", "driving_license", "insurance", "vehicle_registration", "vehicle_technical_sheet", "scooter_responsible_declaration", "dgt_mvp_homologation", "work_authorization_confirmation", "ppe_and_safety", "other"]);
 const partnerDocumentRequestTypes = new Set(["tax_id", "bank_certificate", "insurance", "activity_license", "food_sanitary_authorization", "identity", "other"]);
-const leadDocumentInputSchema = z.object({ type: z.string().trim().min(2).max(80), fileName: z.string().trim().min(1).max(180), mimeType: z.enum(["application/pdf", "image/jpeg", "image/png"]), sizeBytes: z.number().int().min(1).max(2_500_000), sha256: z.string().regex(/^[a-f0-9]{64}$/i), contentBase64: z.string().min(20).max(3_500_000) });
+const leadDocumentInputSchema = z.object({ type: z.string().trim().min(2).max(80), fileName: z.string().trim().min(1).max(180), mimeType: z.literal("application/pdf"), sizeBytes: z.number().int().min(1).max(2_500_000), sha256: z.string().regex(/^[a-f0-9]{64}$/i), contentBase64: z.string().min(20).max(3_500_000) });
 const riderApplicationAttempts = new Map<string, { count: number; resetAt: number }>();
 const ownerEmail = "rrhh.milchollos@gmail.com";
 const MAX_MENU_IMAGE_BYTES = 200 * 1024;
@@ -1071,7 +1071,7 @@ app.patch("/api/v1/admin/partner-leads/:id", requireRole("admin", "commercial", 
   return res.json({ lead });
 });
 
-const partnerDocumentSchema = z.object({ type: z.enum(["tax_id", "bank_certificate", "insurance", "activity_license", "food_sanitary_authorization", "identity", "other"]), fileName: z.string().min(1).max(180), mimeType: z.enum(["application/pdf", "image/jpeg", "image/png"]), sizeBytes: z.number().int().positive().max(2_500_000), sha256: z.string().regex(/^[a-f0-9]{64}$/), contentBase64: z.string().min(20).max(3_500_000) });
+const partnerDocumentSchema = z.object({ type: z.enum(["tax_id", "bank_certificate", "insurance", "activity_license", "food_sanitary_authorization", "identity", "other"]), fileName: z.string().min(1).max(180), mimeType: z.literal("application/pdf"), sizeBytes: z.number().int().positive().max(2_500_000), sha256: z.string().regex(/^[a-f0-9]{64}$/), contentBase64: z.string().min(20).max(3_500_000) });
 const openingHoursSchema = z.record(z.string().min(2).max(15), z.object({ open: z.string().regex(/^\d{2}:\d{2}$/), close: z.string().regex(/^\d{2}:\d{2}$/), closed: z.boolean() }));
 const partnerSchema = z.object({ name: z.string().min(2).max(160), email: z.string().email(), password: z.string().min(12).max(200).regex(/[A-Z]/).regex(/[a-z]/).regex(/[0-9]/), phone: z.string().min(6).max(40), address: z.string().min(5).max(280), legalName: z.string().min(2).max(180), taxId: z.string().regex(/^[A-Za-z0-9-]{5,20}$/), legalForm: z.enum(["autonomo", "sl", "sa", "cooperativa", "otra"]), representativeName: z.string().min(2).max(160), representativeRole: z.string().min(2).max(100), representativeDocument: z.string().min(5).max(30), fiscalAddress: z.string().min(5).max(280), operatingAddress: z.string().min(5).max(280), postalCode: z.string().regex(/^\d{5}$/), city: z.string().min(2).max(100), province: z.string().min(2).max(100), iban: z.string().regex(/^[A-Z]{2}\d{2}[A-Z0-9]{10,30}$/), bankAccountHolder: z.string().min(2).max(180), cuisine: z.string().min(2).max(100), vatRate: z.union([z.literal(4), z.literal(10), z.literal(21)]), commissionAccepted: z.literal(true), termsAcceptedAt: z.coerce.date(), contractAccepted: z.literal(true), privacyAccepted: z.literal(true), dataProcessingAccepted: z.literal(true), pdaUnits: z.number().int().min(1).max(50), pdaUnitCostCents: z.literal(30000), pdaCostAccepted: z.literal(true), pdaCostAcceptedAt: z.coerce.date(), privacyAcceptedAt: z.coerce.date(), dataProcessingAcceptedAt: z.coerce.date(), openingHours: openingHoursSchema, documents: z.array(partnerDocumentSchema).length(5) });
 app.post("/api/v1/partners/onboarding", async (req, res) => {
@@ -1649,7 +1649,8 @@ app.get("/api/v1/admin/restaurants/:id/documents/:documentId/content", requireRo
   const restaurant = await Restaurant.findOne({ _id: id, ...tenantScope(req), "partnerProfile.documents._id": req.params.documentId }).select("+partnerProfile.documents.contentBase64").lean().exec() as any;
   const document = restaurant?.partnerProfile?.documents?.find((item: any) => String(item._id) === req.params.documentId);
   if (!document) return res.status(404).json({ error: "DOCUMENT_NOT_FOUND" });
-  return res.json({ fileName: document.fileName, mimeType: document.mimeType, sizeBytes: document.sizeBytes, sha256: document.sha256, contentBase64: document.contentBase64 });
+  if (document.mimeType !== "application/pdf") return res.status(415).json({ error: "DOCUMENT_PDF_REQUIRED", message: "Este expediente contiene un archivo antiguo no PDF. Solicita que se vuelva a subir en PDF." });
+  return res.json({ fileName: document.fileName, mimeType: document.mimeType, sizeBytes: document.sizeBytes, sha256: document.sha256, contentBase64: document.contentBase64, viewedAt: new Date().toISOString() });
 });
 
 app.patch("/api/v1/admin/restaurants/:id/documents/:documentId/status", requireRole("admin"), async (req, res) => {
@@ -1719,7 +1720,8 @@ app.get("/api/v1/admin/:kind-leads/:id/documents/:documentId/content", requireRo
   const lead = await Model.findOne({ _id: id, ...await onboardingScope(req), "documents._id": req.params.documentId }).select("+documents.contentBase64").lean().exec() as any;
   const document = lead?.documents?.find((item: any) => String(item._id) === req.params.documentId);
   if (!document) return res.status(404).json({ error: "DOCUMENT_NOT_FOUND" });
-  return res.json({ fileName: document.fileName, mimeType: document.mimeType, sizeBytes: document.sizeBytes, sha256: document.sha256, contentBase64: document.contentBase64 });
+  if (document.mimeType !== "application/pdf") return res.status(415).json({ error: "DOCUMENT_PDF_REQUIRED", message: "Este expediente contiene un archivo antiguo no PDF. Solicita que se vuelva a subir en PDF." });
+  return res.json({ fileName: document.fileName, mimeType: document.mimeType, sizeBytes: document.sizeBytes, sha256: document.sha256, contentBase64: document.contentBase64, viewedAt: new Date().toISOString() });
 });
 app.patch("/api/v1/admin/:kind-leads/:id/documents/:documentId/status", requireRole("admin", "commercial", "gerente_comercial_zona"), async (req, res) => {
   const Model = leadModel(Array.isArray(req.params.kind) ? req.params.kind[0] : req.params.kind) as any;
@@ -1813,7 +1815,8 @@ app.get("/api/v1/rider-applications/:id/documents/:documentId/content", requireR
   const application = await RiderApplication.findOne({ _id: id, ...await adminOnboardingScope(req), "documents._id": req.params.documentId }).select("+documents.contentBase64").lean().exec() as any;
   const document = application?.documents?.find((item: any) => String(item._id) === req.params.documentId);
   if (!document) return res.status(404).json({ error: "DOCUMENT_NOT_FOUND" });
-  return res.json({ fileName: document.fileName, mimeType: document.mimeType, sizeBytes: document.sizeBytes, sha256: document.sha256, contentBase64: document.contentBase64 });
+  if (document.mimeType !== "application/pdf") return res.status(415).json({ error: "DOCUMENT_PDF_REQUIRED", message: "Este expediente contiene un archivo antiguo no PDF. Solicita que se vuelva a subir en PDF." });
+  return res.json({ fileName: document.fileName, mimeType: document.mimeType, sizeBytes: document.sizeBytes, sha256: document.sha256, contentBase64: document.contentBase64, viewedAt: new Date().toISOString() });
 });
 app.patch("/api/v1/rider-applications/:id/documents/:documentId/status", requireRole("admin"), async (req, res) => {
   const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
@@ -2081,7 +2084,7 @@ app.post("/api/v1/public/document-requests/:token/documents", async (req, res) =
     if (error instanceof MalwareScannerUnavailableError) return res.status(503).json({ error: "MALWARE_SCANNER_UNAVAILABLE", message: "La carga está temporalmente bloqueada hasta completar el análisis de seguridad." });
     return res.status(400).json({ error: error instanceof Error ? error.message : "DOCUMENT_VALIDATION_FAILED" });
   }
-  const subjectDocuments = uploaded.map((document) => ({ ...document, _id: new mongoose.Types.ObjectId(), documentRequestId: requestState.request._id, status: "received", reviewNotes: "", reviewedAt: null, reviewedBy: null }));
+  const subjectDocuments = uploaded.map((document) => ({ ...document, _id: new mongoose.Types.ObjectId(), documentRequestId: requestState.request._id, status: "received", reviewNotes: "", reviewedAt: null, reviewedBy: null, viewedAt: null, viewedBy: null }));
   const formResponses = parsed.data.responses.map((response) => ({ type: response.type, value: response.value, completedAt: new Date() }));
   const targetScope = requestState.request.tenantId ? { tenantId: requestState.request.tenantId } : { tenantId: null };
   if (requestState.request.subjectType === "rider_application") {
