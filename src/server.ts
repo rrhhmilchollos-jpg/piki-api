@@ -4008,7 +4008,10 @@ async function repairConfiguredPartnerAccess() {
   if (!restaurant) { console.log(JSON.stringify({ event: "partner_access_repair", email, result: "restaurant_not_found", accountId: String(account._id) })); return; }
 
   const isProtectedOwner = Boolean(account.ownerProtected && email === ownerEmail);
-  if (restaurant.slug === "kfc-xativa-test" && isProtectedOwner) {
+  // This function only runs for REPAIR_PARTNER_EMAIL. Keep the demonstration
+  // menu available to that explicitly configured Partner even if an old
+  // owner flag has not yet been migrated in MongoDB.
+  if (restaurant.slug === "kfc-xativa-test") {
     const seeded = await Restaurant.findOneAndUpdate(
       {
         _id: restaurant._id,
@@ -4033,10 +4036,10 @@ async function repairConfiguredPartnerAccess() {
     }
   }
 
-  // The repair itself is already explicitly allow-listed by REPAIR_PARTNER_EMAIL.
-  // For the protected PIKI owner, restore the complete test portfolio even when
-  // a legacy Render service has not synchronized newer Blueprint variables.
-  const includeXativaTestPortfolio = Boolean(account.ownerProtected && email === ownerEmail);
+  // The repair itself is explicitly allow-listed by REPAIR_PARTNER_EMAIL in
+  // render.yaml. Restore the whole fixed demonstration portfolio for that
+  // account; relying on an old ownerProtected flag left it with only KFC.
+  const includeXativaTestPortfolio = process.env.REPAIR_PARTNER_CREATE_TEST === "true";
   const testPortfolio = [
     { slug: "kings-tacos-xativa", name: "Kings Tacos Xàtiva", cuisine: "Mexicana", category: "Mexicana" },
     { slug: "eleven-burgers-xativa", name: "Eleven Burgers Xàtiva", cuisine: "Hamburguesas", category: "Hamburguesas" },
