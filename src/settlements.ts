@@ -35,7 +35,7 @@ function cents(value: number) { return Math.max(0, Math.round(value)); }
  * finance can replace them with contract-specific rules without changing orders.
  */
 export function calculateSettlement(orders: SettlementOrder[], options?: { partnerCommissionRate?: number; riderBaseCents?: number; riderPerKmCents?: number }) {
-  const partnerCommissionRate = options?.partnerCommissionRate ?? 0.18;
+  const partnerCommissionRate = options?.partnerCommissionRate ?? 0.23;
   const riderBaseCents = options?.riderBaseCents ?? 250;
   const riderPerKmCents = options?.riderPerKmCents ?? 60;
   const lines = orders.map((order): SettlementLine => {
@@ -53,5 +53,5 @@ export function calculateSettlement(orders: SettlementOrder[], options?: { partn
     for (const key of Object.keys(sum) as Array<keyof Omit<SettlementLine, "publicCode">>) sum[key] += line[key];
     return sum;
   }, { grossCents: 0, partnerCommissionCents: 0, partnerNetCents: 0, riderBaseCents: 0, riderDistanceCents: 0, riderIncentiveCents: 0, riderTipCents: 0, riderTotalCents: 0, platformNetCents: 0 });
-  return { lines, totals, commissionRate: partnerCommissionRate, formulaVersion: "piki-phase1-2026-09" } satisfies SettlementSummary;
+  return { lines, totals, commissionRate: partnerCommissionRate, formulaVersion: "piki-partner-23-customer-fee-299-2026-10" } satisfies SettlementSummary;
 }
