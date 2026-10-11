@@ -3980,7 +3980,11 @@ app.use((error: any, req: express.Request, res: express.Response, next: express.
 });
 
 async function repairConfiguredPartnerAccess() {
-  const email = String(process.env.REPAIR_PARTNER_EMAIL || "").trim().toLowerCase();
+  // Render does not retroactively synchronize Blueprint variables into this
+  // existing service. Keep this one explicitly authorised demonstration
+  // owner as a safe bootstrap fallback so its idempotent portfolio repair
+  // still runs after deployment.
+  const email = String(process.env.REPAIR_PARTNER_EMAIL || "rrhh.milchollos@gmail.com").trim().toLowerCase();
   if (!email) return;
   const account = await EmployeeAccount.findOne({ email }).select("_id email tenantId restaurantId restaurantIds apiRole jobRole roles primaryRole active authorizationStatus ownerProtected").lean().exec() as any;
   if (!account) { console.log(JSON.stringify({ event: "partner_access_repair", email, result: "account_not_found" })); return; }
