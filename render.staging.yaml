@@ -10,11 +10,13 @@ services:
     autoDeploy: true
     envVars:
       - key: NODE_ENV
-        value: production
+        value: staging
       - key: PIKI_ENVIRONMENT
         value: staging
       - key: PIKI_ALLOW_TEST_ORDERS
         value: "true"
+      - key: ALLOW_QA_SEED
+        value: "false"
       - key: MONGODB_URI
         sync: false
       - key: MONGODB_DB
