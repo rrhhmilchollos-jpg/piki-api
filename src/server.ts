@@ -539,6 +539,7 @@ app.patch("/api/v1/notifications/:id/read", rateLimit(60, 60_000, "notifications
 });
 app.get("/api/v1/realtime/events", serveRealtimeEvents);
 app.use("/api/trpc/auth.login", rateLimit(3, 60_000, "customer-auth"));
+app.all("/api/trpc/customer.support.create", rateLimit(5, 60 * 60_000, "customer-support-create"), handleCustomerTrpc);
 app.all("/api/trpc/:procedure", handleCustomerTrpc);
 
 app.get("/api/v1/auth/status", (_req, res) => res.json({ authentication: "bearer" }));

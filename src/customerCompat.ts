@@ -8,6 +8,8 @@ import { CUSTOMER_CATALOG_RESTAURANT_FILTER, CUSTOMER_ORDERABLE_RESTAURANT_FILTE
 import { modifierGroupsForItem, quoteMenuItem, usesReferenceAddOns } from "./menuModifiers.js";
 import { cashOrderLimitError, isCashOrderWithinLimit } from "./paymentPolicy.js";
 import { createCheckoutSession } from "./stripe.js";
+import { SupportTicket } from "./models.js";
+import { customerSupportCreateSchema, customerSupportTicketNumber, customerSupportTicketView } from "./customerSupportPolicy.js";
 
 const COOKIE = "piki_customer_session";
 let dispatchCustomerOrder: ((orderId: string) => Promise<unknown>) | null = null;
@@ -96,6 +98,52 @@ export async function handleCustomerTrpc(req: Request, res: Response) {
       return reply(res, row ? restaurantView(row) : null);
     }
     if (procedure === "auth.me") return reply(res, await currentCustomer(req).then((user) => publicUser(user)));
+    if (procedure === "customer.support.list") {
+      const user = await currentCustomer(req) as any;
+      if (!user) return fail(res, "Inicia sesión para consultar tus solicitudes de soporte.", "AUTH_REQUIRED");
+      const customerId = String(user._id);
+      const customerEmail = String(user.email || "").trim().toLowerCase();
+      const customerScope = [{ customerId }, ...(customerEmail ? [{ customerId: "", reporterEmail: customerEmail }] : [])];
+      const tickets = await SupportTicket.find({ sourceSurface: "customer", $or: customerScope }).sort({ updatedAt: -1 }).limit(100).select("_id ticketNumber subject description category priority status messages createdAt updatedAt").lean().exec();
+      return reply(res, tickets.map(customerSupportTicketView));
+    }
+    if (procedure === "customer.support.create") {
+      const user = await currentCustomer(req) as any;
+      if (!user) return fail(res, "Inicia sesión para solicitar acceso al piloto.", "AUTH_REQUIRED");
+      const parsed = customerSupportCreateSchema.safeParse(input);
+      if (!parsed.success) return fail(res, "La solicitud de soporte no es válida.");
+      const data = parsed.data;
+      const customerId = String(user._id);
+      const customerName = String(user.name || "Cliente PIKI").trim().slice(0, 160);
+      const reporterEmail = String(user.email || "").trim().toLowerCase();
+      if (!reporterEmail) return fail(res, "Tu cuenta necesita un correo válido para registrar la solicitud.");
+      const isPilotRequest = data.subject === "PIKI Plus · solicitud de acceso piloto";
+      if (isPilotRequest) {
+        const existing = await SupportTicket.findOne({ customerId, sourceSurface: "customer", subject: data.subject, status: { $nin: ["resolved", "closed"] } }).sort({ updatedAt: -1 }).lean().exec();
+        if (existing) return reply(res, customerSupportTicketView(existing));
+      }
+      let order: any = null;
+      if (data.orderRef) {
+        order = await Order.findOne({ publicCode: data.orderRef, customerId }).select("_id publicCode tenantId").lean().exec();
+        if (!order) return fail(res, "No encontramos ese pedido en tu cuenta.", "NOT_FOUND");
+      }
+      const ticket = await SupportTicket.create({
+        tenantId: order?.tenantId || user.tenantId || null,
+        customerId,
+        reporterEmail,
+        sourceSurface: "customer",
+        sourceRole: "customer",
+        category: data.category,
+        priority: data.priority,
+        subject: data.subject,
+        description: data.description,
+        orderId: order?._id || null,
+        orderReference: order?.publicCode || "",
+        ticketNumber: customerSupportTicketNumber(),
+        actions: [{ action: "ticket_created", metadata: { sourceSurface: "customer", customerId, customerName, orderRef: order?.publicCode || data.orderRef || null } }],
+      });
+      return reply(res, customerSupportTicketView(ticket));
+    }
     if (procedure === "customer.deliveryAddress.get") {
       const user = await currentCustomer(req) as any;
       if (!user) return fail(res, "Inicia sesión para consultar tu dirección guardada.", "AUTH_REQUIRED");
