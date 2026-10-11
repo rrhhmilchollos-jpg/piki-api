@@ -18,7 +18,7 @@ import { getVersionPolicy, isPikiSurface, requiresUpdate, setVersionPolicy, sync
 import { publicPushConfig, revokePushSubscription, savePushSubscription } from "./push.js";
 import { publishOrderStatusEvents, publishOrderIntakeEvents, publishRiderOfferEvent, publishRealtimeEvent, serveRealtimeEvents, startRealtimeRelay, tenantAudienceKey } from "./realtime.js";
 import { listNotifications, markAllNotificationsRead, markNotificationRead, startNotificationWorker, stopNotificationWorker, type NotificationPrincipal } from "./notifications.js";
-import { createCheckoutSession } from "./stripe.js";
+import { buildStripePricing, createCheckoutSession, CUSTOMER_SERVICE_FEE_CENTS } from "./stripe.js";
 import { rankDispatchCandidates, computeMobilityAdvice, calculateSanctionDecision, defaultSanctionPolicy } from "./algorithms/index.js";
 import { createSessionToken, generateTemporaryPassword, hashPassword, hashSessionToken, verifyPassword } from "./employeeAuth.js";
 import { evaluateXativaCoverage } from "./coverage/xativaPolicy.js";
@@ -28,6 +28,7 @@ import { activeOperationalOrderStatuses, dispatchableOrderStatuses, dispatchable
 import { canReceivePartnerLocations, partnerCan, partnerPermissions, partnerRolesForEmployee, permissionsForPartnerRoles, type PartnerPermission } from "./partnerAccess.js";
 import { buildApprovedRiderOperationalProfile } from "./riderApproval.js";
 import { effectiveRiderStatus, selectCurrentSlot } from "./shiftPolicy.js";
+import { canRiderOpenSupportCase } from "./supportPolicy.js";
 
 export const app = express();
 app.set("trust proxy", 1);
@@ -1521,12 +1522,17 @@ app.post("/api/v1/payments/checkout", rateLimit(20, 60_000, "payments-checkout")
   if (order.paymentMethod !== "stripe") return res.status(409).json({ error: "ORDER_USES_CASH", message: "Este pedido está configurado para pago en efectivo." });
   if (order.paymentState === "paid") return res.status(409).json({ error: "ORDER_ALREADY_PAID" });
   try {
+    const items = (order.items || []).map((item: any) => ({ name: item.name, quantity: Number(item.quantity), unitPriceCents: Number(item.unitPriceCents) }));
+    const pricing = buildStripePricing({ items, deliveryFeeCents: Number(order.deliveryFeeCents || 0) });
+    if (Number(order.serviceFeeCents || 0) !== CUSTOMER_SERVICE_FEE_CENTS || Number(order.totalCents || 0) !== pricing.totalCents) {
+      await Order.updateOne({ _id: order._id, paymentState: "pending" }, { $set: { subtotalCents: pricing.subtotalCents, serviceFeeCents: pricing.serviceFeeCents, totalCents: pricing.totalCents }, $inc: { version: 1 } }).exec();
+    }
     const session = await createCheckoutSession({
       orderId: String(order._id),
       publicCode: order.publicCode,
       origin: parsed.data.origin,
       customerEmail: parsed.data.customerEmail,
-      items: (order.items || []).map((item: any) => ({ name: item.name, quantity: Number(item.quantity), unitPriceCents: Number(item.unitPriceCents) })),
+      items,
       deliveryFeeCents: Number(order.deliveryFeeCents || 0),
       serviceFeeCents: Number(order.serviceFeeCents || 0),
       preferredPaymentMethod: "stripe",
@@ -1659,13 +1665,12 @@ app.post("/api/v1/riders/:id/support/tickets", requireRole("rider"), async (req,
   if (!parsed.success) return res.status(400).json({ error: "INVALID_RIDER_SUPPORT_TICKET", details: parsed.error.flatten() });
   const riderId = objectId(String(req.params.id)); if (!riderId) return res.status(400).json({ error: "INVALID_RIDER_ID" });
   if (!(await canAccessRiderShift(riderId, req))) return res.status(403).json({ error: "RIDER_ACCESS_DENIED" });
-  const rider = await Rider.findOne({ _id: riderId, ...tenantScope(req) }).select("email name").lean().exec() as any;
+  const rider = await Rider.findOne({ _id: riderId, ...tenantScope(req) }).select("email name status").lean().exec() as any;
   if (!rider) return res.status(404).json({ error: "RIDER_NOT_FOUND" });
-  let orderId: mongoose.Types.ObjectId | null = null;
-  if (parsed.data.orderId) {
-    orderId = objectId(parsed.data.orderId);
-    if (!orderId || !(await Order.exists({ _id: orderId, riderId, ...tenantScope(req) }))) return res.status(404).json({ error: "RIDER_ORDER_NOT_FOUND" });
-  }
+  const orderId = objectId(parsed.data.orderId || "");
+  if (!orderId) return res.status(409).json({ error: "RIDER_SUPPORT_ACTIVE_ORDER_REQUIRED", message: "Solo puedes solicitar asistencia si estás online y tienes un pedido asignado." });
+  const supportOrder = await Order.findOne({ _id: orderId, riderId, assignmentState: "assigned", status: { $nin: ["delivered", "cancelled"] }, ...tenantScope(req) }).select("_id riderId assignmentState status").lean().exec() as any;
+  if (!canRiderOpenSupportCase({ riderStatus: rider.status, order: supportOrder ? { orderId: String(supportOrder._id), riderId: String(supportOrder.riderId), assignmentState: supportOrder.assignmentState, status: supportOrder.status } : null, requestedOrderId: String(orderId) })) return res.status(409).json({ error: "RIDER_SUPPORT_ACTIVE_ORDER_REQUIRED", message: "Solo puedes solicitar asistencia si estás online y tienes un pedido asignado activo." });
   const ticket = await SupportTicket.create({ tenantId: (rider as any).tenantId || null, orderId, reporterEmail: rider.email, sourceSurface: "rider", sourceRole: "rider", category: "rider", priority: parsed.data.priority, subject: parsed.data.subject, description: parsed.data.description, ticketNumber: `SUP-${new Date().toISOString().slice(0, 10).replace(/-/g, "")}-${randomInt(1000, 9999)}`, messages: [{ senderRole: "rider", senderName: rider.name, body: parsed.data.description }], actions: [{ action: "rider_ticket_created", metadata: { riderId: String(riderId) } }] });
   void publishRealtimeEvent({ channel: "admin", audienceKey: tenantAudienceKey((rider as any).tenantId, "admin"), tenantId: (rider as any).tenantId, type: "support.ticket_created", payload: { ticketId: String(ticket._id), ticketNumber: ticket.ticketNumber, riderName: rider.name, priority: ticket.priority, orderId: orderId ? String(orderId) : null }, dedupeKey: `support:created:${String(ticket._id)}` });
   return res.status(201).json({ ticket: { id: ticket._id, ticketNumber: ticket.ticketNumber, status: ticket.status, messages: ticket.messages } });

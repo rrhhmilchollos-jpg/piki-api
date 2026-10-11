@@ -1,12 +1,31 @@
 import Stripe from "stripe";
 import { Order, StripeEvent } from "./models.js";
 import { publishOrderIntakeEvents } from "./realtime.js";
+import { XATIVA_COVERAGE_POLICY } from "./coverage/xativaPolicy.js";
+import { PARTNER_COMMISSION_RATE } from "./settlements.js";
 
 const stripeSecretKey = process.env.STRIPE_SECRET_KEY;
 export const stripe = stripeSecretKey ? new Stripe(stripeSecretKey) : null;
 
 export function stripeConfigured() {
   return Boolean(stripe && process.env.STRIPE_WEBHOOK_SECRET);
+}
+
+export const CUSTOMER_SERVICE_FEE_CENTS = XATIVA_COVERAGE_POLICY.serviceFeeCents;
+
+export function buildStripePricing(input: { items: Array<{ quantity: number; unitPriceCents: number }>; deliveryFeeCents: number }) {
+  const subtotalCents = input.items.reduce((sum, item) => sum + item.quantity * item.unitPriceCents, 0);
+  const deliveryFeeCents = Math.max(0, input.deliveryFeeCents);
+  const partnerCommissionCents = Math.max(0, Math.round(subtotalCents * PARTNER_COMMISSION_RATE));
+  const serviceFeeCents = CUSTOMER_SERVICE_FEE_CENTS;
+  return {
+    subtotalCents,
+    deliveryFeeCents,
+    serviceFeeCents,
+    totalCents: subtotalCents + deliveryFeeCents + serviceFeeCents,
+    partnerCommissionCents,
+    partnerNetCents: Math.max(0, subtotalCents - partnerCommissionCents),
+  };
 }
 
 export async function createCheckoutSession(input: {
@@ -21,7 +40,18 @@ export async function createCheckoutSession(input: {
   preferredPaymentMethod?: "stripe" | "bizum";
 }) {
   if (!stripe) throw new Error("STRIPE_SECRET_KEY no configurada");
-  const metadata = { order_id: input.orderId, order_code: input.publicCode, customer_payment_choice: input.preferredPaymentMethod || "stripe" };
+  const pricing = buildStripePricing({ items: input.items, deliveryFeeCents: input.deliveryFeeCents });
+  const metadata = {
+    order_id: input.orderId,
+    order_code: input.publicCode,
+    customer_payment_choice: input.preferredPaymentMethod || "stripe",
+    pricing_version: "piki-partner-23-customer-fee-299-2026-10",
+    customer_service_fee_cents: String(pricing.serviceFeeCents),
+    partner_commission_rate: String(PARTNER_COMMISSION_RATE),
+    partner_commission_cents: String(pricing.partnerCommissionCents),
+    partner_net_cents: String(pricing.partnerNetCents),
+    checkout_total_cents: String(pricing.totalCents),
+  };
   const lineItems: Stripe.Checkout.SessionCreateParams.LineItem[] = input.items.map((item) => ({
     quantity: item.quantity,
     price_data: { currency: "eur", product_data: { name: item.name }, unit_amount: item.unitPriceCents },

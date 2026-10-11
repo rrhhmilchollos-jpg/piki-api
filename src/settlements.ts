@@ -30,12 +30,14 @@ export type SettlementSummary = {
 
 function cents(value: number) { return Math.max(0, Math.round(value)); }
 
+export const PARTNER_COMMISSION_RATE = 0.23;
+
 /**
  * Phase 1 settlement baseline. Percentages and rates are explicit and versioned;
  * finance can replace them with contract-specific rules without changing orders.
  */
 export function calculateSettlement(orders: SettlementOrder[], options?: { partnerCommissionRate?: number; riderBaseCents?: number; riderPerKmCents?: number }) {
-  const partnerCommissionRate = options?.partnerCommissionRate ?? 0.23;
+  const partnerCommissionRate = options?.partnerCommissionRate ?? PARTNER_COMMISSION_RATE;
   const riderBaseCents = options?.riderBaseCents ?? 250;
   const riderPerKmCents = options?.riderPerKmCents ?? 60;
   const lines = orders.map((order): SettlementLine => {
