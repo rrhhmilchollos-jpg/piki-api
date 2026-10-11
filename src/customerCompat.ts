@@ -4,10 +4,12 @@ import { Order, Restaurant, CustomerAccount, RiderOrderMessage } from "./models.
 import { publishOrderIntakeEvents } from "./realtime.js";
 import { evaluateXativaCoverage } from "./coverage/xativaPolicy.js";
 import { quoteDeliveryRoute } from "./coverage/routing.js";
-import { CUSTOMER_CATALOG_RESTAURANT_FILTER, customerCatalogRestaurantName } from "./customerCatalogPolicy.js";
+import { CUSTOMER_CATALOG_RESTAURANT_FILTER, CUSTOMER_ORDERABLE_RESTAURANT_FILTER, customerCatalogRestaurantName } from "./customerCatalogPolicy.js";
 import { modifierGroupsForItem, quoteMenuItem, usesReferenceAddOns } from "./menuModifiers.js";
 import { cashOrderLimitError, isCashOrderWithinLimit } from "./paymentPolicy.js";
 import { createCheckoutSession } from "./stripe.js";
+import { SupportTicket } from "./models.js";
+import { customerSupportCreateSchema, customerSupportTicketNumber, customerSupportTicketView } from "./customerSupportPolicy.js";
 
 const COOKIE = "piki_customer_session";
 let dispatchCustomerOrder: ((orderId: string) => Promise<unknown>) | null = null;
@@ -76,11 +78,17 @@ const deliveryPin = (orderCode: string) => {
 
 function restaurantView(row: any) {
   const useReferenceFallback = usesReferenceAddOns(row);
-  return { id: String(row._id), name: customerCatalogRestaurantName(row), cuisine: row.cuisine, category: row.category, tagline: row.tagline || "Descubre este establecimiento en PIKI.", eta: `${row.etaMinutes?.[0] || 20}–${row.etaMinutes?.[1] || 35} min`, fee: (row.deliveryFeeCents || 0) / 100, rating: row.rating || 0, reviews: row.reviews || 0, promoted: row.promoted, image: row.image || "", accent: row.accent || "#FFD72E", menu: (row.menu || []).map((item: any) => ({ id: item.id, name: item.name, description: item.description || "", price: item.price, allergens: Array.isArray(item.allergens) ? item.allergens : [], vegetarian: Boolean(item.vegetarian), popular: Boolean(item.popular), modifierGroups: modifierGroupsForItem(item, useReferenceFallback) })) };
+  if (row.availabilityStatus === "coming_soon") return { id: String(row._id), name: row.name, cuisine: row.cuisine, category: row.category, locality: row.locality, tagline: "Disponible muy pronto", availabilityStatus: "coming_soon", isActive: false, onboardingStatus: row.onboardingStatus, menu: [], image: row.image || "" };
+  return { id: String(row._id), name: customerCatalogRestaurantName(row), availabilityStatus: row.availabilityStatus || "available", isActive: row.isActive, onboardingStatus: row.onboardingStatus, cuisine: row.cuisine, category: row.category, tagline: row.tagline || "Descubre este establecimiento en PIKI.", eta: `${row.etaMinutes?.[0] || 20}–${row.etaMinutes?.[1] || 35} min`, fee: (row.deliveryFeeCents || 0) / 100, rating: row.rating || 0, reviews: row.reviews || 0, promoted: row.promoted, image: row.image || "", accent: row.accent || "#FFD72E", menu: (row.menu || []).map((item: any) => ({ id: item.id, name: item.name, description: item.description || "", price: item.price, allergens: Array.isArray(item.allergens) ? item.allergens : [], vegetarian: Boolean(item.vegetarian), popular: Boolean(item.popular), modifierGroups: modifierGroupsForItem(item, useReferenceFallback) })) };
 }
 
 export async function handleCustomerTrpc(req: Request, res: Response) {
-  const procedure = String(req.params.procedure || "");
+  // Some proxy/rewrite combinations preserve the tRPC path in req.path but
+  // leave the named Express parameter empty. Resolve both forms so customer
+  // support and pilot requests do not fall through as an unsupported procedure.
+  const routePath = String(req.originalUrl || req.url || req.path);
+  const pathProcedure = routePath.match(/\/api\/trpc\/([^?/#]+)/)?.[1] || req.path.split("/").filter(Boolean).pop() || "";
+  const procedure = decodeURIComponent(String(req.params.procedure || pathProcedure)).split("?")[0];
   const input = inputOf(req);
   try {
     if (procedure === "catalog.list") {
@@ -95,6 +103,52 @@ export async function handleCustomerTrpc(req: Request, res: Response) {
       return reply(res, row ? restaurantView(row) : null);
     }
     if (procedure === "auth.me") return reply(res, await currentCustomer(req).then((user) => publicUser(user)));
+    if (procedure === "customer.support.list") {
+      const user = await currentCustomer(req) as any;
+      if (!user) return fail(res, "Inicia sesión para consultar tus solicitudes de soporte.", "AUTH_REQUIRED");
+      const customerId = String(user._id);
+      const customerEmail = String(user.email || "").trim().toLowerCase();
+      const customerScope = [{ customerId }, ...(customerEmail ? [{ customerId: "", reporterEmail: customerEmail }] : [])];
+      const tickets = await SupportTicket.find({ sourceSurface: "customer", $or: customerScope }).sort({ updatedAt: -1 }).limit(100).select("_id ticketNumber subject description category priority status messages createdAt updatedAt").lean().exec();
+      return reply(res, tickets.map(customerSupportTicketView));
+    }
+    if (procedure === "customer.support.create") {
+      const user = await currentCustomer(req) as any;
+      if (!user) return fail(res, "Inicia sesión para solicitar acceso al piloto.", "AUTH_REQUIRED");
+      const parsed = customerSupportCreateSchema.safeParse(input);
+      if (!parsed.success) return fail(res, "La solicitud de soporte no es válida.");
+      const data = parsed.data;
+      const customerId = String(user._id);
+      const customerName = String(user.name || "Cliente PIKI").trim().slice(0, 160);
+      const reporterEmail = String(user.email || "").trim().toLowerCase();
+      if (!reporterEmail) return fail(res, "Tu cuenta necesita un correo válido para registrar la solicitud.");
+      const isPilotRequest = data.subject === "PIKI Plus · solicitud de acceso piloto";
+      if (isPilotRequest) {
+        const existing = await SupportTicket.findOne({ customerId, sourceSurface: "customer", subject: data.subject, status: { $nin: ["resolved", "closed"] } }).sort({ updatedAt: -1 }).lean().exec();
+        if (existing) return reply(res, customerSupportTicketView(existing));
+      }
+      let order: any = null;
+      if (data.orderRef) {
+        order = await Order.findOne({ publicCode: data.orderRef, customerId }).select("_id publicCode tenantId").lean().exec();
+        if (!order) return fail(res, "No encontramos ese pedido en tu cuenta.", "NOT_FOUND");
+      }
+      const ticket = await SupportTicket.create({
+        tenantId: order?.tenantId || user.tenantId || null,
+        customerId,
+        reporterEmail,
+        sourceSurface: "customer",
+        sourceRole: "customer",
+        category: data.category,
+        priority: data.priority,
+        subject: data.subject,
+        description: data.description,
+        orderId: order?._id || null,
+        orderReference: order?.publicCode || "",
+        ticketNumber: customerSupportTicketNumber(),
+        actions: [{ action: "ticket_created", metadata: { sourceSurface: "customer", customerId, customerName, orderRef: order?.publicCode || data.orderRef || null } }],
+      });
+      return reply(res, customerSupportTicketView(ticket));
+    }
     if (procedure === "customer.deliveryAddress.get") {
       const user = await currentCustomer(req) as any;
       if (!user) return fail(res, "Inicia sesión para consultar tu dirección guardada.", "AUTH_REQUIRED");
@@ -178,7 +232,7 @@ export async function handleCustomerTrpc(req: Request, res: Response) {
     if (procedure === "order.create" || procedure === "order.checkout") {
       const user = await currentCustomer(req) as any;
       if (!user) return fail(res, "Debes iniciar sesión para realizar pedidos", "AUTH_REQUIRED");
-      const restaurant = await Restaurant.findOne({ _id: input?.restaurantId, ...CUSTOMER_CATALOG_RESTAURANT_FILTER }).lean().exec() as any;
+      const restaurant = await Restaurant.findOne({ _id: input?.restaurantId, ...CUSTOMER_ORDERABLE_RESTAURANT_FILTER }).lean().exec() as any;
       if (!restaurant) return fail(res, "Restaurante no encontrado", "NOT_FOUND");
       const requested = Array.isArray(input?.items) ? input.items : [];
       const useReferenceFallback = usesReferenceAddOns(restaurant);

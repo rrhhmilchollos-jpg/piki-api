@@ -16,6 +16,10 @@ services:
         value: piki
       - key: ADMIN_APP_URL
         value: https://admin.pikidelivery.com
+      - key: REPAIR_PARTNER_EMAIL
+        value: rrhh.milchollos@gmail.com
+      - key: REPAIR_PARTNER_CREATE_TEST
+        value: "true"
       - key: CORS_ORIGINS
         sync: false
       - key: UPSTASH_REDIS_REST_URL

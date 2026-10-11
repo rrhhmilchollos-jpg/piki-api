@@ -1,13 +1,13 @@
 import "dotenv/config";
 import "express-async-errors";
 import { createHash, createHmac, randomBytes, randomInt } from "node:crypto";
-import { MalwareDetectedError, MalwareScannerUnavailableError, scanUploadBuffer } from "./fileSecurity.js";
+import { MalwareDetectedError, MalwareScannerUnavailableError, normalizeDocumentUpload, sanitizeUploadFileName, scanUploadBuffer, scanUploadBuffers } from "./fileSecurity.js";
 import { fileURLToPath } from "node:url";
 import cors from "cors";
 import express from "express";
 import mongoose from "mongoose";
 import { z } from "zod";
-import { CashLedgerEntry, CustomerAccount, DispatchDecision, DocumentRequest, EmployeeAccount, AccessAuthorization, Fleet, Order, Restaurant, PartnerAsset, PartnerLocalityGroup, Rider, RiderApplication, PartnerLead, RiderLead, RiderIncident, RiderOrderMessage, RiderSlot, SignatureRequest, Zone, PushSubscription, RealtimeEvent, Tenant, TenantMembership, RiderAssignmentReservation, SupportTicket, OnboardingRequest, TrackingSession, LocationSample, ensureIndexes } from "./models.js";
+import { CashLedgerEntry, CustomerAccount, DispatchDecision, DocumentRequest, EmployeeAccount, AccessAuthorization, Fleet, Order, Restaurant, PartnerAsset, PartnerLocalityGroup, MenuImportDraft, Rider, RiderApplication, PartnerLead, RiderLead, RiderIncident, RiderOrderMessage, RiderSlot, SignatureRequest, Zone, PushSubscription, RealtimeEvent, Notification, Tenant, TenantMembership, RiderAssignmentReservation, SupportTicket, OnboardingRequest, TrackingSession, LocationSample, ensureIndexes } from "./models.js";
 import { normalizeLeadEmail, partnerLeadSubmissionSchema, riderLeadSubmissionSchema, webLeadReviewSchema, webLeadStatusSchema } from "./webLeads.js";
 import { assertTransition, calculateEtaRange, transitionSchema, validateCoordinates } from "./algorithms/index.js";
 import { configuredAuthRoles, requireOwner, requireRole, resolveRole } from "./auth.js";
@@ -15,25 +15,31 @@ import { EmployeeSession, issueEmployeeSession, revokeEmployeeSessions, sessionR
 import { isStripeSignatureError, processStripeWebhook, stripeConfigured, createSignaturitSignature, signaturitBaseUrl, signaturitConfigured, signaturitMode, signatureWebhookUrl, webhookDigest, handleCustomerTrpc, currentCustomer, setCustomerOrderDispatcher } from "./integrations/index.js";
 import { getVersionPolicy, isPikiSurface, requiresUpdate, setVersionPolicy, syncVersionPolicy, versionPolicySchema, type PikiSurface } from "./appVersion.js";
 import { publicPushConfig, revokePushSubscription, savePushSubscription } from "./push.js";
-import { publishOrderStatusEvents, publishOrderIntakeEvents, publishRiderOfferEvent, publishRiderArrivalEvent, publishRiderLocationEvents, publishRiderScheduleEvent, publishRealtimeEvent, serveRealtimeEvents, startRealtimeRelay, tenantAudienceKey } from "./realtime.js";
+import { publishOrderStatusEvents, publishOrderIntakeEvents, publishRiderOfferEvent, publishRiderArrivalEvent, publishRiderLocationEvents, publishRiderScheduleEvent, publishRiderCustomerMessageEvent, publishRealtimeEvent, serveRealtimeEvents, startRealtimeRelay, tenantAudienceKey } from "./realtime.js";
 import { listNotifications, markAllNotificationsRead, markNotificationRead, sendDocumentRequestEmail, sendDocumentUploadEmail, startNotificationWorker, stopNotificationWorker, type NotificationPrincipal } from "./notifications.js";
 import { captureStripePaymentIntent, createCheckoutSession } from "./stripe.js";
 import { rankDispatchCandidates, computeMobilityAdvice, calculateSanctionDecision, defaultSanctionPolicy } from "./algorithms/index.js";
 import { createSessionToken, generateTemporaryPassword, hashPassword, hashSessionToken, verifyPassword } from "./employeeAuth.js";
+import { EmployeePasswordReset } from "./passwordReset.js";
 import { evaluateXativaCoverage } from "./coverage/xativaPolicy.js";
 import { quoteDeliveryRoute } from "./coverage/routing.js";
-import { runTenantMigration } from "./tenantMigration.js";
+import { ROOT_TENANT_SLUG, runTenantMigration } from "./tenantMigration.js";
 import { onboardingScope } from "./onboardingScope.js";
-import { corporateEmailConfiguration, sendCorporateEmail, sendLeadContactEmail, verifyCorporateEmailConnection } from "./corporateEmail.js";
+import { corporateEmailConfiguration, escapeCorporateHtml, sendCorporateEmail, sendLeadContactEmail, verifyCorporateEmailConnection } from "./corporateEmail.js";
 import { activeOperationalOrderStatuses, dispatchableOrderStatuses, dispatchablePaymentFilter, isDispatchableOrderStatus, isDispatchablePayment } from "./dispatchEligibility.js";
 import { canReceivePartnerLocations, partnerCan, partnerPermissions, partnerRolesForEmployee, permissionsForPartnerRoles, type PartnerPermission } from "./partnerAccess.js";
 import { awardRiderRecruitmentMilestones, claimRiderReferralCode, completeRiderShiftIncentiveTracking, incentiveProgramStatus, loadRiderIncentiveSnapshot, trackRiderLocationForIncentive, trackRiderShiftStart } from "./riderIncentives.js";
 import { buildApprovedRiderOperationalProfile } from "./riderApproval.js";
-import { CUSTOMER_CATALOG_RESTAURANT_FILTER, presentCustomerCatalogRestaurant } from "./customerCatalogPolicy.js";
+import { COMING_SOON_SLUGS, CUSTOMER_CATALOG_RESTAURANT_FILTER, CUSTOMER_ORDERABLE_RESTAURANT_FILTER, presentCustomerCatalogRestaurant } from "./customerCatalogPolicy.js";
+import { PARTNER_DEMO_MENU_VERSION, partnerDemoMenu } from "./partnerDemoMenu.js";
 import { quoteMenuItem, usesReferenceAddOns } from "./menuModifiers.js";
 import { decideLatePickup, pointDistanceMeters } from "./pickupPolicy.js";
 import { buildLegacyRiderSupportTicketFilter, buildRiderSupportTicketFilter } from "./supportTicketScope.js";
 import { cashOrderLimitError, isCashOrderWithinLimit } from "./paymentPolicy.js";
+import { extractAndParseMenu, readAssetBytes } from "./menuImport.js";
+import { purgeTestDataIfEnabled } from "./purgeTestData.js";
+import { validateDocumentRequestSubmission } from "./onboardingDocumentPolicy.js";
+import { buildFleetEntityScope, buildTenantScope } from "./tenantScope.js";
 
 export const app = express();
 app.set("trust proxy", 1);
@@ -71,14 +77,40 @@ app.options("*", cors(corsOptions));
 
 const requestBuckets = new Map<string, { startedAt: number; count: number }>();
 let mongoRateLimitIndexReady = false;
+let mongoRateLimitIndexPromise: Promise<void> | null = null;
+async function ensureMongoRateLimitIndex() {
+  if (mongoRateLimitIndexReady) return;
+  if (mongoRateLimitIndexPromise) return mongoRateLimitIndexPromise;
+  mongoRateLimitIndexPromise = (async () => {
+    const collection = mongoose.connection.collection("piki_rate_limit_buckets") as any;
+    const indexes = await collection.listIndexes().toArray();
+    const expiresIndexes = indexes.filter((index: any) => index.key?.expiresAt === 1);
+    const hasTtlIndex = expiresIndexes.some((index: any) => Number(index.expireAfterSeconds) === 0);
+    if (!hasTtlIndex) {
+      // This collection is ephemeral rate-limit state. Replacing a legacy
+      // non-TTL index is safe and prevents MongoDB IndexOptionsConflict.
+      for (const index of expiresIndexes) await collection.dropIndex(index.name).catch(() => undefined);
+      await collection.createIndex({ expiresAt: 1 }, { name: "expiresAt_ttl", expireAfterSeconds: 0 });
+    }
+    mongoRateLimitIndexReady = true;
+  })().finally(() => { mongoRateLimitIndexPromise = null; });
+  return mongoRateLimitIndexPromise;
+}
+async function ensureExpiresAtTtlIndex(collectionName: string) {
+  const collection = mongoose.connection.collection(collectionName) as any;
+  const indexes = await collection.listIndexes().toArray();
+  const expiresIndexes = indexes.filter((index: any) => index.key?.expiresAt === 1);
+  const hasTtlIndex = expiresIndexes.some((index: any) => Number(index.expireAfterSeconds) === 0);
+  if (!hasTtlIndex) {
+    for (const index of expiresIndexes) await collection.dropIndex(index.name).catch(() => undefined);
+    await collection.createIndex({ expiresAt: 1 }, { name: "expiresAt_1", expireAfterSeconds: 0 });
+  }
+}
 async function incrementMongoRateLimit(key: string, windowMs: number): Promise<number | null> {
   if (!databaseReady || mongoose.connection.readyState !== 1) return null;
   try {
     const collection = mongoose.connection.collection("piki_rate_limit_buckets") as any;
-    if (!mongoRateLimitIndexReady) {
-      await collection.createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 });
-      mongoRateLimitIndexReady = true;
-    }
+    await ensureMongoRateLimitIndex();
     const windowStart = Math.floor(Date.now() / windowMs) * windowMs;
     const bucketId = `${key}:${windowStart}`;
     const expiresAt = new Date(windowStart + windowMs + 60_000);
@@ -169,10 +201,32 @@ app.post(["/api/v1/payments/webhook", "/api/webhooks/stripe"], express.raw({ typ
 app.use(express.json({ limit: "20mb" }));
 
 const objectId = (value: string) => mongoose.isValidObjectId(value) ? new mongoose.Types.ObjectId(value) : null;
+function hasExplicitPlatformSuperadminScope(req: express.Request): boolean {
+  return req.auth?.role === "admin" && req.auth?.isRootOwner === true && Boolean(req.auth.employeeId);
+}
 function tenantScope(req: express.Request): Record<string, unknown> {
-  if (!req.auth?.tenantId) return {};
-  const tenantId = objectId(req.auth.tenantId);
-  return tenantId ? { tenantId } : { _id: null };
+  // A missing tenant must never widen a tenant-owned query. The protected
+  // platform superadmin is the single explicit cross-tenant exception.
+  return hasExplicitPlatformSuperadminScope(req) ? {} : buildTenantScope(req.auth?.tenantId);
+}
+
+async function publicOnboardingTenantScope(): Promise<Record<string, unknown>> {
+  const tenantId = objectId(String(process.env.PIKI_PUBLIC_ONBOARDING_TENANT_ID || ""));
+  if (tenantId) return { tenantId };
+  // The root platform tenant is a server-side fallback only; the client never
+  // supplies or selects a tenant for public onboarding.
+  const rootTenant = await Tenant.findOne({ slug: ROOT_TENANT_SLUG, isPlatformTenant: true, status: "active" }).select("_id").lean().exec() as any;
+  return rootTenant?._id ? { tenantId: rootTenant._id } : { tenantId: null };
+}
+
+async function adminOnboardingScope(req: express.Request): Promise<Record<string, unknown>> {
+  return hasExplicitPlatformSuperadminScope(req) ? {} : onboardingScope(req);
+}
+
+// Cross-tenant support is reserved for the explicit platform superadmin; an
+// ordinary support/admin account remains inside its active tenant.
+function supportTenantScope(req: express.Request): Record<string, unknown> {
+  return hasExplicitPlatformSuperadminScope(req) ? {} : tenantScope(req);
 }
 async function tenantLimits(req: express.Request) {
   if (!req.auth?.tenantId) return { maxRiders: 100000, maxDailySlots: 100000, maxSlotsPerRiderPerDay: 3 };
@@ -185,20 +239,13 @@ async function employeeScope(req: express.Request) {
   return await EmployeeAccount.findOne({ _id: req.auth.employeeId, ...tenantScope(req) }).select("email fleetId zoneSlugs restaurantId portfolioId jobRole apiRole tenantId").lean().exec() as any;
 }
 async function fleetRiderFilter(req: express.Request): Promise<Record<string, unknown>> {
-  if (req.auth?.role !== "fleet") return {};
   const employee = await employeeScope(req);
-  // Newly enabled rider accounts start unassigned. Fleet must be able to see
-  // those accounts so the first slot reservation can link them to this fleet.
-  const realRiderFilter = { isTestRider: { $ne: true } };
-  return employee?.fleetId
-    ? { ...realRiderFilter, $or: [{ fleetId: employee.fleetId }, { fleetId: null }, { fleetId: { $exists: false } }] }
-    : { ...realRiderFilter, $or: [{ fleetId: null }, { fleetId: { $exists: false } }] };
+  return buildFleetEntityScope({ tenantId: req.auth?.tenantId, role: req.auth?.role, fleetId: employee?.fleetId });
 }
 async function fleetCanAccessRider(req: express.Request, riderId: mongoose.Types.ObjectId | null) {
   if (!riderId) return false;
-  if (req.auth?.role !== "fleet") return true;
   const employee = await employeeScope(req);
-  return Boolean(employee?.fleetId && await Rider.exists({ _id: riderId, fleetId: employee.fleetId }));
+  return Boolean(await Rider.exists({ _id: riderId, ...buildFleetEntityScope({ tenantId: req.auth?.tenantId, role: req.auth?.role, fleetId: employee?.fleetId }) }));
 }
 const locationSchema = z.object({ latitude: z.number().min(-90).max(90), longitude: z.number().min(-180).max(180), accuracy: z.number().min(0).max(10_000).optional() });
 const customerModifierSelectionSchema = z.object({ groupId: z.string().min(1).max(80), optionIds: z.array(z.string().min(1).max(80)).max(12) });
@@ -237,12 +284,17 @@ const riderIncidentSchema = z.object({ reason: z.enum(["late_acceptance", "late_
 const riderSlotSchema = z.object({ zoneSlug: z.string().regex(/^[a-z0-9-]+$/), date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/), startTime: z.string().regex(/^(?:[01]\d|2[0-3]):[0-5]\d$/), endTime: z.string().regex(/^(?:[01]\d|2[0-3]):[0-5]\d$/), status: z.enum(["planned", "active", "completed", "cancelled"]).default("planned"), notes: z.string().max(500).default("") });
 const riderSlotCreateSchema = riderSlotSchema.extend({ riderId: z.string().regex(/^[a-f\d]{24}$/) });
 const riderSlotWeekSchema = riderSlotCreateSchema.extend({ weekdays: z.array(z.number().int().min(0).max(6)).min(1).max(7).default([0, 1, 2, 3, 4, 5, 6]) });
-const riderDocumentInputSchema = z.object({ type: z.enum(["identity", "residence_permit", "social_security_number", "bank_certificate", "profile_photo", "driving_license", "insurance", "vehicle_registration", "vehicle_technical_sheet", "scooter_responsible_declaration", "dgt_mvp_homologation", "work_authorization_confirmation", "ppe_and_safety", "other"]), fileName: z.string().min(1).max(180), mimeType: z.literal("application/pdf"), sizeBytes: z.number().int().min(1).max(2_500_000), sha256: z.string().regex(/^[a-f0-9]{64}$/i), contentBase64: z.string().min(1).max(3_500_000) });
+const riderDocumentInputSchema = z.object({ type: z.enum(["identity", "residence_permit", "social_security_number", "bank_certificate", "profile_photo", "driving_license", "insurance", "vehicle_registration", "vehicle_technical_sheet", "scooter_responsible_declaration", "dgt_mvp_homologation", "work_authorization_confirmation", "ppe_and_safety", "other"]), fileName: z.string().min(1).max(180), mimeType: z.string().min(1).max(120), sizeBytes: z.number().int().min(1).max(2_500_000), sha256: z.string().regex(/^[a-f0-9]{64}$/i), contentBase64: z.string().min(1).max(3_500_000) });
 const riderApplicationSchema = z.object({ name: z.string().min(2).max(160), email: z.string().email(), phone: z.string().min(6).max(40), city: z.string().min(2).max(120), vehicle: z.enum(["bike", "electric_bike", "electric_scooter", "motorcycle", "scooter", "car"]), availability: z.string().min(2).max(160), socialSecurityNumber: z.string().min(4).max(40), identityVerificationMethod: z.literal("online_scan"), safetyDeclarationAccepted: z.literal(true), documents: z.array(riderDocumentInputSchema).min(3).max(12), website: z.string().max(0).optional() });
 const documentRequestSubjectSchema = z.enum(["rider_application", "restaurant", "rider_lead", "partner_lead"]);
 const documentRequestRequirementInputSchema = z.object({ type: z.string().regex(/^[a-z0-9_]{2,80}$/), inputMode: z.enum(["file", "form"]).default("file"), label: z.string().trim().min(2).max(160), description: z.string().trim().max(500).default("") });
 const documentRequestCreateSchema = z.object({ subjectType: documentRequestSubjectSchema, subjectId: z.string().regex(/^[a-f\d]{24}$/), message: z.string().trim().min(10).max(2000), dueAt: z.coerce.date().nullable().optional(), requirements: z.array(documentRequestRequirementInputSchema).min(1).max(12), sendEmail: z.boolean().default(true) });
-const publicDocumentUploadSchema = z.object({ responses: z.array(z.object({ type: z.string().regex(/^[a-z0-9_]{2,80}$/), value: z.string().trim().min(1).max(500) })).max(12).default([]), documents: z.array(z.object({ type: z.string().regex(/^[a-z0-9_]{2,80}$/), fileName: z.string().trim().min(1).max(180), mimeType: z.literal("application/pdf"), sizeBytes: z.number().int().min(1).max(2_500_000), sha256: z.string().regex(/^[a-f0-9]{64}$/i), contentBase64: z.string().min(1).max(3_500_000) })).min(1).max(5) });
+const publicDocumentUploadSchema = z.object({
+  responses: z.array(z.object({ type: z.string().regex(/^[a-z0-9_]{2,80}$/), value: z.string().trim().min(1).max(500) })).max(12).default([]),
+  documents: z.array(z.object({ type: z.string().regex(/^[a-z0-9_]{2,80}$/), fileName: z.string().trim().min(1).max(180), mimeType: z.literal("application/pdf"), sizeBytes: z.number().int().min(1).max(2_500_000), sha256: z.string().regex(/^[a-f0-9]{64}$/i), contentBase64: z.string().min(1).max(3_500_000) })).max(5).default([]),
+}).superRefine((value, ctx) => {
+  if (!value.documents.length && !value.responses.length) ctx.addIssue({ code: "custom", path: ["documents"], message: "documents_or_responses_required" });
+});
 const riderDocumentRequestTypes = new Set(["identity", "residence_permit", "social_security_number", "bank_certificate", "profile_photo", "driving_license", "insurance", "vehicle_registration", "vehicle_technical_sheet", "scooter_responsible_declaration", "dgt_mvp_homologation", "work_authorization_confirmation", "ppe_and_safety", "other"]);
 const partnerDocumentRequestTypes = new Set(["tax_id", "bank_certificate", "insurance", "activity_license", "food_sanitary_authorization", "identity", "other"]);
 const leadDocumentInputSchema = z.object({ type: z.string().trim().min(2).max(80), fileName: z.string().trim().min(1).max(180), mimeType: z.literal("application/pdf"), sizeBytes: z.number().int().min(1).max(2_500_000), sha256: z.string().regex(/^[a-f0-9]{64}$/i), contentBase64: z.string().min(20).max(3_500_000) });
@@ -266,6 +318,11 @@ async function nextRiderCode() {
   throw new Error("RIDER_CODE_CAPACITY_REACHED");
 }
 
+function onboardingCode(prefix: "P" | "R", id: unknown): string | null {
+  const rawId = String(id || "").trim();
+  return /^[a-f\d]{24}$/i.test(rawId) ? `PIKI-${prefix}-${rawId.toUpperCase()}` : null;
+}
+
 function allowRiderApplication(ip: string) {
   const now = Date.now(); const current = riderApplicationAttempts.get(ip);
   if (!current || current.resetAt <= now) { riderApplicationAttempts.set(ip, { count: 1, resetAt: now + 15 * 60_000 }); return true; }
@@ -279,6 +336,13 @@ async function createDailyDisplayCode() {
     if (!(await Order.exists({ displayCodeDate: today, displayCode }))) return { displayCode, displayCodeDate: today };
   }
   throw new Error("DAILY_ORDER_CODE_CAPACITY_REACHED");
+}
+async function createRandomOrderCode() {
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    const publicCode = String(randomInt(10_000_000, 100_000_000));
+    if (!(await Order.exists({ publicCode }))) return publicCode;
+  }
+  throw new Error("ORDER_CODE_CAPACITY_REACHED");
 }
 
 async function dispatchLoadPolicy() {
@@ -475,12 +539,101 @@ app.patch("/api/v1/notifications/:id/read", rateLimit(60, 60_000, "notifications
 });
 app.get("/api/v1/realtime/events", serveRealtimeEvents);
 app.use("/api/trpc/auth.login", rateLimit(3, 60_000, "customer-auth"));
+app.all("/api/trpc/customer.support.create", rateLimit(5, 60 * 60_000, "customer-support-create"), handleCustomerTrpc);
 app.all("/api/trpc/:procedure", handleCustomerTrpc);
 
 app.get("/api/v1/auth/status", (_req, res) => res.json({ authentication: "bearer" }));
 const employeeSessionRoles = ["admin", "partner", "rider", "fleet", "commercial", "gerente_comercial_zona", "finance", "support"] as const;
 const partnerOperationalRoles = ["partner_admin", "area_manager", "zone_manager", "store_manager", "manager", "cashier", "cajero", "kitchen", "cocina", "cook", "catalog", "catalogue", "menu_manager", "viewer", "read_only", "solo_lectura"] as const;
 const employeeLoginSchema = z.object({ email: z.string().email(), password: z.string().min(8).max(200), role: z.enum(employeeSessionRoles).optional() });
+const employeePasswordResetRequestSchema = z.object({ email: z.string().email().max(254) });
+const employeePasswordResetConfirmSchema = z.object({ token: z.string().min(40).max(200), newPassword: z.string().min(12).max(200).regex(/[A-Z]/).regex(/[a-z]/).regex(/[0-9]/) });
+const employeeCredentialSurfaces = ["admin", "partner", "rider", "fleet"] as const;
+type EmployeeCredentialSurface = (typeof employeeCredentialSurfaces)[number];
+const employeeCredentialAppUrls: Record<EmployeeCredentialSurface, string> = {
+  admin: String(process.env.ADMIN_APP_URL || "https://admin.pikidelivery.com").replace(/\/$/, ""),
+  partner: String(process.env.PARTNER_APP_URL || "https://partners.pikidelivery.com").replace(/\/$/, ""),
+  rider: String(process.env.RIDER_APP_URL || "https://riders.pikidelivery.com").replace(/\/$/, ""),
+  fleet: String(process.env.FLEET_APP_URL || "https://fleet.pikidelivery.com").replace(/\/$/, ""),
+};
+const employeeCredentialLabels: Record<EmployeeCredentialSurface, string> = {
+  admin: "PIKI Administración",
+  partner: "PIKI Partner Orders",
+  rider: "PIKI Riders",
+  fleet: "PIKI Fleet",
+};
+const passwordResetMessage = "Si el correo corresponde a una cuenta PIKI activa, recibirás un enlace para crear una contraseña nueva.";
+
+function employeeCredentialSurface(value: unknown): EmployeeCredentialSurface | null {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (normalized === "partners") return "partner";
+  return (employeeCredentialSurfaces as readonly string[]).includes(normalized) ? normalized as EmployeeCredentialSurface : null;
+}
+
+function employeeCanUseCredentialSurface(employee: any, surface: EmployeeCredentialSurface) {
+  return Boolean(employee && sessionRole(employee, surface));
+}
+
+function preferredCredentialSurface(employee: any): EmployeeCredentialSurface | null {
+  const candidates = [employee?.primaryRole, employee?.apiRole, employee?.jobRole, ...(Array.isArray(employee?.roles) ? employee.roles : [])];
+  for (const candidate of candidates) {
+    const surface = employeeCredentialSurface(candidate);
+    if (surface && employeeCanUseCredentialSurface(employee, surface)) return surface;
+  }
+  return employeeCanUseCredentialSurface(employee, "admin") ? "admin" : null;
+}
+
+async function createEmployeePasswordReset(employee: any, surface: EmployeeCredentialSurface, ttlMs = 30 * 60_000) {
+  const rawToken = randomBytes(32).toString("hex");
+  const tokenHash = createHash("sha256").update(rawToken).digest("hex");
+  const expiresAt = new Date(Date.now() + ttlMs);
+  await EmployeePasswordReset.updateMany({ employeeId: employee._id, usedAt: null }, { $set: { usedAt: new Date() } }).exec();
+  await EmployeePasswordReset.create({ employeeId: employee._id, email: String(employee.email).trim().toLowerCase(), tokenHash, expiresAt });
+  return { tokenHash, expiresAt, resetUrl: `${employeeCredentialAppUrls[surface]}/?reset=${encodeURIComponent(rawToken)}` };
+}
+
+async function sendEmployeePasswordLink(employee: any, surface: EmployeeCredentialSurface, purpose: "recovery" | "activation") {
+  const reset = await createEmployeePasswordReset(employee, surface, purpose === "activation" ? 24 * 60 * 60_000 : 30 * 60_000);
+  const appLabel = employeeCredentialLabels[surface];
+  const safeName = escapeCorporateHtml(String(employee.name || "equipo PIKI"));
+  const expiryText = purpose === "activation" ? "24 horas" : "30 minutos";
+  const action = purpose === "activation" ? "Crear acceso" : "Crear contraseña nueva";
+  const delivery = await sendCorporateEmail({
+    recipientEmail: String(employee.email).trim().toLowerCase(),
+    subject: `${appLabel} · ${purpose === "activation" ? "Activa tu acceso" : "Recupera tu contraseña"}`,
+    idempotencyKey: `piki-employee-password-${purpose}-${reset.tokenHash}`,
+    text: `Hola ${employee.name || "equipo PIKI"},\n\n${purpose === "activation" ? `Tu acceso a ${appLabel} ha sido autorizado.` : `Hemos recibido una solicitud para recuperar tu acceso a ${appLabel}.`}\n\n${action}: ${reset.resetUrl}\n\nEl enlace caduca en ${expiryText} y solo puede utilizarse una vez. Si no esperabas este correo, ignóralo y avisa a RRHH.\n\nEquipo PIKI`,
+    html: `<div style="font-family:Arial,sans-serif;line-height:1.6;color:#171717"><h2>${escapeCorporateHtml(appLabel)}</h2><p>Hola ${safeName}:</p><p>${purpose === "activation" ? "Tu acceso ha sido autorizado por Administración." : "Hemos recibido una solicitud para crear una contraseña nueva."}</p><p><a href="${reset.resetUrl}" style="display:inline-block;padding:13px 20px;border-radius:10px;background:#ffd400;color:#171717;text-decoration:none;font-weight:700">${action}</a></p><p style="font-size:13px;color:#666">El enlace caduca en ${expiryText} y solo puede utilizarse una vez. Si no esperabas este correo, ignóralo y avisa a RRHH.</p></div>`,
+  });
+  return { delivery, reset };
+}
+
+app.post("/api/v1/auth/employee/password-reset/request", rateLimit(3, 15 * 60_000, "employee-password-reset"), async (req, res) => {
+  const parsed = employeePasswordResetRequestSchema.safeParse(req.body);
+  const surface = employeeCredentialSurface(req.header("x-piki-surface"));
+  if (!parsed.success || !surface) return res.status(202).json({ message: passwordResetMessage });
+  const email = parsed.data.email.trim().toLowerCase();
+  const employee = await EmployeeAccount.findOne({ email, active: true, authorizationStatus: "approved" }).select("_id email name jobRole apiRole roles primaryRole ownerProtected authorizationStatus").lean().exec() as any;
+  if (employee && employeeCanUseCredentialSurface(employee, surface)) {
+    const { delivery } = await sendEmployeePasswordLink(employee, surface, "recovery");
+    if (!delivery.sent) console.warn("Employee password reset email was not delivered", { error: delivery.error });
+  }
+  return res.status(202).json({ message: passwordResetMessage });
+});
+app.post("/api/v1/auth/employee/password-reset/confirm", rateLimit(8, 15 * 60_000, "employee-password-reset-confirm"), async (req, res) => {
+  const parsed = employeePasswordResetConfirmSchema.safeParse(req.body);
+  const surface = employeeCredentialSurface(req.header("x-piki-surface"));
+  if (!parsed.success || !surface) return res.status(400).json({ error: "INVALID_PASSWORD_CHANGE", message: "La nueva contraseña debe tener 12 caracteres e incluir mayúscula, minúscula y número." });
+  const tokenHash = createHash("sha256").update(parsed.data.token).digest("hex");
+  const reset = await EmployeePasswordReset.findOne({ tokenHash, usedAt: null, expiresAt: { $gt: new Date() } }).exec() as any;
+  if (!reset) return res.status(400).json({ error: "PASSWORD_RESET_INVALID", message: "El enlace no es válido o ya ha caducado. Solicita otro enlace." });
+  const employee = await EmployeeAccount.findOne({ _id: reset.employeeId, active: true, authorizationStatus: "approved" }).select("+passwordHash email jobRole apiRole roles primaryRole ownerProtected authorizationStatus").exec() as any;
+  if (!employee || !employeeCanUseCredentialSurface(employee, surface)) return res.status(400).json({ error: "PASSWORD_RESET_INVALID", message: "El enlace no es válido o ya ha caducado. Solicita otro enlace." });
+  employee.passwordHash = hashPassword(parsed.data.newPassword); employee.mustChangePassword = false; employee.passwordChangedAt = new Date(); employee.sessionHash = null; await employee.save();
+  await EmployeeSession.deleteMany({ employeeId: employee._id }).exec();
+  reset.usedAt = new Date(); await reset.save();
+  return res.json({ changed: true });
+});
 app.post("/api/v1/auth/employee/login", async (req, res) => {
   const parsed = employeeLoginSchema.safeParse(req.body); if (!parsed.success) return res.status(400).json({ error: "INVALID_LOGIN" });
   if (String(req.headers["x-piki-surface"] || "").toLowerCase() === "admin" && parsed.data.email.toLowerCase() !== ownerEmail) { /* subadmins are allowed; destructive operations remain superadmin-only */ }
@@ -501,7 +654,7 @@ app.post("/api/v1/auth/employee/login", async (req, res) => {
 app.post("/api/v1/auth/employee/switch-role", requireRole("admin", "partner", "rider", "fleet", "commercial", "gerente_comercial_zona", "finance", "support"), async (req, res) => {
   const parsed = z.object({ role: z.enum(employeeSessionRoles) }).safeParse(req.body);
   const requestedRole = parsed.success ? parsed.data.role : "";
-  const employee = req.auth?.employeeId ? await EmployeeAccount.findById(req.auth.employeeId).select("email apiRole roles primaryRole ownerProtected authorizationStatus").lean().exec() as any : null;
+  const employee = req.auth?.employeeId ? await EmployeeAccount.findOne({ _id: req.auth.employeeId, ...tenantScope(req) }).select("email tenantId accessLevel apiRole roles primaryRole ownerProtected authorizationStatus").lean().exec() as any : null;
   if (!employee || !requestedRole) return res.status(400).json({ error: "INVALID_ROLE" });
   const surface = String(req.headers["x-piki-surface"] || "admin").toLowerCase();
   const issued = await issueEmployeeSession(employee, surface, requestedRole);
@@ -516,7 +669,7 @@ app.post("/api/v1/auth/employee/logout", requireRole("admin", "partner", "rider"
   return res.status(204).end();
 });
 app.get("/api/v1/auth/employee/me", requireRole("admin", "partner", "rider", "fleet", "commercial", "gerente_comercial_zona", "finance", "support"), async (req, res) => {
-  const employee = req.auth?.employeeId ? await EmployeeAccount.findById(req.auth.employeeId).select("name email ownerProtected accessLevel authorizationStatus jobRole apiRole roles partnerRoles primaryRole zoneSlugs restaurantId restaurantIds").lean().exec() as any : null;
+  const employee = req.auth?.employeeId ? await EmployeeAccount.findOne({ _id: req.auth.employeeId, ...tenantScope(req) }).select("name email tenantId ownerProtected accessLevel authorizationStatus jobRole apiRole roles partnerRoles primaryRole zoneSlugs restaurantId restaurantIds").lean().exec() as any : null;
   const roles = partnerRolesForEmployee(employee);
   const permissions = [...permissionsForPartnerRoles(roles)];
   const locations = employee ? await partnerLocationsFor(employee, roles, permissions) : [];
@@ -550,7 +703,14 @@ app.post("/api/v1/admin/employees", requireOwner(), async (req, res) => {
   try {
     const employee = await EmployeeAccount.create({ ...parsed.data, roles, primaryRole, accessLevel: "subadmin", authorizationStatus: "approved", authorizedAt: new Date(), authorizedBy: req.auth?.employeeId ? objectId(req.auth.employeeId) : null, restaurantId: parsed.data.restaurantId ? objectId(parsed.data.restaurantId) : null, fleetId: parsed.data.fleetId ? objectId(parsed.data.fleetId) : null, apiRole, passwordHash: hashPassword(temporaryPassword), mustChangePassword: true, active: true });
     await AccessAuthorization.create({ employeeId: employee._id, action: "created", previousStatus: null, nextStatus: "approved", previousRole: null, nextRole: apiRole, accessLevel: "subadmin", actorEmployeeId: objectId(req.auth!.employeeId!), reason: "Cuenta creada y autorizada por RRHH superadmin." });
-    return res.status(201).json({ employee: { id: employee.id, name: employee.name, email: employee.email, jobRole: employee.jobRole, apiRole: employee.apiRole, roles: employee.roles?.length ? employee.roles : [employee.apiRole], primaryRole: employee.primaryRole || employee.apiRole, portfolioId: employee.portfolioId, fleetId: employee.fleetId, zoneSlugs: employee.zoneSlugs, active: employee.active }, temporaryPassword, warning: "Mostrar esta contraseña una sola vez y entregarla por un canal seguro." });
+    const surface = preferredCredentialSurface(employee);
+    let activationEmail: { sent: boolean; error?: string; surface?: EmployeeCredentialSurface } = { sent: false };
+    if (surface) {
+      const { delivery } = await sendEmployeePasswordLink(employee, surface, "activation");
+      activationEmail = { sent: delivery.sent, error: delivery.error, surface };
+      if (delivery.sent) await AccessAuthorization.create({ employeeId: employee._id, action: "credentials_sent", previousStatus: "approved", nextStatus: "approved", previousRole: apiRole, nextRole: apiRole, accessLevel: "subadmin", actorEmployeeId: objectId(req.auth!.employeeId!), reason: `Enlace de activación enviado para ${employeeCredentialLabels[surface]}.` });
+    }
+    return res.status(201).json({ employee: { id: employee.id, name: employee.name, email: employee.email, jobRole: employee.jobRole, apiRole: employee.apiRole, roles: employee.roles?.length ? employee.roles : [employee.apiRole], primaryRole: employee.primaryRole || employee.apiRole, portfolioId: employee.portfolioId, fleetId: employee.fleetId, zoneSlugs: employee.zoneSlugs, active: employee.active }, activationEmail, warning: activationEmail.sent ? undefined : "La cuenta se creó, pero no se pudo confirmar el envío del enlace. Usa “Enviar activación” cuando el correo corporativo esté disponible." });
   } catch (error) { if ((error as any)?.code === 11000) return res.status(409).json({ error: "EMPLOYEE_EMAIL_ALREADY_EXISTS" }); throw error; }
 });
 const onboardingRequestSchema = z.object({
@@ -634,6 +794,31 @@ app.post("/api/v1/admin/employees/:id/reset-password", requireOwner(), async (re
   const employee = await EmployeeAccount.findByIdAndUpdate(id, { $set: { passwordHash: hashPassword(parsed.data.newPassword), mustChangePassword: true, passwordChangedAt: new Date(), sessionHash: null, active: true } }, { new: true }).select("name email jobRole apiRole active mustChangePassword").lean().exec();
   await revokeEmployeeSessions(id);
   return res.json({ employee, reset: true });
+});
+app.post("/api/v1/admin/employees/:id/send-activation", requireOwner(), async (req, res) => {
+  const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
+  if (!id) return res.status(400).json({ error: "INVALID_EMPLOYEE_ID" });
+  const target = await EmployeeAccount.findById(id).select("_id name email jobRole apiRole roles primaryRole ownerProtected authorizationStatus active accessLevel tenantId").lean().exec() as any;
+  if (!target) return res.status(404).json({ error: "EMPLOYEE_NOT_FOUND" });
+  if (target.ownerProtected || target.email === ownerEmail) return res.status(403).json({ error: "OWNER_ACCOUNT_PROTECTED" });
+  if (!target.active || target.authorizationStatus !== "approved") return res.status(409).json({ error: "EMPLOYEE_NOT_APPROVED", message: "Aprueba la cuenta antes de enviar sus credenciales." });
+  const surface = preferredCredentialSurface(target);
+  if (!surface) return res.status(409).json({ error: "EMPLOYEE_SURFACE_NOT_CONFIGURED", message: "La cuenta no tiene un panel operativo configurado para recibir el enlace." });
+  const { delivery } = await sendEmployeePasswordLink(target, surface, "activation");
+  if (!delivery.sent) return res.status(503).json({ error: "CREDENTIAL_EMAIL_NOT_SENT", message: "No se pudo enviar el correo corporativo. Comprueba la configuración de correo y vuelve a intentarlo." });
+  await AccessAuthorization.create({
+    tenantId: target.tenantId || null,
+    employeeId: target._id,
+    action: "credentials_sent",
+    previousStatus: target.authorizationStatus,
+    nextStatus: target.authorizationStatus,
+    previousRole: target.apiRole,
+    nextRole: target.apiRole,
+    accessLevel: target.accessLevel || "subadmin",
+    actorEmployeeId: objectId(req.auth!.employeeId!),
+    reason: `Enlace de activación enviado para ${employeeCredentialLabels[surface]}.`,
+  });
+  return res.json({ sent: true, surface, recipient: target.email, message: `Se ha enviado un enlace de activación a ${target.email}.` });
 });
 app.patch("/api/v1/admin/employees/:id/authorization", requireOwner(), async (req, res) => {
   const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id); if (!id) return res.status(400).json({ error: "INVALID_EMPLOYEE_ID" });
@@ -742,13 +927,14 @@ app.get("/api/v1/catalog/restaurants", async (req, res) => {
   if (cached && cached.expiresAt > Date.now()) { res.setHeader("Cache-Control", "public, max-age=30, s-maxage=30, stale-while-revalidate=60, stale-if-error=120"); return res.json(cached.body); }
   const shared = await sharedCacheGet<{ restaurants: unknown[] }>(`piki:catalog:${cacheKey}`);
   if (shared) { catalogCache.set(cacheKey, { expiresAt: Date.now() + CATALOG_CACHE_MS, body: shared }); res.setHeader("Cache-Control", "public, max-age=30, s-maxage=30, stale-while-revalidate=60, stale-if-error=120"); return res.json(shared); }
-  const filter: Record<string, unknown> = { ...CUSTOMER_CATALOG_RESTAURANT_FILTER };
-  if (category && category !== "Todos") filter.category = category;
-  if (query) filter.$or = [{ name: { $regex: query, $options: "i" } }, { cuisine: { $regex: query, $options: "i" } }, { category: { $regex: query, $options: "i" } }];
+  const clauses: Record<string, unknown>[] = [CUSTOMER_CATALOG_RESTAURANT_FILTER];
+  if (category && category !== "Todos") clauses.push({ category });
+  if (query) clauses.push({ $or: [{ name: { $regex: query, $options: "i" } }, { cuisine: { $regex: query, $options: "i" } }, { category: { $regex: query, $options: "i" } }] });
+  const filter: Record<string, unknown> = clauses.length === 1 ? clauses[0] : { $and: clauses };
   const restaurants = await Restaurant.find(filter)
     // Explicit inclusion avoids MongoDB path-collision errors caused by
     // partnerProfile.documents having select:false nested fields.
-    .select("slug name cuisine category locality partnerGroupKey tagline etaMinutes deliveryFeeCents rating reviews promoted image accent phone address location menu isActive onboardingStatus")
+    .select("slug name cuisine category locality partnerGroupKey tagline etaMinutes deliveryFeeCents rating reviews promoted image accent phone address location menu isActive onboardingStatus availabilityStatus upcomingAt upcomingMessage")
     .sort({ promoted: -1, rating: -1, reviews: -1 }).lean().exec();
   const body = { restaurants: restaurants.map((restaurant: any) => presentCustomerCatalogRestaurant(restaurant)) };
   catalogCache.set(cacheKey, { expiresAt: Date.now() + CATALOG_CACHE_MS, body });
@@ -815,10 +1001,10 @@ app.get("/api/v1/coverage", async (req, res) => {
   let catalogAvailable = true;
   if (coverage.covered) {
     try {
-      const rows = await Restaurant.find(CUSTOMER_CATALOG_RESTAURANT_FILTER)
+      const rows = await Restaurant.find(CUSTOMER_ORDERABLE_RESTAURANT_FILTER)
         // Inclusive projection avoids a MongoDB path collision with the
         // select:false document payload nested under partnerProfile.
-        .select("slug name cuisine category locality tagline etaMinutes deliveryFeeCents rating reviews promoted image accent phone address location menu")
+        .select("slug name cuisine category locality tagline etaMinutes deliveryFeeCents rating reviews promoted image accent phone address location menu availabilityStatus upcomingAt upcomingMessage")
         .sort({ promoted: -1, rating: -1, reviews: -1 }).lean().exec();
       restaurants = rows.map((restaurant: any) => presentCustomerCatalogRestaurant(restaurant));
     } catch (error) {
@@ -893,29 +1079,34 @@ app.post("/api/v1/partners/onboarding", async (req, res) => {
   if (!parsed.success) return res.status(400).json({ error: "INVALID_PARTNER", details: parsed.error.flatten() });
   const requiredDocumentTypes = new Set(["tax_id", "bank_certificate", "activity_license", "insurance", "food_sanitary_authorization"]);
   if (![...requiredDocumentTypes].every((type) => parsed.data.documents.some((document) => document.type === type))) return res.status(400).json({ error: "REQUIRED_PARTNER_DOCUMENTS_MISSING", required: [...requiredDocumentTypes] });
-  for (const document of parsed.data.documents) {
-    const digest = createHash("sha256").update(Buffer.from(document.contentBase64, "base64")).digest("hex");
-    if (digest !== document.sha256) return res.status(400).json({ error: "PARTNER_DOCUMENT_CHECKSUM_MISMATCH", fileName: document.fileName });
+  let documents: Array<typeof parsed.data.documents[number]>;
+  try {
+    documents = await normalizeAndScanOnboardingDocuments(parsed.data.documents) as Array<typeof parsed.data.documents[number]>;
+  } catch (error) {
+    if (error instanceof MalwareDetectedError) return res.status(422).json({ error: "MALWARE_DETECTED" });
+    if (error instanceof MalwareScannerUnavailableError) return res.status(503).json({ error: "MALWARE_SCANNER_UNAVAILABLE" });
+    return res.status(400).json({ error: error instanceof Error ? error.message : "DOCUMENT_VALIDATION_FAILED" });
   }
-  const existingTaxId = await Restaurant.findOne({ "partnerProfile.taxId": parsed.data.taxId.toUpperCase() }).select("_id").lean().exec();
+  const publicTenant = await publicOnboardingTenantScope();
+  const existingTaxId = await Restaurant.findOne({ ...publicTenant, "partnerProfile.taxId": parsed.data.taxId.toUpperCase() }).select("_id").lean().exec();
   if (existingTaxId) return res.status(409).json({ error: "PARTNER_TAX_ID_ALREADY_EXISTS" });
   const normalizedEmail = parsed.data.email.toLowerCase();
   if (await EmployeeAccount.exists({ email: normalizedEmail })) return res.status(409).json({ error: "PARTNER_EMAIL_ALREADY_EXISTS", message: "Ya existe una solicitud o cuenta con este correo." });
   const slug = `${parsed.data.name.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "")}-${Date.now().toString(36)}`;
-  const { legalName, taxId, legalForm, representativeName, representativeRole, representativeDocument, fiscalAddress, operatingAddress, postalCode, city, province, iban, bankAccountHolder, cuisine, vatRate, commissionAccepted, termsAcceptedAt, contractAccepted, privacyAccepted, dataProcessingAccepted, pdaUnits, pdaUnitCostCents, pdaCostAccepted, pdaCostAcceptedAt, privacyAcceptedAt, dataProcessingAcceptedAt, openingHours, documents, password: _password, ...contact } = parsed.data;
+  const { legalName, taxId, legalForm, representativeName, representativeRole, representativeDocument, fiscalAddress, operatingAddress, postalCode, city, province, iban, bankAccountHolder, cuisine, vatRate, commissionAccepted, termsAcceptedAt, contractAccepted, privacyAccepted, dataProcessingAccepted, pdaUnits, pdaUnitCostCents, pdaCostAccepted, pdaCostAcceptedAt, privacyAcceptedAt, dataProcessingAcceptedAt, openingHours, documents: _incomingDocuments, password: _password, ...contact } = parsed.data;
   const locality = city.trim();
   const groupKey = localityKey(locality);
-  const partner = await Restaurant.create({ slug, name: contact.name, cuisine, category: cuisine, locality, partnerGroupKey: groupKey, address: operatingAddress, tagline: "Solicitud recibida por PIKI", onboardingStatus: "pending_review", isActive: false, email: contact.email, phone: contact.phone, partnerProfile: { legalName, taxId: taxId.toUpperCase(), legalForm, representativeName, representativeRole, representativeDocument, fiscalAddress, operatingAddress, postalCode, city, province, iban: iban.toUpperCase(), bankAccountHolder, cuisine, vatRate, commissionAccepted, termsAcceptedAt, contractAcceptedAt: contractAccepted ? termsAcceptedAt : null, privacyAcceptedAt, dataProcessingAcceptedAt, pdaUnits, pdaUnitCostCents, pdaCostAcceptedAt: pdaCostAccepted ? pdaCostAcceptedAt : null, openingHours, documents: documents.map(({ contentBase64, ...metadata }) => ({ ...metadata, contentBase64, status: "received" })) } });
+  const partner = await Restaurant.create({ ...publicTenant, slug, name: contact.name, cuisine, category: cuisine, locality, partnerGroupKey: groupKey, address: operatingAddress, tagline: "Solicitud recibida por PIKI", onboardingStatus: "pending_review", isActive: false, email: contact.email, phone: contact.phone, partnerProfile: { legalName, taxId: taxId.toUpperCase(), legalForm, representativeName, representativeRole, representativeDocument, fiscalAddress, operatingAddress, postalCode, city, province, iban: iban.toUpperCase(), bankAccountHolder, cuisine, vatRate, commissionAccepted, termsAcceptedAt, contractAcceptedAt: contractAccepted ? termsAcceptedAt : null, privacyAcceptedAt, dataProcessingAcceptedAt, pdaUnits, pdaUnitCostCents, pdaCostAcceptedAt: pdaCostAccepted ? pdaCostAcceptedAt : null, openingHours, documents: documents.map(({ contentBase64, ...metadata }) => ({ ...metadata, contentBase64, status: "received" })) } });
   try {
-    await EmployeeAccount.create({ name: contact.name, email: normalizedEmail, jobRole: "partner", apiRole: "partner", roles: ["partner"], partnerRoles: ["partner_admin"], accessLevel: "subadmin", authorizationStatus: "pending", restaurantId: partner._id, restaurantIds: [partner._id], passwordHash: hashPassword(parsed.data.password), mustChangePassword: false, active: false });
+    await EmployeeAccount.create({ ...publicTenant, name: contact.name, email: normalizedEmail, jobRole: "partner", apiRole: "partner", roles: ["partner"], partnerRoles: ["partner_admin"], accessLevel: "subadmin", authorizationStatus: "pending", restaurantId: partner._id, restaurantIds: [partner._id], passwordHash: hashPassword(parsed.data.password), mustChangePassword: false, active: false });
   } catch (error) {
     await Restaurant.findByIdAndDelete(partner._id).exec();
     if ((error as any)?.code === 11000) return res.status(409).json({ error: "PARTNER_EMAIL_ALREADY_EXISTS", message: "Ya existe una solicitud o cuenta con este correo." });
     throw error;
   }
-  await PartnerLocalityGroup.findOneAndUpdate({ localityKey: groupKey }, { $set: { localityName: locality, province, isActive: true }, $addToSet: { restaurantIds: partner._id } }, { upsert: true, new: true });
+  await PartnerLocalityGroup.findOneAndUpdate({ ...publicTenant, localityKey: groupKey }, { $set: { localityName: locality, province, isActive: true }, $setOnInsert: publicTenant, $addToSet: { restaurantIds: partner._id } }, { upsert: true, new: true });
   await notifyOnboarding({ channel: "admin", type: "onboarding.partner_application.created", entityId: String(partner._id), tenantId: (partner as any).tenantId });
-  res.status(201).json({ message: "Solicitud recibida para revisión.", partner: { id: partner.id, name: partner.name, email: partner.email, phone: partner.phone, locality, partnerGroupKey: groupKey, onboarding_status: partner.onboardingStatus } });
+  res.status(201).json({ message: "Solicitud recibida para revisión.", partner: { id: partner.id, partnerCode: onboardingCode("P", partner._id), name: partner.name, email: partner.email, phone: partner.phone, locality, partnerGroupKey: groupKey, onboarding_status: partner.onboardingStatus } });
 });
 
 function assignedRestaurantIds(employee: any): string[] {
@@ -928,11 +1119,23 @@ function assignedRestaurantIds(employee: any): string[] {
 
 async function partnerLocationsFor(employee: any, roles = partnerRolesForEmployee(employee), permissions = [...permissionsForPartnerRoles(roles)]) {
   const ids = assignedRestaurantIds(employee);
-  if (!ids.length) return [];
-  const restaurants = await Restaurant.find({ _id: { $in: ids }, ...(employee?.tenantId ? { tenantId: employee.tenantId } : {}) }).select("_id name address isActive onboardingStatus").lean().exec() as any[];
+  if (!employee?.tenantId) return [];
+  const tenantFilter = { tenantId: employee.tenantId };
+  let restaurants = ids.length
+    ? await Restaurant.find({ _id: { $in: ids }, ...tenantFilter }).select("_id name address email isActive onboardingStatus").lean().exec() as any[]
+    : [];
+  // Compatibilidad con cuentas de prueba/legacy creadas antes de guardar restaurantIds.
+  // Solo se acepta una coincidencia exacta de correo entre la cuenta y el comercio.
+  if (!restaurants.length && employee?.email) {
+    const email = String(employee.email).trim().toLowerCase();
+    if (email) restaurants = await Restaurant.find({ email, ...tenantFilter }).select("_id name address email isActive onboardingStatus").limit(10).lean().exec() as any[];
+  }
+  if (!restaurants.length) return [];
   const byId = new Map(restaurants.map((restaurant) => [String(restaurant._id), restaurant]));
-  return ids.map((id) => byId.get(id)).filter(Boolean).map((restaurant: any) => ({
+  const ordered = ids.length ? ids.map((id) => byId.get(id)).filter(Boolean) : restaurants;
+  return ordered.map((restaurant: any) => ({
     id: String(restaurant._id),
+    partnerCode: onboardingCode("P", restaurant._id),
     name: restaurant.name,
     address: restaurant.address || "",
     isOpen: Boolean(restaurant.isActive && restaurant.onboardingStatus === "approved"),
@@ -1033,6 +1236,93 @@ app.post("/api/v1/partners/menu/assets", requireRole("partner"), async (req, res
   await PartnerLocalityGroup.findOneAndUpdate({ localityKey: groupKey }, { $set: { localityName: locality, province: "Valencia", isActive: true }, $addToSet: { restaurantIds: objectId(restaurantId) } }, { upsert: true, new: true });
   return res.status(201).json({ asset: assetResponse(asset) });
 });
+function menuImportResponse(draft: any) {
+  return {
+    id: String(draft._id),
+    sourceAssetId: String(draft.sourceAssetId),
+    sourceFileName: draft.sourceFileName,
+    extractionMethod: draft.extractionMethod,
+    extractedLines: draft.extractedLines,
+    warnings: draft.warnings || [],
+    textPreview: draft.textPreview || "",
+    items: draft.items || [],
+    status: draft.status,
+    createdAt: draft.createdAt,
+    publishedAt: draft.publishedAt || null,
+  };
+}
+const importedMenuItemsSchema = z.array(partnerMenuItemSchema).max(500);
+app.post("/api/v1/partners/menu/imports", requireRole("partner"), async (req, res) => {
+  const { access, allowed } = await partnerRequestAccess(req, "menu:write");
+  if (!allowed) return res.status(403).json({ error: "PARTNER_PERMISSION_DENIED", permission: "menu:write" });
+  const restaurantId = await employeeRestaurant(req, access);
+  const parsed = z.object({ assetId: z.string().min(1) }).safeParse(req.body);
+  const assetId = parsed.success ? objectId(parsed.data.assetId) : null;
+  const createdBy = objectId(String(req.auth?.employeeId || ""));
+  if (!parsed.success || !assetId || !createdBy) return res.status(400).json({ error: "INVALID_MENU_IMPORT" });
+  if (!restaurantId) return res.status(403).json({ error: "PARTNER_RESTAURANT_NOT_ASSIGNED" });
+  const asset = await PartnerAsset.findOne({ _id: assetId, restaurantId: objectId(restaurantId), kind: { $in: MENU_ASSET_KINDS }, scanStatus: "clean" }).select("+contentBase64 fileName mimeType sizeBytes").lean().exec() as any;
+  if (!asset) return res.status(404).json({ error: "MENU_ASSET_NOT_FOUND" });
+  try {
+    const parsedMenu = await extractAndParseMenu(readAssetBytes(asset.contentBase64), asset.mimeType);
+    const draft = await MenuImportDraft.create({ restaurantId: objectId(restaurantId), sourceAssetId: asset._id, sourceFileName: asset.fileName, extractionMethod: parsedMenu.extractionMethod, extractedLines: parsedMenu.extractedLines, warnings: parsedMenu.warnings, textPreview: parsedMenu.textPreview, items: parsedMenu.items, createdBy, status: "draft" });
+    return res.status(201).json({ draft: menuImportResponse(draft) });
+  } catch (error) {
+    console.error("Menu import extraction failed", error instanceof Error ? error.message : error);
+    return res.status(422).json({ error: "MENU_EXTRACTION_FAILED", message: "No se ha podido extraer texto de la carta. Comprueba que el PDF sea legible o que el OCR esté disponible." });
+  }
+});
+app.get("/api/v1/partners/menu/imports/:id", requireRole("partner"), async (req, res) => {
+  const { access, allowed } = await partnerRequestAccess(req, "menu:read");
+  if (!allowed) return res.status(403).json({ error: "PARTNER_PERMISSION_DENIED", permission: "menu:read" });
+  const restaurantId = await employeeRestaurant(req, access);
+  const id = objectId(String(req.params.id));
+  if (!restaurantId || !id) return res.status(400).json({ error: "INVALID_MENU_IMPORT_ID" });
+  const draft = await MenuImportDraft.findOne({ _id: id, restaurantId: objectId(restaurantId) }).lean().exec();
+  if (!draft) return res.status(404).json({ error: "MENU_IMPORT_NOT_FOUND" });
+  return res.json({ draft: menuImportResponse(draft) });
+});
+app.put("/api/v1/partners/menu/imports/:id", requireRole("partner"), async (req, res) => {
+  const { access, allowed } = await partnerRequestAccess(req, "menu:write");
+  if (!allowed) return res.status(403).json({ error: "PARTNER_PERMISSION_DENIED", permission: "menu:write" });
+  const restaurantId = await employeeRestaurant(req, access);
+  const id = objectId(String(req.params.id));
+  const parsed = z.object({ items: importedMenuItemsSchema }).safeParse(req.body);
+  if (!restaurantId || !id || !parsed.success) return res.status(400).json({ error: "INVALID_MENU_IMPORT_ITEMS", details: parsed.success ? undefined : parsed.error.flatten() });
+  const draft = await MenuImportDraft.findOneAndUpdate({ _id: id, restaurantId: objectId(restaurantId), status: "draft" }, { $set: { items: parsed.data.items, reviewedBy: objectId(String(req.auth?.employeeId || "")) } }, { new: true }).lean().exec();
+  if (!draft) return res.status(404).json({ error: "MENU_IMPORT_NOT_FOUND_OR_CLOSED" });
+  return res.json({ draft: menuImportResponse(draft) });
+});
+app.post("/api/v1/partners/menu/imports/:id/publish", requireRole("partner"), async (req, res) => {
+  const { access, allowed } = await partnerRequestAccess(req, "menu:write");
+  if (!allowed) return res.status(403).json({ error: "PARTNER_PERMISSION_DENIED", permission: "menu:write" });
+  const restaurantId = await employeeRestaurant(req, access);
+  const id = objectId(String(req.params.id));
+  if (!restaurantId || !id) return res.status(400).json({ error: "INVALID_MENU_IMPORT_ID" });
+  const draft = await MenuImportDraft.findOne({ _id: id, restaurantId: objectId(restaurantId), status: "draft" }).lean().exec() as any;
+  if (!draft) return res.status(404).json({ error: "MENU_IMPORT_NOT_FOUND_OR_CLOSED" });
+  if (!Array.isArray(draft.items) || !draft.items.length) return res.status(409).json({ error: "MENU_IMPORT_EMPTY", message: "Añade al menos un producto antes de publicar." });
+  const session = await mongoose.startSession();
+  try {
+    let restaurant: any = null;
+    let published: any = null;
+    await session.withTransaction(async () => {
+      restaurant = await Restaurant.findOneAndUpdate({ _id: objectId(restaurantId), onboardingStatus: "approved" }, { $set: { menu: draft.items } }, { new: true, session }).select("name menu").lean().exec() as any;
+      if (!restaurant) throw new Error("RESTAURANT_NOT_APPROVED");
+      published = await MenuImportDraft.findOneAndUpdate({ _id: id, restaurantId: objectId(restaurantId), status: "draft" }, { $set: { status: "published", publishedAt: new Date(), reviewedBy: objectId(String(req.auth?.employeeId || "")) } }, { new: true, session }).lean().exec();
+      if (!published) throw new Error("MENU_IMPORT_NOT_FOUND_OR_CLOSED");
+    });
+    return res.json({ published: true, restaurant, draft: menuImportResponse(published) });
+  } catch (error) {
+    const code = error instanceof Error ? error.message : "MENU_IMPORT_PUBLISH_FAILED";
+    if (code === "RESTAURANT_NOT_APPROVED") return res.status(409).json({ error: code });
+    if (code === "MENU_IMPORT_NOT_FOUND_OR_CLOSED") return res.status(404).json({ error: code });
+    console.error("Menu import publish transaction failed", code);
+    return res.status(503).json({ error: "MENU_IMPORT_PUBLISH_FAILED", message: "No se pudo publicar la carta; no se han aplicado cambios parciales." });
+  } finally {
+    await session.endSession();
+  }
+});
 app.delete("/api/v1/partners/menu/assets/:id", requireRole("partner"), async (req, res) => {
   const restaurantId = await employeeRestaurant(req);
   const assetId = objectId(String(req.params.id));
@@ -1066,7 +1356,7 @@ app.get("/api/v1/partners/menu", requireRole("partner"), async (req, res) => {
   if (!allowed) return res.status(403).json({ error: "PARTNER_PERMISSION_DENIED", permission: "menu:read" });
   const restaurantId = await employeeRestaurant(req, access);
   if (!restaurantId) return res.status(403).json({ error: access?.restaurantIds.length ? "PARTNER_RESTAURANT_ACCESS_DENIED" : "PARTNER_RESTAURANT_NOT_ASSIGNED" });
-  const restaurant = await Restaurant.findById(restaurantId).select("name menu").lean().exec() as any;
+  const restaurant = await Restaurant.findById(restaurantId).select("name slug internalDemo menu").lean().exec() as any;
   if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
   return res.json({ restaurant, menu: restaurant.menu || [] });
 });
@@ -1105,7 +1395,40 @@ app.get("/api/v1/partners/kitchen/orders", requireRole("partner"), async (req, r
   const [restaurantRecord, customers] = await Promise.all([Restaurant.findOne({ _id: restaurantId, ...tenantScope(req) }).select("name address phone cuisine").lean().exec(), CustomerAccount.find({ _id: { $in: orders.map((order) => order.customerId).filter(Boolean) }, ...tenantScope(req) }).select("name email").lean().exec()]);
   const restaurant = restaurantRecord as any;
   const customerMap = new Map(customers.map((customer: any) => [String(customer._id), customer]));
-  return res.json({ orders: orders.map((order: any) => ({ ...order, restaurant: restaurant ? { name: restaurant.name, address: restaurant.address || "", phone: restaurant.phone || "", cuisine: restaurant.cuisine || "" } : null, customer: order.customerId ? customerMap.get(String(order.customerId)) || null : null, pickupQrUrl: order.status === "ready_for_pickup" ? pickupQrUrl(order.publicCode) : null, pickupPin: order.status === "ready_for_pickup" ? pickupQrPin(order.publicCode) : null, partnerPrepDeadlineAt: order.partnerPrepDeadlineAt || null, partnerPrepOverdue: Boolean(order.partnerPrepDeadlineAt && new Date(order.partnerPrepDeadlineAt).getTime() < Date.now()) })) });
+  return res.json({ orders: orders.map((order: any) => {
+    const linkedCustomer = order.customerId ? customerMap.get(String(order.customerId)) : null;
+    const customerName = String(linkedCustomer?.name || order.customerName || "").trim();
+    return {
+      ...order,
+      restaurant: restaurant ? { name: restaurant.name, address: restaurant.address || "", phone: restaurant.phone || "", cuisine: restaurant.cuisine || "" } : null,
+      customer: customerName ? { name: customerName, email: linkedCustomer?.email || "" } : null,
+      pickupQrUrl: order.status === "ready_for_pickup" ? pickupQrUrl(order.publicCode) : null,
+      pickupPin: order.status === "ready_for_pickup" ? pickupQrPin(order.publicCode) : null,
+      partnerPrepDeadlineAt: order.partnerPrepDeadlineAt || null,
+      partnerPrepOverdue: Boolean(order.partnerPrepDeadlineAt && new Date(order.partnerPrepDeadlineAt).getTime() < Date.now()),
+    };
+  }) });
+});
+const partnerPaymentSchema = z.object({
+  required: z.boolean(),
+  amountCents: z.number().int().min(0).max(1_000_000).nullable().optional(),
+});
+app.patch("/api/v1/partners/kitchen/orders/:id/partner-payment", requireRole("partner"), async (req, res) => {
+  const parsed = partnerPaymentSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "INVALID_PARTNER_PAYMENT", details: parsed.error.flatten() });
+  const { access, allowed } = await partnerRequestAccess(req, "orders:write");
+  if (!allowed) return res.status(403).json({ error: "PARTNER_PERMISSION_DENIED", permission: "orders:write" });
+  const restaurantId = await employeeRestaurant(req, access);
+  if (!restaurantId) return res.status(403).json({ error: "PARTNER_RESTAURANT_ACCESS_DENIED" });
+  const orderId = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
+  if (!orderId) return res.status(400).json({ error: "INVALID_ORDER_ID" });
+  const order = await Order.findOne({ _id: orderId, restaurantId, ...tenantScope(req), status: { $in: ["pending", "accepted", "preparing", "ready_for_pickup"] } });
+  if (!order) return res.status(404).json({ error: "ORDER_NOT_FOUND_OR_NOT_EDITABLE" });
+  order.partnerPaymentRequired = parsed.data.required;
+  order.partnerPaymentCents = parsed.data.required ? (parsed.data.amountCents ?? order.totalCents ?? 0) : null;
+  order.statusHistory.push({ status: order.status, actorRole: "partner", reason: parsed.data.required ? `Pago al Partner configurado: ${order.partnerPaymentCents} céntimos` : "Pago al Partner desactivado" } as any);
+  await order.save();
+  return res.json({ updated: true, partnerPaymentRequired: order.partnerPaymentRequired, partnerPaymentCents: order.partnerPaymentCents });
 });
 app.get("/api/v1/partners/kitchen/orders/archive", requireRole("partner"), async (req, res) => {
   const { access, allowed } = await partnerRequestAccess(req, "orders:read");
@@ -1179,6 +1502,7 @@ app.post("/api/v1/partners/support/tickets", requireRole("partner"), async (req,
     subject: parsed.data.subject,
     description: `[${restaurant.name}] ${parsed.data.description}`,
     orderId: order?._id || null,
+    orderReference: order?.publicCode || "",
     ticketNumber: `SUP-${new Date().toISOString().slice(0, 10).replace(/-/g, "")}-${randomInt(1000, 9999)}`,
     messages: [{ senderRole: "partner", body: parsed.data.description }],
     actions: [{ action: "partner_ticket_created", metadata: { restaurantId: String(restaurantId), restaurantName: restaurant.name, employeeId: String(req.auth?.employeeId || ""), orderRef: order?.publicCode || order?.displayCode || null } }],
@@ -1243,9 +1567,9 @@ app.patch("/api/v1/admin/employees/:id/partner-locations", requireOwner(), async
 
 app.get("/api/v1/admin/restaurants", requireRole("admin"), async (req, res) => {
   const status = typeof req.query.status === "string" ? req.query.status : undefined;
-  const filter = status ? { onboardingStatus: status } : {};
+  const filter = { ...tenantScope(req), ...(status ? { onboardingStatus: status } : {}) };
   const restaurants = await Restaurant.find(filter).sort({ createdAt: -1 }).limit(200).lean().exec();
-  return res.json({ restaurants });
+  return res.json({ restaurants: restaurants.map((restaurant: any) => ({ ...restaurant, partnerCode: onboardingCode("P", restaurant._id) })) });
 });
 
 app.patch("/api/v1/admin/restaurants/:id/customer-name", requireOwner(), async (req, res) => {
@@ -1268,24 +1592,25 @@ app.patch("/api/v1/admin/restaurants/:id/status", requireRole("admin"), async (r
   const id = objectId(idParam); if (!id) return res.status(400).json({ error: "INVALID_RESTAURANT_ID" });
   const parsed = z.object({ status: z.enum(["pending_review", "approved", "rejected", "suspended"]) }).safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_RESTAURANT_STATUS", details: parsed.error.flatten() });
-  const existing = await Restaurant.findById(id).select("partnerProfile onboardingStatus").lean().exec() as any;
+  const scope = tenantScope(req);
+  const existing = await Restaurant.findOne({ _id: id, ...scope }).select("partnerProfile onboardingStatus").lean().exec() as any;
   if (!existing) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
   if (["approved", "rejected"].includes(parsed.data.status)) {
     const documents = existing.partnerProfile?.documents || [];
     if (!documents.length || documents.some((document: any) => document.status === "received")) return res.status(409).json({ error: "PARTNER_DOCUMENT_REVIEW_REQUIRED", message: "Debes revisar todos los documentos del partner antes de aprobar o rechazar la solicitud." });
     if (parsed.data.status === "approved" && documents.some((document: any) => document.status !== "approved")) return res.status(409).json({ error: "PARTNER_DOCUMENTS_NOT_APPROVED", message: "No se puede aprobar: existe documentación del partner rechazada." });
   }
-  const restaurant = await Restaurant.findByIdAndUpdate(id, { $set: { onboardingStatus: parsed.data.status, isActive: parsed.data.status === "approved", onboardingReviewedBy: objectId(req.auth!.employeeId!), onboardingReviewedAt: new Date() } }, { new: true }).lean().exec() as any;
+  const restaurant = await Restaurant.findOneAndUpdate({ _id: id, ...scope }, { $set: { onboardingStatus: parsed.data.status, isActive: parsed.data.status === "approved", onboardingReviewedBy: objectId(req.auth!.employeeId!), onboardingReviewedAt: new Date() } }, { new: true }).lean().exec() as any;
   if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
-  const partnerAccount = await EmployeeAccount.findOne({ restaurantId: restaurant._id, apiRole: "partner" }).select("_id authorizationStatus").exec() as any;
+  const partnerAccount = await EmployeeAccount.findOne({ restaurantId: restaurant._id, apiRole: "partner", ...scope }).select("_id authorizationStatus").exec() as any;
   if (parsed.data.status === "approved" && !partnerAccount) {
-    await Restaurant.findByIdAndUpdate(id, { $set: { onboardingStatus: "pending_review", isActive: false } }).exec();
+    await Restaurant.updateOne({ _id: id, ...scope }, { $set: { onboardingStatus: "pending_review", isActive: false } }).exec();
     return res.status(409).json({ error: "PARTNER_ACCOUNT_MISSING", message: "La solicitud no tiene una cuenta Partner asociada." });
   }
   if (partnerAccount) {
     const approved = parsed.data.status === "approved";
     const nextStatus = approved ? "approved" : parsed.data.status === "rejected" ? "revoked" : "suspended";
-    await EmployeeAccount.findByIdAndUpdate(partnerAccount._id, { $set: { authorizationStatus: nextStatus, active: approved, authorizedAt: approved ? new Date() : null, authorizedBy: approved ? objectId(req.auth!.employeeId!) : null, authorizationReason: `Estado del comercio: ${parsed.data.status}`, ...(approved ? {} : { sessionHash: null }) } }).exec();
+    await EmployeeAccount.findOneAndUpdate({ _id: partnerAccount._id, ...scope }, { $set: { authorizationStatus: nextStatus, active: approved, authorizedAt: approved ? new Date() : null, authorizedBy: approved ? objectId(req.auth!.employeeId!) : null, authorizationReason: `Estado del comercio: ${parsed.data.status}`, ...(approved ? {} : { sessionHash: null }) } }).exec();
     if (!approved) await revokeEmployeeSessions(String(partnerAccount._id));
     await AccessAuthorization.create({ employeeId: partnerAccount._id, action: parsed.data.status, previousStatus: partnerAccount.authorizationStatus || "pending", nextStatus, previousRole: "partner", nextRole: "partner", accessLevel: "subadmin", actorEmployeeId: objectId(req.auth!.employeeId!), reason: `Estado del comercio: ${parsed.data.status}` });
   }
@@ -1313,19 +1638,18 @@ app.patch("/api/v1/admin/restaurants/:id/demo-visibility", requireOwner(), async
 app.get("/api/v1/admin/restaurants/:id/documents", requireRole("admin"), async (req, res) => {
   const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
   if (!id) return res.status(400).json({ error: "INVALID_RESTAURANT_ID" });
-  const restaurant = await Restaurant.findById(id).lean().exec() as any;
+  const restaurant = await Restaurant.findOne({ _id: id, ...tenantScope(req) }).lean().exec() as any;
   if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
   const profile = restaurant.partnerProfile || {};
-  return res.json({ restaurantId: restaurant._id, legalName: profile.legalName || null, taxId: profile.taxId || null, documents: (profile.documents || []).map(({ contentBase64, ...metadata }: any) => metadata) });
+  return res.json({ restaurantId: restaurant._id, partnerCode: onboardingCode("P", restaurant._id), legalName: profile.legalName || null, taxId: profile.taxId || null, documents: (profile.documents || []).map(({ contentBase64, ...metadata }: any) => metadata) });
 });
 app.get("/api/v1/admin/restaurants/:id/documents/:documentId/content", requireRole("admin"), async (req, res) => {
   const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
   if (!id) return res.status(400).json({ error: "INVALID_RESTAURANT_ID" });
-  const restaurant = await Restaurant.findOne({ _id: id, "partnerProfile.documents._id": req.params.documentId }).select("+partnerProfile.documents.contentBase64").lean().exec() as any;
+  const restaurant = await Restaurant.findOne({ _id: id, ...tenantScope(req), "partnerProfile.documents._id": req.params.documentId }).select("+partnerProfile.documents.contentBase64").lean().exec() as any;
   const document = restaurant?.partnerProfile?.documents?.find((item: any) => String(item._id) === req.params.documentId);
   if (!document) return res.status(404).json({ error: "DOCUMENT_NOT_FOUND" });
   if (document.mimeType !== "application/pdf") return res.status(415).json({ error: "DOCUMENT_PDF_REQUIRED", message: "Este expediente contiene un archivo antiguo no PDF. Solicita que se vuelva a subir en PDF." });
-  await Restaurant.updateOne({ _id: id, "partnerProfile.documents._id": req.params.documentId }, { $set: { "partnerProfile.documents.$.viewedAt": new Date(), "partnerProfile.documents.$.viewedBy": objectId(req.auth!.employeeId!) } }).exec().catch(() => undefined);
   return res.json({ fileName: document.fileName, mimeType: document.mimeType, sizeBytes: document.sizeBytes, sha256: document.sha256, contentBase64: document.contentBase64, viewedAt: new Date().toISOString() });
 });
 
@@ -1334,7 +1658,7 @@ app.patch("/api/v1/admin/restaurants/:id/documents/:documentId/status", requireR
   if (!restaurantId) return res.status(400).json({ error: "INVALID_RESTAURANT_ID" });
   const parsed = z.object({ status: z.enum(["received", "approved", "rejected"]), reviewNotes: z.string().max(1000).default("") }).safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_DOCUMENT_STATUS", details: parsed.error.flatten() });
-  const restaurant = await Restaurant.findOneAndUpdate({ _id: restaurantId, "partnerProfile.documents._id": req.params.documentId }, { $set: { "partnerProfile.documents.$.status": parsed.data.status, "partnerProfile.documents.$.reviewNotes": parsed.data.reviewNotes, "partnerProfile.documents.$.reviewedAt": new Date(), "partnerProfile.documents.$.reviewedBy": objectId(req.auth!.employeeId!) } }, { new: true }).lean().exec() as any;
+  const restaurant = await Restaurant.findOneAndUpdate({ _id: restaurantId, ...tenantScope(req), "partnerProfile.documents._id": req.params.documentId }, { $set: { "partnerProfile.documents.$.status": parsed.data.status, "partnerProfile.documents.$.reviewNotes": parsed.data.reviewNotes, "partnerProfile.documents.$.reviewedAt": new Date(), "partnerProfile.documents.$.reviewedBy": objectId(req.auth!.employeeId!) } }, { new: true }).lean().exec() as any;
   if (!restaurant) return res.status(404).json({ error: "DOCUMENT_NOT_FOUND" });
   const document = (restaurant.partnerProfile?.documents || []).find((item: any) => String(item._id) === req.params.documentId);
   return res.json({ restaurantId, document: document ? { _id: document._id, type: document.type, fileName: document.fileName, status: document.status } : null });
@@ -1368,12 +1692,16 @@ app.post("/api/v1/admin/:kind-leads/:id/documents", requireRole("admin", "commer
   const parsed = leadDocumentInputSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_LEAD_DOCUMENT", details: parsed.error.flatten() });
   if (!leadDocumentTypes[kind].includes(parsed.data.type)) return res.status(400).json({ error: "INVALID_LEAD_DOCUMENT_TYPE", allowed: leadDocumentTypes[kind] });
-  const rawBase64 = parsed.data.contentBase64.replace(/^data:[^;]+;base64,/, "");
-  const bytes = Buffer.from(rawBase64, "base64");
-  if (bytes.length !== parsed.data.sizeBytes) return res.status(400).json({ error: "LEAD_DOCUMENT_SIZE_MISMATCH" });
-  const digest = createHash("sha256").update(bytes).digest("hex");
-  if (digest.toLowerCase() !== parsed.data.sha256.toLowerCase()) return res.status(400).json({ error: "LEAD_DOCUMENT_CHECKSUM_MISMATCH" });
-  const lead = await Model.findByIdAndUpdate(id, { $push: { documents: { ...parsed.data, contentBase64: rawBase64, status: "received" } } }, { new: true }).select("name email documents").lean().exec() as any;
+  let normalized: ReturnType<typeof normalizeDocumentUpload>;
+  try {
+    normalized = normalizeDocumentUpload(parsed.data);
+    await scanUploadBuffers([{ buffer: normalized.bytes, originalName: sanitizeUploadFileName(parsed.data.fileName) }]);
+  } catch (error) {
+    if (error instanceof MalwareDetectedError) return res.status(422).json({ error: "MALWARE_DETECTED" });
+    if (error instanceof MalwareScannerUnavailableError) return res.status(503).json({ error: "MALWARE_SCANNER_UNAVAILABLE" });
+    return res.status(400).json({ error: error instanceof Error ? error.message : "DOCUMENT_VALIDATION_FAILED" });
+  }
+  const lead = await Model.findOneAndUpdate({ _id: id, ...await adminOnboardingScope(req) }, { $push: { documents: { ...parsed.data, fileName: sanitizeUploadFileName(parsed.data.fileName), sha256: parsed.data.sha256.toLowerCase(), contentBase64: normalized.contentBase64, status: "received" } } }, { new: true }).select("name email documents").lean().exec() as any;
   if (!lead) return res.status(404).json({ error: "LEAD_NOT_FOUND" });
   return res.status(201).json({ leadId: lead._id, documents: (lead.documents || []).map(({ contentBase64, ...metadata }: any) => metadata) });
 });
@@ -1383,7 +1711,7 @@ app.get("/api/v1/admin/:kind-leads/:id/documents", requireRole("admin", "commerc
   if (!Model || !id) return res.status(400).json({ error: "INVALID_LEAD_DOCUMENT_TARGET" });
   const lead = await Model.findOne({ _id: id, ...await onboardingScope(req) }).lean().exec() as any;
   if (!lead) return res.status(404).json({ error: "LEAD_NOT_FOUND" });
-  return res.json({ leadId: lead._id, name: lead.name, email: lead.email, documents: (lead.documents || []).map(({ contentBase64, ...metadata }: any) => metadata) });
+  return res.json({ leadId: lead._id, name: lead.name, email: lead.email, documents: lead.documents || [] });
 });
 app.get("/api/v1/admin/:kind-leads/:id/documents/:documentId/content", requireRole("admin", "commercial", "gerente_comercial_zona"), async (req, res) => {
   const Model = leadModel(Array.isArray(req.params.kind) ? req.params.kind[0] : req.params.kind) as any;
@@ -1393,7 +1721,6 @@ app.get("/api/v1/admin/:kind-leads/:id/documents/:documentId/content", requireRo
   const document = lead?.documents?.find((item: any) => String(item._id) === req.params.documentId);
   if (!document) return res.status(404).json({ error: "DOCUMENT_NOT_FOUND" });
   if (document.mimeType !== "application/pdf") return res.status(415).json({ error: "DOCUMENT_PDF_REQUIRED", message: "Este expediente contiene un archivo antiguo no PDF. Solicita que se vuelva a subir en PDF." });
-  await Model.updateOne({ _id: id, "documents._id": req.params.documentId }, { $set: { "documents.$.viewedAt": new Date(), "documents.$.viewedBy": objectId(req.auth!.employeeId!) } }).exec().catch(() => undefined);
   return res.json({ fileName: document.fileName, mimeType: document.mimeType, sizeBytes: document.sizeBytes, sha256: document.sha256, contentBase64: document.contentBase64, viewedAt: new Date().toISOString() });
 });
 app.patch("/api/v1/admin/:kind-leads/:id/documents/:documentId/status", requireRole("admin", "commercial", "gerente_comercial_zona"), async (req, res) => {
@@ -1440,19 +1767,29 @@ app.post("/api/v1/riders/applications", async (req, res) => {
   }
   if (parsed.data.vehicle === "electric_scooter") for (const required of ["scooter_responsible_declaration", "dgt_mvp_homologation"]) if (!documentTypes.has(required)) missing.push(required);
   if (missing.length) return res.status(400).json({ error: "REQUIRED_RIDER_DOCUMENTS_MISSING", required: missing });
-  const duplicate = await RiderApplication.findOne({ email: parsed.data.email.toLowerCase(), status: { $in: ["pending", "contacted", "approved"] } }).lean().exec();
+  let documents: Array<typeof parsed.data.documents[number]>;
+  try {
+    documents = await normalizeAndScanOnboardingDocuments(parsed.data.documents) as Array<typeof parsed.data.documents[number]>;
+  } catch (error) {
+    if (error instanceof MalwareDetectedError) return res.status(422).json({ error: "MALWARE_DETECTED" });
+    if (error instanceof MalwareScannerUnavailableError) return res.status(503).json({ error: "MALWARE_SCANNER_UNAVAILABLE" });
+    return res.status(400).json({ error: error instanceof Error ? error.message : "DOCUMENT_VALIDATION_FAILED" });
+  }
+  const publicTenant = await publicOnboardingTenantScope();
+  const duplicate = await RiderApplication.findOne({ ...publicTenant, email: parsed.data.email.toLowerCase(), status: { $in: ["pending", "contacted", "approved"] } }).lean().exec();
   if (duplicate) return res.status(409).json({ error: "APPLICATION_ALREADY_EXISTS" });
-  const application = await RiderApplication.create({ ...parsed.data, email: parsed.data.email.toLowerCase(), status: "pending", source: "rider_landing" });
+  const application = await RiderApplication.create({ ...parsed.data, ...publicTenant, documents, email: parsed.data.email.toLowerCase(), status: "pending", source: "rider_landing" });
   await notifyOnboarding({ channel: "admin", type: "onboarding.rider_application.created", entityId: String(application._id), tenantId: (application as any).tenantId });
-  return res.status(201).json({ message: "Solicitud recibida. El equipo Fleet se pondrá en contacto contigo.", application: { id: application.id, status: application.status } });
+  return res.status(201).json({ message: "Solicitud recibida. El equipo Fleet se pondrá en contacto contigo.", application: { id: application.id, applicationCode: onboardingCode("R", application._id), status: application.status } });
 });
 
 app.get("/api/v1/rider-applications", requireRole("admin"), async (req, res) => {
   const status = typeof req.query.status === "string" ? req.query.status : undefined;
   const leadStatus = status === "pending" ? "new" : status === "contacted" ? "info_requested" : status === "approved" ? "qualified" : status === "rejected" ? "rejected" : undefined;
+  const scope = await adminOnboardingScope(req);
   const [applications, leads] = await Promise.all([
-    RiderApplication.find(status ? { status } : {}).sort({ createdAt: -1 }).limit(200).lean().exec(),
-    RiderLead.find(leadStatus ? { status: leadStatus } : {}).sort({ createdAt: -1 }).limit(200).lean().exec(),
+    RiderApplication.find({ ...scope, ...(status ? { status } : {}) }).sort({ createdAt: -1 }).limit(200).lean().exec(),
+    RiderLead.find({ ...scope, ...(leadStatus ? { status: leadStatus } : {}) }).sort({ createdAt: -1 }).limit(200).lean().exec(),
   ]);
   const normalizedLeads = leads.map((lead: any) => ({
     ...lead,
@@ -1460,7 +1797,7 @@ app.get("/api/v1/rider-applications", requireRole("admin"), async (req, res) => 
     status: lead.status === "new" ? "pending" : lead.status === "info_requested" ? "contacted" : lead.status === "qualified" ? "approved" : "rejected",
     documents: [],
   }));
-  const normalizedApplications = applications.map((application: any) => ({ ...application, source: application.source || "rider_landing" }));
+  const normalizedApplications = applications.map((application: any) => ({ ...application, applicationCode: onboardingCode("R", application._id), source: application.source || "rider_landing" }));
   const combined = [...normalizedApplications, ...normalizedLeads].sort((a: any, b: any) => new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime()).slice(0, 200);
   return res.json({ applications: combined, counts: { applications: applications.length, webLeads: leads.length, total: combined.length } });
 });
@@ -1468,18 +1805,17 @@ app.get("/api/v1/rider-applications", requireRole("admin"), async (req, res) => 
 app.get("/api/v1/rider-applications/:id/documents", requireRole("admin"), async (req, res) => {
   const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
   if (!id) return res.status(400).json({ error: "INVALID_APPLICATION_ID" });
-  const application = await RiderApplication.findById(id).select("name email documents").lean().exec() as any;
+  const application = await RiderApplication.findOne({ _id: id, ...await adminOnboardingScope(req) }).select("name email documents").lean().exec() as any;
   if (!application) return res.status(404).json({ error: "APPLICATION_NOT_FOUND" });
-  return res.json({ applicationId: application._id, name: application.name, email: application.email, documents: (application.documents || []).map(({ contentBase64, ...metadata }: any) => metadata) });
+  return res.json({ applicationId: application._id, applicationCode: onboardingCode("R", application._id), name: application.name, email: application.email, documents: (application.documents || []).map(({ contentBase64, ...metadata }: any) => metadata) });
 });
 app.get("/api/v1/rider-applications/:id/documents/:documentId/content", requireRole("admin"), async (req, res) => {
   const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
   if (!id) return res.status(400).json({ error: "INVALID_APPLICATION_ID" });
-  const application = await RiderApplication.findOne({ _id: id, "documents._id": req.params.documentId }).select("+documents.contentBase64").lean().exec() as any;
+  const application = await RiderApplication.findOne({ _id: id, ...await adminOnboardingScope(req), "documents._id": req.params.documentId }).select("+documents.contentBase64").lean().exec() as any;
   const document = application?.documents?.find((item: any) => String(item._id) === req.params.documentId);
   if (!document) return res.status(404).json({ error: "DOCUMENT_NOT_FOUND" });
   if (document.mimeType !== "application/pdf") return res.status(415).json({ error: "DOCUMENT_PDF_REQUIRED", message: "Este expediente contiene un archivo antiguo no PDF. Solicita que se vuelva a subir en PDF." });
-  await RiderApplication.updateOne({ _id: id, "documents._id": req.params.documentId }, { $set: { "documents.$.viewedAt": new Date(), "documents.$.viewedBy": objectId(req.auth!.employeeId!) } }).exec().catch(() => undefined);
   return res.json({ fileName: document.fileName, mimeType: document.mimeType, sizeBytes: document.sizeBytes, sha256: document.sha256, contentBase64: document.contentBase64, viewedAt: new Date().toISOString() });
 });
 app.patch("/api/v1/rider-applications/:id/documents/:documentId/status", requireRole("admin"), async (req, res) => {
@@ -1487,7 +1823,7 @@ app.patch("/api/v1/rider-applications/:id/documents/:documentId/status", require
   if (!id) return res.status(400).json({ error: "INVALID_APPLICATION_ID" });
   const parsed = z.object({ status: z.enum(["approved", "rejected"]), reviewNotes: z.string().max(1000).default("") }).safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_DOCUMENT_STATUS", details: parsed.error.flatten() });
-  const application = await RiderApplication.findOneAndUpdate({ _id: id, "documents._id": req.params.documentId }, { $set: { "documents.$.status": parsed.data.status, "documents.$.reviewNotes": parsed.data.reviewNotes, "documents.$.reviewedAt": new Date(), "documents.$.reviewedBy": objectId(req.auth!.employeeId!) } }, { new: true }).select("name email documents").lean().exec() as any;
+  const application = await RiderApplication.findOneAndUpdate({ _id: id, ...await adminOnboardingScope(req), "documents._id": req.params.documentId }, { $set: { "documents.$.status": parsed.data.status, "documents.$.reviewNotes": parsed.data.reviewNotes, "documents.$.reviewedAt": new Date(), "documents.$.reviewedBy": objectId(req.auth!.employeeId!) } }, { new: true }).select("name email documents").lean().exec() as any;
   if (!application) return res.status(404).json({ error: "DOCUMENT_NOT_FOUND" });
   return res.json({ applicationId: application._id, documents: (application.documents || []).map(({ contentBase64, ...metadata }: any) => metadata) });
 });
@@ -1496,7 +1832,8 @@ app.patch("/api/v1/rider-applications/:id/status", requireRole("admin"), async (
   const id = objectId(idParam); if (!id) return res.status(400).json({ error: "INVALID_APPLICATION_ID" });
   const parsed = z.object({ status: z.enum(["pending", "contacted", "approved", "rejected"]), notes: z.string().max(1000).optional(), assignedFleetId: z.string().regex(/^[a-f\d]{24}$/).nullable().optional() }).safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_APPLICATION_STATUS", details: parsed.error.flatten() });
-  const existing = await RiderApplication.findById(id).select("documents status tenantId").lean().exec() as any;
+  const scope = await adminOnboardingScope(req);
+  const existing = await RiderApplication.findOne({ _id: id, ...scope }).select("documents status tenantId").lean().exec() as any;
   if (!existing) return res.status(404).json({ error: "APPLICATION_NOT_FOUND" });
   if (parsed.data.status === "approved") {
     const documents = existing.documents || [];
@@ -1507,12 +1844,14 @@ app.patch("/api/v1/rider-applications/:id/status", requireRole("admin"), async (
   const update: Record<string, unknown> = { status: parsed.data.status, notes: parsed.data.notes, reviewedBy: objectId(req.auth!.employeeId!), reviewedAt: new Date() };
   if (parsed.data.status === "approved") update.identityVerificationStatus = "verified";
   if (parsed.data.assignedFleetId !== undefined) update.assignedFleetId = parsed.data.assignedFleetId ? objectId(parsed.data.assignedFleetId) : null;
-  const application = await RiderApplication.findByIdAndUpdate(id, { $set: update }, { new: true }).lean().exec() as any;
+  const application = await RiderApplication.findOneAndUpdate({ _id: id, ...scope }, { $set: update }, { new: true }).lean().exec() as any;
   if (!application) return res.status(404).json({ error: "APPLICATION_NOT_FOUND" });
   let approvedRiderId = "";
   if (parsed.data.status === "approved") {
-    const existingRider = await Rider.findOne({ email: application.email }).select("_id riderCode").lean().exec() as any;
-    const approvedRider = await Rider.findOneAndUpdate({ email: application.email }, { $set: { tenantId: application.tenantId || null, ...buildApprovedRiderOperationalProfile(application), fleetId: application.assignedFleetId || null, status: "offline" }, $setOnInsert: { riderCode: existingRider?.riderCode || await nextRiderCode() } }, { upsert: true, new: true }).select("_id").lean().exec() as any;
+    const applicationTenantScope = application.tenantId ? { tenantId: application.tenantId } : { tenantId: null };
+    const existingRider = await Rider.findOne({ email: application.email }).select("_id tenantId riderCode").lean().exec() as any;
+    if (existingRider && String(existingRider.tenantId || "") !== String(application.tenantId || "")) return res.status(409).json({ error: "RIDER_EMAIL_OWNED_BY_ANOTHER_TENANT" });
+    const approvedRider = await Rider.findOneAndUpdate({ email: application.email, ...applicationTenantScope }, { $set: { tenantId: application.tenantId || null, ...buildApprovedRiderOperationalProfile(application), fleetId: application.assignedFleetId || null, status: "offline" }, $setOnInsert: { riderCode: existingRider?.riderCode || await nextRiderCode() } }, { upsert: true, new: true }).select("_id").lean().exec() as any;
     approvedRiderId = approvedRider ? String(approvedRider._id) : "";
   }
   if (existing.status !== parsed.data.status && ["approved", "rejected"].includes(parsed.data.status)) {
@@ -1522,7 +1861,7 @@ app.patch("/api/v1/rider-applications/:id/status", requireRole("admin"), async (
     if (parsed.data.status === "approved") await notifyOnboarding({ channel: "fleet", type, entityId: approvedRiderId || String(application._id), tenantId: (application as any).tenantId, payload });
   }
   const documentReviewPending = (application.documents || []).some((document: any) => document.status !== "approved");
-  return res.json({ application, documentReviewPending, warning: documentReviewPending ? "La solicitud se ha gestionado; el expediente documental continúa pendiente de revisión." : undefined });
+  return res.json({ application: { ...application, applicationCode: onboardingCode("R", application._id) }, documentReviewPending, warning: documentReviewPending ? "La solicitud se ha gestionado; el expediente documental continúa pendiente de revisión." : undefined });
 });
 
 
@@ -1585,19 +1924,38 @@ function normalizeDocumentBytes(contentBase64: string, sizeBytes: number, mimeTy
   if (digest !== sha256.toLowerCase()) throw new Error("DOCUMENT_CHECKSUM_MISMATCH");
   return { bytes, contentBase64: rawBase64 };
 }
+type IncomingOnboardingDocument = {
+  type: string;
+  fileName: string;
+  mimeType: string;
+  sizeBytes: number;
+  sha256: string;
+  contentBase64: string;
+};
+async function normalizeAndScanOnboardingDocuments<T extends IncomingOnboardingDocument>(documents: readonly T[]): Promise<T[]> {
+  const normalized = documents.map((document) => {
+    const upload = normalizeDocumentUpload(document);
+    return {
+      document: { ...document, fileName: sanitizeUploadFileName(document.fileName), sha256: document.sha256.toLowerCase(), contentBase64: upload.contentBase64 } as T,
+      bytes: upload.bytes,
+    };
+  });
+  if (normalized.length) await scanUploadBuffers(normalized.map(({ document, bytes }) => ({ buffer: bytes, originalName: document.fileName })));
+  return normalized.map(({ document }) => document);
+}
 type DocumentRequestSubjectType = "rider_application" | "restaurant" | "rider_lead" | "partner_lead";
 async function documentRequestSubject(subjectType: DocumentRequestSubjectType, subjectId: mongoose.Types.ObjectId, scope: Record<string, unknown>) {
   if (subjectType === "rider_application") {
-    const subject = await RiderApplication.findOne({ _id: subjectId, ...scope }).select("name email").lean().exec() as any;
-    return subject ? { id: subject._id as mongoose.Types.ObjectId, recipientName: String(subject.name || "Rider"), recipientEmail: String(subject.email || "").toLowerCase() } : null;
+    const subject = await RiderApplication.findOne({ _id: subjectId, ...scope }).select("name email tenantId").lean().exec() as any;
+    return subject ? { id: subject._id as mongoose.Types.ObjectId, tenantId: subject.tenantId || null, recipientName: String(subject.name || "Rider"), recipientEmail: String(subject.email || "").toLowerCase() } : null;
   }
   if (subjectType === "rider_lead" || subjectType === "partner_lead") {
     const Model = subjectType === "rider_lead" ? RiderLead : PartnerLead;
-    const subject = await Model.findOne({ _id: subjectId, ...scope }).select("name email").lean().exec() as any;
-    return subject ? { id: subject._id as mongoose.Types.ObjectId, recipientName: String(subject.name || (subjectType === "rider_lead" ? "Rider" : "Partner")), recipientEmail: String(subject.email || "").toLowerCase() } : null;
+    const subject = await Model.findOne({ _id: subjectId, ...scope }).select("name email tenantId").lean().exec() as any;
+    return subject ? { id: subject._id as mongoose.Types.ObjectId, tenantId: subject.tenantId || null, recipientName: String(subject.name || (subjectType === "rider_lead" ? "Rider" : "Partner")), recipientEmail: String(subject.email || "").toLowerCase() } : null;
   }
-  const subject = await Restaurant.findOne({ _id: subjectId, ...scope }).select("name email partnerProfile").lean().exec() as any;
-  return subject ? { id: subject._id as mongoose.Types.ObjectId, recipientName: String(subject.name || "Comercio"), recipientEmail: String(subject.email || "").toLowerCase(), hasProfile: Boolean(subject.partnerProfile) } : null;
+  const subject = await Restaurant.findOne({ _id: subjectId, ...scope }).select("name email tenantId partnerProfile").lean().exec() as any;
+  return subject ? { id: subject._id as mongoose.Types.ObjectId, tenantId: subject.tenantId || null, recipientName: String(subject.name || "Comercio"), recipientEmail: String(subject.email || "").toLowerCase(), hasProfile: Boolean(subject.partnerProfile) } : null;
 }
 function publicDocumentRequestResponse(request: any) {
   return { request: { id: String(request._id), recipientName: request.recipientName, message: request.message, requirements: (request.requirements || []).map((item: any) => ({ type: item.type, inputMode: item.inputMode || "file", label: item.label, description: item.description || "" })), dueAt: request.dueAt || null, expiresAt: request.expiresAt, status: request.status, uploadedTypes: [...new Set((request.documents || []).map((item: any) => item.type))] } };
@@ -1623,13 +1981,13 @@ app.post("/api/v1/admin/document-requests", requireRole("admin"), async (req, re
   const allowedTypes = parsed.data.subjectType === "rider_application" || parsed.data.subjectType === "rider_lead" ? riderDocumentRequestTypes : partnerDocumentRequestTypes;
   const requestedTypes = parsed.data.requirements.map((item) => item.type);
   if (requestedTypes.some((type) => !allowedTypes.has(type)) || new Set(requestedTypes).size !== requestedTypes.length) return res.status(400).json({ error: "INVALID_DOCUMENT_REQUIREMENTS" });
-  const subject = await documentRequestSubject(parsed.data.subjectType, subjectId, parsed.data.subjectType.endsWith("_lead") ? await onboardingScope(req) : tenantScope(req));
+  const subject = await documentRequestSubject(parsed.data.subjectType, subjectId, parsed.data.subjectType.endsWith("_lead") ? await adminOnboardingScope(req) : tenantScope(req));
   if (!subject) return res.status(404).json({ error: "DOCUMENT_REQUEST_SUBJECT_NOT_FOUND", message: "No se ha encontrado el aspirante dentro de tu ámbito de administración. Actualiza la bandeja y selecciona de nuevo su solicitud." });
   if (!subject.recipientEmail || !z.string().email().safeParse(subject.recipientEmail).success) return res.status(409).json({ error: "SUBJECT_EMAIL_REQUIRED", message: "Añade un correo de contacto válido antes de solicitar documentación." });
   if (parsed.data.subjectType === "restaurant" && !subject.hasProfile) return res.status(409).json({ error: "PARTNER_PROFILE_REQUIRED", message: "Este comercio no tiene expediente de partner para recibir documentación." });
   const token = randomBytes(32).toString("base64url");
   const expiresAt = new Date(Date.now() + 14 * 24 * 60 * 60_000);
-  const request = await DocumentRequest.create({ ...tenantScope(req), subjectType: parsed.data.subjectType, subjectId, recipientName: subject.recipientName, recipientEmail: subject.recipientEmail, createdBy, message: parsed.data.message, requirements: parsed.data.requirements, dueAt: parsed.data.dueAt || null, expiresAt, tokenHash: documentRequestTokenHash(token), tokenPrefix: token.slice(0, 8) });
+  const request = await DocumentRequest.create({ tenantId: subject.tenantId, subjectType: parsed.data.subjectType, subjectId, recipientName: subject.recipientName, recipientEmail: subject.recipientEmail, createdBy, message: parsed.data.message, requirements: parsed.data.requirements, dueAt: parsed.data.dueAt || null, expiresAt, tokenHash: documentRequestTokenHash(token), tokenPrefix: token.slice(0, 8) });
   await notifyOnboarding({ channel: "admin", type: "onboarding.document_request.created", entityId: String(request._id), tenantId: (request as any).tenantId, payload: { subjectType: request.subjectType, subjectId: String(subjectId) } });
   const uploadUrl = documentRequestUploadUrl(token);
   const mailtoUrl = `mailto:${encodeURIComponent(subject.recipientEmail)}?subject=${encodeURIComponent("PIKI · Documentación pendiente")}&body=${encodeURIComponent(`Hola ${subject.recipientName},\n\n${parsed.data.message}\n\nPuedes subir la documentación solicitada mediante este enlace seguro (válido hasta ${expiresAt.toLocaleDateString("es-ES")}):\n${uploadUrl}\n\nEquipo PIKI`)}`;
@@ -1658,7 +2016,7 @@ app.post("/api/v1/admin/document-requests/:id/send-email", requireRole("admin"),
   const id = objectId(String(req.params.id));
   const parsed = z.object({ token: z.string().regex(/^[A-Za-z0-9_-]{40,100}$/) }).safeParse(req.body);
   if (!id || !parsed.success) return res.status(400).json({ error: "INVALID_DOCUMENT_REQUEST_LINK", message: "El enlace documental no es válido." });
-  const request = await DocumentRequest.findOne({ _id: id, ...await onboardingScope(req) }).select("+tokenHash").lean().exec() as any;
+  const request = await DocumentRequest.findOne({ _id: id, ...await adminOnboardingScope(req) }).select("+tokenHash").lean().exec() as any;
   if (!request || request.tokenHash !== documentRequestTokenHash(parsed.data.token)) return res.status(404).json({ error: "DOCUMENT_REQUEST_NOT_FOUND", message: "El enlace no pertenece a esta solicitud." });
   if (request.status === "revoked" || new Date(request.expiresAt).getTime() <= Date.now()) return res.status(410).json({ error: "DOCUMENT_REQUEST_UNAVAILABLE", message: "El enlace ha caducado o ha sido revocado. Genera uno nuevo." });
   if (request.emailSentAt) return res.json({ emailSent: true, recipientEmail: request.recipientEmail, alreadySent: true });
@@ -1686,14 +2044,14 @@ app.get("/api/v1/admin/document-requests", requireRole("admin"), async (req, res
   if (subjectType && !subjectType.success) return res.status(400).json({ error: "INVALID_DOCUMENT_REQUEST_SUBJECT" });
   const subjectId = typeof req.query.subjectId === "string" ? objectId(req.query.subjectId) : null;
   if (req.query.subjectId !== undefined && !subjectId) return res.status(400).json({ error: "INVALID_DOCUMENT_REQUEST_SUBJECT_ID" });
-  const requests = await DocumentRequest.find({ ...await onboardingScope(req), ...(subjectType?.success ? { subjectType: subjectType.data } : {}), ...(subjectId ? { subjectId } : {}) }).sort({ createdAt: -1 }).limit(200).lean().exec();
+  const requests = await DocumentRequest.find({ ...await adminOnboardingScope(req), ...(subjectType?.success ? { subjectType: subjectType.data } : {}), ...(subjectId ? { subjectId } : {}) }).sort({ createdAt: -1 }).limit(200).lean().exec();
   return res.json({ requests: requests.map((request: any) => ({ id: String(request._id), subjectType: request.subjectType, subjectId: String(request.subjectId), recipientName: request.recipientName, recipientEmail: request.recipientEmail, status: request.status, requirements: request.requirements, documents: request.documents, dueAt: request.dueAt, expiresAt: request.expiresAt, createdAt: request.createdAt, emailSentAt: request.emailSentAt || null, submittedAt: request.submittedAt, revokedAt: request.revokedAt })) });
 });
 
 app.post("/api/v1/admin/document-requests/:id/revoke", requireRole("admin"), async (req, res) => {
   const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
   if (!id) return res.status(400).json({ error: "INVALID_DOCUMENT_REQUEST_ID" });
-  const request = await DocumentRequest.findOneAndUpdate({ _id: id, ...await onboardingScope(req), status: { $in: ["open", "partially_submitted", "submitted"] } }, { $set: { status: "revoked", revokedAt: new Date() } }, { new: true }).lean().exec() as any;
+  const request = await DocumentRequest.findOneAndUpdate({ _id: id, ...await adminOnboardingScope(req), status: { $in: ["open", "partially_submitted", "submitted"] } }, { $set: { status: "revoked", revokedAt: new Date() } }, { new: true }).lean().exec() as any;
   if (!request) return res.status(404).json({ error: "DOCUMENT_REQUEST_NOT_FOUND_OR_CLOSED" });
   return res.json({ request: { id: String(request._id), status: request.status, revokedAt: request.revokedAt } });
 });
@@ -1712,45 +2070,46 @@ app.post("/api/v1/public/document-requests/:token/documents", async (req, res) =
   if (requestState.unavailable) return res.status(410).json({ error: requestState.unavailable === "revoked" ? "DOCUMENT_REQUEST_REVOKED" : "DOCUMENT_REQUEST_EXPIRED" });
   const parsed = publicDocumentUploadSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_DOCUMENT_UPLOAD", details: parsed.error.flatten() });
-  const documentTypes = parsed.data.documents.map((document) => document.type);
-  const responseTypes = parsed.data.responses.map((response) => response.type);
-  const allowedTypes = new Set((requestState.request.requirements || []).map((item: any) => item.type));
-  if ([...documentTypes, ...responseTypes].some((type) => !allowedTypes.has(type)) || new Set(documentTypes).size !== documentTypes.length || new Set(responseTypes).size !== responseTypes.length) return res.status(400).json({ error: "DOCUMENT_TYPE_NOT_REQUESTED" });
-  const formRequirements = new Set((requestState.request.requirements || []).filter((item: any) => item.inputMode === "form").map((item: any) => item.type));
-  if (documentTypes.some((type) => formRequirements.has(type)) || responseTypes.some((type) => !formRequirements.has(type))) return res.status(400).json({ error: "DOCUMENT_INPUT_MODE_MISMATCH" });
+  const submission = validateDocumentRequestSubmission(requestState.request.requirements || [], parsed.data);
+  if (!submission.ok) return res.status(400).json({ error: submission.error });
   const uploaded = [] as Array<{ type: string; fileName: string; mimeType: string; sizeBytes: number; sha256: string; contentBase64: string }>;
   try {
-    for (const document of parsed.data.documents) {
-      const normalized = normalizeDocumentBytes(document.contentBase64, document.sizeBytes, document.mimeType, document.sha256);
-      await scanUploadBuffer(normalized.bytes, document.fileName);
-      uploaded.push({ ...document, sha256: document.sha256.toLowerCase(), contentBase64: normalized.contentBase64 });
+    const normalizedDocuments = parsed.data.documents.map((document) => ({ document, normalized: normalizeDocumentUpload(document) }));
+    if (normalizedDocuments.length) await scanUploadBuffers(normalizedDocuments.map(({ document, normalized }) => ({ buffer: normalized.bytes, originalName: sanitizeUploadFileName(document.fileName) })));
+    for (const { document, normalized } of normalizedDocuments) {
+      uploaded.push({ ...document, fileName: sanitizeUploadFileName(document.fileName), sha256: document.sha256.toLowerCase(), contentBase64: normalized.contentBase64 });
     }
   } catch (error) {
     if (error instanceof MalwareDetectedError) return res.status(422).json({ error: "MALWARE_DETECTED", message: "Uno de los archivos ha sido rechazado por seguridad." });
     if (error instanceof MalwareScannerUnavailableError) return res.status(503).json({ error: "MALWARE_SCANNER_UNAVAILABLE", message: "La carga está temporalmente bloqueada hasta completar el análisis de seguridad." });
     return res.status(400).json({ error: error instanceof Error ? error.message : "DOCUMENT_VALIDATION_FAILED" });
   }
-  const subjectDocuments = uploaded.map((document) => ({ ...document, _id: new mongoose.Types.ObjectId(), status: "received", reviewNotes: "", reviewedAt: null, reviewedBy: null, viewedAt: null, viewedBy: null }));
-  const uploadedTypes = uploaded.map((document) => document.type);
+  const subjectDocuments = uploaded.map((document) => ({ ...document, _id: new mongoose.Types.ObjectId(), documentRequestId: requestState.request._id, status: "received", reviewNotes: "", reviewedAt: null, reviewedBy: null, viewedAt: null, viewedBy: null }));
   const formResponses = parsed.data.responses.map((response) => ({ type: response.type, value: response.value, completedAt: new Date() }));
-  const completedTypes = new Set([...uploadedTypes, ...formResponses.map((response) => response.type)]);
+  const targetScope = requestState.request.tenantId ? { tenantId: requestState.request.tenantId } : { tenantId: null };
   if (requestState.request.subjectType === "rider_application") {
-    const result = await RiderApplication.updateOne({ _id: requestState.request.subjectId }, [{ $set: { documents: { $concatArrays: [{ $filter: { input: { $ifNull: ["$documents", []] }, as: "doc", cond: { $not: [{ $in: ["$$doc.type", { $literal: uploadedTypes }] }] } } }, { $literal: subjectDocuments }] } } }] as any).exec();
+    const result = await RiderApplication.updateOne({ _id: requestState.request.subjectId, ...targetScope }, [{ $set: { documents: { $concatArrays: [{ $filter: { input: { $ifNull: ["$documents", []] }, as: "doc", cond: { $not: [{ $in: ["$$doc.type", { $literal: submission.uploadedTypes }] }] } } }, { $literal: subjectDocuments }] } } }] as any).exec();
     if (!result.matchedCount) return res.status(410).json({ error: "DOCUMENT_REQUEST_SUBJECT_GONE" });
   } else if (requestState.request.subjectType === "restaurant") {
-    const result = await Restaurant.updateOne({ _id: requestState.request.subjectId, "partnerProfile": { $exists: true } }, [{ $set: { "partnerProfile.documents": { $concatArrays: [{ $filter: { input: { $ifNull: ["$partnerProfile.documents", []] }, as: "doc", cond: { $not: [{ $in: ["$$doc.type", { $literal: uploadedTypes }] }] } } }, { $literal: subjectDocuments }] } } }] as any).exec();
+    const result = await Restaurant.updateOne({ _id: requestState.request.subjectId, ...targetScope, "partnerProfile": { $exists: true } }, [{ $set: { "partnerProfile.documents": { $concatArrays: [{ $filter: { input: { $ifNull: ["$partnerProfile.documents", []] }, as: "doc", cond: { $not: [{ $in: ["$$doc.type", { $literal: submission.uploadedTypes }] }] } } }, { $literal: subjectDocuments }] } } }] as any).exec();
     if (!result.matchedCount) return res.status(410).json({ error: "DOCUMENT_REQUEST_SUBJECT_GONE" });
   } else {
     const Model = requestState.request.subjectType === "rider_lead" ? RiderLead : PartnerLead;
-    const result = await Model.updateOne({ _id: requestState.request.subjectId }, [{ $set: { documents: { $concatArrays: [{ $filter: { input: { $ifNull: ["$documents", []] }, as: "doc", cond: { $not: [{ $in: ["$$doc.type", { $literal: uploadedTypes }] }] } } }, { $literal: subjectDocuments }] } } }] as any).exec();
+    const result = await Model.updateOne({ _id: requestState.request.subjectId, ...targetScope }, [{ $set: { documents: { $concatArrays: [{ $filter: { input: { $ifNull: ["$documents", []] }, as: "doc", cond: { $not: [{ $in: ["$$doc.type", { $literal: submission.uploadedTypes }] }] } } }, { $literal: subjectDocuments }] } } }] as any).exec();
     if (!result.matchedCount) return res.status(410).json({ error: "DOCUMENT_REQUEST_SUBJECT_GONE" });
   }
-  const existingMetadata = (requestState.request.documents || []).filter((document: any) => !uploadedTypes.includes(document.type));
+  const existingMetadata = (requestState.request.documents || []).filter((document: any) => !submission.uploadedTypes.includes(document.type));
   const metadata = [...existingMetadata, ...uploaded.map(documentRequestMetadata)];
-  const completed = (requestState.request.requirements || []).every((requirement: any) => completedTypes.has(requirement.type) || (requestState.request.formResponses || []).some((response: any) => response.type === requirement.type));
-  const updated = await DocumentRequest.findByIdAndUpdate(requestState.request._id, { $set: { documents: metadata, formResponses: [...(requestState.request.formResponses || []).filter((response: any) => !formResponses.some((next: any) => next.type === response.type)), ...formResponses], status: completed ? "submitted" : "partially_submitted", submittedAt: new Date(), lastAccessedAt: new Date() } }, { new: true }).lean().exec() as any;
-  await notifyOnboarding({ channel: "admin", type: "onboarding.document_request.uploaded", entityId: String(updated._id), tenantId: updated.tenantId, payload: { subjectType: updated.subjectType, subjectId: String(updated.subjectId), uploadedTypes } });
-  await sendDocumentUploadEmail({ requestId: String(updated._id), subjectType: updated.subjectType, subjectName: requestState.request.recipientName, subjectEmail: requestState.request.recipientEmail, uploadedTypes, uploadedFiles: uploaded.map((document) => document.fileName), completed });
+  const updatedFormResponses = [...(requestState.request.formResponses || []).filter((response: any) => !submission.responseTypes.includes(response.type)), ...formResponses];
+  const completedDocumentTypes = new Set(metadata.map((document: any) => document.type));
+  const completedResponseTypes = new Set(updatedFormResponses.map((response: any) => response.type));
+  const completed = (requestState.request.requirements || []).every((requirement: any) => (requirement.inputMode || "file") === "form" ? completedResponseTypes.has(requirement.type) : completedDocumentTypes.has(requirement.type));
+  const updated = await DocumentRequest.findOneAndUpdate({ _id: requestState.request._id, ...targetScope }, { $set: { documents: metadata, formResponses: updatedFormResponses, status: completed ? "submitted" : "partially_submitted", submittedAt: new Date(), lastAccessedAt: new Date() } }, { new: true }).lean().exec() as any;
+  if (!updated) return res.status(410).json({ error: "DOCUMENT_REQUEST_SUBJECT_GONE" });
+  void Promise.allSettled([
+    notifyOnboarding({ channel: "admin", type: "onboarding.document_request.uploaded", entityId: String(updated._id), tenantId: updated.tenantId, payload: { subjectType: updated.subjectType, subjectId: String(updated.subjectId), uploadedTypes: submission.uploadedTypes } }),
+    sendDocumentUploadEmail({ requestId: String(updated._id), subjectType: updated.subjectType, subjectName: requestState.request.recipientName, subjectEmail: requestState.request.recipientEmail, uploadedTypes: submission.uploadedTypes, uploadedFiles: uploaded.map((document) => document.fileName), completed }),
+  ]);
   return res.status(201).json({ message: completed ? "Documentación enviada para revisión." : "Documentación parcial recibida. Puedes continuar con los requisitos pendientes.", ...publicDocumentRequestResponse(updated) });
 });
 
@@ -1966,10 +2325,10 @@ app.post("/api/v1/orders", rateLimit(20, 60_000, "orders-create"), async (req, r
   const serviceFeeCents = coverage.serviceFeeCents;
   const totalCents = subtotalCents + deliveryFeeCents + serviceFeeCents;
   if (!isCashOrderWithinLimit(parsed.data.paymentMethod, totalCents)) return res.status(422).json(cashOrderLimitError(totalCents));
-  const publicCode = `PIKI-${Date.now().toString(36).toUpperCase()}`;
+  const publicCode = await createRandomOrderCode();
   const dailyCode = await createDailyDisplayCode();
   const authenticatedCustomer = await currentCustomer(req) as any;
-  const order = await Order.create({ tenantId: restaurant.tenantId || null, publicCode, ...dailyCode, restaurantId: restaurant._id, customerId: authenticatedCustomer?._id || null, items: normalizedItems, deliveryAddress: parsed.data.deliveryAddress, deliveryNote: parsed.data.deliveryNote, deliveryLocation: { type: "Point", coordinates: deliveryPoint }, coveragePolicySlug: coverage.policySlug, coveragePolicyVersion: coverage.policyVersion, coverageDecision: coverage.reason, straightLineDistanceKm: coverage.straightLineDistanceKm, withinMunicipality: coverage.withinMunicipality, deliveryBaseFeeCents: coverage.deliveryBaseFeeCents, outsideMunicipalitySurchargeCents: coverage.outsideMunicipalitySurchargeCents, routeDistanceKm: route.routeDistanceKm, routeDurationMinutes: route.routeDurationMinutes, routeProvider: route.routeProvider, routingDegraded: route.routingDegraded, requiredVehicleClasses: route.requiredVehicleClasses, subtotalCents, deliveryFeeCents, serviceFeeCents, totalCents, paymentMethod: parsed.data.paymentMethod, paymentState: "pending", statusHistory: [{ status: "pending", actorRole: "customer", reason: parsed.data.paymentMethod === "cash" ? "Pedido a contrarreembolso; cobro pendiente hasta la entrega" : "Pedido creado con política de cobertura Xàtiva" }] });
+  const order = await Order.create({ tenantId: restaurant.tenantId || null, publicCode, ...dailyCode, restaurantId: restaurant._id, customerId: authenticatedCustomer?._id || null, customerName: String(authenticatedCustomer?.name || "").trim(), items: normalizedItems, deliveryAddress: parsed.data.deliveryAddress, deliveryNote: parsed.data.deliveryNote, deliveryLocation: { type: "Point", coordinates: deliveryPoint }, coveragePolicySlug: coverage.policySlug, coveragePolicyVersion: coverage.policyVersion, coverageDecision: coverage.reason, straightLineDistanceKm: coverage.straightLineDistanceKm, withinMunicipality: coverage.withinMunicipality, deliveryBaseFeeCents: coverage.deliveryBaseFeeCents, outsideMunicipalitySurchargeCents: coverage.outsideMunicipalitySurchargeCents, routeDistanceKm: route.routeDistanceKm, routeDurationMinutes: route.routeDurationMinutes, routeProvider: route.routeProvider, routingDegraded: route.routingDegraded, requiredVehicleClasses: route.requiredVehicleClasses, subtotalCents, deliveryFeeCents, serviceFeeCents, totalCents, paymentMethod: parsed.data.paymentMethod, paymentState: "pending", statusHistory: [{ status: "pending", actorRole: "customer", reason: parsed.data.paymentMethod === "cash" ? "Pedido a contrarreembolso; cobro pendiente hasta la entrega" : "Pedido creado con política de cobertura Xàtiva" }] });
   if (parsed.data.paymentMethod === "cash") {
     const dispatch = queueAutomaticDispatch(order._id as mongoose.Types.ObjectId).catch((error) => console.warn("Immediate cash-order dispatch failed", error instanceof Error ? error.message : error));
     await Promise.all([dispatch, publishOrderIntakeEvents(order, { settlement: "cash_due", message: "Contrarreembolso: el Rider cobrará en efectivo al entregar." })]);
@@ -1977,7 +2336,7 @@ app.post("/api/v1/orders", rateLimit(20, 60_000, "orders-create"), async (req, r
   res.status(201).json({ order: { id: order.id, publicCode, displayCode: order.displayCode, displayCodeDate: order.displayCodeDate, status: order.status, paymentState: parsed.data.paymentMethod === "cash" ? "pending_cash_collection" : order.paymentState, paymentMethod: parsed.data.paymentMethod, cashDueAtDelivery: parsed.data.paymentMethod === "cash", deliveryQrUrl: deliveryQrUrl(publicCode), subtotalCents, deliveryFeeCents, serviceFeeCents, totalCents, coverage, route, partnerPreparationLimitMinutes: PARTNER_PREPARATION_LIMIT_MINUTES, customerDeliveryTargetMinutes: CUSTOMER_DELIVERY_TARGET_MINUTES, etaMinutes: calculateEtaRange([PARTNER_PREPARATION_LIMIT_MINUTES, PARTNER_PREPARATION_LIMIT_MINUTES], [5, 15]) } });
 });
 
-const customerOrderSyncSchema = z.object({ publicCode: z.string().trim().min(6).max(64), restaurantSlug: z.string().trim().min(1).max(120), customerId: z.string().nullable().optional(), deliveryAddress: z.string().trim().min(5).max(1000), deliveryNote: z.string().trim().max(500).default(""), deliveryLocation: z.object({ latitude: z.number().finite(), longitude: z.number().finite() }).nullable().optional(), items: z.array(z.object({ itemId: z.string().min(1), name: z.string().min(1), quantity: z.number().int().min(1).max(20), unitPriceCents: z.number().int().min(0), totalCents: z.number().int().min(0).optional() })).min(1), subtotalCents: z.number().int().min(0), deliveryFeeCents: z.number().int().min(0), serviceFeeCents: z.number().int().min(0), totalCents: z.number().int().min(0), paymentMethod: z.enum(["stripe", "cash"]).default("stripe"), paymentState: z.enum(["pending", "authorized", "paid", "failed", "refunded"]).default("pending"), stripeCheckoutSessionId: z.string().nullable().optional(), stripePaymentIntentId: z.string().nullable().optional() });
+const customerOrderSyncSchema = z.object({ publicCode: z.string().trim().min(6).max(64), restaurantSlug: z.string().trim().min(1).max(120), customerId: z.string().nullable().optional(), customerName: z.string().trim().max(160).nullable().optional(), deliveryAddress: z.string().trim().min(5).max(1000), deliveryNote: z.string().trim().max(500).default(""), deliveryLocation: z.object({ latitude: z.number().finite(), longitude: z.number().finite() }).nullable().optional(), items: z.array(z.object({ itemId: z.string().min(1), name: z.string().min(1), quantity: z.number().int().min(1).max(20), unitPriceCents: z.number().int().min(0), totalCents: z.number().int().min(0).optional() })).min(1), subtotalCents: z.number().int().min(0), deliveryFeeCents: z.number().int().min(0), serviceFeeCents: z.number().int().min(0), totalCents: z.number().int().min(0), paymentMethod: z.enum(["stripe", "cash"]).default("stripe"), paymentState: z.enum(["pending", "authorized", "paid", "failed", "refunded"]).default("pending"), stripeCheckoutSessionId: z.string().nullable().optional(), stripePaymentIntentId: z.string().nullable().optional() });
 app.post("/api/v1/internal/customer-orders/sync", async (req, res) => {
   const expected = process.env.PIKI_CUSTOMER_SYNC_SECRET;
   if (!expected || req.header("x-piki-customer-sync-secret") !== expected) return res.status(401).json({ error: "INVALID_SYNC_AUTH" });
@@ -1993,7 +2352,7 @@ app.post("/api/v1/internal/customer-orders/sync", async (req, res) => {
   // Customer is the source of truth: never rebuild lines from a second menu copy.
   // This prevents price/name drift between Customer, Partner and Rider screens.
   const canonicalItems = input.items.map(({ itemId, name, quantity, unitPriceCents, totalCents }) => ({ itemId, name, quantity, unitPriceCents, ...(totalCents == null ? {} : { totalCents }) }));
-  const order = await Order.findOneAndUpdate({ publicCode: input.publicCode }, { $set: { tenantId: restaurant.tenantId || null, restaurantId: restaurant._id, customerId: input.customerId || null, items: canonicalItems, deliveryAddress: input.deliveryAddress, deliveryNote: input.deliveryNote, deliveryLocation: location, subtotalCents: input.subtotalCents, deliveryFeeCents: input.deliveryFeeCents, serviceFeeCents: input.serviceFeeCents, totalCents: input.totalCents, paymentMethod: input.paymentMethod, paymentState: input.paymentState, ...(input.stripeCheckoutSessionId !== undefined ? { stripeCheckoutSessionId: input.stripeCheckoutSessionId } : {}), ...(input.stripePaymentIntentId !== undefined ? { stripePaymentIntentId: input.stripePaymentIntentId } : {}), ...(["authorized", "paid"].includes(input.paymentState) && !["authorized", "paid"].includes(existing?.paymentState || "") ? { status: "pending", assignmentState: "unassigned" } : {}) }, $setOnInsert: { publicCode: input.publicCode, status: "pending", assignmentState: "unassigned", statusHistory: [{ status: "pending", actorRole: "system", reason: "Pedido sincronizado desde PIKI Customer" }] } }, { upsert: true, new: true, setDefaultsOnInsert: true }).lean().exec() as any;
+  const order = await Order.findOneAndUpdate({ publicCode: input.publicCode }, { $set: { tenantId: restaurant.tenantId || null, restaurantId: restaurant._id, customerId: input.customerId || null, ...(input.customerName !== undefined ? { customerName: input.customerName || "" } : {}), items: canonicalItems, deliveryAddress: input.deliveryAddress, deliveryNote: input.deliveryNote, deliveryLocation: location, subtotalCents: input.subtotalCents, deliveryFeeCents: input.deliveryFeeCents, serviceFeeCents: input.serviceFeeCents, totalCents: input.totalCents, paymentMethod: input.paymentMethod, paymentState: input.paymentState, ...(input.stripeCheckoutSessionId !== undefined ? { stripeCheckoutSessionId: input.stripeCheckoutSessionId } : {}), ...(input.stripePaymentIntentId !== undefined ? { stripePaymentIntentId: input.stripePaymentIntentId } : {}), ...(["authorized", "paid"].includes(input.paymentState) && !["authorized", "paid"].includes(existing?.paymentState || "") ? { status: "pending", assignmentState: "unassigned" } : {}) }, $setOnInsert: { publicCode: input.publicCode, status: "pending", assignmentState: "unassigned", statusHistory: [{ status: "pending", actorRole: "system", reason: "Pedido sincronizado desde PIKI Customer" }] } }, { upsert: true, new: true, setDefaultsOnInsert: true }).lean().exec() as any;
   const newlyPaid = ["authorized", "paid"].includes(input.paymentState) && !["authorized", "paid"].includes(existing?.paymentState || "");
   const newCashOrder = input.paymentMethod === "cash" && !existing;
   if (newlyPaid || newCashOrder) {
@@ -2020,11 +2379,12 @@ app.post("/api/v1/internal/customer-support/tickets", async (req, res) => {
   const input = parsed.data;
   let orderId: mongoose.Types.ObjectId | null = null;
   if (input.orderRef) {
-    const order = await Order.findOne({ ...supportOrderFilter(input.orderRef), customerId: input.customerId }).select("_id").lean().exec() as any;
+    const order = await Order.findOne({ ...supportOrderFilter(input.orderRef), customerId: input.customerId }).select("_id publicCode").lean().exec() as any;
     if (!order) return res.status(404).json({ error: "CUSTOMER_ORDER_NOT_FOUND" });
     orderId = order._id;
   }
-  const ticket = await SupportTicket.create({ customerId: input.customerId, reporterEmail: input.customerEmail, sourceSurface: "customer", sourceRole: "customer", category: input.category, priority: input.priority, subject: input.subject, description: input.description, orderId, ticketNumber: `SUP-${new Date().toISOString().slice(0, 10).replace(/-/g, "")}-${randomInt(1000, 9999)}`, actions: [{ action: "ticket_created", metadata: { sourceSurface: "customer", customerId: input.customerId, customerName: input.customerName, orderRef: input.orderRef || null } }] });
+  const linkedOrder = orderId ? await Order.findById(orderId).select("publicCode").lean().exec() as any : null;
+  const ticket = await SupportTicket.create({ customerId: input.customerId, reporterEmail: input.customerEmail, sourceSurface: "customer", sourceRole: "customer", category: input.category, priority: input.priority, subject: input.subject, description: input.description, orderId, orderReference: linkedOrder?.publicCode || "", ticketNumber: `SUP-${new Date().toISOString().slice(0, 10).replace(/-/g, "")}-${randomInt(1000, 9999)}`, actions: [{ action: "ticket_created", metadata: { sourceSurface: "customer", customerId: input.customerId, customerName: input.customerName, orderRef: linkedOrder?.publicCode || input.orderRef || null } }] });
   return res.status(201).json({ ticket: { _id: ticket._id, ticketNumber: ticket.ticketNumber, subject: ticket.subject, description: ticket.description, category: ticket.category, priority: ticket.priority, status: ticket.status, reporterEmail: ticket.reporterEmail, messages: ticket.messages, createdAt: ticket.createdAt, updatedAt: ticket.updatedAt } });
 });
 app.post("/api/v1/internal/customer-support/tickets/list", async (req, res) => {
@@ -2056,6 +2416,17 @@ app.post("/api/v1/internal/customer-orders/:publicCode/messages", async (req, re
     const body = String(req.body?.body || "").trim();
     if (!body || body.length > 500) return res.status(400).json({ error: "INVALID_MESSAGE" });
     const message = await RiderOrderMessage.create({ orderId: order._id, riderId: order.riderId, senderRole: "customer", body });
+    // The Rider receives an encrypted device push (when enabled) and a durable
+    // realtime signal. The notification deliberately excludes message text and
+    // contact details; the authenticated order chat remains the only place to read it.
+    void publishRealtimeEvent({
+      channel: "rider",
+      audienceKey: `rider:${String(order.riderId)}`,
+      tenantId: order.tenantId || null,
+      type: "order.message",
+      payload: { orderId: String(order._id), publicCode: order.publicCode, status: order.status, senderRole: "customer" },
+      dedupeKey: `order:message:customer:${String(message._id)}`,
+    }).catch((error) => console.warn("Customer-to-rider message notification failed", error instanceof Error ? error.message : "unknown error"));
     return res.status(201).json({ id: String(message._id), senderRole: message.senderRole, body: message.body, createdAt: message.createdAt });
   }
   const messages = await RiderOrderMessage.find({ orderId: order._id }).sort({ createdAt: 1 }).limit(100).lean().exec();
@@ -2096,6 +2467,7 @@ const supportTicketInput = z.object({ orderRef: z.string().trim().max(120).optio
 const supportMessageInput = z.object({ body: z.string().trim().min(1).max(2000) });
 const supportStatusInput = z.object({ status: z.enum(["open", "in_progress", "waiting", "resolved", "closed"]) });
 const supportCancelInput = z.object({ reason: z.string().trim().min(10).max(500), ticketId: z.string().optional() });
+const supportReassignInput = z.object({ reason: z.string().trim().min(10).max(500), ticketId: z.string().optional() });
 function supportOrderFilter(ref: string): Record<string, unknown> { const id = objectId(ref); return id ? { _id: id } : { $or: [{ publicCode: ref }, { displayCode: ref }] }; }
 async function enrichSupportTickets(tickets: any[]) {
   const orderIds = tickets.map((ticket) => ticket.orderId?._id || ticket.orderId).filter((id) => id && mongoose.isValidObjectId(id));
@@ -2104,48 +2476,52 @@ async function enrichSupportTickets(tickets: any[]) {
   const customerIds = orders.map((order) => order.customerId).filter((id) => mongoose.isValidObjectId(String(id))).map((id) => new mongoose.Types.ObjectId(String(id)));
   const customers = customerIds.length ? await CustomerAccount.find({ _id: { $in: customerIds } }).select("name email deliveryAddress").lean().exec() as any[] : [];
   const customerMap = new Map(customers.map((customer) => [String(customer._id), customer]));
-  const orderMap = new Map(orders.map((order) => [String(order._id), { ...order, customer: order.customerId ? customerMap.get(String(order.customerId)) || null : null, customerPhone: order.customerPhone || null }]));
+  const orderMap = new Map(orders.map((order) => { const linkedCustomer = order.customerId ? customerMap.get(String(order.customerId)) : null; const customerName = String(linkedCustomer?.name || order.customerName || "").trim(); return [String(order._id), { ...order, customer: customerName ? { name: customerName, email: linkedCustomer?.email || "" } : null, customerPhone: order.customerPhone || null }]; }));
   return tickets.map((ticket) => { const orderId = ticket.orderId?._id || ticket.orderId; const order = orderMap.get(String(orderId)); return order ? { ...ticket, orderId: order } : ticket; });
 }
 const supportRoles = ["admin", "partner", "rider", "fleet", "commercial", "gerente_comercial_zona", "support"] as const;
+// A person may hold an Admin account while operating from the separate PIKI Support surface.
+// This grants the Support workflow only; the Admin UI no longer exposes the inbox.
+const supportOperatorRoles = ["support", "admin"] as const;
+const supportInboxRoles = ["support", "admin", "finance"] as const;
 const financeTicketCategories = ["billing", "finance"] as const;
 const isFinanceTicketCategory = (category: string) => financeTicketCategories.includes(category as typeof financeTicketCategories[number]);
 const ticketRoleScope = (req: express.Request): Record<string, unknown> => req.auth?.role === "finance" ? { category: { $in: financeTicketCategories } } : req.auth?.role === "support" ? { category: { $nin: financeTicketCategories } } : {};
 app.post("/api/v1/support/tickets", requireRole(...supportRoles), async (req, res) => {
   const parsed = supportTicketInput.safeParse(req.body); if (!parsed.success) return res.status(400).json({ error: "INVALID_SUPPORT_TICKET", details: parsed.error.flatten() });
   if (req.auth?.role === "support" && isFinanceTicketCategory(parsed.data.category)) return res.status(403).json({ error: "SUPPORT_TICKET_CATEGORY_RESTRICTED" });
-  const order = parsed.data.orderRef ? await Order.findOne({ ...tenantScope(req), ...supportOrderFilter(parsed.data.orderRef) }).select("_id").lean().exec() as any : null;
+  const order = parsed.data.orderRef ? await Order.findOne({ ...supportTenantScope(req), ...supportOrderFilter(parsed.data.orderRef) }).select("_id").lean().exec() as any : null;
   if (parsed.data.orderRef && !order) return res.status(404).json({ error: "ORDER_NOT_FOUND" });
   const actorEmployeeId = objectId(String(req.auth?.employeeId || ""));
   const sourceSurface = String(req.header("x-piki-surface") || "admin").toLowerCase();
-  const ticket = await SupportTicket.create({ ...parsed.data, reporterEmail: parsed.data.reporterEmail || "", sourceSurface, sourceRole: req.auth?.role || "", orderId: order?._id || null, ticketNumber: `SUP-${new Date().toISOString().slice(0, 10).replace(/-/g, "")}-${randomInt(1000, 9999)}`, createdBy: actorEmployeeId, actions: [{ action: "ticket_created", actorEmployeeId, metadata: { orderRef: parsed.data.orderRef || null, sourceSurface, sourceRole: req.auth?.role || null } }] });
+  const ticket = await SupportTicket.create({ ...parsed.data, reporterEmail: parsed.data.reporterEmail || "", sourceSurface, sourceRole: req.auth?.role || "", orderId: order?._id || null, orderReference: order?.publicCode || parsed.data.orderRef || "", ticketNumber: `SUP-${new Date().toISOString().slice(0, 10).replace(/-/g, "")}-${randomInt(1000, 9999)}`, createdBy: actorEmployeeId, actions: [{ action: "ticket_created", actorEmployeeId, metadata: { orderRef: order?.publicCode || parsed.data.orderRef || null, sourceSurface, sourceRole: req.auth?.role || null } }] });
   return res.status(201).json({ ticket });
 });
 app.get("/api/v1/support/tickets/mine", requireRole(...supportRoles), async (req, res) => {
-  const tickets = await SupportTicket.find({ ...tenantScope(req), ...ticketRoleScope(req), $or: [{ createdBy: objectId(String(req.auth?.employeeId || "")) }, { reporterEmail: String(req.query.email || "").toLowerCase() }] }).sort({ updatedAt: -1 }).limit(100).lean().exec();
+  const tickets = await SupportTicket.find({ ...supportTenantScope(req), ...ticketRoleScope(req), $or: [{ createdBy: objectId(String(req.auth?.employeeId || "")) }, { reporterEmail: String(req.query.email || "").toLowerCase() }] }).sort({ updatedAt: -1 }).limit(100).lean().exec();
   return res.json({ tickets });
 });
-app.get("/api/v1/admin/support/orders/search", requireRole("admin", "support"), async (req, res) => {
+app.get("/api/v1/admin/support/orders/search", requireRole(...supportOperatorRoles), async (req, res) => {
   const q = typeof req.query.q === "string" ? req.query.q.trim() : "";
   if (q.length < 2) return res.json({ orders: [] });
-  const orders = await Order.find({ ...tenantScope(req), ...supportOrderFilter(q) }).sort({ createdAt: -1 }).limit(25).select("_id publicCode displayCode status paymentState paymentMethod riderId restaurantId customerId totalCents createdAt statusHistory").populate("riderId", "name riderCode email").populate("restaurantId", "name").lean().exec();
+  const orders = await Order.find({ ...supportTenantScope(req), ...supportOrderFilter(q) }).sort({ createdAt: -1 }).limit(25).select("_id publicCode displayCode status paymentState paymentMethod riderId restaurantId customerId totalCents createdAt statusHistory").populate("riderId", "name riderCode email").populate("restaurantId", "name").lean().exec();
   return res.json({ orders });
 });
-app.get("/api/v1/admin/support/tickets", requireRole("admin", "support", "finance"), async (req, res) => {
-  const filter: Record<string, unknown> = { ...tenantScope(req), ...ticketRoleScope(req) };
+app.get("/api/v1/admin/support/tickets", requireRole(...supportInboxRoles), async (req, res) => {
+  const filter: Record<string, unknown> = { ...supportTenantScope(req), ...ticketRoleScope(req) };
   if (typeof req.query.status === "string" && req.query.status !== "all") filter.status = req.query.status;
   if (typeof req.query.q === "string" && req.query.q.trim()) { const q = req.query.q.trim(); filter.$or = [{ ticketNumber: q }, { reporterEmail: { $regex: q, $options: "i" } }, { subject: { $regex: q, $options: "i" } }]; }
   const tickets = await SupportTicket.find(filter).sort({ updatedAt: -1 }).limit(500).populate("assignedTo", "name email").lean().exec();
   return res.json({ tickets: await enrichSupportTickets(tickets) });
 });
-app.post("/api/v1/admin/support/tickets", requireRole("admin", "support", "finance"), async (req, res) => {
+app.post("/api/v1/admin/support/tickets", requireRole(...supportInboxRoles), async (req, res) => {
   const parsed = supportTicketInput.safeParse(req.body); if (!parsed.success) return res.status(400).json({ error: "INVALID_SUPPORT_TICKET", details: parsed.error.flatten() });
   if (req.auth?.role === "finance" && !isFinanceTicketCategory(parsed.data.category)) return res.status(403).json({ error: "FINANCE_TICKET_CATEGORY_REQUIRED" });
   if (req.auth?.role === "support" && isFinanceTicketCategory(parsed.data.category)) return res.status(403).json({ error: "SUPPORT_TICKET_CATEGORY_RESTRICTED" });
-  const order = parsed.data.orderRef ? await Order.findOne({ ...tenantScope(req), ...supportOrderFilter(parsed.data.orderRef) }).select("_id").lean().exec() as any : null;
+  const order = parsed.data.orderRef ? await Order.findOne({ ...supportTenantScope(req), ...supportOrderFilter(parsed.data.orderRef) }).select("_id").lean().exec() as any : null;
   if (parsed.data.orderRef && !order) return res.status(404).json({ error: "ORDER_NOT_FOUND" });
   const actorEmployeeId = objectId(String(req.auth?.employeeId || ""));
-  const ticket = await SupportTicket.create({ ...parsed.data, orderId: order?._id || null, ticketNumber: `SUP-${new Date().toISOString().slice(0, 10).replace(/-/g, "")}-${randomInt(1000, 9999)}`, createdBy: actorEmployeeId, actions: [{ action: "ticket_created", actorEmployeeId, metadata: { orderRef: parsed.data.orderRef || null } }] });
+  const ticket = await SupportTicket.create({ ...parsed.data, sourceSurface: "support", sourceRole: req.auth?.role || "support", orderId: order?._id || null, orderReference: order?.publicCode || parsed.data.orderRef || "", ticketNumber: `SUP-${new Date().toISOString().slice(0, 10).replace(/-/g, "")}-${randomInt(1000, 9999)}`, createdBy: actorEmployeeId, actions: [{ action: "ticket_created", actorEmployeeId, metadata: { orderRef: order?.publicCode || parsed.data.orderRef || null, sourceSurface: "support" } }] });
   return res.status(201).json({ ticket });
 });
 async function supportAgent(req: express.Request) {
@@ -2156,47 +2532,83 @@ async function riderForSupportTicket(ticket: any) {
   const rider = ticket.reporterEmail ? await Rider.findOne({ email: ticket.reporterEmail }).select("_id").lean().exec() as any : null;
   return rider ? String(rider._id) : null;
 }
-app.post("/api/v1/admin/support/tickets/:id/messages", requireRole("admin", "support", "finance"), async (req, res) => {
+app.post("/api/v1/admin/support/tickets/:id/messages", requireRole(...supportInboxRoles), async (req, res) => {
   const parsed = supportMessageInput.safeParse(req.body); if (!parsed.success) return res.status(400).json({ error: "INVALID_SUPPORT_MESSAGE" });
   const id = objectId(String(req.params.id)); if (!id) return res.status(400).json({ error: "INVALID_TICKET_ID" });
   const agent = await supportAgent(req); if (!agent) return res.status(403).json({ error: "SUPPORT_AGENT_NOT_FOUND" });
-  const agentDisplayName = String(agent.name || agent.email || "Agente de soporte").trim().split(/\s+/).slice(0, 2).join(" ");
-  const current = await SupportTicket.findOne({ _id: id, ...tenantScope(req), ...ticketRoleScope(req) }).lean().exec() as any;
+  const agentDisplayName = String(agent.name || agent.email || "Agente de soporte").trim().slice(0, 160);
+  const current = await SupportTicket.findOne({ _id: id, ...supportTenantScope(req), ...ticketRoleScope(req) }).lean().exec() as any;
   if (!current) return res.status(404).json({ error: "TICKET_NOT_FOUND" });
   if (["resolved", "closed"].includes(current.status)) return res.status(409).json({ error: "SUPPORT_CHAT_CLOSED" });
   if (current.assignedTo && String(current.assignedTo) !== String(agent._id)) return res.status(409).json({ error: "SUPPORT_TICKET_ASSIGNED", assignedTo: String(current.assignedTo) });
-  const ticket = await SupportTicket.findOneAndUpdate({ _id: id, ...tenantScope(req), ...ticketRoleScope(req), $or: [{ assignedTo: null }, { assignedTo: agent._id }] }, { $push: { messages: { senderRole: "support", senderEmployeeId: agent._id, senderName: agentDisplayName, body: parsed.data.body } }, $set: { status: "in_progress", assignedTo: agent._id, agentTypingAt: null } }, { new: true }).populate("assignedTo", "name email").lean().exec() as any;
+  const hasSupportReply = Array.isArray(current.messages) && current.messages.some((message: any) => message?.senderRole === "support");
+  const messages = [
+    ...(hasSupportReply ? [] : [{ senderRole: "support", senderEmployeeId: agent._id, senderName: agentDisplayName, body: `¡Hola!\n\nSoy ${agentDisplayName}, la persona que te ayudará hoy.` }]),
+    { senderRole: "support", senderEmployeeId: agent._id, senderName: agentDisplayName, body: parsed.data.body },
+  ];
+  const ticket = await SupportTicket.findOneAndUpdate({ _id: id, ...supportTenantScope(req), ...ticketRoleScope(req), $or: [{ assignedTo: null }, { assignedTo: agent._id }] }, { $push: { messages: { $each: messages } }, $set: { status: "in_progress", assignedTo: agent._id, agentTypingAt: null } }, { new: true }).populate("assignedTo", "name email").lean().exec() as any;
   const riderId = await riderForSupportTicket(current);
   if (riderId) void publishRealtimeEvent({ channel: "rider", audienceKey: `rider:${riderId}`, tenantId: current.tenantId, type: "support.message", payload: { ticketId: String(id), status: ticket?.status, senderRole: "support" } });
   void publishRealtimeEvent({ channel: "admin", audienceKey: tenantAudienceKey(current.tenantId, "admin"), tenantId: current.tenantId, type: "support.message", payload: { ticketId: String(id), status: ticket?.status, senderRole: "support" } }).catch(() => undefined);
   return res.json({ ticket });
 });
-app.patch("/api/v1/admin/support/tickets/:id/status", requireRole("admin", "support", "finance"), async (req, res) => {
+app.patch("/api/v1/admin/support/tickets/:id/status", requireRole(...supportInboxRoles), async (req, res) => {
   const parsed = supportStatusInput.safeParse(req.body); if (!parsed.success) return res.status(400).json({ error: "INVALID_SUPPORT_STATUS" });
   const id = objectId(String(req.params.id)); if (!id) return res.status(400).json({ error: "INVALID_TICKET_ID" });
   const actorEmployeeId = objectId(String(req.auth?.employeeId || ""));
   const agent = await supportAgent(req); if (!agent) return res.status(403).json({ error: "SUPPORT_AGENT_NOT_FOUND" });
-  const current = await SupportTicket.findOne({ _id: id, ...tenantScope(req), ...ticketRoleScope(req) }).select("assignedTo category").lean().exec() as any;
+  const current = await SupportTicket.findOne({ _id: id, ...supportTenantScope(req), ...ticketRoleScope(req) }).select("assignedTo category").lean().exec() as any;
   if (!current) return res.status(404).json({ error: "TICKET_NOT_FOUND" });
   if (current.assignedTo && String(current.assignedTo) !== String(agent._id)) return res.status(409).json({ error: "SUPPORT_TICKET_ASSIGNED", assignedTo: String(current.assignedTo) });
-  const ticket = await SupportTicket.findOneAndUpdate({ _id: id, ...tenantScope(req), ...ticketRoleScope(req) }, { $set: { status: parsed.data.status, assignedTo: agent._id, ...(parsed.data.status === "resolved" || parsed.data.status === "closed" ? { resolvedAt: new Date() } : {}) }, $push: { actions: { action: "status_changed", actorEmployeeId, reason: parsed.data.status === "closed" ? `Conversación cerrada por ${String(agent.name || agent.email || "Agente de soporte").trim().split(/\s+/).slice(0, 2).join(" ")}.` : "", metadata: { status: parsed.data.status, agentName: String(agent.name || agent.email || "Agente de soporte").trim().split(/\s+/).slice(0, 2).join(" ") } } } }, { new: true }).populate("assignedTo", "name email").lean().exec();
+  const ticket = await SupportTicket.findOneAndUpdate({ _id: id, ...supportTenantScope(req), ...ticketRoleScope(req) }, { $set: { status: parsed.data.status, assignedTo: agent._id, ...(parsed.data.status === "resolved" || parsed.data.status === "closed" ? { resolvedAt: new Date() } : {}) }, $push: { actions: { action: "status_changed", actorEmployeeId, reason: parsed.data.status === "closed" ? `Conversación cerrada por ${String(agent.name || agent.email || "Agente de soporte").trim().split(/\s+/).slice(0, 2).join(" ")}.` : "", metadata: { status: parsed.data.status, agentName: String(agent.name || agent.email || "Agente de soporte").trim().split(/\s+/).slice(0, 2).join(" ") } } } }, { new: true }).populate("assignedTo", "name email").lean().exec();
   if (!ticket) return res.status(404).json({ error: "TICKET_NOT_FOUND" });
   void publishRealtimeEvent({ channel: "admin", audienceKey: tenantAudienceKey((ticket as any).tenantId, "admin"), tenantId: (ticket as any).tenantId, type: "support.ticket_updated", payload: { ticketId: String(id), status: (ticket as any).status, senderRole: "support" } }).catch(() => undefined);
   return res.json({ ticket });
 });
-app.post("/api/v1/admin/support/orders/:id/cancel", requireRole("admin", "support"), async (req, res) => {
+app.post("/api/v1/admin/support/orders/:id/cancel", requireRole(...supportOperatorRoles), async (req, res) => {
   const parsed = supportCancelInput.safeParse(req.body); if (!parsed.success) return res.status(400).json({ error: "INVALID_SUPPORT_CANCELLATION", details: parsed.error.flatten() });
   const orderId = objectId(String(req.params.id)); if (!orderId) return res.status(400).json({ error: "INVALID_ORDER_ID" });
-  const order = await Order.findOne({ _id: orderId, ...tenantScope(req) }).lean().exec() as any;
+  const order = await Order.findOne({ _id: orderId, ...supportTenantScope(req) }).lean().exec() as any;
   if (!order) return res.status(404).json({ error: "ORDER_NOT_FOUND" });
   if (["delivered", "cancelled"].includes(order.status)) return res.status(409).json({ error: "ORDER_ALREADY_CLOSED", status: order.status });
   const updated = await Order.findOneAndUpdate({ _id: orderId, status: order.status, version: order.version }, { $set: { status: "cancelled", cancelledAt: new Date() }, $inc: { version: 1 }, $push: { statusHistory: { status: "cancelled", actorRole: "admin", reason: parsed.data.reason } } }, { new: true }).lean().exec();
   if (!updated) return res.status(409).json({ error: "ORDER_CHANGED_RETRY" });
   await releaseRiderOrderSlot(orderId, order.riderId);
   const actorEmployeeId = objectId(String(req.auth?.employeeId || ""));
-  if (parsed.data.ticketId) await SupportTicket.updateOne({ _id: objectId(parsed.data.ticketId), ...tenantScope(req) }, { $push: { actions: { action: "order_cancelled", actorEmployeeId, reason: parsed.data.reason, metadata: { orderId: String(orderId) } } } }).exec();
+  if (parsed.data.ticketId) await SupportTicket.updateOne({ _id: objectId(parsed.data.ticketId), ...supportTenantScope(req) }, { $push: { actions: { action: "order_cancelled", actorEmployeeId, reason: parsed.data.reason, metadata: { orderId: String(orderId) } } } }).exec();
   scheduleCustomerOrderPush(updated, "cancelled");
   return res.json({ order: updated, audit: { action: "order_cancelled", reason: parsed.data.reason } });
+});
+app.post("/api/v1/admin/support/orders/:id/reassign", requireRole(...supportOperatorRoles), async (req, res) => {
+  const parsed = supportReassignInput.safeParse(req.body); if (!parsed.success) return res.status(400).json({ error: "INVALID_SUPPORT_REASSIGNMENT", details: parsed.error.flatten() });
+  const orderId = objectId(String(req.params.id)); if (!orderId) return res.status(400).json({ error: "INVALID_ORDER_ID" });
+  const order = await Order.findOne({ _id: orderId, ...supportTenantScope(req) }).lean().exec() as any;
+  if (!order) return res.status(404).json({ error: "ORDER_NOT_FOUND" });
+  if (!order.riderId || !["offered", "assigned"].includes(order.assignmentState)) return res.status(409).json({ error: "ORDER_NOT_ASSIGNED", assignmentState: order.assignmentState });
+  if (!["pending", "accepted", "preparing", "ready_for_pickup"].includes(order.status) || order.riderArrivedAt) {
+    return res.status(409).json({ error: "SUPPORT_REASSIGNMENT_NOT_ALLOWED", message: "La reasignación solo puede hacerse antes de que el Rider llegue al establecimiento." });
+  }
+  const previousRiderId = order.riderId as mongoose.Types.ObjectId;
+  const released = await Order.findOneAndUpdate(
+    { _id: orderId, ...supportTenantScope(req), riderId: previousRiderId, assignmentState: order.assignmentState, version: order.version },
+    {
+      $set: { riderId: null, assignmentState: "expired", assignmentExpiresAt: null, pickupDeadlineAt: null },
+      $inc: { dispatchAttempts: 1, version: 1 },
+      $push: { statusHistory: { status: order.status, actorRole: "support", reason: parsed.data.reason } },
+    },
+    { new: false },
+  ).lean().exec() as any;
+  if (!released?.riderId) return res.status(409).json({ error: "ORDER_CHANGED_RETRY" });
+  await releaseRiderOrderSlot(orderId, previousRiderId);
+  await DispatchDecision.updateMany({ orderId, riderId: previousRiderId, outcome: { $in: ["accepted", "offered"] } }, { $set: { outcome: "expired", actorRole: "support" } }).exec();
+  const actorEmployeeId = objectId(String(req.auth?.employeeId || ""));
+  if (parsed.data.ticketId) await SupportTicket.updateOne({ _id: objectId(parsed.data.ticketId), ...supportTenantScope(req) }, { $push: { actions: { action: "order_reassigned", actorEmployeeId, reason: parsed.data.reason, metadata: { orderId: String(orderId), previousRiderId: String(previousRiderId), qaScenario: Boolean(order.isTestOrder) } } } }).exec();
+  await publishOrderStatusEvents(released, released.status);
+  // A QA order must never fall back to the live candidate pool. Reuse only its
+  // dedicated test rider, preserving the non-commercial boundary of this scenario.
+  const preferredQaRiderId = order.isTestOrder && order.qaRiderId ? objectId(String(order.qaRiderId)) || undefined : undefined;
+  const assignment = await queueAutomaticDispatch(orderId, preferredQaRiderId);
+  return res.json({ assignment, audit: { action: "order_reassigned", reason: parsed.data.reason, previousRiderId: String(previousRiderId), qaScenario: Boolean(order.isTestOrder) } });
 });
 
 function riderSupportTicketFilter(req: express.Request, riderId: mongoose.Types.ObjectId, reporterEmail: string, ticketId?: mongoose.Types.ObjectId) {
@@ -2229,7 +2641,8 @@ app.post("/api/v1/riders/:id/support/tickets", requireRole("rider"), async (req,
     orderId = objectId(parsed.data.orderId);
     if (!orderId || !(await Order.exists({ _id: orderId, riderId, ...tenantScope(req) }))) return res.status(404).json({ error: "RIDER_ORDER_NOT_FOUND" });
   }
-  const ticket = await SupportTicket.create({ tenantId: (rider as any).tenantId || null, orderId, reporterEmail: rider.email, sourceSurface: "rider", sourceRole: "rider", category: "rider", priority: parsed.data.priority, subject: parsed.data.subject, description: parsed.data.description, ticketNumber: `SUP-${new Date().toISOString().slice(0, 10).replace(/-/g, "")}-${randomInt(1000, 9999)}`, messages: [{ senderRole: "rider", senderName: rider.name, body: parsed.data.description }, { senderRole: "system", senderName: "PIKI Soporte", body: `Hemos recibido tu incidencia${orderId ? " vinculada al pedido" : ""}. Un agente de Soporte PIKI revisará el caso y te responderá por este chat. Si existe riesgo para tu seguridad, detén el reparto en un lugar seguro y contacta con emergencias.` }], actions: [{ action: "rider_ticket_created", metadata: { riderId: String(riderId) } }] });
+  const linkedOrder = orderId ? await Order.findById(orderId).select("publicCode").lean().exec() as any : null;
+  const ticket = await SupportTicket.create({ tenantId: (rider as any).tenantId || null, orderId, orderReference: linkedOrder?.publicCode || "", reporterEmail: rider.email, sourceSurface: "rider", sourceRole: "rider", category: "rider", priority: parsed.data.priority, subject: parsed.data.subject, description: parsed.data.description, ticketNumber: `SUP-${new Date().toISOString().slice(0, 10).replace(/-/g, "")}-${randomInt(1000, 9999)}`, messages: [{ senderRole: "rider", senderName: rider.name, body: parsed.data.description }, { senderRole: "system", senderName: "PIKI Soporte", body: `Hemos recibido tu incidencia${orderId ? " vinculada al pedido" : ""}. Un agente de Soporte PIKI revisará el caso y te responderá por este chat. Si existe riesgo para tu seguridad, detén el reparto en un lugar seguro y contacta con emergencias.` }], actions: [{ action: "rider_ticket_created", metadata: { riderId: String(riderId) } }] });
   void publishRealtimeEvent({ channel: "admin", audienceKey: tenantAudienceKey((rider as any).tenantId, "admin"), tenantId: (rider as any).tenantId, type: "support.ticket_created", payload: { ticketId: String(ticket._id), priority: ticket.priority, orderId: orderId ? String(orderId) : null } });
   return res.status(201).json({ ticket: { id: ticket._id, ticketNumber: ticket.ticketNumber, status: ticket.status, messages: ticket.messages } });
 });
@@ -2239,7 +2652,7 @@ app.get("/api/v1/riders/:riderId/support/tickets", requireRole("rider"), async (
   const tickets = await SupportTicket.find(riderSupportTicketFilter(req, riderId, rider.email)).sort({ updatedAt: -1 }).limit(50).populate("assignedTo", "name email").lean().exec();
   return res.json({ tickets });
 });
-app.post("/api/v1/admin/support/tickets/:id/typing", requireRole("admin", "support", "finance"), async (req, res) => {
+app.post("/api/v1/admin/support/tickets/:id/typing", requireRole(...supportInboxRoles), async (req, res) => {
   const agent = await supportAgent(req); if (!agent) return res.status(403).json({ error: "SUPPORT_AGENT_NOT_FOUND" });
   const active = Boolean(req.body?.active);
   const ticket = await SupportTicket.findOneAndUpdate({ _id: req.params.id, ...tenantScope(req), ...ticketRoleScope(req), $or: [{ assignedTo: null }, { assignedTo: agent._id }] }, { $set: { agentTypingAt: active ? new Date() : null, ...(active ? { assignedTo: agent._id, status: "in_progress" } : {}) } }, { new: true }).lean().exec() as any;
@@ -2271,6 +2684,23 @@ app.post("/api/v1/riders/:riderId/support/tickets/:ticketId/messages", requireRo
   if (repaired) void publishRealtimeEvent({ channel: "admin", audienceKey: tenantAudienceKey(rider.tenantId, "admin"), tenantId: rider.tenantId, type: "support.ticket_created", payload: { ticketId: String(ticket._id), priority: ticket.priority, orderId: ticket.orderId ? String(ticket.orderId) : null } }).catch(() => undefined);
   void publishRealtimeEvent({ channel: "admin", audienceKey: tenantAudienceKey((rider as any).tenantId, "admin"), tenantId: (rider as any).tenantId, type: "support.message", payload: { ticketId: String(ticketId), status: (ticket as any)?.status, senderRole: "rider" } }).catch(() => undefined);
   return res.json({ ticket });
+});
+app.post("/api/v1/admin/orders/cleanup-test-data", requireOwner(), async (_req, res) => {
+  const testOrders = await Order.find({ isTestOrder: true }).select("_id publicCode displayCode").lean().exec() as any[];
+  const orderIds = testOrders.map((order) => order._id);
+  if (!orderIds.length) return res.json({ deleted: false, message: "No quedan pedidos de prueba en producción.", counts: { orders: 0, messages: 0, dispatchDecisions: 0, reservations: 0, supportTickets: 0, cashEntries: 0, realtimeEvents: 0, notifications: 0 } });
+  const orderIdFilter = { orderId: { $in: orderIds } };
+  const [messages, dispatchDecisions, reservations, supportTickets, cashEntries, realtimeEvents, notifications, orders] = await Promise.all([
+    RiderOrderMessage.deleteMany(orderIdFilter).exec(),
+    DispatchDecision.deleteMany(orderIdFilter).exec(),
+    RiderAssignmentReservation.deleteMany(orderIdFilter).exec(),
+    SupportTicket.deleteMany(orderIdFilter).exec(),
+    CashLedgerEntry.deleteMany(orderIdFilter).exec(),
+    RealtimeEvent.deleteMany({ "payload.orderId": { $in: orderIds.map(String) } }).exec(),
+    Notification.deleteMany({ entityType: "order", entityId: { $in: orderIds.map(String) } }).exec(),
+    Order.deleteMany({ _id: { $in: orderIds }, isTestOrder: true }).exec(),
+  ]);
+  return res.json({ deleted: true, orderCodes: testOrders.map((order) => order.displayCode || order.publicCode), counts: { orders: orders.deletedCount, messages: messages.deletedCount, dispatchDecisions: dispatchDecisions.deletedCount, reservations: reservations.deletedCount, supportTickets: supportTickets.deletedCount, cashEntries: cashEntries.deletedCount, realtimeEvents: realtimeEvents.deletedCount, notifications: notifications.deletedCount } });
 });
 app.get("/api/v1/orders", requireRole("admin", "partner", "rider", "fleet"), async (req, res) => {
   const filter: Record<string, unknown> = { ...tenantScope(req) };
@@ -2450,7 +2880,7 @@ async function riderOrderAccess(riderIdParam: string, orderIdParam: string, req:
   if (!riderId || !orderId) return null;
   const rider = await riderAccessForRequest(riderId, req);
   if (!rider) return null;
-  return await Order.findOne({ _id: orderId, riderId, assignmentState: "assigned", status: { $nin: ["delivered", "cancelled"] } }).select("_id riderId status").lean().exec() as any;
+  return await Order.findOne({ _id: orderId, riderId, assignmentState: "assigned", status: { $nin: ["delivered", "cancelled"] } }).select("_id riderId customerId tenantId publicCode status").lean().exec() as any;
 }
 app.get("/api/v1/riders/:riderId/orders/:orderId/messages", requireRole("rider"), async (req, res) => {
   const order = await riderOrderAccess(String(req.params.riderId), String(req.params.orderId), req);
@@ -2464,6 +2894,7 @@ app.post("/api/v1/riders/:riderId/orders/:orderId/messages", requireRole("rider"
   const parsed = riderMessageSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_MESSAGE", details: parsed.error.flatten() });
   const message = await RiderOrderMessage.create({ orderId: order._id, riderId: order.riderId, senderRole: "rider", body: parsed.data.body });
+  await publishRiderCustomerMessageEvent(order, message).catch((error) => console.warn("Rider customer message notification failed", error instanceof Error ? error.message : error));
   return res.status(201).json({ message });
 });
 app.post("/api/v1/riders/:riderId/orders/:orderId/accept-offer", requireRole("rider"), async (req, res) => {
@@ -2765,17 +3196,18 @@ async function canAccessRiderShift(riderId: mongoose.Types.ObjectId, req: expres
 app.get("/api/v1/riders/session", requireRole("rider"), async (req, res) => {
   const employeeId = req.auth?.employeeId;
   if (!employeeId) return res.status(403).json({ error: "RIDER_EMPLOYEE_SESSION_REQUIRED" });
-  const employee = await EmployeeAccount.findById(employeeId).lean().exec() as any;
-  const rider = employee ? await Rider.findOne({ email: employee.email }).lean().exec() as any : null;
+  const tenant = tenantScope(req);
+  const employee = await EmployeeAccount.findOne({ _id: employeeId, ...tenant }).lean().exec() as any;
+  const rider = employee ? await Rider.findOne({ email: employee.email, ...tenant }).lean().exec() as any : null;
   if (!rider) return res.status(404).json({ error: "RIDER_ACCOUNT_NOT_LINKED" });
   const { now, slot } = await findCurrentRiderSlot(rider._id);
   // A previous browser session must never keep a rider online after its slot ended.
-  await RiderSlot.updateMany({ riderId: rider._id, status: "active", date: { $lt: now.date } }, { $set: { status: "completed" } }).exec();
-  const hasActiveOrder = Boolean(await Order.exists({ riderId: rider._id, status: { $nin: ["delivered", "cancelled"] }, assignmentState: { $in: ["offered", "assigned"] } }));
+  await RiderSlot.updateMany({ ...tenant, riderId: rider._id, status: "active", date: { $lt: now.date } }, { $set: { status: "completed" } }).exec();
+  const hasActiveOrder = Boolean(await Order.exists({ ...tenant, riderId: rider._id, status: { $nin: ["delivered", "cancelled"] }, assignmentState: { $in: ["offered", "assigned"] } }));
   const effectiveStatus = hasActiveOrder ? "busy" : (slot as any)?.status === "active" ? rider.status : "offline";
   const update: Record<string, unknown> = { status: effectiveStatus };
   if (!hasActiveOrder && effectiveStatus === "offline") update.activeOrderId = null;
-  if (effectiveStatus !== rider.status || update.activeOrderId === null) await Rider.updateOne({ _id: rider._id }, { $set: update }).exec();
+  if (effectiveStatus !== rider.status || update.activeOrderId === null) await Rider.updateOne({ _id: rider._id, ...tenant }, { $set: update }).exec();
   return res.json({ rider: { id: rider._id, riderCode: rider.riderCode, name: rider.name, email: rider.email, status: effectiveStatus, fleetId: rider.fleetId }, now, slot: slot || null });
 });
 
@@ -2864,9 +3296,11 @@ app.post("/api/v1/riders/:id/slots", requireRole("admin", "fleet"), async (req, 
   }
 });
 
-app.get("/api/v1/fleet/heatmap", requireRole("admin", "fleet"), async (_req, res) => {
+app.get("/api/v1/fleet/heatmap", requireRole("admin", "fleet"), async (req, res) => {
   const since = new Date(Date.now() - 24 * 60 * 60 * 1000);
-  const rows = await Order.find({ createdAt: { $gte: since }, deliveryLocation: { $exists: true }, status: { $ne: "cancelled" } }).select("deliveryLocation status createdAt").lean().exec();
+  const tenant = tenantScope(req);
+  const fleetRiders = req.auth?.role === "fleet" ? await Rider.find(await fleetRiderFilter(req)).select("_id").lean().exec() : null;
+  const rows = await Order.find({ ...tenant, ...(fleetRiders ? { riderId: { $in: fleetRiders.map((rider: any) => rider._id) } } : {}), createdAt: { $gte: since }, deliveryLocation: { $exists: true }, status: { $ne: "cancelled" } }).select("deliveryLocation status createdAt").lean().exec();
   const bins = new Map<string, { latitude: number; longitude: number; demand: number; active: number }>();
   for (const row of rows as any[]) { const [longitude, latitude] = row.deliveryLocation.coordinates || []; if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) continue; const key = `${latitude.toFixed(3)}:${longitude.toFixed(3)}`; const current = bins.get(key) || { latitude: Number(latitude.toFixed(3)), longitude: Number(longitude.toFixed(3)), demand: 0, active: 0 }; current.demand += 1; if (row.status !== "delivered") current.active += 1; bins.set(key, current); }
   return res.json({ since, points: [...bins.values()].sort((a, b) => b.demand - a.demand) });
@@ -2971,7 +3405,15 @@ async function assignOrderAutomatically(orderId: mongoose.Types.ObjectId, prefer
     const policy = await dispatchLoadPolicy();
     const freshness = new Date(Date.now() - 90_000);
     const currentRiderIds = await currentSlotRiderIds(tenantFilter);
-    const riderFilter: Record<string, unknown> = { ...tenantFilter, isTestRider: { $ne: true }, _id: { $in: currentRiderIds }, status: { $in: ["available", "busy"] }, lastLocationAt: { $gte: freshness }, location: { $exists: true } };
+    const useQaRider = Boolean(order.isTestOrder && preferredRiderId);
+    const riderFilter: Record<string, unknown> = {
+      ...tenantFilter,
+      isTestRider: useQaRider ? true : { $ne: true },
+      _id: { $in: currentRiderIds },
+      status: { $in: ["available", "busy"] },
+      lastLocationAt: { $gte: freshness },
+      location: { $exists: true },
+    };
     if (preferredRiderId) riderFilter._id = { $in: currentRiderIds.filter((id) => String(id) === String(preferredRiderId)) };
     const riders = await Rider.find(riderFilter).limit(100).lean().exec() as any[];
     const counts = await activeOrderCounts(riders.map((rider) => rider._id));
@@ -3008,6 +3450,112 @@ async function queueAutomaticDispatch(orderId: mongoose.Types.ObjectId, preferre
 setCustomerOrderDispatcher(async (orderId) => {
   if (!mongoose.Types.ObjectId.isValid(orderId)) return { state: "invalid_order_id" as const };
   return queueAutomaticDispatch(new mongoose.Types.ObjectId(orderId));
+});
+
+/**
+ * Creates a short-lived, non-commercial dispatch scenario.  It can only target
+ * a dedicated QA rider and is removed through the paired DELETE route, so test
+ * traffic never reaches a real rider, partner settlement, or customer history.
+ */
+app.post("/api/v1/admin/qa/dispatch-orders", requireRole("admin"), async (req, res) => {
+  const employee = await employeeScope(req);
+  const scope = tenantScope(req);
+  const requestedRestaurantSlug = typeof req.body?.restaurantSlug === "string" ? req.body.restaurantSlug.trim().toLowerCase() : "";
+  if (requestedRestaurantSlug && !/^[a-z0-9][a-z0-9-]{1,118}$/.test(requestedRestaurantSlug)) return res.status(400).json({ error: "INVALID_QA_RESTAURANT_SLUG" });
+  const requestedRestaurantName = requestedRestaurantSlug.replace(/-/g, " ");
+  const selectedRestaurant = requestedRestaurantSlug ? { $or: [{ slug: requestedRestaurantSlug }, { name: new RegExp(`^${requestedRestaurantName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, "i") }] } : {};
+  const restaurant = await Restaurant.findOne({ ...scope, ...selectedRestaurant, isActive: true, onboardingStatus: "approved" })
+    .select("_id tenantId name location menu").lean().exec() as any;
+  const coordinates = Array.isArray(restaurant?.location?.coordinates) && restaurant.location.coordinates.length >= 2
+    ? restaurant.location.coordinates
+    : [0, 0];
+  if (!restaurant) return res.status(409).json({ error: requestedRestaurantSlug ? "QA_REQUESTED_RESTAURANT_UNAVAILABLE" : "QA_RESTAURANT_LOCATION_UNAVAILABLE" });
+
+  const now = madridNow();
+  const expiresAt = new Date(Date.now() + 30 * 60_000);
+  const qaEmail = `dispatch-qa-${Date.now()}@qa.invalid`;
+  const qaRider = await Rider.create({
+    tenantId: restaurant.tenantId || null,
+    isTestRider: true,
+    riderCode: `QA-${Date.now().toString(36).toUpperCase()}`,
+    name: "PIKI Rider QA automático",
+    email: qaEmail,
+    city: "Xàtiva",
+    availability: "Simulación aislada",
+    status: "available",
+    lifecycleStatus: "active",
+    vehicle: "electric_bike",
+    location: { type: "Point", coordinates: [Number(coordinates[0]) + 0.0015, Number(coordinates[1]) + 0.0015] },
+    lastLocationAt: new Date(),
+    reliabilityScore: 0.95,
+    ratingScore: 0.95,
+  });
+  await RiderSlot.create({ tenantId: restaurant.tenantId || null, riderId: qaRider._id, zoneSlug: "qa-dispatch", date: now.date, startTime: now.time, endTime: "23:59", status: "active", notes: "PIKI QA dispatch automatico" });
+
+  const publicCode = await createRandomOrderCode();
+  const dailyCode = await createDailyDisplayCode();
+  const menuItem = Array.isArray(restaurant.menu) && restaurant.menu[0] ? restaurant.menu[0] : null;
+  const itemName = String(menuItem?.name || "Pedido de simulación QA");
+  const unitPriceCents = Math.max(0, Number(menuItem?.priceCents || 0));
+  const order = await Order.create({
+    tenantId: restaurant.tenantId || null,
+    qaRiderId: qaRider._id,
+    isTestOrder: true,
+    publicCode,
+    ...dailyCode,
+    restaurantId: restaurant._id,
+    customerName: "Cliente QA",
+    items: [{ itemId: String(menuItem?._id || "qa-dispatch"), name: itemName, quantity: 1, unitPriceCents }],
+    deliveryAddress: "SIMULACIÓN QA · No realizar entrega",
+    deliveryNote: "Pedido de prueba aislado. Se elimina al finalizar la comprobación.",
+    deliveryLocation: { type: "Point", coordinates: [Number(coordinates[0]) + 0.004, Number(coordinates[1]) + 0.004] },
+    subtotalCents: unitPriceCents,
+    deliveryFeeCents: 0,
+    serviceFeeCents: 0,
+    totalCents: unitPriceCents,
+    paymentMethod: "cash",
+    paymentState: "pending",
+    status: "ready_for_pickup",
+    assignmentState: "unassigned",
+    statusHistory: [{ status: "ready_for_pickup", actorRole: "system", reason: `Simulación QA solicitada por ${employee?.email || "admin"}. Sin cobro ni entrega real.` }],
+  });
+  const dispatch = await queueAutomaticDispatch(order._id as mongoose.Types.ObjectId, qaRider._id as mongoose.Types.ObjectId);
+  const supportTicket = await SupportTicket.create({
+    tenantId: restaurant.tenantId || null,
+    orderId: order._id,
+    orderReference: order.publicCode,
+    reporterEmail: qaEmail,
+    sourceSurface: "support",
+    sourceRole: "qa",
+    category: "rider",
+    priority: "normal",
+    subject: "QA · Reasignación automática de Rider",
+    description: "Caso aislado creado para comprobar la reasignación de un pedido QA desde PIKI Support. No intervienen pedidos, Riders ni cobros comerciales.",
+    ticketNumber: `SUP-QA-${Date.now().toString(36).toUpperCase()}`,
+    messages: [{ senderRole: "rider", senderName: qaRider.name, body: "Prueba QA: solicito reasignación del pedido de simulación." }],
+    actions: [{ action: "qa_ticket_created", metadata: { qaScenario: true, orderId: String(order._id), riderId: String(qaRider._id) } }],
+  });
+  const current = await Order.findById(order._id).lean().exec();
+  return res.status(201).json({ order: current, qa: { riderId: String(qaRider._id), ticketId: String(supportTicket._id), ticketNumber: supportTicket.ticketNumber, expiresAt: expiresAt.toISOString(), dispatch } });
+});
+
+app.delete("/api/v1/admin/qa/dispatch-orders/:id", requireRole("admin"), async (req, res) => {
+  const orderId = objectId(String(req.params.id));
+  if (!orderId) return res.status(400).json({ error: "INVALID_ORDER_ID" });
+  const order = await Order.findOne({ _id: orderId, ...tenantScope(req), isTestOrder: true }).lean().exec() as any;
+  if (!order) return res.status(404).json({ error: "QA_ORDER_NOT_FOUND" });
+  if (order.riderId) await releaseRiderOrderSlot(order._id, order.riderId);
+  await Promise.all([
+    DispatchDecision.deleteMany({ orderId: order._id }),
+    RiderAssignmentReservation.deleteMany({ orderId: order._id }),
+    SupportTicket.deleteMany({ orderId: order._id }),
+    Order.deleteOne({ _id: order._id, isTestOrder: true }),
+  ]);
+  if (order.qaRiderId) {
+    await RiderSlot.deleteMany({ riderId: order.qaRiderId, notes: "PIKI QA dispatch automatico" });
+    await Rider.deleteOne({ _id: order.qaRiderId, isTestRider: true });
+  }
+  return res.status(204).end();
 });
 
 async function expireStaleOffers() {
@@ -3179,7 +3727,7 @@ app.get("/api/v1/riders/:id/offers", requireRole("rider"), async (req, res) => {
   const rider = await riderAccessForRequest(riderId, req);
   if (!rider) return res.status(403).json({ error: "RIDER_ACCESS_DENIED" });
   const offers = await Order.find({ riderId, assignmentState: { $in: ["offered", "assigned"] }, status: { $nin: ["delivered", "cancelled"] } })
-.select("_id publicCode displayCode displayCodeDate restaurantId customerId riderId status paymentState paymentMethod subtotalCents deliveryFeeCents serviceFeeCents totalCents assignmentState assignmentExpiresAt pickupDeadlineAt partnerPrepDeadlineAt deliveryAddress deliveryNote deliveryLocation items createdAt")
+.select("_id publicCode displayCode displayCodeDate restaurantId customerId riderId status paymentState paymentMethod partnerPaymentRequired partnerPaymentCents subtotalCents deliveryFeeCents serviceFeeCents totalCents assignmentState assignmentExpiresAt pickupDeadlineAt partnerPrepDeadlineAt deliveryAddress deliveryNote deliveryLocation items createdAt")
     .sort({ createdAt: -1 }).limit(10).lean().exec() as any[];
   const riderProfile = await Rider.findById(riderId).select("vehicle").lean().exec() as any;
   const restaurantIds = offers.map((offer) => offer.restaurantId).filter(Boolean);
@@ -3204,6 +3752,8 @@ app.get("/api/v1/riders/:id/offers", requireRole("rider"), async (req, res) => {
       status: offer.status,
       paymentState: offer.paymentState,
       paymentMethod: offer.paymentMethod || "stripe",
+      partnerPaymentRequired: Boolean(offer.partnerPaymentRequired),
+      partnerPaymentCents: offer.partnerPaymentRequired && offer.partnerPaymentCents != null ? Number(offer.partnerPaymentCents) : null,
       subtotalCents: Number(offer.subtotalCents || 0),
       deliveryFeeCents: Number(offer.deliveryFeeCents || 0),
       serviceFeeCents: Number(offer.serviceFeeCents || 0),
@@ -3226,7 +3776,7 @@ partnerPrepDeadlineAt: offer.partnerPrepDeadlineAt || null,
       phase: phase[offer.status] || "assigned",
       etaMinutes: offer.assignmentExpiresAt ? Math.max(0, Math.ceil((new Date(offer.assignmentExpiresAt).getTime() - now) / 60000)) : null,
       restaurant: restaurant ? { name: restaurant.name, address: restaurant.address || "", phone: restaurant.phone || "", cuisine: restaurant.cuisine || "", etaMinutes: restaurant.etaMinutes || [] } : null,
-      customerName: customerPhase ? customer?.name || "Cliente" : null,
+      customerName: customerPhase ? customer?.name || offer.customerName || "Cliente" : null,
       deliveryAddress: customerPhase ? offer.deliveryAddress || "" : null,
       deliveryNote: customerPhase ? offer.deliveryNote || null : null,
       deliveryLocation: customerPhase ? offer.deliveryLocation || null : null,
@@ -3236,9 +3786,10 @@ partnerPrepDeadlineAt: offer.partnerPrepDeadlineAt || null,
 });
 
 app.get("/api/v1/riders/operational-map", requireRole("rider"), async (req, res) => {
-  const employee = req.auth?.employeeId ? await EmployeeAccount.findById(req.auth.employeeId).select("zoneSlugs fleetId").lean().exec() as any : null;
+  const tenant = tenantScope(req);
+  const employee = req.auth?.employeeId ? await EmployeeAccount.findOne({ _id: req.auth.employeeId, ...tenant }).select("zoneSlugs fleetId").lean().exec() as any : null;
   const zoneSlugs = Array.isArray(employee?.zoneSlugs) ? employee.zoneSlugs.filter((value: unknown): value is string => typeof value === "string") : [];
-  const filter: Record<string, unknown> = { isActive: true };
+  const filter: Record<string, unknown> = { ...tenant, isActive: true };
   if (zoneSlugs.length) filter.slug = { $in: zoneSlugs };
   const zones = await Zone.find(filter).select("slug name isActive polygon").sort({ name: 1 }).lean().exec();
   return res.json({ zones, source: "piki-api", refreshedAt: new Date().toISOString() });
@@ -3246,20 +3797,21 @@ app.get("/api/v1/riders/operational-map", requireRole("rider"), async (req, res)
 app.get("/api/v1/riders/:id/mobility-advice", requireRole("rider"), async (req, res) => {
   const riderId = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
   if (!riderId || !req.auth?.employeeId) return res.status(400).json({ error: "INVALID_RIDER_SESSION" });
-  const employee = await EmployeeAccount.findById(req.auth.employeeId).select("email").lean().exec() as any;
-  const rider = employee ? await Rider.findOne({ _id: riderId, email: employee.email }).select("location").lean().exec() as any : null;
+  const tenant = tenantScope(req);
+  const employee = await EmployeeAccount.findOne({ _id: req.auth.employeeId, ...tenant }).select("email").lean().exec() as any;
+  const rider = employee ? await Rider.findOne({ _id: riderId, email: employee.email, ...tenant }).select("location").lean().exec() as any : null;
   if (!rider) return res.status(403).json({ error: "RIDER_ACCESS_DENIED" });
-  const zones = await Zone.find({ isActive: true }).select("slug name polygon").lean().exec() as any[];
+  const zones = await Zone.find({ ...tenant, isActive: true }).select("slug name polygon").lean().exec() as any[];
   const since = new Date(Date.now() - 45 * 60 * 1000);
   const zoneDemand = await Promise.all(zones.map(async (zone) => {
     const coordinates = zone.polygon?.coordinates?.[0]?.[0];
     const anchor: [number, number] = Array.isArray(coordinates) ? [Number(coordinates[0]), Number(coordinates[1])] : [0, 0];
-    const ordersLastWindow = await Order.countDocuments({ createdAt: { $gte: since }, status: { $nin: ["cancelled"] }, deliveryLocation: { $geoWithin: { $geometry: zone.polygon } } });
+    const ordersLastWindow = await Order.countDocuments({ ...tenant, createdAt: { $gte: since }, status: { $nin: ["cancelled"] }, deliveryLocation: { $geoWithin: { $geometry: zone.polygon } } });
     return { slug: zone.slug, name: zone.name, anchor, ordersLastWindow };
   }));
   const currentPoint = rider.location?.coordinates;
   const currentZoneRaw = Array.isArray(currentPoint) && currentPoint.length >= 2
-    ? await Zone.findOne({ isActive: true, polygon: { $geoIntersects: { $geometry: { type: "Point", coordinates: currentPoint } } } }).select("slug").lean().exec() as any
+    ? await Zone.findOne({ ...tenant, isActive: true, polygon: { $geoIntersects: { $geometry: { type: "Point", coordinates: currentPoint } } } }).select("slug").lean().exec() as any
     : null;
   const currentZone = currentZoneRaw ? zoneDemand.find((zone) => zone.slug === currentZoneRaw.slug) || null : null;
   const advice = computeMobilityAdvice({ currentZone, zones: zoneDemand, lowActivityMinutes: Number(req.query.lowActivityMinutes || 15) });
@@ -3313,55 +3865,60 @@ app.post("/api/v1/fleets", requireRole("admin", "fleet"), async (req, res) => {
 app.patch("/api/v1/rider-applications/:id/assign-fleet", requireRole("admin", "fleet"), async (req, res) => {
   const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id); if (!id) return res.status(400).json({ error: "INVALID_APPLICATION_ID" });
   const fleetId = objectId(typeof req.body?.fleetId === "string" ? req.body.fleetId : ""); if (!fleetId) return res.status(400).json({ error: "INVALID_FLEET_ID" });
-  const fleet = await Fleet.findOne({ _id: fleetId, ...(req.auth?.role === "fleet" ? { _id: (await employeeScope(req))?.fleetId || null } : {}) }).lean() as any; if (!fleet) return res.status(404).json({ error: "FLEET_NOT_FOUND" });
-  const application = await RiderApplication.findOneAndUpdate({ _id: id, ...(req.auth?.role === "fleet" ? { assignedFleetId: fleet._id } : {}) }, { $set: { assignedFleetId: fleetId } }, { new: true }).lean().exec() as any;
+  const tenant = tenantScope(req);
+  const fleet = await Fleet.findOne({ _id: fleetId, ...tenant, ...(req.auth?.role === "fleet" ? { _id: (await employeeScope(req))?.fleetId || null } : {}) }).lean() as any; if (!fleet) return res.status(404).json({ error: "FLEET_NOT_FOUND" });
+  const application = await RiderApplication.findOneAndUpdate({ _id: id, ...await adminOnboardingScope(req), ...(req.auth?.role === "fleet" ? { assignedFleetId: fleet._id } : {}) }, { $set: { assignedFleetId: fleetId } }, { new: true }).lean().exec() as any;
   if (!application) return res.status(404).json({ error: "APPLICATION_NOT_FOUND" });
-  if (application.status === "approved") await Rider.updateOne({ email: application.email }, { $set: { fleetId } }).exec();
-  return res.json({ application, fleet });
+  if (application.status === "approved") await Rider.updateOne({ email: application.email, ...(application.tenantId ? { tenantId: application.tenantId } : { tenantId: null }) }, { $set: { fleetId } }).exec();
+  return res.json({ application: { ...application, applicationCode: onboardingCode("R", application._id) }, fleet });
 });
 
 app.get("/api/v1/fleets/pending-partner-orders", requireRole("admin", "fleet", "commercial"), async (req, res) => {
   const employee = await employeeScope(req);
-  const commercialRestaurants = req.auth?.role === "commercial" ? await Restaurant.find({ commercialEmployeeId: employee?._id }).select("_id").lean().exec() : [];
-  const orders = await Order.find({ ...dispatchablePaymentFilter, status: "pending", ...(req.auth?.role === "commercial" ? { restaurantId: { $in: commercialRestaurants.map((restaurant: any) => restaurant._id) } } : {}) }).select("publicCode restaurantId totalCents createdAt status paymentState paymentMethod assignmentState").sort({ createdAt: 1 }).limit(100).lean().exec() as any[];
-  const restaurants = await Restaurant.find({ _id: { $in: orders.map((order) => order.restaurantId) } }).select("name").lean().exec() as any[];
+  const tenant = tenantScope(req);
+  const commercialRestaurants = req.auth?.role === "commercial" ? await Restaurant.find({ ...tenant, commercialEmployeeId: employee?._id }).select("_id").lean().exec() : [];
+  const orders = await Order.find({ ...tenant, ...dispatchablePaymentFilter, status: "pending", ...(req.auth?.role === "commercial" ? { restaurantId: { $in: commercialRestaurants.map((restaurant: any) => restaurant._id) } } : {}) }).select("publicCode restaurantId totalCents createdAt status paymentState paymentMethod assignmentState").sort({ createdAt: 1 }).limit(100).lean().exec() as any[];
+  const restaurants = await Restaurant.find({ ...tenant, _id: { $in: orders.map((order) => order.restaurantId) } }).select("name").lean().exec() as any[];
   const names = new Map(restaurants.map((restaurant) => [String(restaurant._id), restaurant.name]));
   return res.json({ orders: orders.map((order) => ({ id: String(order._id), publicCode: order.publicCode, restaurant: names.get(String(order.restaurantId)) || "Restaurante", totalCents: order.totalCents, createdAt: order.createdAt, status: order.status, paymentState: order.paymentState, paymentMethod: order.paymentMethod || "stripe", cashDueAtDelivery: order.paymentMethod === "cash", assignmentState: order.assignmentState })) });
 });
-app.get("/api/v1/finance/overview", requireRole("admin", "finance"), async (_req, res) => {
+app.get("/api/v1/finance/overview", requireRole("admin", "finance"), async (req, res) => {
   const startOfDay = new Date(); startOfDay.setHours(0, 0, 0, 0);
+  const tenant = tenantScope(req);
   const [gmv, cashIn, cashOut, pendingCash] = await Promise.all([
-    Order.aggregate([{ $match: { paymentState: "paid", createdAt: { $gte: startOfDay } } }, { $group: { _id: null, totalCents: { $sum: "$totalCents" }, orders: { $sum: 1 } } }]),
-    CashLedgerEntry.aggregate([{ $match: { direction: "in", createdAt: { $gte: startOfDay } } }, { $group: { _id: null, totalCents: { $sum: "$amountCents" } } }]),
-    CashLedgerEntry.aggregate([{ $match: { direction: "out", createdAt: { $gte: startOfDay } } }, { $group: { _id: null, totalCents: { $sum: "$amountCents" } } }]),
-    CashLedgerEntry.aggregate([{ $group: { _id: { riderId: "$riderId", direction: "$direction" }, totalCents: { $sum: "$amountCents" } } }]),
+    Order.aggregate([{ $match: { ...tenant, paymentState: "paid", createdAt: { $gte: startOfDay } } }, { $group: { _id: null, totalCents: { $sum: "$totalCents" }, orders: { $sum: 1 } } }]),
+    CashLedgerEntry.aggregate([{ $match: { ...tenant, direction: "in", createdAt: { $gte: startOfDay } } }, { $group: { _id: null, totalCents: { $sum: "$amountCents" } } }]),
+    CashLedgerEntry.aggregate([{ $match: { ...tenant, direction: "out", createdAt: { $gte: startOfDay } } }, { $group: { _id: null, totalCents: { $sum: "$amountCents" } } }]),
+    CashLedgerEntry.aggregate([{ $match: tenant }, { $group: { _id: { riderId: "$riderId", direction: "$direction" }, totalCents: { $sum: "$amountCents" } } }]),
   ]);
   const balances = new Map<string, number>(); for (const row of pendingCash as any[]) { const key = String(row._id.riderId); balances.set(key, (balances.get(key) || 0) + (row._id.direction === "in" ? row.totalCents : -row.totalCents)); }
   return res.json({ service: "piki-api", overview: { gmv_today_cents: Number(gmv[0]?.totalCents || 0), paid_orders_today: Number(gmv[0]?.orders || 0), cash_collected_today_cents: Number(cashIn[0]?.totalCents || 0), cash_handed_over_today_cents: Number(cashOut[0]?.totalCents || 0), cash_pending_cents: Array.from(balances.values()).reduce((sum, value) => sum + Math.max(0, value), 0) } });
 });
 
-app.get("/api/v1/admin/overview", requireRole("admin"), async (_req, res) => {
+app.get("/api/v1/admin/overview", requireRole("admin"), async (req, res) => {
   const startOfDay = new Date(); startOfDay.setHours(0, 0, 0, 0);
+  const tenant = tenantScope(req);
   const [activeRestaurants, pendingRestaurants, riders, openOrders, deliveredToday, gmv] = await Promise.all([
-    Restaurant.countDocuments({ isActive: true, onboardingStatus: "approved" }),
-    Restaurant.countDocuments({ onboardingStatus: "pending_review" }),
-    Rider.countDocuments({ isTestRider: { $ne: true } }),
-    Order.countDocuments({ status: { $in: ["pending", "accepted", "preparing", "ready_for_pickup", "picked_up", "on_the_way"] } }),
-    Order.countDocuments({ status: "delivered", deliveredAt: { $gte: startOfDay } }),
-    Order.aggregate([{ $match: { paymentState: "paid", createdAt: { $gte: startOfDay } } }, { $group: { _id: null, totalCents: { $sum: "$totalCents" }, orders: { $sum: 1 } } }]),
+    Restaurant.countDocuments({ ...tenant, isActive: true, onboardingStatus: "approved" }),
+    Restaurant.countDocuments({ ...tenant, onboardingStatus: "pending_review" }),
+    Rider.countDocuments({ ...tenant, isTestRider: { $ne: true } }),
+    Order.countDocuments({ ...tenant, status: { $in: ["pending", "accepted", "preparing", "ready_for_pickup", "picked_up", "on_the_way"] } }),
+    Order.countDocuments({ ...tenant, status: "delivered", deliveredAt: { $gte: startOfDay } }),
+    Order.aggregate([{ $match: { ...tenant, paymentState: "paid", createdAt: { $gte: startOfDay } } }, { $group: { _id: null, totalCents: { $sum: "$totalCents" }, orders: { $sum: 1 } } }]),
   ]);
   res.json({ service: "piki-api", overview: { active_restaurants: activeRestaurants, pending_restaurants: pendingRestaurants, riders, open_orders: openOrders, delivered_today: deliveredToday, gmv_today_cents: Number(gmv[0]?.totalCents || 0), paid_orders_today: Number(gmv[0]?.orders || 0) } });
 });
 
-app.get("/api/v1/admin/operations/health", requireRole("admin", "fleet"), async (_req, res) => {
+app.get("/api/v1/admin/operations/health", requireRole("admin", "fleet"), async (req, res) => {
   const now = Date.now();
   const freshCutoff = new Date(now - 90_000);
   const staleCutoff = new Date(now - 10 * 60_000);
+  const tenant = tenantScope(req);
   const [riders, dispatchQueue, activeOffers, activeOrders] = await Promise.all([
-    Rider.find({ isTestRider: { $ne: true } }).select("status lastLocationAt location fleetId zoneSlug").lean().exec(),
-    Order.countDocuments({ riderId: null, assignmentState: { $in: ["unassigned", "expired", "rejected"] }, ...dispatchablePaymentFilter, status: { $in: [...dispatchableOrderStatuses] } }),
-    Order.countDocuments({ assignmentState: "offered", assignmentExpiresAt: { $gt: new Date() } }),
-    Order.countDocuments({ status: { $in: [...activeOperationalOrderStatuses] } }),
+    Rider.find({ ...await fleetRiderFilter(req), isTestRider: { $ne: true } }).select("status lastLocationAt location fleetId zoneSlug").lean().exec(),
+    Order.countDocuments({ ...tenant, riderId: null, assignmentState: { $in: ["unassigned", "expired", "rejected"] }, ...dispatchablePaymentFilter, status: { $in: [...dispatchableOrderStatuses] } }),
+    Order.countDocuments({ ...tenant, assignmentState: "offered", assignmentExpiresAt: { $gt: new Date() } }),
+    Order.countDocuments({ ...tenant, status: { $in: [...activeOperationalOrderStatuses] } }),
   ]);
   const summary = riders.reduce((acc: any, rider: any) => {
     const hasGps = Array.isArray(rider.location?.coordinates) && rider.location.coordinates.length >= 2;
@@ -3379,15 +3936,34 @@ app.get("/api/v1/admin/operations/health", requireRole("admin", "fleet"), async 
   return res.json({ service: "piki-api", generatedAt: new Date().toISOString(), riders: summary, dispatch: { queue: dispatchQueue, activeOffers, activeOrders }, automaticDispatchSweep: { ...automaticDispatchSweepStats, intervalSeconds: 5, healthy: automaticDispatchSweepStats.runs > 0 && automaticDispatchSweepStats.errors === 0 && Boolean(automaticDispatchSweepStats.lastCompletedAt) }, thresholds: { freshGpsSeconds: 90, staleGpsMinutes: 10, pickupReassignMinutes: 10, pickupArrivalRadiusMeters: PICKUP_ARRIVAL_RADIUS_METERS, partnerPreparationMinutes: PARTNER_PREPARATION_LIMIT_MINUTES, customerDeliveryTargetMinutes: CUSTOMER_DELIVERY_TARGET_MINUTES } });
 });
 
-app.get("/api/v1/admin/operations/live", requireRole("admin"), async (_req, res) => {
-  const riders = await Rider.find({ isTestRider: { $ne: true } }).select("riderCode name email status lifecycleStatus lifecycleReason vehicle location lastLocationAt activeOrderId fleetId zoneSlug").lean().exec() as any[];
+app.get("/api/v1/admin/operations/live", requireRole("admin"), async (req, res) => {
+  const tenant = tenantScope(req);
+  const riders = await Rider.find({ ...tenant, isTestRider: { $ne: true } }).select("riderCode name email status lifecycleStatus lifecycleReason vehicle location lastLocationAt activeOrderId fleetId zoneSlug").lean().exec() as any[];
   const riderIds = riders.map((rider) => rider._id);
-  const orders = await Order.find({ riderId: { $in: riderIds }, status: { $in: [...activeOperationalOrderStatuses] } }).select("publicCode displayCode status assignmentState deliveryAddress restaurantId customerId riderId").select("+customerPhone").lean().exec() as any[];
-  const restaurants = await Restaurant.find({ _id: { $in: orders.map((order) => order.restaurantId) } }).select("name address").lean().exec() as any[];
+  const orders = await Order.find({ ...tenant, riderId: { $in: riderIds }, status: { $in: [...activeOperationalOrderStatuses] } }).select("publicCode displayCode status assignmentState deliveryAddress restaurantId customerId riderId").select("+customerPhone").lean().exec() as any[];
+  const restaurants = await Restaurant.find({ ...tenant, _id: { $in: orders.map((order) => order.restaurantId) } }).select("name address").lean().exec() as any[];
   const restaurantMap = new Map(restaurants.map((restaurant) => [String(restaurant._id), restaurant]));
   const orderMap = new Map(orders.map((order) => [String(order.riderId), { ...order, customerPhone: order.customerPhone || null, restaurant: restaurantMap.get(String(order.restaurantId)) || null }]));
   const now = Date.now();
   return res.json({ refreshedAt: new Date().toISOString(), riders: riders.map((rider) => { const age = rider.lastLocationAt ? Math.max(0, Math.round((now - new Date(rider.lastLocationAt).getTime()) / 1000)) : null; return { id: String(rider._id), riderCode: rider.riderCode, name: rider.name, status: rider.status, lifecycleStatus: rider.lifecycleStatus || "active", lifecycleReason: rider.lifecycleReason || "", vehicle: rider.vehicle, location: rider.location, lastLocationAt: rider.lastLocationAt, gpsState: age !== null && age <= 90 && rider.location?.coordinates?.length === 2 ? "fresh" : age !== null && age <= 600 ? "stale" : "missing", gpsAgeSeconds: age, activeOrder: orderMap.get(String(rider._id)) || null }; }) });
+});
+
+/**
+ * Fleet sees only operationally valid positions: an active shift, a live GPS
+ * heartbeat (<=90 seconds) and an available/busy Rider state. Historical or
+ * offline coordinates never reach this response, so the map cannot present a
+ * stale position as live.
+ */
+app.get("/api/v1/fleet/operations/live", requireRole("admin", "fleet"), async (req, res) => {
+  const now = madridNow();
+  const freshSince = new Date(Date.now() - 90_000);
+  const tenant = tenantScope(req);
+  const activeRiderIds = await RiderSlot.distinct("riderId", { ...tenant, date: now.date, status: "active", startTime: { $lte: now.time }, endTime: { $gt: now.time } });
+  const riders = await Rider.find({ ...await fleetRiderFilter(req), _id: { $in: activeRiderIds }, status: { $in: ["available", "busy"] }, lastLocationAt: { $gte: freshSince }, location: { $exists: true } }).select("riderCode name status vehicle location lastLocationAt activeOrderId").lean().exec() as any[];
+  const activeOrderIds = riders.map((rider) => rider.activeOrderId).filter(Boolean);
+  const orders = await Order.find({ ...tenant, _id: { $in: activeOrderIds } }).select("publicCode displayCode status assignmentState").lean().exec() as any[];
+  const orderMap = new Map(orders.map((order) => [String(order._id), order]));
+  return res.json({ refreshedAt: new Date().toISOString(), freshnessSeconds: 90, riders: riders.map((rider) => ({ _id: rider._id, id: rider._id, riderCode: rider.riderCode, name: rider.name, status: rider.status, vehicle: rider.vehicle, location: rider.location, lastLocationAt: rider.lastLocationAt, activeOrder: rider.activeOrderId ? orderMap.get(String(rider.activeOrderId)) || null : null })) });
 });
 
 app.get("/api/v1/riders/overview", requireRole("admin", "fleet"), async (_req, res) => {
@@ -3398,13 +3974,14 @@ app.get("/api/v1/riders/overview", requireRole("admin", "fleet"), async (_req, r
 
 app.get("/api/v1/riders/statistics", requireRole("rider"), async (req, res) => {
   if (!req.auth?.employeeId) return res.status(409).json({ error: "RIDER_EMPLOYEE_SESSION_REQUIRED" });
-  const employee = await EmployeeAccount.findById(req.auth.employeeId).select("email").lean().exec() as any;
-  const rider = employee ? await Rider.findOne({ email: employee.email }).select("_id reliabilityScore").lean().exec() as any : null;
+  const tenant = tenantScope(req);
+  const employee = await EmployeeAccount.findOne({ _id: req.auth.employeeId, ...tenant }).select("email").lean().exec() as any;
+  const rider = employee ? await Rider.findOne({ email: employee.email, ...tenant }).select("_id reliabilityScore").lean().exec() as any : null;
   if (!rider) return res.status(404).json({ error: "RIDER_NOT_FOUND" });
   const start = new Date(); start.setHours(0, 0, 0, 0); start.setDate(start.getDate() - 6);
   const [summary, daily] = await Promise.all([
-    Order.aggregate([{ $match: { riderId: rider._id } }, { $group: { _id: null, completed: { $sum: { $cond: [{ $eq: ["$status", "delivered"] }, 1, 0] } }, cancelled: { $sum: { $cond: [{ $eq: ["$status", "cancelled"] }, 1, 0] } }, accepted: { $sum: 1 } } }]),
-    Order.aggregate([{ $match: { riderId: rider._id, deliveredAt: { $gte: start }, status: "delivered" } }, { $group: { _id: { $dateToString: { format: "%Y-%m-%d", date: "$deliveredAt", timezone: "Europe/Madrid" } }, completed: { $sum: 1 } } }, { $sort: { _id: 1 } }]),
+    Order.aggregate([{ $match: { ...tenant, riderId: rider._id } }, { $group: { _id: null, completed: { $sum: { $cond: [{ $eq: ["$status", "delivered"] }, 1, 0] } }, cancelled: { $sum: { $cond: [{ $eq: ["$status", "cancelled"] }, 1, 0] } }, accepted: { $sum: 1 } } }]),
+    Order.aggregate([{ $match: { ...tenant, riderId: rider._id, deliveredAt: { $gte: start }, status: "delivered" } }, { $group: { _id: { $dateToString: { format: "%Y-%m-%d", date: "$deliveredAt", timezone: "Europe/Madrid" } }, completed: { $sum: 1 } } }, { $sort: { _id: 1 } }]),
   ]);
   const dailyMap = new Map(daily.map((item: any) => [item._id, item.completed]));
   const dailyDeliveries = Array.from({ length: 7 }, (_, index) => { const day = new Date(start); day.setDate(start.getDate() + index); const key = new Intl.DateTimeFormat("en-CA", { timeZone: "Europe/Madrid" }).format(day); return { date: key, completed: dailyMap.get(key) || 0 }; });
@@ -3430,27 +4007,128 @@ app.use((error: any, req: express.Request, res: express.Response, next: express.
 });
 
 async function repairConfiguredPartnerAccess() {
-  const email = String(process.env.REPAIR_PARTNER_EMAIL || "").trim().toLowerCase();
+  // Render does not retroactively synchronize Blueprint variables into this
+  // existing service. Keep this one explicitly authorised demonstration
+  // owner as a safe bootstrap fallback so its idempotent portfolio repair
+  // still runs after deployment.
+  const email = String(process.env.REPAIR_PARTNER_EMAIL || "rrhh.milchollos@gmail.com").trim().toLowerCase();
   if (!email) return;
-  const account = await EmployeeAccount.findOne({ email }).select("_id email restaurantId apiRole jobRole roles primaryRole active authorizationStatus").lean().exec() as any;
+  const account = await EmployeeAccount.findOne({ email }).select("_id email tenantId restaurantId restaurantIds apiRole jobRole roles primaryRole active authorizationStatus ownerProtected").lean().exec() as any;
   if (!account) { console.log(JSON.stringify({ event: "partner_access_repair", email, result: "account_not_found" })); return; }
-  const restaurant = account.restaurantId
-    ? await Restaurant.findById(account.restaurantId).select("_id email onboardingStatus isActive").lean().exec() as any
-    : await Restaurant.findOne({ email }).select("_id email onboardingStatus isActive").lean().exec() as any;
-  if (!restaurant) { console.log(JSON.stringify({ event: "partner_access_repair", email, result: "restaurant_not_found", accountId: String(account._id) })); return; }
-  if (restaurant.onboardingStatus !== "approved" || restaurant.isActive !== true) {
-    console.log(JSON.stringify({ event: "partner_access_repair", email, result: "restaurant_not_approved", restaurantId: String(restaurant._id), onboardingStatus: restaurant.onboardingStatus, isActive: restaurant.isActive })); return;
-  }
-  const roles = [...new Set([...(Array.isArray(account.roles) ? account.roles : []), "partner", "rider"])];
-  await EmployeeAccount.updateOne({ _id: account._id }, { $set: { restaurantId: restaurant._id, restaurantIds: [restaurant._id], apiRole: "partner", jobRole: "partner", roles, primaryRole: "partner", active: true, authorizationStatus: "approved", authorizedAt: new Date(), authorizationReason: "Reparación de acceso Partner + Rider solicitada por PIKI para pruebas operativas." } }).exec();
-  const rider = await Rider.findOneAndUpdate({ email }, { $set: { email, name: account.email, status: "offline" }, $setOnInsert: { riderCode: await nextRiderCode() } }, { upsert: true, new: true, setDefaultsOnInsert: true }).select("_id email status").lean().exec() as any;
-  console.log(JSON.stringify({ event: "partner_rider_access_repair", email, result: "repaired", restaurantId: String(restaurant._id), riderId: rider?._id ? String(rider._id) : null, previous: { active: account.active, authorizationStatus: account.authorizationStatus, apiRole: account.apiRole, jobRole: account.jobRole, roles: account.roles || [], restaurantId: account.restaurantId ? String(account.restaurantId) : null } }));
-}
 
+  const createOrUseTestRestaurant = process.env.REPAIR_PARTNER_CREATE_TEST === "true";
+  let restaurant: any = null;
+  if (createOrUseTestRestaurant) {
+    // The exact test slug is unique; adopting a legacy record also ensures it
+    // lives in the same tenant as the account that will operate it.
+    restaurant = await Restaurant.findOneAndUpdate(
+      { slug: "kfc-xativa-test" },
+      {
+        $set: { tenantId: account.tenantId || null, email, onboardingStatus: "approved", isActive: true, internalDemo: true },
+        $setOnInsert: { slug: "kfc-xativa-test", name: "KFC XATIVA TEST", cuisine: "Americana", category: "Americana", locality: "Xàtiva", partnerGroupKey: "xativa", tagline: "Entorno de demostración interna de PIKI · sin afiliación comercial.", phone: "", address: "Xàtiva" },
+      },
+      { upsert: true, new: true, setDefaultsOnInsert: true },
+    ).select("_id email slug name tenantId onboardingStatus isActive internalDemo demoMenuVersion").lean().exec();
+    console.log(JSON.stringify({ event: "partner_access_repair", email, result: "test_restaurant_created_or_reused", restaurantId: String(restaurant._id), restaurantName: restaurant.name, tenantId: restaurant.tenantId ? String(restaurant.tenantId) : null }));
+  } else {
+    const tenantFilter = account.tenantId ? { tenantId: account.tenantId } : { tenantId: null };
+    restaurant = account.restaurantId
+      ? await Restaurant.findOne({ _id: account.restaurantId, ...tenantFilter }).select("_id email slug name tenantId onboardingStatus isActive").lean().exec()
+      : await Restaurant.findOne({ email, ...tenantFilter }).select("_id email slug name tenantId onboardingStatus isActive").lean().exec();
+  }
+  if (!restaurant) { console.log(JSON.stringify({ event: "partner_access_repair", email, result: "restaurant_not_found", accountId: String(account._id) })); return; }
+
+  const isProtectedOwner = Boolean(account.ownerProtected && email === ownerEmail);
+  // This function only runs for REPAIR_PARTNER_EMAIL. Keep the demonstration
+  // menu available to that explicitly configured Partner even if an old
+  // owner flag has not yet been migrated in MongoDB.
+  if (restaurant.slug === "kfc-xativa-test") {
+    const seeded = await Restaurant.findOneAndUpdate(
+      {
+        _id: restaurant._id,
+        $or: [
+          { demoMenuVersion: { $lt: PARTNER_DEMO_MENU_VERSION } },
+          { demoMenuVersion: { $exists: false } },
+        ],
+      },
+      {
+        $set: {
+          internalDemo: true,
+          demoMenuVersion: PARTNER_DEMO_MENU_VERSION,
+          tagline: "Entorno de demostración interna de PIKI · sin afiliación comercial.",
+          menu: partnerDemoMenu,
+        },
+      },
+      { new: true },
+    ).select("_id email slug name tenantId onboardingStatus isActive internalDemo demoMenuVersion").lean().exec();
+    if (seeded) {
+      restaurant = seeded;
+      console.log(JSON.stringify({ event: "partner_demo_menu_restored", restaurantId: String(restaurant._id), menuVersion: PARTNER_DEMO_MENU_VERSION, itemCount: partnerDemoMenu.length }));
+    }
+  }
+
+  // The repair itself is explicitly allow-listed by REPAIR_PARTNER_EMAIL in
+  // render.yaml. Restore the whole fixed demonstration portfolio for that
+  // account; relying on an old ownerProtected flag left it with only KFC.
+  const includeXativaTestPortfolio = true;
+  const testPortfolio = [
+    { slug: "kings-tacos-xativa", name: "Kings Tacos Xàtiva", cuisine: "Mexicana", category: "Mexicana" },
+    { slug: "eleven-burgers-xativa", name: "Eleven Burgers Xàtiva", cuisine: "Hamburguesas", category: "Hamburguesas" },
+    { slug: "nakama-sushi-xativa", name: "Nakama Sushi Xàtiva", cuisine: "Japonesa", category: "Japonesa" },
+    { slug: "rooster-kebab-xativa", name: "Rooster Kebab Xàtiva", cuisine: "Kebab", category: "Kebab" },
+    { slug: "alibaba-kebab-xativa", name: "Alibaba Kebab Xàtiva", cuisine: "Kebab", category: "Kebab" },
+  ] as const;
+  const assignedRestaurants = includeXativaTestPortfolio
+    ? await Promise.all(testPortfolio.map((location) => Restaurant.findOneAndUpdate(
+      { slug: location.slug },
+      {
+        $set: {
+          tenantId: account.tenantId || null,
+          name: location.name,
+          cuisine: location.cuisine,
+          category: location.category,
+          locality: "Xàtiva",
+          partnerGroupKey: "xativa",
+          availabilityStatus: "coming_soon",
+          upcomingMessage: "Disponible muy pronto",
+          onboardingStatus: "approved",
+          isActive: false,
+        },
+        $setOnInsert: { slug: location.slug, tagline: "Próximo partner PIKI en Xàtiva", phone: "", address: "Xàtiva" },
+      },
+      { upsert: true, new: true, setDefaultsOnInsert: true },
+    ).select("_id slug name").lean().exec()))
+    : [];
+  const portfolioIds = [restaurant._id, ...assignedRestaurants.map((location: any) => location._id)];
+  if (includeXativaTestPortfolio && new Set(assignedRestaurants.map((location: any) => location.slug)).size !== COMING_SOON_SLUGS.length) {
+    throw new Error("Configured Xàtiva test portfolio does not match the public catalog");
+  }
+
+  const roles = [...new Set([...(Array.isArray(account.roles) ? account.roles : []), "partner", ...(isProtectedOwner ? ["admin"] : [])])];
+  await EmployeeAccount.updateOne(
+    { _id: account._id },
+    {
+      $set: {
+        restaurantId: restaurant._id,
+        restaurantIds: portfolioIds,
+        apiRole: isProtectedOwner ? "admin" : "partner",
+        jobRole: isProtectedOwner ? "admin" : "partner",
+        roles,
+        primaryRole: isProtectedOwner ? "admin" : "partner",
+        active: true,
+        authorizationStatus: "approved",
+        authorizedAt: new Date(),
+        authorizationReason: includeXativaTestPortfolio ? "Asignación de cartera de pruebas Partner de Xàtiva." : "Asignación de KFC XATIVA TEST para pruebas Partner.",
+      },
+    },
+  ).exec();
+  console.log(JSON.stringify({ event: "partner_access_repair", email, result: "repaired", restaurantId: String(restaurant._id), restaurantName: restaurant.name, assignedRestaurantCount: portfolioIds.length, ownerPreserved: isProtectedOwner }));
+}
 async function start() {
   const uri = process.env.MONGODB_URI;
-  if (uri) { await mongoose.connect(uri, { dbName: databaseName, serverSelectionTimeoutMS: 10_000, socketTimeoutMS: 45_000, maxPoolSize: 20, minPoolSize: 2, retryWrites: true }); await EmployeeAccount.updateMany({ authorizationStatus: { $exists: false } }, { $set: { authorizationStatus: "approved", accessLevel: "subadmin" } }).exec(); await EmployeeAccount.updateOne({ email: ownerEmail }, { $set: { accessLevel: "superadmin", authorizationStatus: "approved", ownerProtected: true, active: true } }).exec(); const owner = await EmployeeAccount.findOne({ email: ownerEmail }).select("_id").lean().exec() as any; const legacyApproved = await EmployeeAccount.find({ email: { $ne: ownerEmail }, authorizationStatus: "approved", authorizedAt: null }).select("_id apiRole accessLevel createdAt").lean().exec() as any[]; for (const employee of legacyApproved) { const authorizedAt = employee.createdAt || new Date(); await EmployeeAccount.updateOne({ _id: employee._id, authorizedAt: null }, { $set: { authorizedAt, authorizedBy: owner?._id || null, authorizationReason: "Migración de autorización aprobada existente." } }).exec(); if (owner?._id && !(await AccessAuthorization.exists({ employeeId: employee._id }))) await AccessAuthorization.create({ employeeId: employee._id, action: "created", previousStatus: null, nextStatus: "approved", previousRole: null, nextRole: employee.apiRole, accessLevel: employee.accessLevel || "subadmin", actorEmployeeId: owner._id, reason: "Migración de autorización aprobada existente." }); } await ensureIndexes(); startRealtimeRelay(); startNotificationWorker(); if (process.env.REPAIR_PARTNER_EMAIL) await repairConfiguredPartnerAccess(); databaseReady = true; if (process.env.RUN_TENANT_MIGRATION === "true") { if (process.env.ALLOW_TENANT_MIGRATION !== "true") throw new Error("RUN_TENANT_MIGRATION requires ALLOW_TENANT_MIGRATION=true"); console.log(JSON.stringify({ event: "tenant_migration_started" })); console.log(JSON.stringify({ event: "tenant_migration_completed", ...(await runTenantMigration()) })); } } else console.warn("MONGODB_URI is not configured; /ready will remain unavailable.");
+  if (uri) { await mongoose.connect(uri, { dbName: databaseName, serverSelectionTimeoutMS: 10_000, socketTimeoutMS: 45_000, maxPoolSize: 20, minPoolSize: 2, retryWrites: true }); await EmployeeAccount.updateMany({ authorizationStatus: { $exists: false } }, { $set: { authorizationStatus: "approved", accessLevel: "subadmin" } }).exec(); await EmployeeAccount.updateOne({ email: ownerEmail }, { $set: { accessLevel: "superadmin", authorizationStatus: "approved", ownerProtected: true, active: true } }).exec(); const owner = await EmployeeAccount.findOne({ email: ownerEmail }).select("_id").lean().exec() as any; const legacyApproved = await EmployeeAccount.find({ email: { $ne: ownerEmail }, authorizationStatus: "approved", authorizedAt: null }).select("_id apiRole accessLevel createdAt").lean().exec() as any[]; for (const employee of legacyApproved) { const authorizedAt = employee.createdAt || new Date(); await EmployeeAccount.updateOne({ _id: employee._id, authorizedAt: null }, { $set: { authorizedAt, authorizedBy: owner?._id || null, authorizationReason: "Migración de autorización aprobada existente." } }).exec(); if (owner?._id && !(await AccessAuthorization.exists({ employeeId: employee._id }))) await AccessAuthorization.create({ employeeId: employee._id, action: "created", previousStatus: null, nextStatus: "approved", previousRole: null, nextRole: employee.apiRole, accessLevel: employee.accessLevel || "subadmin", actorEmployeeId: owner._id, reason: "Migración de autorización aprobada existente." }); } await ensureExpiresAtTtlIndex("employee_sessions"); await ensureExpiresAtTtlIndex("employee_password_resets"); await ensureIndexes(); startRealtimeRelay(); startNotificationWorker(); await repairConfiguredPartnerAccess(); await purgeTestDataIfEnabled(); databaseReady = true; if (process.env.RUN_TENANT_MIGRATION === "true") { if (process.env.ALLOW_TENANT_MIGRATION !== "true") throw new Error("RUN_TENANT_MIGRATION requires ALLOW_TENANT_MIGRATION=true"); console.log(JSON.stringify({ event: "tenant_migration_started" })); console.log(JSON.stringify({ event: "tenant_migration_completed", ...(await runTenantMigration()) })); } } else console.warn("MONGODB_URI is not configured; /ready will remain unavailable.");
   await EmployeeSession.init();
+  await EmployeePasswordReset.init();
   const server = app.listen(port, "0.0.0.0", () => console.log(`PIKI API listening on port ${port}`));
   void verifyCorporateEmailConnection().then(result => console.log(JSON.stringify({ event: "corporate_email_transport_probe", ...result }))).catch(() => console.warn("Corporate email probe failed without exposing credentials"));
   const sweepTimer = setInterval(() => { void runAutomaticDispatchSweep().catch((error) => console.error("Automatic dispatch sweep crashed", error)); }, 5_000).unref();

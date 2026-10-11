@@ -152,6 +152,28 @@ export function buildNoticeCopy(input: RealtimeNotificationInput, recipient: Rec
     if (recipient.surface !== "rider") return null;
     return { category: "delivery", title: "Nuevo reparto asignado", body: `Tienes una nueva oferta para ${orderRef}.`, url, entityType: "order", entityId: orderId };
   }
+  if (input.type === "order.message") {
+    if (recipient.surface !== "rider") return null;
+    return {
+      category: "message",
+      title: "Nuevo mensaje del cliente",
+      body: `Tienes un mensaje nuevo sobre ${orderRef}.`,
+      url: "/?section=Entregas",
+      entityType: "order",
+      entityId: orderId,
+    };
+  }
+  if (input.type === "support.message") {
+    if (recipient.surface !== "rider") return null;
+    return {
+      category: "support",
+      title: "Respuesta de Soporte PIKI",
+      body: "Un agente ha respondido a tu incidencia. Abre Soporte para verla.",
+      url: "/?section=Soporte",
+      entityType: "support_ticket",
+      entityId: String(input.payload.ticketId || ""),
+    };
+  }
   if (input.type === "security.rider_shift_out_of_hours") {
     if (!["fleet", "admin"].includes(recipient.surface)) return null;
     const riderName = String(input.payload.riderName || input.payload.riderEmail || "Rider desconocido").slice(0, 120);
@@ -214,6 +236,11 @@ export function buildNoticeCopy(input: RealtimeNotificationInput, recipient: Rec
       ? String(input.payload.message || `Tu pedido ${orderRef} está ${label}.`).slice(0, 240)
       : `${orderRef} está ${label}.`;
     return { category: "order", title: status === "cancelled" ? "Pedido cancelado" : "Actualización de pedido", body, url, entityType: "order", entityId: orderId };
+  }
+  if (input.type === "order.rider_message") {
+    if (recipient.surface !== "customer") return null;
+    const message = String(input.payload.message || "El Rider te ha enviado un mensaje.").slice(0, 240);
+    return { category: "order", title: `Mensaje de tu Rider · ${orderRef}`, body: message, url, entityType: "order", entityId: orderId };
   }
   if (input.type === "cash.wallet_changed" || input.type === "cash.handover_recorded") {
     if (!["rider", "fleet", "admin"].includes(recipient.surface)) return null;

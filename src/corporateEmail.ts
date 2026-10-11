@@ -36,7 +36,7 @@ export async function sendCorporateEmail(input: CorporateEmail): Promise<Corpora
     });
     try {
       const result = await transport.sendMail({ from: configuration.from, sender: configuration.from, replyTo: configuration.replyTo, to: input.recipientEmail, subject: input.subject, text: input.text, html: input.html, messageId: `<${deliveryKey}@pikidelivery.com>`, headers: { "X-PIKI-Delivery-Key": deliveryKey, "X-Mailer": "PIKI Delivery", "X-Auto-Response-Suppress": "All" }, envelope: { from: process.env.SMTP_USER!.trim(), to: input.recipientEmail } });
-      if (!(result.accepted || []).some(address => String(address).toLowerCase() === input.recipientEmail.toLowerCase())) return { sent: false, error: "CORPORATE_EMAIL_RECIPIENT_REJECTED" };
+      if (!(result.accepted || []).some((address: string) => String(address).toLowerCase() === input.recipientEmail.toLowerCase())) return { sent: false, error: "CORPORATE_EMAIL_RECIPIENT_REJECTED" };
       return { sent: true, providerId: String(result.messageId) };
     } catch (error) {
       const code = (error as { code?: string }).code || "UNKNOWN";
