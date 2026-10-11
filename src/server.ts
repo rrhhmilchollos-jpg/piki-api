@@ -4043,7 +4043,7 @@ async function repairConfiguredPartnerAccess() {
   // The repair itself is explicitly allow-listed by REPAIR_PARTNER_EMAIL in
   // render.yaml. Restore the whole fixed demonstration portfolio for that
   // account; relying on an old ownerProtected flag left it with only KFC.
-  const includeXativaTestPortfolio = process.env.REPAIR_PARTNER_CREATE_TEST === "true";
+  const includeXativaTestPortfolio = true;
   const testPortfolio = [
     { slug: "kings-tacos-xativa", name: "Kings Tacos Xàtiva", cuisine: "Mexicana", category: "Mexicana" },
     { slug: "eleven-burgers-xativa", name: "Eleven Burgers Xàtiva", cuisine: "Hamburguesas", category: "Hamburguesas" },
