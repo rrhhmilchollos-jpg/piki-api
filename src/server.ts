@@ -1409,6 +1409,27 @@ app.get("/api/v1/partners/kitchen/orders", requireRole("partner"), async (req, r
     };
   }) });
 });
+const partnerPaymentSchema = z.object({
+  required: z.boolean(),
+  amountCents: z.number().int().min(0).max(1_000_000).nullable().optional(),
+});
+app.patch("/api/v1/partners/kitchen/orders/:id/partner-payment", requireRole("partner"), async (req, res) => {
+  const parsed = partnerPaymentSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "INVALID_PARTNER_PAYMENT", details: parsed.error.flatten() });
+  const { access, allowed } = await partnerRequestAccess(req, "orders:write");
+  if (!allowed) return res.status(403).json({ error: "PARTNER_PERMISSION_DENIED", permission: "orders:write" });
+  const restaurantId = await employeeRestaurant(req, access);
+  if (!restaurantId) return res.status(403).json({ error: "PARTNER_RESTAURANT_ACCESS_DENIED" });
+  const orderId = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
+  if (!orderId) return res.status(400).json({ error: "INVALID_ORDER_ID" });
+  const order = await Order.findOne({ _id: orderId, restaurantId, ...tenantScope(req), status: { $in: ["pending", "accepted", "preparing", "ready_for_pickup"] } });
+  if (!order) return res.status(404).json({ error: "ORDER_NOT_FOUND_OR_NOT_EDITABLE" });
+  order.partnerPaymentRequired = parsed.data.required;
+  order.partnerPaymentCents = parsed.data.required ? (parsed.data.amountCents ?? order.totalCents ?? 0) : null;
+  order.statusHistory.push({ status: order.status, actorRole: "partner", reason: parsed.data.required ? `Pago al Partner configurado: ${order.partnerPaymentCents} céntimos` : "Pago al Partner desactivado" } as any);
+  await order.save();
+  return res.json({ updated: true, partnerPaymentRequired: order.partnerPaymentRequired, partnerPaymentCents: order.partnerPaymentCents });
+});
 app.get("/api/v1/partners/kitchen/orders/archive", requireRole("partner"), async (req, res) => {
   const { access, allowed } = await partnerRequestAccess(req, "orders:read");
   if (!allowed) return res.status(403).json({ error: "PARTNER_PERMISSION_DENIED", permission: "orders:read" });
@@ -3703,7 +3724,7 @@ app.get("/api/v1/riders/:id/offers", requireRole("rider"), async (req, res) => {
   const rider = await riderAccessForRequest(riderId, req);
   if (!rider) return res.status(403).json({ error: "RIDER_ACCESS_DENIED" });
   const offers = await Order.find({ riderId, assignmentState: { $in: ["offered", "assigned"] }, status: { $nin: ["delivered", "cancelled"] } })
-.select("_id publicCode displayCode displayCodeDate restaurantId customerId riderId status paymentState paymentMethod subtotalCents deliveryFeeCents serviceFeeCents totalCents assignmentState assignmentExpiresAt pickupDeadlineAt partnerPrepDeadlineAt deliveryAddress deliveryNote deliveryLocation items createdAt")
+.select("_id publicCode displayCode displayCodeDate restaurantId customerId riderId status paymentState paymentMethod partnerPaymentRequired partnerPaymentCents subtotalCents deliveryFeeCents serviceFeeCents totalCents assignmentState assignmentExpiresAt pickupDeadlineAt partnerPrepDeadlineAt deliveryAddress deliveryNote deliveryLocation items createdAt")
     .sort({ createdAt: -1 }).limit(10).lean().exec() as any[];
   const riderProfile = await Rider.findById(riderId).select("vehicle").lean().exec() as any;
   const restaurantIds = offers.map((offer) => offer.restaurantId).filter(Boolean);
@@ -3728,6 +3749,8 @@ app.get("/api/v1/riders/:id/offers", requireRole("rider"), async (req, res) => {
       status: offer.status,
       paymentState: offer.paymentState,
       paymentMethod: offer.paymentMethod || "stripe",
+      partnerPaymentRequired: Boolean(offer.partnerPaymentRequired),
+      partnerPaymentCents: offer.partnerPaymentRequired && offer.partnerPaymentCents != null ? Number(offer.partnerPaymentCents) : null,
       subtotalCents: Number(offer.subtotalCents || 0),
       deliveryFeeCents: Number(offer.deliveryFeeCents || 0),
       serviceFeeCents: Number(offer.serviceFeeCents || 0),
