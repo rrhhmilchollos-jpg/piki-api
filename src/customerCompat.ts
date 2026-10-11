@@ -83,7 +83,10 @@ function restaurantView(row: any) {
 }
 
 export async function handleCustomerTrpc(req: Request, res: Response) {
-  const procedure = String(req.params.procedure || "");
+  // Some proxy/rewrite combinations preserve the tRPC path in req.path but
+  // leave the named Express parameter empty. Resolve both forms so customer
+  // support and pilot requests do not fall through as an unsupported procedure.
+  const procedure = String(req.params.procedure || req.path.split("/").filter(Boolean).pop() || "").split("?")[0];
   const input = inputOf(req);
   try {
     if (procedure === "catalog.list") {
