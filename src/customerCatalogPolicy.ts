@@ -5,6 +5,7 @@ export const CUSTOMER_CATALOG_RESTAURANT_NAME = "PIKI-PRUEBA" as const;
 export const COMING_SOON_SLUGS = ["kings-tacos-xativa", "eleven-burgers-xativa", "nakama-sushi-xativa", "rooster-kebab-xativa", "alibaba-kebab-xativa"] as const;
 export const CUSTOMER_ORDERABLE_RESTAURANT_FILTER = {
   slug: { $in: [CUSTOMER_CATALOG_RESTAURANT_SLUG, "kfc-xativa"] },
+  internalDemo: { $ne: true },
   isActive: true,
   onboardingStatus: "approved",
   availabilityStatus: { $ne: "coming_soon" },

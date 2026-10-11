@@ -31,6 +31,7 @@ import { canReceivePartnerLocations, partnerCan, partnerPermissions, partnerRole
 import { awardRiderRecruitmentMilestones, claimRiderReferralCode, completeRiderShiftIncentiveTracking, incentiveProgramStatus, loadRiderIncentiveSnapshot, trackRiderLocationForIncentive, trackRiderShiftStart } from "./riderIncentives.js";
 import { buildApprovedRiderOperationalProfile } from "./riderApproval.js";
 import { COMING_SOON_SLUGS, CUSTOMER_CATALOG_RESTAURANT_FILTER, CUSTOMER_ORDERABLE_RESTAURANT_FILTER, presentCustomerCatalogRestaurant } from "./customerCatalogPolicy.js";
+import { PARTNER_DEMO_MENU_VERSION, partnerDemoMenu } from "./partnerDemoMenu.js";
 import { quoteMenuItem, usesReferenceAddOns } from "./menuModifiers.js";
 import { decideLatePickup, pointDistanceMeters } from "./pickupPolicy.js";
 import { buildLegacyRiderSupportTicketFilter, buildRiderSupportTicketFilter } from "./supportTicketScope.js";
@@ -1354,7 +1355,7 @@ app.get("/api/v1/partners/menu", requireRole("partner"), async (req, res) => {
   if (!allowed) return res.status(403).json({ error: "PARTNER_PERMISSION_DENIED", permission: "menu:read" });
   const restaurantId = await employeeRestaurant(req, access);
   if (!restaurantId) return res.status(403).json({ error: access?.restaurantIds.length ? "PARTNER_RESTAURANT_ACCESS_DENIED" : "PARTNER_RESTAURANT_NOT_ASSIGNED" });
-  const restaurant = await Restaurant.findById(restaurantId).select("name menu").lean().exec() as any;
+  const restaurant = await Restaurant.findById(restaurantId).select("name slug internalDemo menu").lean().exec() as any;
   if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
   return res.json({ restaurant, menu: restaurant.menu || [] });
 });
@@ -3992,11 +3993,11 @@ async function repairConfiguredPartnerAccess() {
     restaurant = await Restaurant.findOneAndUpdate(
       { slug: "kfc-xativa-test" },
       {
-        $set: { tenantId: account.tenantId || null, email, onboardingStatus: "approved", isActive: true },
-        $setOnInsert: { slug: "kfc-xativa-test", name: "KFC XATIVA TEST", cuisine: "Americana", category: "Americana", locality: "Xàtiva", partnerGroupKey: "xativa", tagline: "Partner de prueba PIKI", phone: "", address: "Xàtiva" },
+        $set: { tenantId: account.tenantId || null, email, onboardingStatus: "approved", isActive: true, internalDemo: true },
+        $setOnInsert: { slug: "kfc-xativa-test", name: "KFC XATIVA TEST", cuisine: "Americana", category: "Americana", locality: "Xàtiva", partnerGroupKey: "xativa", tagline: "Entorno de demostración interna de PIKI · sin afiliación comercial.", phone: "", address: "Xàtiva" },
       },
       { upsert: true, new: true, setDefaultsOnInsert: true },
-    ).select("_id email slug name tenantId onboardingStatus isActive").lean().exec();
+    ).select("_id email slug name tenantId onboardingStatus isActive internalDemo demoMenuVersion").lean().exec();
     console.log(JSON.stringify({ event: "partner_access_repair", email, result: "test_restaurant_created_or_reused", restaurantId: String(restaurant._id), restaurantName: restaurant.name, tenantId: restaurant.tenantId ? String(restaurant.tenantId) : null }));
   } else {
     const tenantFilter = account.tenantId ? { tenantId: account.tenantId } : { tenantId: null };
@@ -4005,6 +4006,32 @@ async function repairConfiguredPartnerAccess() {
       : await Restaurant.findOne({ email, ...tenantFilter }).select("_id email slug name tenantId onboardingStatus isActive").lean().exec();
   }
   if (!restaurant) { console.log(JSON.stringify({ event: "partner_access_repair", email, result: "restaurant_not_found", accountId: String(account._id) })); return; }
+
+  const isProtectedOwner = Boolean(account.ownerProtected && email === ownerEmail);
+  if (restaurant.slug === "kfc-xativa-test" && isProtectedOwner) {
+    const seeded = await Restaurant.findOneAndUpdate(
+      {
+        _id: restaurant._id,
+        $or: [
+          { demoMenuVersion: { $lt: PARTNER_DEMO_MENU_VERSION } },
+          { demoMenuVersion: { $exists: false } },
+        ],
+      },
+      {
+        $set: {
+          internalDemo: true,
+          demoMenuVersion: PARTNER_DEMO_MENU_VERSION,
+          tagline: "Entorno de demostración interna de PIKI · sin afiliación comercial.",
+          menu: partnerDemoMenu,
+        },
+      },
+      { new: true },
+    ).select("_id email slug name tenantId onboardingStatus isActive internalDemo demoMenuVersion").lean().exec();
+    if (seeded) {
+      restaurant = seeded;
+      console.log(JSON.stringify({ event: "partner_demo_menu_restored", restaurantId: String(restaurant._id), menuVersion: PARTNER_DEMO_MENU_VERSION, itemCount: partnerDemoMenu.length }));
+    }
+  }
 
   // The repair itself is already explicitly allow-listed by REPAIR_PARTNER_EMAIL.
   // For the protected PIKI owner, restore the complete test portfolio even when
@@ -4043,7 +4070,6 @@ async function repairConfiguredPartnerAccess() {
     throw new Error("Configured Xàtiva test portfolio does not match the public catalog");
   }
 
-  const isProtectedOwner = Boolean(account.ownerProtected && email === ownerEmail);
   const roles = [...new Set([...(Array.isArray(account.roles) ? account.roles : []), "partner", ...(isProtectedOwner ? ["admin"] : [])])];
   await EmployeeAccount.updateOne(
     { _id: account._id },
