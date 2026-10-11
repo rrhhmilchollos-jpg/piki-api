@@ -20,6 +20,8 @@ services:
         value: rrhh.milchollos@gmail.com
       - key: REPAIR_PARTNER_CREATE_TEST
         value: "true"
+      - key: REPAIR_PARTNER_TEST_LOCATIONS
+        value: "true"
       - key: CORS_ORIGINS
         sync: false
       - key: UPSTASH_REDIS_REST_URL

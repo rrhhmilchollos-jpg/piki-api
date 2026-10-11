@@ -30,7 +30,7 @@ import { activeOperationalOrderStatuses, dispatchableOrderStatuses, dispatchable
 import { canReceivePartnerLocations, partnerCan, partnerPermissions, partnerRolesForEmployee, permissionsForPartnerRoles, type PartnerPermission } from "./partnerAccess.js";
 import { awardRiderRecruitmentMilestones, claimRiderReferralCode, completeRiderShiftIncentiveTracking, incentiveProgramStatus, loadRiderIncentiveSnapshot, trackRiderLocationForIncentive, trackRiderShiftStart } from "./riderIncentives.js";
 import { buildApprovedRiderOperationalProfile } from "./riderApproval.js";
-import { CUSTOMER_CATALOG_RESTAURANT_FILTER, CUSTOMER_ORDERABLE_RESTAURANT_FILTER, presentCustomerCatalogRestaurant } from "./customerCatalogPolicy.js";
+import { COMING_SOON_SLUGS, CUSTOMER_CATALOG_RESTAURANT_FILTER, CUSTOMER_ORDERABLE_RESTAURANT_FILTER, presentCustomerCatalogRestaurant } from "./customerCatalogPolicy.js";
 import { quoteMenuItem, usesReferenceAddOns } from "./menuModifiers.js";
 import { decideLatePickup, pointDistanceMeters } from "./pickupPolicy.js";
 import { buildLegacyRiderSupportTicketFilter, buildRiderSupportTicketFilter } from "./supportTicketScope.js";
@@ -4006,6 +4006,40 @@ async function repairConfiguredPartnerAccess() {
   }
   if (!restaurant) { console.log(JSON.stringify({ event: "partner_access_repair", email, result: "restaurant_not_found", accountId: String(account._id) })); return; }
 
+  const includeXativaTestPortfolio = process.env.REPAIR_PARTNER_TEST_LOCATIONS === "true";
+  const testPortfolio = [
+    { slug: "kings-tacos-xativa", name: "Kings Tacos Xàtiva", cuisine: "Mexicana", category: "Mexicana" },
+    { slug: "eleven-burgers-xativa", name: "Eleven Burgers Xàtiva", cuisine: "Hamburguesas", category: "Hamburguesas" },
+    { slug: "nakama-sushi-xativa", name: "Nakama Sushi Xàtiva", cuisine: "Japonesa", category: "Japonesa" },
+    { slug: "rooster-kebab-xativa", name: "Rooster Kebab Xàtiva", cuisine: "Kebab", category: "Kebab" },
+    { slug: "alibaba-kebab-xativa", name: "Alibaba Kebab Xàtiva", cuisine: "Kebab", category: "Kebab" },
+  ] as const;
+  const assignedRestaurants = includeXativaTestPortfolio
+    ? await Promise.all(testPortfolio.map((location) => Restaurant.findOneAndUpdate(
+      { slug: location.slug },
+      {
+        $set: {
+          tenantId: account.tenantId || null,
+          name: location.name,
+          cuisine: location.cuisine,
+          category: location.category,
+          locality: "Xàtiva",
+          partnerGroupKey: "xativa",
+          availabilityStatus: "coming_soon",
+          upcomingMessage: "Disponible muy pronto",
+          onboardingStatus: "approved",
+          isActive: false,
+        },
+        $setOnInsert: { slug: location.slug, tagline: "Próximo partner PIKI en Xàtiva", phone: "", address: "Xàtiva" },
+      },
+      { upsert: true, new: true, setDefaultsOnInsert: true },
+    ).select("_id slug name").lean().exec()))
+    : [];
+  const portfolioIds = [restaurant._id, ...assignedRestaurants.map((location: any) => location._id)];
+  if (includeXativaTestPortfolio && new Set(assignedRestaurants.map((location: any) => location.slug)).size !== COMING_SOON_SLUGS.length) {
+    throw new Error("Configured Xàtiva test portfolio does not match the public catalog");
+  }
+
   const isProtectedOwner = Boolean(account.ownerProtected && email === ownerEmail);
   const roles = [...new Set([...(Array.isArray(account.roles) ? account.roles : []), "partner", ...(isProtectedOwner ? ["admin"] : [])])];
   await EmployeeAccount.updateOne(
@@ -4013,7 +4047,7 @@ async function repairConfiguredPartnerAccess() {
     {
       $set: {
         restaurantId: restaurant._id,
-        restaurantIds: [restaurant._id],
+        restaurantIds: portfolioIds,
         apiRole: isProtectedOwner ? "admin" : "partner",
         jobRole: isProtectedOwner ? "admin" : "partner",
         roles,
@@ -4021,11 +4055,11 @@ async function repairConfiguredPartnerAccess() {
         active: true,
         authorizationStatus: "approved",
         authorizedAt: new Date(),
-        authorizationReason: "Asignación de KFC XATIVA TEST para pruebas Partner.",
+        authorizationReason: includeXativaTestPortfolio ? "Asignación de cartera de pruebas Partner de Xàtiva." : "Asignación de KFC XATIVA TEST para pruebas Partner.",
       },
     },
   ).exec();
-  console.log(JSON.stringify({ event: "partner_access_repair", email, result: "repaired", restaurantId: String(restaurant._id), restaurantName: restaurant.name, ownerPreserved: isProtectedOwner }));
+  console.log(JSON.stringify({ event: "partner_access_repair", email, result: "repaired", restaurantId: String(restaurant._id), restaurantName: restaurant.name, assignedRestaurantCount: portfolioIds.length, ownerPreserved: isProtectedOwner }));
 }
 async function start() {
   const uri = process.env.MONGODB_URI;
