@@ -546,40 +546,87 @@ const partnerOperationalRoles = ["partner_admin", "area_manager", "zone_manager"
 const employeeLoginSchema = z.object({ email: z.string().email(), password: z.string().min(8).max(200), role: z.enum(employeeSessionRoles).optional() });
 const employeePasswordResetRequestSchema = z.object({ email: z.string().email().max(254) });
 const employeePasswordResetConfirmSchema = z.object({ token: z.string().min(40).max(200), newPassword: z.string().min(12).max(200).regex(/[A-Z]/).regex(/[a-z]/).regex(/[0-9]/) });
-const passwordResetMessage = "Si el correo corresponde a una cuenta Partner activa, recibirás un enlace para crear una contraseña nueva.";
+const employeeCredentialSurfaces = ["admin", "partner", "rider", "fleet"] as const;
+type EmployeeCredentialSurface = (typeof employeeCredentialSurfaces)[number];
+const employeeCredentialAppUrls: Record<EmployeeCredentialSurface, string> = {
+  admin: String(process.env.ADMIN_APP_URL || "https://admin.pikidelivery.com").replace(/\/$/, ""),
+  partner: String(process.env.PARTNER_APP_URL || "https://partners.pikidelivery.com").replace(/\/$/, ""),
+  rider: String(process.env.RIDER_APP_URL || "https://riders.pikidelivery.com").replace(/\/$/, ""),
+  fleet: String(process.env.FLEET_APP_URL || "https://fleet.pikidelivery.com").replace(/\/$/, ""),
+};
+const employeeCredentialLabels: Record<EmployeeCredentialSurface, string> = {
+  admin: "PIKI Administración",
+  partner: "PIKI Partner Orders",
+  rider: "PIKI Riders",
+  fleet: "PIKI Fleet",
+};
+const passwordResetMessage = "Si el correo corresponde a una cuenta PIKI activa, recibirás un enlace para crear una contraseña nueva.";
+
+function employeeCredentialSurface(value: unknown): EmployeeCredentialSurface | null {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (normalized === "partners") return "partner";
+  return (employeeCredentialSurfaces as readonly string[]).includes(normalized) ? normalized as EmployeeCredentialSurface : null;
+}
+
+function employeeCanUseCredentialSurface(employee: any, surface: EmployeeCredentialSurface) {
+  return Boolean(employee && sessionRole(employee, surface));
+}
+
+function preferredCredentialSurface(employee: any): EmployeeCredentialSurface | null {
+  const candidates = [employee?.primaryRole, employee?.apiRole, employee?.jobRole, ...(Array.isArray(employee?.roles) ? employee.roles : [])];
+  for (const candidate of candidates) {
+    const surface = employeeCredentialSurface(candidate);
+    if (surface && employeeCanUseCredentialSurface(employee, surface)) return surface;
+  }
+  return employeeCanUseCredentialSurface(employee, "admin") ? "admin" : null;
+}
+
+async function createEmployeePasswordReset(employee: any, surface: EmployeeCredentialSurface, ttlMs = 30 * 60_000) {
+  const rawToken = randomBytes(32).toString("hex");
+  const tokenHash = createHash("sha256").update(rawToken).digest("hex");
+  const expiresAt = new Date(Date.now() + ttlMs);
+  await EmployeePasswordReset.updateMany({ employeeId: employee._id, usedAt: null }, { $set: { usedAt: new Date() } }).exec();
+  await EmployeePasswordReset.create({ employeeId: employee._id, email: String(employee.email).trim().toLowerCase(), tokenHash, expiresAt });
+  return { tokenHash, expiresAt, resetUrl: `${employeeCredentialAppUrls[surface]}/?reset=${encodeURIComponent(rawToken)}` };
+}
+
+async function sendEmployeePasswordLink(employee: any, surface: EmployeeCredentialSurface, purpose: "recovery" | "activation") {
+  const reset = await createEmployeePasswordReset(employee, surface, purpose === "activation" ? 24 * 60 * 60_000 : 30 * 60_000);
+  const appLabel = employeeCredentialLabels[surface];
+  const safeName = escapeCorporateHtml(String(employee.name || "equipo PIKI"));
+  const expiryText = purpose === "activation" ? "24 horas" : "30 minutos";
+  const action = purpose === "activation" ? "Crear acceso" : "Crear contraseña nueva";
+  const delivery = await sendCorporateEmail({
+    recipientEmail: String(employee.email).trim().toLowerCase(),
+    subject: `${appLabel} · ${purpose === "activation" ? "Activa tu acceso" : "Recupera tu contraseña"}`,
+    idempotencyKey: `piki-employee-password-${purpose}-${reset.tokenHash}`,
+    text: `Hola ${employee.name || "equipo PIKI"},\n\n${purpose === "activation" ? `Tu acceso a ${appLabel} ha sido autorizado.` : `Hemos recibido una solicitud para recuperar tu acceso a ${appLabel}.`}\n\n${action}: ${reset.resetUrl}\n\nEl enlace caduca en ${expiryText} y solo puede utilizarse una vez. Si no esperabas este correo, ignóralo y avisa a RRHH.\n\nEquipo PIKI`,
+    html: `<div style="font-family:Arial,sans-serif;line-height:1.6;color:#171717"><h2>${escapeCorporateHtml(appLabel)}</h2><p>Hola ${safeName}:</p><p>${purpose === "activation" ? "Tu acceso ha sido autorizado por Administración." : "Hemos recibido una solicitud para crear una contraseña nueva."}</p><p><a href="${reset.resetUrl}" style="display:inline-block;padding:13px 20px;border-radius:10px;background:#ffd400;color:#171717;text-decoration:none;font-weight:700">${action}</a></p><p style="font-size:13px;color:#666">El enlace caduca en ${expiryText} y solo puede utilizarse una vez. Si no esperabas este correo, ignóralo y avisa a RRHH.</p></div>`,
+  });
+  return { delivery, reset };
+}
+
 app.post("/api/v1/auth/employee/password-reset/request", rateLimit(3, 15 * 60_000, "employee-password-reset"), async (req, res) => {
   const parsed = employeePasswordResetRequestSchema.safeParse(req.body);
-  if (!parsed.success) return res.status(202).json({ message: passwordResetMessage });
+  const surface = employeeCredentialSurface(req.header("x-piki-surface"));
+  if (!parsed.success || !surface) return res.status(202).json({ message: passwordResetMessage });
   const email = parsed.data.email.trim().toLowerCase();
-  const employee = await EmployeeAccount.findOne({ email, active: true, authorizationStatus: "approved", $or: [{ apiRole: "partner" }, { roles: "partner" }] }).select("_id email name").lean().exec() as any;
-  if (employee) {
-    const rawToken = randomBytes(32).toString("hex");
-    const tokenHash = createHash("sha256").update(rawToken).digest("hex");
-    const expiresAt = new Date(Date.now() + 30 * 60_000);
-    await EmployeePasswordReset.updateMany({ employeeId: employee._id, usedAt: null }, { $set: { usedAt: new Date() } }).exec();
-    await EmployeePasswordReset.create({ employeeId: employee._id, email, tokenHash, expiresAt });
-    const appUrl = String(process.env.PARTNER_APP_URL || "https://partners.pikidelivery.com").replace(/\/$/, "");
-    const resetUrl = `${appUrl}/?reset=${encodeURIComponent(rawToken)}`;
-    const safeName = escapeCorporateHtml(String(employee.name || "equipo Partner"));
-    const delivery = await sendCorporateEmail({
-      recipientEmail: email,
-      subject: "PIKI Partner · Recupera tu contraseña",
-      idempotencyKey: `piki-employee-password-reset-${tokenHash}`,
-      text: `Hola ${employee.name || "equipo Partner"},\n\nPuedes crear una contraseña nueva en este enlace: ${resetUrl}\n\nEl enlace caduca en 30 minutos y solo puede utilizarse una vez. Si no solicitaste este cambio, ignora este mensaje.\n\nEquipo PIKI`,
-      html: `<div style="font-family:Arial,sans-serif;line-height:1.6;color:#171717"><h2>Recuperación de acceso PIKI Partner</h2><p>Hola ${safeName}:</p><p>Hemos recibido una solicitud para crear una contraseña nueva.</p><p><a href="${resetUrl}" style="display:inline-block;padding:13px 20px;border-radius:10px;background:#ffd400;color:#171717;text-decoration:none;font-weight:700">Crear contraseña nueva</a></p><p style="font-size:13px;color:#666">El enlace caduca en 30 minutos y solo puede utilizarse una vez. Si no solicitaste este cambio, ignora este mensaje.</p></div>`,
-    });
+  const employee = await EmployeeAccount.findOne({ email, active: true, authorizationStatus: "approved" }).select("_id email name jobRole apiRole roles primaryRole ownerProtected authorizationStatus").lean().exec() as any;
+  if (employee && employeeCanUseCredentialSurface(employee, surface)) {
+    const { delivery } = await sendEmployeePasswordLink(employee, surface, "recovery");
     if (!delivery.sent) console.warn("Employee password reset email was not delivered", { error: delivery.error });
   }
   return res.status(202).json({ message: passwordResetMessage });
 });
 app.post("/api/v1/auth/employee/password-reset/confirm", rateLimit(8, 15 * 60_000, "employee-password-reset-confirm"), async (req, res) => {
   const parsed = employeePasswordResetConfirmSchema.safeParse(req.body);
-  if (!parsed.success) return res.status(400).json({ error: "INVALID_PASSWORD_CHANGE", message: "La nueva contraseña debe tener 12 caracteres e incluir mayúscula, minúscula y número." });
+  const surface = employeeCredentialSurface(req.header("x-piki-surface"));
+  if (!parsed.success || !surface) return res.status(400).json({ error: "INVALID_PASSWORD_CHANGE", message: "La nueva contraseña debe tener 12 caracteres e incluir mayúscula, minúscula y número." });
   const tokenHash = createHash("sha256").update(parsed.data.token).digest("hex");
   const reset = await EmployeePasswordReset.findOne({ tokenHash, usedAt: null, expiresAt: { $gt: new Date() } }).exec() as any;
   if (!reset) return res.status(400).json({ error: "PASSWORD_RESET_INVALID", message: "El enlace no es válido o ya ha caducado. Solicita otro enlace." });
-  const employee = await EmployeeAccount.findOne({ _id: reset.employeeId, active: true, authorizationStatus: "approved", $or: [{ apiRole: "partner" }, { roles: "partner" }] }).select("+passwordHash").exec() as any;
-  if (!employee) return res.status(400).json({ error: "PASSWORD_RESET_INVALID", message: "El enlace no es válido o ya ha caducado. Solicita otro enlace." });
+  const employee = await EmployeeAccount.findOne({ _id: reset.employeeId, active: true, authorizationStatus: "approved" }).select("+passwordHash email jobRole apiRole roles primaryRole ownerProtected authorizationStatus").exec() as any;
+  if (!employee || !employeeCanUseCredentialSurface(employee, surface)) return res.status(400).json({ error: "PASSWORD_RESET_INVALID", message: "El enlace no es válido o ya ha caducado. Solicita otro enlace." });
   employee.passwordHash = hashPassword(parsed.data.newPassword); employee.mustChangePassword = false; employee.passwordChangedAt = new Date(); employee.sessionHash = null; await employee.save();
   await EmployeeSession.deleteMany({ employeeId: employee._id }).exec();
   reset.usedAt = new Date(); await reset.save();
@@ -654,7 +701,14 @@ app.post("/api/v1/admin/employees", requireOwner(), async (req, res) => {
   try {
     const employee = await EmployeeAccount.create({ ...parsed.data, roles, primaryRole, accessLevel: "subadmin", authorizationStatus: "approved", authorizedAt: new Date(), authorizedBy: req.auth?.employeeId ? objectId(req.auth.employeeId) : null, restaurantId: parsed.data.restaurantId ? objectId(parsed.data.restaurantId) : null, fleetId: parsed.data.fleetId ? objectId(parsed.data.fleetId) : null, apiRole, passwordHash: hashPassword(temporaryPassword), mustChangePassword: true, active: true });
     await AccessAuthorization.create({ employeeId: employee._id, action: "created", previousStatus: null, nextStatus: "approved", previousRole: null, nextRole: apiRole, accessLevel: "subadmin", actorEmployeeId: objectId(req.auth!.employeeId!), reason: "Cuenta creada y autorizada por RRHH superadmin." });
-    return res.status(201).json({ employee: { id: employee.id, name: employee.name, email: employee.email, jobRole: employee.jobRole, apiRole: employee.apiRole, roles: employee.roles?.length ? employee.roles : [employee.apiRole], primaryRole: employee.primaryRole || employee.apiRole, portfolioId: employee.portfolioId, fleetId: employee.fleetId, zoneSlugs: employee.zoneSlugs, active: employee.active }, temporaryPassword, warning: "Mostrar esta contraseña una sola vez y entregarla por un canal seguro." });
+    const surface = preferredCredentialSurface(employee);
+    let activationEmail: { sent: boolean; error?: string; surface?: EmployeeCredentialSurface } = { sent: false };
+    if (surface) {
+      const { delivery } = await sendEmployeePasswordLink(employee, surface, "activation");
+      activationEmail = { sent: delivery.sent, error: delivery.error, surface };
+      if (delivery.sent) await AccessAuthorization.create({ employeeId: employee._id, action: "credentials_sent", previousStatus: "approved", nextStatus: "approved", previousRole: apiRole, nextRole: apiRole, accessLevel: "subadmin", actorEmployeeId: objectId(req.auth!.employeeId!), reason: `Enlace de activación enviado para ${employeeCredentialLabels[surface]}.` });
+    }
+    return res.status(201).json({ employee: { id: employee.id, name: employee.name, email: employee.email, jobRole: employee.jobRole, apiRole: employee.apiRole, roles: employee.roles?.length ? employee.roles : [employee.apiRole], primaryRole: employee.primaryRole || employee.apiRole, portfolioId: employee.portfolioId, fleetId: employee.fleetId, zoneSlugs: employee.zoneSlugs, active: employee.active }, activationEmail, warning: activationEmail.sent ? undefined : "La cuenta se creó, pero no se pudo confirmar el envío del enlace. Usa “Enviar activación” cuando el correo corporativo esté disponible." });
   } catch (error) { if ((error as any)?.code === 11000) return res.status(409).json({ error: "EMPLOYEE_EMAIL_ALREADY_EXISTS" }); throw error; }
 });
 const onboardingRequestSchema = z.object({
@@ -738,6 +792,31 @@ app.post("/api/v1/admin/employees/:id/reset-password", requireOwner(), async (re
   const employee = await EmployeeAccount.findByIdAndUpdate(id, { $set: { passwordHash: hashPassword(parsed.data.newPassword), mustChangePassword: true, passwordChangedAt: new Date(), sessionHash: null, active: true } }, { new: true }).select("name email jobRole apiRole active mustChangePassword").lean().exec();
   await revokeEmployeeSessions(id);
   return res.json({ employee, reset: true });
+});
+app.post("/api/v1/admin/employees/:id/send-activation", requireOwner(), async (req, res) => {
+  const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
+  if (!id) return res.status(400).json({ error: "INVALID_EMPLOYEE_ID" });
+  const target = await EmployeeAccount.findById(id).select("_id name email jobRole apiRole roles primaryRole ownerProtected authorizationStatus active accessLevel tenantId").lean().exec() as any;
+  if (!target) return res.status(404).json({ error: "EMPLOYEE_NOT_FOUND" });
+  if (target.ownerProtected || target.email === ownerEmail) return res.status(403).json({ error: "OWNER_ACCOUNT_PROTECTED" });
+  if (!target.active || target.authorizationStatus !== "approved") return res.status(409).json({ error: "EMPLOYEE_NOT_APPROVED", message: "Aprueba la cuenta antes de enviar sus credenciales." });
+  const surface = preferredCredentialSurface(target);
+  if (!surface) return res.status(409).json({ error: "EMPLOYEE_SURFACE_NOT_CONFIGURED", message: "La cuenta no tiene un panel operativo configurado para recibir el enlace." });
+  const { delivery } = await sendEmployeePasswordLink(target, surface, "activation");
+  if (!delivery.sent) return res.status(503).json({ error: "CREDENTIAL_EMAIL_NOT_SENT", message: "No se pudo enviar el correo corporativo. Comprueba la configuración de correo y vuelve a intentarlo." });
+  await AccessAuthorization.create({
+    tenantId: target.tenantId || null,
+    employeeId: target._id,
+    action: "credentials_sent",
+    previousStatus: target.authorizationStatus,
+    nextStatus: target.authorizationStatus,
+    previousRole: target.apiRole,
+    nextRole: target.apiRole,
+    accessLevel: target.accessLevel || "subadmin",
+    actorEmployeeId: objectId(req.auth!.employeeId!),
+    reason: `Enlace de activación enviado para ${employeeCredentialLabels[surface]}.`,
+  });
+  return res.json({ sent: true, surface, recipient: target.email, message: `Se ha enviado un enlace de activación a ${target.email}.` });
 });
 app.patch("/api/v1/admin/employees/:id/authorization", requireOwner(), async (req, res) => {
   const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id); if (!id) return res.status(400).json({ error: "INVALID_EMPLOYEE_ID" });
@@ -1054,6 +1133,7 @@ async function partnerLocationsFor(employee: any, roles = partnerRolesForEmploye
   const ordered = ids.length ? ids.map((id) => byId.get(id)).filter(Boolean) : restaurants;
   return ordered.map((restaurant: any) => ({
     id: String(restaurant._id),
+    partnerCode: onboardingCode("P", restaurant._id),
     name: restaurant.name,
     address: restaurant.address || "",
     isOpen: Boolean(restaurant.isActive && restaurant.onboardingStatus === "approved"),
