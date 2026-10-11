@@ -86,7 +86,9 @@ export async function handleCustomerTrpc(req: Request, res: Response) {
   // Some proxy/rewrite combinations preserve the tRPC path in req.path but
   // leave the named Express parameter empty. Resolve both forms so customer
   // support and pilot requests do not fall through as an unsupported procedure.
-  const procedure = String(req.params.procedure || req.path.split("/").filter(Boolean).pop() || "").split("?")[0];
+  const routePath = String(req.originalUrl || req.url || req.path);
+  const pathProcedure = routePath.match(/\/api\/trpc\/([^?/#]+)/)?.[1] || req.path.split("/").filter(Boolean).pop() || "";
+  const procedure = decodeURIComponent(String(req.params.procedure || pathProcedure)).split("?")[0];
   const input = inputOf(req);
   try {
     if (procedure === "catalog.list") {
