@@ -4006,10 +4006,10 @@ async function repairConfiguredPartnerAccess() {
   }
   if (!restaurant) { console.log(JSON.stringify({ event: "partner_access_repair", email, result: "restaurant_not_found", accountId: String(account._id) })); return; }
 
-  // Existing Render services already enable REPAIR_PARTNER_CREATE_TEST. Keep the
-  // Xàtiva test portfolio coupled to that explicit, allow-listed repair rather
-  // than relying on a newly introduced Blueprint variable to be synchronized.
-  const includeXativaTestPortfolio = createOrUseTestRestaurant;
+  // The repair itself is already explicitly allow-listed by REPAIR_PARTNER_EMAIL.
+  // For the protected PIKI owner, restore the complete test portfolio even when
+  // a legacy Render service has not synchronized newer Blueprint variables.
+  const includeXativaTestPortfolio = Boolean(account.ownerProtected && email === ownerEmail);
   const testPortfolio = [
     { slug: "kings-tacos-xativa", name: "Kings Tacos Xàtiva", cuisine: "Mexicana", category: "Mexicana" },
     { slug: "eleven-burgers-xativa", name: "Eleven Burgers Xàtiva", cuisine: "Hamburguesas", category: "Hamburguesas" },
