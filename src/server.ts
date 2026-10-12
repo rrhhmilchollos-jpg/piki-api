@@ -40,7 +40,7 @@ import { cashOrderLimitError, isCashOrderWithinLimit } from "./paymentPolicy.js"
 import { extractAndParseMenu, readAssetBytes } from "./menuImport.js";
 import { purgeTestDataIfEnabled } from "./purgeTestData.js";
 import { validateDocumentRequestSubmission } from "./onboardingDocumentPolicy.js";
-import { dispatchInitialIdempotencyKey, dispatchRequeueIdempotencyKey, enqueueDispatchOutbox } from "./dispatchOutbox.js";
+import { dispatchInitialIdempotencyKey, dispatchRequeueIdempotencyKey, enqueueDispatchOutbox, processDispatchOutboxBatch, type DispatchOutboxEvent } from "./dispatchOutbox.js";
 import { buildFleetEntityScope, buildTenantScope } from "./tenantScope.js";
 import { authenticationOptions, registrationOptions, verifyAuthentication, verifyRegistration } from "./passkeys.js";
 
@@ -4225,6 +4225,26 @@ async function start() {
   await EmployeeSession.init();
   await EmployeePasswordReset.init();
   const server = app.listen(port, "0.0.0.0", () => console.log(`PIKI API listening on port ${port}`));
+  // Fallback operativo: si Render no tiene levantado el worker dedicado, el
+  // API consume la outbox con leases atómicos. Si el worker existe, ambos
+  // procesos compiten de forma segura por cada evento y nunca duplican ofertas.
+  if (process.env.PIKI_NO_LISTEN !== "true" && process.env.PIKI_INLINE_DISPATCH_WORKER !== "false") {
+    const inlineWorkerId = `api-dispatch-${process.pid}-${randomUUID()}`;
+    const pollInlineDispatch = async () => {
+      try {
+        const result = await processDispatchOutboxBatch(inlineWorkerId, async (event: DispatchOutboxEvent) => {
+          const preferredRiderId = event.payload?.preferredRiderId;
+          const outcome = await queueAutomaticDispatch(new mongoose.Types.ObjectId(String(event.orderId)), preferredRiderId && mongoose.isValidObjectId(preferredRiderId) ? new mongoose.Types.ObjectId(preferredRiderId) : undefined);
+          if (["no_eligible_rider", "reservation_race", "database_unavailable", "in_progress"].includes(String(outcome.state))) throw new Error(`DISPATCH_${String(outcome.state).toUpperCase()}`);
+        }, { batchSize: 10 });
+        if (result.processed || result.deadLettered) console.log(JSON.stringify({ event: "inline_dispatch_outbox_batch", workerId: inlineWorkerId, ...result }));
+      } catch (error) {
+        console.error(JSON.stringify({ event: "inline_dispatch_worker_error", workerId: inlineWorkerId, error: error instanceof Error ? error.message : String(error) }));
+      }
+    };
+    setInterval(() => { void pollInlineDispatch(); }, Math.max(500, Number(process.env.PIKI_INLINE_DISPATCH_POLL_MS || 1_000))).unref();
+    void pollInlineDispatch();
+  }
   void verifyCorporateEmailConnection().then(result => console.log(JSON.stringify({ event: "corporate_email_transport_probe", ...result }))).catch(() => console.warn("Corporate email probe failed without exposing credentials"));
   // Dispatch is intentionally not scheduled in the web process. Run
   // `npm run start:dispatch-worker` as a separate service to consume the
