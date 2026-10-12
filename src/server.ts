@@ -12,7 +12,7 @@ import { normalizeLeadEmail, partnerLeadSubmissionSchema, riderLeadSubmissionSch
 import { assertTransition, calculateEtaRange, transitionSchema, validateCoordinates } from "./algorithms/index.js";
 import { configuredAuthRoles, requireOwner, requireRole, resolveRole } from "./auth.js";
 import { EmployeeSession, issueEmployeeSession, revokeEmployeeSessions, sessionRole } from "./employeeSessions.js";
-import { isStripeSignatureError, processStripeWebhook, stripeConfigured, createSignaturitSignature, signaturitBaseUrl, signaturitConfigured, signaturitMode, signatureWebhookUrl, webhookDigest, handleCustomerTrpc, currentCustomer, setCustomerOrderDispatcher } from "./integrations/index.js";
+import { isStripeSignatureError, processStripeWebhook, stripeConfigured, createSignaturitSignature, signaturitBaseUrl, signaturitConfigured, signaturitMode, signatureWebhookUrl, webhookDigest, handleCustomerTrpc, currentCustomer, issueCustomerSession, setCustomerOrderDispatcher } from "./integrations/index.js";
 import { getVersionPolicy, isPikiSurface, requiresUpdate, setVersionPolicy, syncVersionPolicy, versionPolicySchema, type PikiSurface } from "./appVersion.js";
 import { publicPushConfig, revokePushSubscription, savePushSubscription } from "./push.js";
 import { publishOrderStatusEvents, publishOrderIntakeEvents, publishRiderOfferEvent, publishRiderArrivalEvent, publishRiderLocationEvents, publishRiderScheduleEvent, publishRiderCustomerMessageEvent, publishRealtimeEvent, serveRealtimeEvents, startRealtimeRelay, tenantAudienceKey } from "./realtime.js";
@@ -40,6 +40,7 @@ import { extractAndParseMenu, readAssetBytes } from "./menuImport.js";
 import { purgeTestDataIfEnabled } from "./purgeTestData.js";
 import { validateDocumentRequestSubmission } from "./onboardingDocumentPolicy.js";
 import { buildFleetEntityScope, buildTenantScope } from "./tenantScope.js";
+import { authenticationOptions, registrationOptions, verifyAuthentication, verifyRegistration } from "./passkeys.js";
 
 export const app = express();
 app.set("trust proxy", 1);
@@ -538,6 +539,35 @@ app.patch("/api/v1/notifications/:id/read", rateLimit(60, 60_000, "notifications
   return res.json({ updated: true });
 });
 app.get("/api/v1/realtime/events", serveRealtimeEvents);
+const customerPasskeyEmailSchema = z.object({ email: z.string().trim().email().max(320) });
+app.post("/api/v1/passkeys/customer/register/options", rateLimit(8, 15 * 60_000, "customer-passkey-register"), async (req, res) => {
+  const customer = await currentCustomer(req) as any;
+  if (!customer) return res.status(401).json({ error: "AUTHENTICATION_REQUIRED" });
+  return registrationOptions(req, res, "customer", { _id: customer._id, name: String(customer.name || "Cliente PIKI"), email: String(customer.email || "").toLowerCase() });
+});
+app.post("/api/v1/passkeys/customer/register/verify", rateLimit(12, 15 * 60_000, "customer-passkey-register"), async (req, res) => {
+  const customer = await currentCustomer(req) as any;
+  if (!customer) return res.status(401).json({ error: "AUTHENTICATION_REQUIRED" });
+  return verifyRegistration(req, res, "customer", { _id: customer._id });
+});
+app.post("/api/v1/passkeys/customer/auth/options", rateLimit(8, 15 * 60_000, "customer-passkey-auth"), async (req, res) => {
+  const parsed = customerPasskeyEmailSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "EMAIL_REQUIRED" });
+  const customer = await CustomerAccount.findOne({ email: parsed.data.email.toLowerCase() }).select("_id").lean().exec() as any;
+  if (!customer) return res.status(404).json({ error: "PASSKEY_NOT_REGISTERED" });
+  return authenticationOptions(req, res, "customer", String(customer._id));
+});
+app.post("/api/v1/passkeys/customer/auth/verify", rateLimit(12, 15 * 60_000, "customer-passkey-auth"), async (req, res) => {
+  const parsed = customerPasskeyEmailSchema.safeParse({ email: req.body?.email });
+  if (!parsed.success) return res.status(400).json({ error: "EMAIL_REQUIRED" });
+  const customer = await CustomerAccount.findOne({ email: parsed.data.email.toLowerCase() }).select("_id name email createdAt lastSignedIn").lean().exec() as any;
+  if (!customer) return res.status(404).json({ error: "PASSKEY_NOT_REGISTERED" });
+  const verification = await verifyAuthentication(req, res, "customer", String(customer._id));
+  if (!verification) return;
+  await issueCustomerSession(res, String(customer._id));
+  res.setHeader("Cache-Control", "no-store, max-age=0");
+  return res.json({ verified: true, user: { id: String(customer._id), name: customer.name, email: customer.email, role: "user", createdAt: customer.createdAt, lastSignedIn: new Date() } });
+});
 app.use("/api/trpc/auth.login", rateLimit(3, 60_000, "customer-auth"));
 app.all("/api/trpc/customer.support.create", rateLimit(5, 60 * 60_000, "customer-support-create"), handleCustomerTrpc);
 app.all("/api/trpc/:procedure", handleCustomerTrpc);

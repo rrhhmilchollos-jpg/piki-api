@@ -93,6 +93,17 @@ const passkeyCredentialSchema = new Schema({
   deviceName: { type: String, default: "" },
 }, { timestamps: true, collection: "passkey_credentials" });
 passkeyCredentialSchema.index({ ownerType: 1, ownerId: 1 });
+// Challenges must survive API restarts and concurrent replicas. They are
+// single-use and are removed by MongoDB once their short validity expires.
+const passkeyChallengeSchema = new Schema({
+  ownerType: { type: String, enum: ["customer", "employee"], required: true, index: true },
+  ownerId: { type: Schema.Types.ObjectId, required: true, index: true },
+  kind: { type: String, enum: ["registration", "authentication"], required: true, index: true },
+  challenge: { type: String, required: true },
+  expiresAt: { type: Date, required: true, index: true, expires: 0 },
+  consumedAt: { type: Date, default: null, index: true },
+}, { timestamps: true, collection: "passkey_challenges" });
+passkeyChallengeSchema.index({ ownerType: 1, ownerId: 1, kind: 1, createdAt: -1 });
 const realtimeEventSchema = new Schema({
   tenantId: { type: Schema.Types.ObjectId, ref: "Tenant", default: null, index: true },
   channel: { type: String, enum: ["partner", "fleet", "admin", "rider", "customer"], required: true, index: true },
@@ -329,6 +340,7 @@ export const OnboardingRequest = mongoose.models.OnboardingRequest || mongoose.m
 export const RiderSlot = mongoose.models.RiderSlot || mongoose.model("RiderSlot", riderSlotSchema);
 export const SignatureRequest = mongoose.models.SignatureRequest || mongoose.model("SignatureRequest", signatureRequestSchema);
 export const PasskeyCredential = mongoose.models.PasskeyCredential || mongoose.model("PasskeyCredential", passkeyCredentialSchema);
+export const PasskeyChallenge = mongoose.models.PasskeyChallenge || mongoose.model("PasskeyChallenge", passkeyChallengeSchema);
 export const PushSubscription = mongoose.models.PushSubscription || mongoose.model("PushSubscription", pushSubscriptionSchema);
 export const Notification = mongoose.models.Notification || mongoose.model("Notification", notificationSchema);
 export const RealtimeEvent = mongoose.models.RealtimeEvent || mongoose.model("RealtimeEvent", realtimeEventSchema);
@@ -344,7 +356,7 @@ export async function ensureIndexes() {
     }
   }
   await Promise.all([PartnerLocalityGroup.syncIndexes(), Fleet.syncIndexes(), Zone.syncIndexes(), RiderSlot.syncIndexes(), RiderReferralProfile.syncIndexes(), RiderShiftIncentiveMetric.syncIndexes(), RiderIncentiveEntry.syncIndexes(), RiderIncentiveBudget.syncIndexes()]);
-  await Promise.all([Tenant.init(), TenantMembership.init(), Restaurant.init(), PartnerAsset.init(), PartnerLocalityGroup.init(), MenuImportDraft.init(), Fleet.init(), Order.init(), Zone.init(), StripeEvent.init(), CashLedgerEntry.init(), DispatchDecision.init(), RiderIncident.init(), RiderOrderMessage.init(), RiderApplication.init(), PartnerLead.init(), RiderLead.init(), DocumentRequest.init(), CustomerAccount.init(), RiderSlot.init(), SignatureRequest.init(), PasskeyCredential.init(), PushSubscription.init(), Notification.init(), RealtimeEvent.init(), RiderAssignmentReservation.init(), TrackingSession.init(), LocationSample.init(), EmployeeAccount.init(), AccessAuthorization.init(), OnboardingRequest.init(), RiderReferralProfile.init(), RiderShiftIncentiveMetric.init(), RiderIncentiveEntry.init(), RiderIncentiveBudget.init()]);
+  await Promise.all([Tenant.init(), TenantMembership.init(), Restaurant.init(), PartnerAsset.init(), PartnerLocalityGroup.init(), MenuImportDraft.init(), Fleet.init(), Order.init(), Zone.init(), StripeEvent.init(), CashLedgerEntry.init(), DispatchDecision.init(), RiderIncident.init(), RiderOrderMessage.init(), RiderApplication.init(), PartnerLead.init(), RiderLead.init(), DocumentRequest.init(), CustomerAccount.init(), RiderSlot.init(), SignatureRequest.init(), PasskeyCredential.init(), PasskeyChallenge.init(), PushSubscription.init(), Notification.init(), RealtimeEvent.init(), RiderAssignmentReservation.init(), TrackingSession.init(), LocationSample.init(), EmployeeAccount.init(), AccessAuthorization.init(), OnboardingRequest.init(), RiderReferralProfile.init(), RiderShiftIncentiveMetric.init(), RiderIncentiveEntry.init(), RiderIncentiveBudget.init()]);
   const ridersWithoutCode = await Rider.find({ $or: [{ riderCode: { $exists: false } }, { riderCode: null }, { riderCode: "" }] }).select("_id").lean().exec();
   for (const rider of ridersWithoutCode) {
     const base = `PIKI-R-${String(rider._id).slice(-6).toUpperCase()}`;

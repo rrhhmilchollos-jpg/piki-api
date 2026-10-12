@@ -46,7 +46,8 @@ function getSession(req: Request) {
   return cookie ? cookie.slice(COOKIE.length + 1) : null;
 }
 export async function currentCustomer(req: Request) { const raw = getSession(req); return raw ? CustomerAccount.findOne({ sessionHash: hashToken(raw) }).lean().exec() : null; }
-async function setSession(res: Response, userId: string) { const raw = randomBytes(32).toString("base64url"); await CustomerAccount.updateOne({ _id: userId }, { $set: { sessionHash: hashToken(raw), lastSignedIn: new Date() } }).exec(); res.setHeader("Set-Cookie", `${COOKIE}=${raw}; Max-Age=31536000; Path=/; HttpOnly; Secure; SameSite=None`); }
+export async function issueCustomerSession(res: Response, userId: string) { const raw = randomBytes(32).toString("base64url"); await CustomerAccount.updateOne({ _id: userId }, { $set: { sessionHash: hashToken(raw), lastSignedIn: new Date() } }).exec(); res.setHeader("Set-Cookie", `${COOKIE}=${raw}; Max-Age=31536000; Path=/; HttpOnly; Secure; SameSite=None`); }
+async function setSession(res: Response, userId: string) { return issueCustomerSession(res, userId); }
 const customerPaymentMethod = (value: unknown) => {
   const method = String(value || "cash");
   return method === "cash" || method === "stripe" ? method : null;
