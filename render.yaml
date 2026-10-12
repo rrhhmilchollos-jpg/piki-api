@@ -28,7 +28,31 @@ services:
         sync: false
       - key: CHECKOUT_TOKEN_SECRET
         sync: false
+      - key: STRIPE_SECRET_KEY
+        sync: false
+      - key: STRIPE_WEBHOOK_SECRET
+        sync: false
       - key: PIKI_CUSTOMER_SYNC_SECRET
         sync: false
       - key: GOOGLE_MAPS_API_KEY
         sync: false
+  - type: web
+    name: piki-dispatch-worker
+    runtime: docker
+    region: frankfurt
+    plan: starter
+    dockerfilePath: ./Dockerfile
+    startCommand: npm run start:dispatch-worker
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: MONGODB_URI
+        sync: false
+      - key: MONGODB_DB
+        value: piki
+      - key: PIKI_DISPATCH_WORKER_POLL_MS
+        value: "1000"
+      - key: PIKI_DISPATCH_WORKER_BATCH_SIZE
+        value: "25"
