@@ -189,6 +189,13 @@ export function buildNoticeCopy(input: RealtimeNotificationInput, recipient: Rec
       entityId: String(input.payload.riderId || ""),
     };
   }
+  if (input.type === "support.ticket_created" || input.type === "support.message_created") {
+    if (recipient.surface !== "admin") return null;
+    const ticketNumber = String(input.payload.ticketNumber || "incidencia").slice(0, 80);
+    const riderName = String(input.payload.riderName || "Un Rider").slice(0, 100);
+    const isNewTicket = input.type === "support.ticket_created";
+    return { category: "support", title: isNewTicket ? "Nueva incidencia de Rider" : "Nuevo mensaje de soporte", body: `${riderName} ${isNewTicket ? "ha abierto una incidencia" : "ha enviado un nuevo mensaje"} · ${ticketNumber}. Atiéndelo cuanto antes.`, url: "/?section=Soporte", entityType: "support_ticket", entityId: String(input.payload.ticketId || "") };
+  }
   if (input.type.startsWith("onboarding.")) {
     const entityId = String(input.payload.entityId || input.payload.applicationId || input.payload.leadId || "");
     const applicationId = String(input.payload.applicationId || entityId);
@@ -284,7 +291,7 @@ async function resolveRecipients(input: RealtimeNotificationInput): Promise<Reci
 
   const expected = input.channel === "fleet" ? "fleet" : "admin";
   const roleQuery: Record<string, unknown> = {
-    apiRole: expected === "fleet" ? { $in: ["fleet", "commercial"] } : "admin",
+    apiRole: expected === "fleet" ? { $in: ["fleet", "commercial"] } : { $in: ["admin", "support"] },
     active: true,
     authorizationStatus: "approved",
   };
@@ -423,6 +430,7 @@ export async function processNotificationPushBatch(batchSize = 20): Promise<numb
           url: notification.url,
           tag: String(notification.dedupeKey),
           renotify: true,
+          requireInteraction: notification.category === "support",
         },
       });
       if (delivery.delivered > 0) {

@@ -1,35 +1,31 @@
 import Stripe from "stripe";
-import mongoose from "mongoose";
 import { Order, StripeEvent } from "./models.js";
 import { publishOrderIntakeEvents } from "./realtime.js";
-import { dispatchInitialIdempotencyKey, enqueueDispatchOutbox } from "./dispatchOutbox.js";
-import {
-  allowedPriorPaymentStates,
-  shouldPublishOperationalIntake,
-  stripePaymentIntentId,
-  stripePaymentTransition,
-  type StripePaymentState,
-  type StripeWebhookObject,
-} from "./stripeWebhookPolicy.js";
+import { XATIVA_COVERAGE_POLICY } from "./coverage/xativaPolicy.js";
+import { PARTNER_COMMISSION_RATE } from "./settlements.js";
 
 const stripeSecretKey = process.env.STRIPE_SECRET_KEY;
 export const stripe = stripeSecretKey ? new Stripe(stripeSecretKey) : null;
-const PROCESSING_LEASE_MS = 5 * 60_000;
 
 export function stripeConfigured() {
   return Boolean(stripe && process.env.STRIPE_WEBHOOK_SECRET);
 }
 
-export function isStripeSignatureError(error: unknown): boolean {
-  return error instanceof Error && error.name === "StripeSignatureVerificationError";
-}
+export const CUSTOMER_SERVICE_FEE_CENTS = XATIVA_COVERAGE_POLICY.serviceFeeCents;
 
-export class StripeWebhookProcessingError extends Error {
-  readonly code = "STRIPE_WEBHOOK_PROCESSING_FAILED";
-  constructor(message: string, { cause }: { cause?: unknown } = {}) {
-    super(message, { cause });
-    this.name = "StripeWebhookProcessingError";
-  }
+export function buildStripePricing(input: { items: Array<{ quantity: number; unitPriceCents: number }>; deliveryFeeCents: number }) {
+  const subtotalCents = input.items.reduce((sum, item) => sum + item.quantity * item.unitPriceCents, 0);
+  const deliveryFeeCents = Math.max(0, input.deliveryFeeCents);
+  const partnerCommissionCents = Math.max(0, Math.round(subtotalCents * PARTNER_COMMISSION_RATE));
+  const serviceFeeCents = CUSTOMER_SERVICE_FEE_CENTS;
+  return {
+    subtotalCents,
+    deliveryFeeCents,
+    serviceFeeCents,
+    totalCents: subtotalCents + deliveryFeeCents + serviceFeeCents,
+    partnerCommissionCents,
+    partnerNetCents: Math.max(0, subtotalCents - partnerCommissionCents),
+  };
 }
 
 export async function createCheckoutSession(input: {
@@ -44,7 +40,18 @@ export async function createCheckoutSession(input: {
   preferredPaymentMethod?: "stripe" | "bizum";
 }) {
   if (!stripe) throw new Error("STRIPE_SECRET_KEY no configurada");
-  const metadata = { order_id: input.orderId, order_code: input.publicCode, customer_payment_choice: input.preferredPaymentMethod || "stripe" };
+  const pricing = buildStripePricing({ items: input.items, deliveryFeeCents: input.deliveryFeeCents });
+  const metadata = {
+    order_id: input.orderId,
+    order_code: input.publicCode,
+    customer_payment_choice: input.preferredPaymentMethod || "stripe",
+    pricing_version: "piki-partner-23-customer-fee-299-2026-10",
+    customer_service_fee_cents: String(pricing.serviceFeeCents),
+    partner_commission_rate: String(PARTNER_COMMISSION_RATE),
+    partner_commission_cents: String(pricing.partnerCommissionCents),
+    partner_net_cents: String(pricing.partnerNetCents),
+    checkout_total_cents: String(pricing.totalCents),
+  };
   const lineItems: Stripe.Checkout.SessionCreateParams.LineItem[] = input.items.map((item) => ({
     quantity: item.quantity,
     price_data: { currency: "eur", product_data: { name: item.name }, unit_amount: item.unitPriceCents },
@@ -58,182 +65,73 @@ export async function createCheckoutSession(input: {
     customer_email: input.customerEmail,
     client_reference_id: input.publicCode,
     metadata,
-    // Do not send payment_method_types here. Manual-capture rollout must be
-    // validated with compatible card payments before any other method is
-    // considered; this code does not announce an additional method as enabled.
-    payment_intent_data: { metadata, capture_method: "manual" },
+    // Do not send payment_method_types: Stripe Dynamic Payment Methods decides
+    // card, Apple Pay, Google Pay and Bizum eligibility in the Dashboard.
+    payment_intent_data: { metadata },
     success_url: `${input.origin}/?checkout=success&order_id=${encodeURIComponent(input.publicCode)}`,
     cancel_url: `${input.origin}/?checkout=cancelled&order_id=${encodeURIComponent(input.publicCode)}`,
   }, { idempotencyKey: `piki-checkout-${input.publicCode}` });
 }
 
-type StripeEventLike = { id: string; type: string; data: { object: StripeWebhookObject } };
-type Reservation = "acquired" | "processed" | "in_progress";
-type PaymentApplyResult = { order: any | null; transitioned: boolean };
-
-export type StripeWebhookDependencies = {
-  reserve(event: StripeEventLike, orderCode: string | null): Promise<Reservation>;
-  applyPaymentTransition(input: { orderCode: string; paymentState: StripePaymentState; eventType: string; object: StripeWebhookObject }): Promise<PaymentApplyResult>;
-  publishIntake(order: any): Promise<void>;
-  markProcessed(stripeEventId: string): Promise<void>;
-  markFailed(stripeEventId: string, error: unknown): Promise<void>;
-};
-
-async function reserveStripeEvent(event: StripeEventLike, orderCode: string | null): Promise<Reservation> {
+async function reserveStripeEvent(event: Stripe.Event, orderCode: string | null): Promise<boolean> {
   try {
-    await StripeEvent.create({
-      stripeEventId: event.id,
-      type: event.type,
-      orderCode,
-      processingStatus: "processing",
-      processingStartedAt: new Date(),
-    });
-    return "acquired";
+    await StripeEvent.create({ stripeEventId: event.id, type: event.type, orderCode });
+    return true;
   } catch (error: any) {
-    if (error?.code !== 11000) throw error;
+    if (error?.code === 11000) return false;
+    throw error;
   }
-
-  // A failed attempt is deliberately reclaimable. A stale processing lease is
-  // also reclaimable after process death; an active duplicate asks Stripe to
-  // retry rather than incorrectly acknowledging an unfinished event.
-  const reclaimableBefore = new Date(Date.now() - PROCESSING_LEASE_MS);
-  const reclaimed = await StripeEvent.findOneAndUpdate(
-    {
-      stripeEventId: event.id,
-      $or: [
-        { processingStatus: "failed" },
-        { processingStatus: "processing", processingStartedAt: { $lte: reclaimableBefore } },
-      ],
-    },
-    {
-      $set: {
-        type: event.type,
-        orderCode,
-        processingStatus: "processing",
-        processingStartedAt: new Date(),
-        processedAt: null,
-        failedAt: null,
-        lastError: null,
-      },
-    },
-    { new: true },
-  ).lean().exec();
-  if (reclaimed) return "acquired";
-
-  const existing = await StripeEvent.findOne({ stripeEventId: event.id }).select("processingStatus").lean().exec() as any;
-  // Events persisted before this migration were already acknowledged by the
-  // former handler; do not replay them blindly.
-  return existing?.processingStatus === "processing" ? "in_progress" : "processed";
 }
-
-async function applyPaymentTransition(input: { orderCode: string; paymentState: StripePaymentState; eventType: string; object: StripeWebhookObject }): Promise<PaymentApplyResult> {
-  const paymentIntentId = stripePaymentIntentId(input.object);
-  const isCheckoutEvent = input.eventType.startsWith("checkout.session");
-  const update = {
-    $set: {
-      paymentState: input.paymentState,
-      ...(isCheckoutEvent && typeof input.object.id === "string" ? { stripeCheckoutSessionId: input.object.id } : {}),
-      ...(paymentIntentId ? { stripePaymentIntentId: paymentIntentId } : {}),
-    },
-    $inc: { version: 1 },
-  };
-  // Payment and dispatch intent share one Mongo transaction. A redelivery uses
-  // the same idempotency key, so it repairs a missing intent without a second
-  // rider offer.
-  let result: PaymentApplyResult = { order: null, transitioned: false };
-  const session = await mongoose.startSession();
-  try {
-    await session.withTransaction(async () => {
-      const transitioned = await Order.findOneAndUpdate(
-        {
-          publicCode: input.orderCode,
-          paymentMethod: "stripe",
-          paymentState: { $in: allowedPriorPaymentStates(input.paymentState) },
-        },
-        update,
-        { new: true, session },
-      ).lean().exec() as any;
-      const order = transitioned || await Order.findOne({ publicCode: input.orderCode }).session(session).lean().exec() as any;
-      if (shouldPublishOperationalIntake(order, { paymentState: input.paymentState, activatesOperationalIntake: ["authorized", "paid"].includes(input.paymentState) })) {
-        await enqueueDispatchOutbox({
-          orderId: order._id,
-          tenantId: order.tenantId || null,
-          idempotencyKey: dispatchInitialIdempotencyKey(order._id),
-          reason: "stripe_payment_confirmed",
-          session,
-        });
-      }
-      result = { order, transitioned: Boolean(transitioned) };
-    });
-  } finally {
-    await session.endSession();
-  }
-  return result;
-}
-
-const defaultStripeWebhookDependencies: StripeWebhookDependencies = {
-  reserve: reserveStripeEvent,
-  applyPaymentTransition,
-  publishIntake: async (order) => publishOrderIntakeEvents(order, { settlement: "paid", message: "Pago online confirmado por Stripe." }),
-  markProcessed: async (stripeEventId) => {
-    await StripeEvent.updateOne(
-      { stripeEventId, processingStatus: "processing" },
-      { $set: { processingStatus: "processed", processedAt: new Date(), failedAt: null, lastError: null } },
-    ).exec();
-  },
-  markFailed: async (stripeEventId, error) => {
-    const errorName = error instanceof Error ? error.name : "UnknownError";
-    await StripeEvent.updateOne(
-      { stripeEventId },
-      { $set: { processingStatus: "failed", failedAt: new Date(), lastError: errorName.slice(0, 120) } },
-    ).exec();
-  },
-};
 
 /**
- * Idempotent Stripe saga: reserve → order transition → durable realtime outbox
- * → processed marker. A failure before the marker returns non-2xx to Stripe,
- * and a redelivery reclaims the event to finish any missing outbox writes.
+ * Verifies Stripe's raw signature before touching application data. A paid event
+ * is admitted once, moves the order to pending/paid atomically, and only then
+ * writes durable realtime events. Re-delivered Stripe events are harmless.
  */
-export async function processStripeEvent(event: StripeEventLike, dependencies: StripeWebhookDependencies = defaultStripeWebhookDependencies) {
-  const object = event.data.object;
-  const orderCode = object.metadata?.order_code || null;
-  const reservation = await dependencies.reserve(event, orderCode);
-  if (reservation === "processed") return { duplicate: true, eventType: event.type, orderCode, activated: false };
-  if (reservation === "in_progress") throw new StripeWebhookProcessingError("STRIPE_EVENT_IN_PROGRESS");
-
-  try {
-    const transition = stripePaymentTransition(event.type);
-    let activated = false;
-    if (orderCode && transition) {
-      const { order } = await dependencies.applyPaymentTransition({ orderCode, paymentState: transition.paymentState, eventType: event.type, object });
-      if (shouldPublishOperationalIntake(order, transition)) {
-        await dependencies.publishIntake(order);
-        activated = true;
-      }
-    }
-    await dependencies.markProcessed(event.id);
-    return { duplicate: false, eventType: event.type, orderCode, activated };
-  } catch (error) {
-    try {
-      await dependencies.markFailed(event.id, error);
-    } catch (markError) {
-      console.error("Stripe event failure marker unavailable", markError instanceof Error ? markError.name : "UnknownError");
-    }
-    throw new StripeWebhookProcessingError("STRIPE_EVENT_PROCESSING_FAILED", { cause: error });
-  }
-}
-
-/** Verifies Stripe's raw signature before starting the idempotent event saga. */
 export async function processStripeWebhook(rawBody: Buffer, signature: string) {
   if (!stripe || !process.env.STRIPE_WEBHOOK_SECRET) throw new Error("Stripe webhook no configurado");
   const event = stripe.webhooks.constructEvent(rawBody, signature, process.env.STRIPE_WEBHOOK_SECRET);
-  return processStripeEvent(event as unknown as StripeEventLike);
-}
+  const object = event.data.object as Stripe.Checkout.Session | Stripe.PaymentIntent | Stripe.Charge;
+  const metadata = "metadata" in object ? object.metadata : undefined;
+  const orderCode = metadata?.order_code || null;
+  if (!(await reserveStripeEvent(event, orderCode))) return { duplicate: true, eventType: event.type, orderCode, activated: false };
 
-export async function captureStripePaymentIntent(paymentIntentId: string) {
-  if (!stripe) throw new Error("STRIPE_SECRET_KEY no configurada");
-  const intent = await stripe.paymentIntents.capture(paymentIntentId, {}, { idempotencyKey: `piki-capture-${paymentIntentId}` });
-  if (intent.status !== "succeeded") throw new Error(`STRIPE_CAPTURE_STATUS_${intent.status}`);
-  return intent;
+  const paid = event.type === "checkout.session.completed" || event.type === "checkout.session.async_payment_succeeded" || event.type === "payment_intent.succeeded";
+  const failed = event.type === "checkout.session.async_payment_failed" || event.type === "payment_intent.payment_failed";
+  const refunded = event.type === "charge.refunded";
+  const expired = event.type === "checkout.session.expired";
+  const paymentState = paid ? "paid" : failed ? "failed" : refunded ? "refunded" : expired ? "expired" : null;
+  let activated = false;
+
+  if (orderCode && paymentState) {
+    const session = object as Stripe.Checkout.Session;
+    const paymentIntent = "payment_intent" in session && typeof session.payment_intent === "string" ? session.payment_intent : undefined;
+    if (paid) {
+      const order = await Order.findOneAndUpdate(
+        { publicCode: orderCode, paymentState: { $ne: "paid" } },
+        {
+          $set: {
+            paymentState: "paid",
+            status: "pending",
+            assignmentState: "unassigned",
+            ...(event.type.startsWith("checkout.session") ? { stripeCheckoutSessionId: session.id } : {}),
+            ...(paymentIntent ? { stripePaymentIntentId: paymentIntent } : {}),
+          },
+          $inc: { version: 1 },
+          $push: { statusHistory: { status: "pending", actorRole: "system", reason: "Pago Stripe confirmado" } },
+        },
+        { new: true },
+      ).lean().exec() as any;
+      if (order) {
+        await publishOrderIntakeEvents(order);
+        activated = true;
+      }
+    } else {
+      await Order.updateOne(
+        { publicCode: orderCode },
+        { $set: { paymentState, ...(event.type.startsWith("checkout.session") ? { stripeCheckoutSessionId: session.id } : {}), ...(paymentIntent ? { stripePaymentIntentId: paymentIntent } : {}) } },
+      ).exec();
+    }
+  }
+  return { duplicate: false, eventType: event.type, orderCode, activated };
 }

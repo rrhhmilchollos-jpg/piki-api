@@ -25,5 +25,5 @@ console.log("08 PARTNER", JSON.stringify({ action: "pedido listo", status: "read
 console.log("09 RIDER", JSON.stringify({ action: "confirmar recogida", status: "picked_up" }));
 console.log("10 RIDER", JSON.stringify({ action: "confirmar entrega con PIN", status: "delivered" }));
 
-const settlement = calculateSettlement([{ publicCode: order.publicCode, subtotalCents: 1590, deliveryFeeCents: 149, serviceFeeCents: 79, distanceKm: 1.7, tipCents: 0 }]);
+const settlement = calculateSettlement([{ publicCode: order.publicCode, subtotalCents: 1590, deliveryFeeCents: 149, serviceFeeCents: 299, distanceKm: 1.7, tipCents: 0 }]);
 console.log("11 FINANCE", JSON.stringify({ action: "liquidación calculada", settlement: settlement.lines[0], formulaVersion: settlement.formulaVersion }));

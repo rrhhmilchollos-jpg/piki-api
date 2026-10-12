@@ -65,32 +65,14 @@ function writeEvent(response: Response, event: PersistedRealtimeEvent) {
 }
 
 export async function publishRealtimeEvent(input: { channel: RealtimeChannel; audienceKey: string; type: string; payload: RealtimeEventPayload; tenantId?: string | mongoose.Types.ObjectId | null; dedupeKey?: string }) {
-  const eventData = {
+  const document = await RealtimeEvent.create({
     tenantId: validTenantId(input.tenantId),
     channel: input.channel,
     audienceKey: input.audienceKey,
     type: input.type,
     payload: input.payload,
     ...(input.dedupeKey ? { dedupeKey: input.dedupeKey } : {}),
-  };
-  // Use Mongo's unique dedupe index as the cross-instance lock. This makes
-  // retries safe even when two Render instances publish the same event at once.
-  let document;
-  if (input.dedupeKey) {
-    try {
-      document = await RealtimeEvent.findOneAndUpdate(
-        { dedupeKey: input.dedupeKey },
-        { $setOnInsert: eventData },
-        { upsert: true, new: true, setDefaultsOnInsert: true },
-      ).exec();
-    } catch (error) {
-      if ((error as any)?.code !== 11000) throw error;
-      document = await RealtimeEvent.findOne({ dedupeKey: input.dedupeKey }).exec();
-    }
-  } else {
-    document = await RealtimeEvent.create(eventData);
-  }
-  if (!document) throw new Error("REALTIME_EVENT_NOT_PERSISTED");
+  });
   const event = document.toObject() as PersistedRealtimeEvent;
   emitOnce(event);
   try {
@@ -180,71 +162,6 @@ export async function publishRiderOfferEvent(order: any, riderId: string) {
     dedupeKey: `offer:rider:${String(order._id)}:${riderId}:${order.dispatchAttempts || 0}`,
   });
 }
-export async function publishRiderCustomerMessageEvent(order: any, message: any) {
-  if (!order.customerId || !mongoose.isValidObjectId(order.customerId)) return;
-  const messageId = String(message._id || `${order._id}:${message.createdAt || Date.now()}`);
-  await publishRealtimeEvent({
-    channel: "customer",
-    audienceKey: `customer:${String(order.customerId)}`,
-    tenantId: validTenantId(order.tenantId),
-    type: "order.rider_message",
-    payload: { orderId: String(order._id), publicCode: order.publicCode, riderId: order.riderId ? String(order.riderId) : null, messageId, message: String(message.body || "").slice(0, 240), senderRole: "rider" },
-    dedupeKey: `message:customer:${messageId}`,
-  });
-}
-export async function publishRiderScheduleEvent(input: { riderId: string; tenantId?: string | mongoose.Types.ObjectId | null; action: "updated" | "cancelled" | "weekly_updated" }) {
-  const riderId = String(input.riderId);
-  await publishRealtimeEvent({
-    channel: "rider",
-    audienceKey: `rider:${riderId}`,
-    tenantId: input.tenantId,
-    type: "rider.schedule_updated",
-    payload: { riderId, action: input.action, updatedAt: new Date().toISOString() },
-    dedupeKey: `schedule:rider:${riderId}:${input.action}:${Date.now()}`,
-  });
-}
-
-export async function publishRiderArrivalEvent(order: any, rider: any, distanceMeters: number, source: "rider" | "gps_sweep") {
-  const tenantId = validTenantId(order.tenantId);
-  const base = {
-    orderId: String(order._id), publicCode: order.publicCode, restaurantId: String(order.restaurantId), riderId: String(rider._id),
-    status: order.status, assignmentState: order.assignmentState, arrivedAt: order.riderArrivedAt || new Date(),
-    distanceMeters: Math.round(distanceMeters), source,
-  };
-  const events: Array<Promise<unknown>> = [
-    publishRealtimeEvent({ channel: "rider", audienceKey: `rider:${base.riderId}`, tenantId, type: "order.rider_arrived_at_partner", payload: base, dedupeKey: `arrival:rider:${base.orderId}:${order.version || 0}` }),
-    publishRealtimeEvent({ channel: "partner", audienceKey: `restaurant:${base.restaurantId}`, tenantId, type: "order.rider_arrived_at_partner", payload: base, dedupeKey: `arrival:partner:${base.orderId}:${order.version || 0}` }),
-    publishRealtimeEvent({ channel: "fleet", audienceKey: tenantAudienceKey(tenantId, "fleet"), tenantId, type: "order.rider_arrived_at_partner", payload: base, dedupeKey: `arrival:fleet:${base.orderId}:${order.version || 0}` }),
-    publishRealtimeEvent({ channel: "admin", audienceKey: tenantAudienceKey(tenantId, "admin"), tenantId, type: "order.rider_arrived_at_partner", payload: base, dedupeKey: `arrival:admin:${base.orderId}:${order.version || 0}` }),
-  ];
-  if (order.customerId && mongoose.isValidObjectId(order.customerId)) {
-    events.push(publishRealtimeEvent({ channel: "customer", audienceKey: `customer:${String(order.customerId)}`, tenantId, type: "order.rider_arrived_at_partner", payload: { ...customerOrderPayload(order), message: "Tu repartidor ya está en el establecimiento." }, dedupeKey: `arrival:customer:${base.orderId}:${order.version || 0}` }));
-  }
-  await Promise.all(events);
-}
-
-/** Emits a compact location update only for an active delivery and its authorised audiences. */
-export async function publishRiderLocationEvents(order: any, rider: any) {
-  const coordinates = rider?.location?.coordinates;
-  if (!Array.isArray(coordinates) || coordinates.length < 2) return;
-  const [longitude, latitude] = coordinates;
-  if (!Number.isFinite(Number(latitude)) || !Number.isFinite(Number(longitude))) return;
-  const tenantId = validTenantId(order.tenantId);
-  const recordedAt = new Date(rider.lastLocationAt || Date.now()).toISOString();
-  const bucket = Math.floor(new Date(recordedAt).getTime() / 5_000);
-  const base = {
-    orderId: String(order._id), publicCode: order.publicCode, riderId: String(rider._id), status: order.status,
-    latitude: Number(Number(latitude).toFixed(5)), longitude: Number(Number(longitude).toFixed(5)), recordedAt,
-  };
-  const events: Array<Promise<unknown>> = [
-    publishRealtimeEvent({ channel: "fleet", audienceKey: tenantAudienceKey(tenantId, "fleet"), tenantId, type: "rider.location_updated", payload: base, dedupeKey: `location:fleet:${base.orderId}:${bucket}` }),
-    publishRealtimeEvent({ channel: "admin", audienceKey: tenantAudienceKey(tenantId, "admin"), tenantId, type: "rider.location_updated", payload: base, dedupeKey: `location:admin:${base.orderId}:${bucket}` }),
-  ];
-  if (order.customerId && mongoose.isValidObjectId(order.customerId)) {
-    events.push(publishRealtimeEvent({ channel: "customer", audienceKey: `customer:${String(order.customerId)}`, tenantId, type: "rider.location_updated", payload: base, dedupeKey: `location:customer:${base.orderId}:${bucket}` }));
-  }
-  await Promise.all(events);
-}
 
 async function resolveAudience(request: Request): Promise<ResolvedAudience | null> {
   const surface = String(request.header("x-piki-surface") || request.query.surface || "").toLowerCase();
@@ -254,7 +171,7 @@ async function resolveAudience(request: Request): Promise<ResolvedAudience | nul
   }
   const auth = await resolveRole(request);
   if (!auth?.employeeId) return null;
-  if (surface === "admin" && ["admin", "support", "finance"].includes(auth.role)) {
+  if (surface === "admin" && ["admin", "support"].includes(auth.role)) {
     const employee = await EmployeeAccount.findById(auth.employeeId).select("tenantId ownerProtected accessLevel").lean().exec() as any;
     if (!employee) return null;
     if (employee.ownerProtected === true && employee.accessLevel === "superadmin") {
@@ -269,11 +186,8 @@ async function resolveAudience(request: Request): Promise<ResolvedAudience | nul
     return employee ? { channel: "fleet", audienceKeys: [tenantAudienceKey(employee.tenantId, "fleet")] } : null;
   }
   if (surface === "partner" && auth.role === "partner") {
-    const employee = await EmployeeAccount.findById(auth.employeeId).select("restaurantId restaurantIds").lean().exec() as any;
-    const assignedRestaurantIds = [...new Set([...(Array.isArray(employee?.restaurantIds) ? employee.restaurantIds : []), employee?.restaurantId].filter(Boolean).map(String))];
-    const requestedRestaurantId = String(request.header("x-piki-restaurant-id") || "").trim();
-    const restaurantIds = requestedRestaurantId ? assignedRestaurantIds.filter((id) => id === requestedRestaurantId) : assignedRestaurantIds;
-    return restaurantIds.length ? { channel: "partner", audienceKeys: restaurantIds.map((id) => `restaurant:${id}`) } : null;
+    const employee = await EmployeeAccount.findById(auth.employeeId).select("restaurantId").lean().exec() as any;
+    return employee?.restaurantId ? { channel: "partner", audienceKeys: [`restaurant:${String(employee.restaurantId)}`] } : null;
   }
   if (surface === "rider" && auth.role === "rider") {
     const employee = await EmployeeAccount.findById(auth.employeeId).select("email").lean().exec() as any;
@@ -313,10 +227,7 @@ export async function serveRealtimeEvents(request: Request, response: Response) 
   };
   const heartbeat = setInterval(() => response.write(`: heartbeat ${Date.now()}\n\n`), HEARTBEAT_MS);
   stream.on("event", listener);
-  const backlog = (after
-    ? await RealtimeEvent.find(query).sort({ _id: 1 }).limit(REPLAY_LIMIT).lean().exec()
-    : (await RealtimeEvent.find(query).sort({ _id: -1 }).limit(REPLAY_LIMIT).lean().exec()).reverse()
-  ) as unknown as PersistedRealtimeEvent[];
+  const backlog = await RealtimeEvent.find(query).sort({ _id: 1 }).limit(REPLAY_LIMIT).lean().exec() as unknown as PersistedRealtimeEvent[];
   backlog.forEach((event) => writeUniqueEvent(event));
   const close = () => { clearInterval(heartbeat); stream.off("event", listener); };
   request.on("close", close);

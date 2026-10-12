@@ -1,55 +1,39 @@
 import "dotenv/config";
 import "express-async-errors";
-import { createHash, createHmac, randomBytes, randomInt, randomUUID } from "node:crypto";
-import { MalwareDetectedError, MalwareScannerUnavailableError, normalizeDocumentUpload, sanitizePdfFileName, scanUploadBuffer, scanUploadBuffers } from "./fileSecurity.js";
+import { createHash, createHmac, randomInt } from "node:crypto";
+import { MalwareDetectedError, MalwareScannerUnavailableError, scanUploadBuffer } from "./fileSecurity.js";
 import { fileURLToPath } from "node:url";
 import cors from "cors";
 import express from "express";
 import mongoose from "mongoose";
 import { z } from "zod";
-import { CashLedgerEntry, CustomerAccount, DispatchDecision, DocumentRequest, EmployeeAccount, AccessAuthorization, Fleet, Order, Restaurant, PartnerAsset, PartnerLocalityGroup, MenuImportDraft, Rider, RiderApplication, PartnerLead, RiderLead, RiderIncident, RiderOrderMessage, RiderSlot, SignatureRequest, Zone, PushSubscription, RealtimeEvent, Notification, Tenant, TenantMembership, RiderAssignmentReservation, SupportTicket, OnboardingRequest, TrackingSession, LocationSample, ensureIndexes } from "./models.js";
+import { CashLedgerEntry, CustomerAccount, DispatchDecision, EmployeeAccount, AccessAuthorization, Fleet, Order, Restaurant, PartnerAsset, PartnerLocalityGroup, Rider, RiderApplication, PartnerLead, RiderLead, RiderIncident, RiderOrderMessage, RiderSlot, SignatureRequest, Zone, PushSubscription, RealtimeEvent, Tenant, TenantMembership, RiderAssignmentReservation, SupportTicket, OnboardingRequest, ensureIndexes } from "./models.js";
 import { normalizeLeadEmail, partnerLeadSubmissionSchema, riderLeadSubmissionSchema, webLeadReviewSchema, webLeadStatusSchema } from "./webLeads.js";
+import { seedCatalog, seedOperationalZones } from "./seed.js";
 import { assertTransition, calculateEtaRange, transitionSchema, validateCoordinates } from "./algorithms/index.js";
 import { configuredAuthRoles, requireOwner, requireRole, resolveRole } from "./auth.js";
 import { EmployeeSession, issueEmployeeSession, revokeEmployeeSessions, sessionRole } from "./employeeSessions.js";
-import { isStripeSignatureError, processStripeWebhook, stripeConfigured, createSignaturitSignature, signaturitBaseUrl, signaturitConfigured, signaturitMode, signatureWebhookUrl, webhookDigest, handleCustomerTrpc, currentCustomer, issueCustomerSession, setCustomerOrderDispatcher } from "./integrations/index.js";
+import { processStripeWebhook, stripeConfigured, createSignaturitSignature, signaturitBaseUrl, signaturitConfigured, signaturitMode, signatureWebhookUrl, webhookDigest, handleCustomerTrpc, currentCustomer, setCustomerOrderDispatcher } from "./integrations/index.js";
 import { getVersionPolicy, isPikiSurface, requiresUpdate, setVersionPolicy, syncVersionPolicy, versionPolicySchema, type PikiSurface } from "./appVersion.js";
 import { publicPushConfig, revokePushSubscription, savePushSubscription } from "./push.js";
-import { publishOrderStatusEvents, publishOrderIntakeEvents, publishRiderOfferEvent, publishRiderArrivalEvent, publishRiderLocationEvents, publishRiderScheduleEvent, publishRiderCustomerMessageEvent, publishRealtimeEvent, serveRealtimeEvents, startRealtimeRelay, tenantAudienceKey } from "./realtime.js";
-import { listNotifications, markAllNotificationsRead, markNotificationRead, sendDocumentRequestEmail, sendDocumentUploadEmail, startNotificationWorker, stopNotificationWorker, type NotificationPrincipal } from "./notifications.js";
-import { captureStripePaymentIntent, createCheckoutSession } from "./stripe.js";
+import { publishOrderStatusEvents, publishOrderIntakeEvents, publishRiderOfferEvent, publishRealtimeEvent, serveRealtimeEvents, startRealtimeRelay, tenantAudienceKey } from "./realtime.js";
+import { listNotifications, markAllNotificationsRead, markNotificationRead, startNotificationWorker, stopNotificationWorker, type NotificationPrincipal } from "./notifications.js";
+import { buildStripePricing, createCheckoutSession, CUSTOMER_SERVICE_FEE_CENTS } from "./stripe.js";
 import { rankDispatchCandidates, computeMobilityAdvice, calculateSanctionDecision, defaultSanctionPolicy } from "./algorithms/index.js";
 import { createSessionToken, generateTemporaryPassword, hashPassword, hashSessionToken, verifyPassword } from "./employeeAuth.js";
-import { EmployeePasswordReset } from "./passwordReset.js";
 import { evaluateXativaCoverage } from "./coverage/xativaPolicy.js";
 import { quoteDeliveryRoute } from "./coverage/routing.js";
-import { ROOT_TENANT_SLUG, runTenantMigration } from "./tenantMigration.js";
-import { onboardingScope } from "./onboardingScope.js";
-import { corporateEmailConfiguration, escapeCorporateHtml, sendCorporateEmail, sendLeadContactEmail, verifyCorporateEmailConnection } from "./corporateEmail.js";
-import { activeOperationalOrderStatuses, dispatchableOrderStatuses, dispatchablePaymentFilter, isDispatchableOrderStatus, isDispatchablePayment } from "./dispatchEligibility.js";
+import { runTenantMigration } from "./tenantMigration.js";
+import { activeOperationalOrderStatuses, dispatchableOrderStatuses, dispatchablePaymentFilter, isDispatchableOrderStatus } from "./dispatchEligibility.js";
 import { canReceivePartnerLocations, partnerCan, partnerPermissions, partnerRolesForEmployee, permissionsForPartnerRoles, type PartnerPermission } from "./partnerAccess.js";
-import { awardRiderRecruitmentMilestones, claimRiderReferralCode, completeRiderShiftIncentiveTracking, incentiveProgramStatus, loadRiderIncentiveSnapshot, trackRiderLocationForIncentive, trackRiderShiftStart } from "./riderIncentives.js";
 import { buildApprovedRiderOperationalProfile } from "./riderApproval.js";
-import { COMING_SOON_SLUGS, CUSTOMER_CATALOG_RESTAURANT_FILTER, CUSTOMER_ORDERABLE_RESTAURANT_FILTER, presentCustomerCatalogRestaurant } from "./customerCatalogPolicy.js";
-import { PARTNER_DEMO_MENU_VERSION, partnerDemoMenu } from "./partnerDemoMenu.js";
-import { configuredPartnerRestaurantUpsert } from "./partnerRepairPolicy.js";
-import { quoteMenuItem, usesReferenceAddOns } from "./menuModifiers.js";
-import { decideLatePickup, pointDistanceMeters } from "./pickupPolicy.js";
-import { buildLegacyRiderSupportTicketFilter, buildRiderSupportTicketFilter } from "./supportTicketScope.js";
-import { cashOrderLimitError, isCashOrderWithinLimit } from "./paymentPolicy.js";
-import { extractAndParseMenu, readAssetBytes } from "./menuImport.js";
-import { purgeTestDataIfEnabled } from "./purgeTestData.js";
-import { validateDocumentRequestSubmission } from "./onboardingDocumentPolicy.js";
-import { dispatchInitialIdempotencyKey, dispatchRequeueIdempotencyKey, enqueueDispatchOutbox } from "./dispatchOutbox.js";
-import { buildFleetEntityScope, buildTenantScope } from "./tenantScope.js";
-import { authenticationOptions, registrationOptions, verifyAuthentication, verifyRegistration } from "./passkeys.js";
+import { effectiveRiderStatus, selectCurrentSlot } from "./shiftPolicy.js";
+import { canRiderOpenSupportCase } from "./supportPolicy.js";
 
 export const app = express();
 app.set("trust proxy", 1);
 const port = Number(process.env.PORT || 3000);
-const PARTNER_PREPARATION_LIMIT_MINUTES = 10;
-const CUSTOMER_DELIVERY_TARGET_MINUTES = 30;
-const defaultOrigins = ["http://localhost:3000", "http://localhost:5173", "https://localhost", "https://pikidelivery.com", "https://www.pikidelivery.com", "https://app.pikidelivery.com", "https://partners.pikidelivery.com", "https://admin.pikidelivery.com", "https://support.pikidelivery.com", "https://piki-admin-live.vercel.app", "https://piki-support.vercel.app", "https://riders.pikidelivery.com", "https://fleet.pikidelivery.com", "https://piki-customer.onrender.com", "https://piki-riders.onrender.com", "https://piki-admin.onrender.com", "https://edpexgfa.manus.space"];
+const defaultOrigins = ["http://localhost:3000", "http://localhost:5173", "https://pikidelivery.com", "https://www.pikidelivery.com", "https://app.pikidelivery.com", "https://partners.pikidelivery.com", "https://admin.pikidelivery.com", "https://support.pikidelivery.com", "https://piki-admin-live.vercel.app", "https://piki-support.vercel.app", "https://riders.pikidelivery.com", "https://fleet.pikidelivery.com", "https://piki-customer.onrender.com", "https://piki-riders.onrender.com", "https://piki-admin.onrender.com", "https://edpexgfa.manus.space"];
 const configuredOrigins = (process.env.CORS_ORIGINS || "").split(",").map((origin) => origin.trim()).filter(Boolean);
 const allowedOrigins = new Set([...defaultOrigins, ...configuredOrigins]);
 const managedPikiVercelOrigin = /^https:\/\/piki-(?:customer|partner|admin|fleet|rider|support)(?:-[a-z0-9-]+)?-rrhhmilchollos-jpgs-projects\.vercel\.app$/i;
@@ -57,12 +41,7 @@ const isAllowedCorsOrigin = (origin?: string) => !origin || allowedOrigins.has(o
 const corsOptions = { origin: (origin: string | undefined, callback: (error: Error | null, allowed?: boolean) => void) => callback(null, isAllowedCorsOrigin(origin)), credentials: true };
 const databaseName = process.env.MONGODB_DB || "piki";
 let databaseReady = false;
-const catalogCache = new Map<string, { expiresAt: number; body: { restaurants: unknown[] } }>();
-const geocodeCache = new Map<string, { expiresAt: number; body: any }>();
-const CATALOG_CACHE_MS = 30_000;
-const GEOCODE_CACHE_MS = 300_000;
-const boundedFetch = (input: string | URL, init: RequestInit = {}) => fetch(input, { ...init, signal: AbortSignal.timeout(1_200) });
-mongoose.connection.on("connected", () => { databaseReady = true; startRealtimeRelay(); });
+mongoose.connection.on("connected", () => { databaseReady = true; });
 mongoose.connection.on("disconnected", () => { databaseReady = false; console.warn("MongoDB disconnected; API entering not-ready state"); });
 mongoose.connection.on("error", (error) => { databaseReady = false; console.error("MongoDB connection error", error instanceof Error ? error.message : error); });
 
@@ -80,40 +59,14 @@ app.options("*", cors(corsOptions));
 
 const requestBuckets = new Map<string, { startedAt: number; count: number }>();
 let mongoRateLimitIndexReady = false;
-let mongoRateLimitIndexPromise: Promise<void> | null = null;
-async function ensureMongoRateLimitIndex() {
-  if (mongoRateLimitIndexReady) return;
-  if (mongoRateLimitIndexPromise) return mongoRateLimitIndexPromise;
-  mongoRateLimitIndexPromise = (async () => {
-    const collection = mongoose.connection.collection("piki_rate_limit_buckets") as any;
-    const indexes = await collection.listIndexes().toArray();
-    const expiresIndexes = indexes.filter((index: any) => index.key?.expiresAt === 1);
-    const hasTtlIndex = expiresIndexes.some((index: any) => Number(index.expireAfterSeconds) === 0);
-    if (!hasTtlIndex) {
-      // This collection is ephemeral rate-limit state. Replacing a legacy
-      // non-TTL index is safe and prevents MongoDB IndexOptionsConflict.
-      for (const index of expiresIndexes) await collection.dropIndex(index.name).catch(() => undefined);
-      await collection.createIndex({ expiresAt: 1 }, { name: "expiresAt_ttl", expireAfterSeconds: 0 });
-    }
-    mongoRateLimitIndexReady = true;
-  })().finally(() => { mongoRateLimitIndexPromise = null; });
-  return mongoRateLimitIndexPromise;
-}
-async function ensureExpiresAtTtlIndex(collectionName: string) {
-  const collection = mongoose.connection.collection(collectionName) as any;
-  const indexes = await collection.listIndexes().toArray();
-  const expiresIndexes = indexes.filter((index: any) => index.key?.expiresAt === 1);
-  const hasTtlIndex = expiresIndexes.some((index: any) => Number(index.expireAfterSeconds) === 0);
-  if (!hasTtlIndex) {
-    for (const index of expiresIndexes) await collection.dropIndex(index.name).catch(() => undefined);
-    await collection.createIndex({ expiresAt: 1 }, { name: "expiresAt_1", expireAfterSeconds: 0 });
-  }
-}
 async function incrementMongoRateLimit(key: string, windowMs: number): Promise<number | null> {
   if (!databaseReady || mongoose.connection.readyState !== 1) return null;
   try {
     const collection = mongoose.connection.collection("piki_rate_limit_buckets") as any;
-    await ensureMongoRateLimitIndex();
+    if (!mongoRateLimitIndexReady) {
+      await collection.createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 });
+      mongoRateLimitIndexReady = true;
+    }
     const windowStart = Math.floor(Date.now() / windowMs) * windowMs;
     const bucketId = `${key}:${windowStart}`;
     const expiresAt = new Date(windowStart + windowMs + 60_000);
@@ -143,19 +96,6 @@ async function incrementDistributedRateLimit(key: string, windowMs: number): Pro
     return null;
   }
 }
-async function sharedCacheGet<T>(key: string): Promise<T | null> {
-  if (!upstashRedisUrl || !upstashRedisToken) return null;
-  try {
-    const response = await fetch(`${upstashRedisUrl}/get/${encodeURIComponent(key)}`, { headers: { Authorization: `Bearer ${upstashRedisToken}` }, signal: AbortSignal.timeout(250) });
-    if (!response.ok) return null;
-    const payload = await response.json() as { result?: string | null };
-    return payload.result ? JSON.parse(payload.result) as T : null;
-  } catch { return null; }
-}
-async function sharedCacheSet(key: string, value: unknown, ttlSeconds: number): Promise<void> {
-  if (!upstashRedisUrl || !upstashRedisToken) return;
-  try { await fetch(`${upstashRedisUrl}/set/${encodeURIComponent(key)}/${encodeURIComponent(JSON.stringify(value))}/EX/${ttlSeconds}`, { method: "POST", headers: { Authorization: `Bearer ${upstashRedisToken}` }, signal: AbortSignal.timeout(250) }); } catch { /* local cache fallback */ }
-}
 const rateLimit = (limit: number, windowMs: number, keyPrefix: string) => async (req: express.Request, res: express.Response, next: express.NextFunction) => {
   const surfaceKey = String(req.header("x-piki-surface") || req.query.surface || "-").toLowerCase();
   const clientIp = String(req.ip || "unknown").trim();
@@ -183,7 +123,6 @@ app.use("/api/v1/partners/onboarding", rateLimit(10, 60_000, "partner-onboarding
 app.use("/api/v1/riders/applications", rateLimit(10, 60_000, "rider-onboarding"));
 app.use("/api/v1/public/partner-leads", rateLimit(10, 60_000, "partner-leads"));
 app.use("/api/v1/public/rider-leads", rateLimit(10, 60_000, "rider-leads"));
-app.use("/api/v1/public/document-requests", rateLimit(20, 60_000, "document-requests"));
 app.use("/api/v1/partners/menu/assets", rateLimit(20, 60_000, "partner-assets"));
 app.use("/api/v1/payments/webhook", rateLimit(100, 60_000, "stripe-webhook"));
 app.use("/api/webhooks/stripe", rateLimit(100, 60_000, "stripe-webhook"));
@@ -194,42 +133,17 @@ const stripeWebhookHandler = async (req: express.Request, res: express.Response)
     const result = await processStripeWebhook(req.body as Buffer, signature);
     return res.status(200).json({ received: true, ...result });
   } catch (error) {
-    // Invalid signatures are terminal client errors; processing/outbox failures
-    // must remain non-2xx so Stripe retries the same event id.
-    if (isStripeSignatureError(error)) return res.status(400).json({ error: "INVALID_STRIPE_WEBHOOK" });
-    return res.status(500).json({ error: "STRIPE_WEBHOOK_PROCESSING_FAILED" });
+    return res.status(400).json({ error: "INVALID_STRIPE_WEBHOOK", message: error instanceof Error ? error.message : "Webhook rejected" });
   }
 };
 app.post(["/api/v1/payments/webhook", "/api/webhooks/stripe"], express.raw({ type: "application/json" }), stripeWebhookHandler);
-app.use(express.json({ limit: "20mb" }));
+app.use(express.json({ limit: "12mb" }));
 
 const objectId = (value: string) => mongoose.isValidObjectId(value) ? new mongoose.Types.ObjectId(value) : null;
-function hasExplicitPlatformSuperadminScope(req: express.Request): boolean {
-  return req.auth?.role === "admin" && req.auth?.isRootOwner === true && Boolean(req.auth.employeeId);
-}
 function tenantScope(req: express.Request): Record<string, unknown> {
-  // A missing tenant must never widen a tenant-owned query. The protected
-  // platform superadmin is the single explicit cross-tenant exception.
-  return hasExplicitPlatformSuperadminScope(req) ? {} : buildTenantScope(req.auth?.tenantId);
-}
-
-async function publicOnboardingTenantScope(): Promise<Record<string, unknown>> {
-  const tenantId = objectId(String(process.env.PIKI_PUBLIC_ONBOARDING_TENANT_ID || ""));
-  if (tenantId) return { tenantId };
-  // The root platform tenant is a server-side fallback only; the client never
-  // supplies or selects a tenant for public onboarding.
-  const rootTenant = await Tenant.findOne({ slug: ROOT_TENANT_SLUG, isPlatformTenant: true, status: "active" }).select("_id").lean().exec() as any;
-  return rootTenant?._id ? { tenantId: rootTenant._id } : { tenantId: null };
-}
-
-async function adminOnboardingScope(req: express.Request): Promise<Record<string, unknown>> {
-  return hasExplicitPlatformSuperadminScope(req) ? {} : onboardingScope(req);
-}
-
-// Cross-tenant support is reserved for the explicit platform superadmin; an
-// ordinary support/admin account remains inside its active tenant.
-function supportTenantScope(req: express.Request): Record<string, unknown> {
-  return hasExplicitPlatformSuperadminScope(req) ? {} : tenantScope(req);
+  if (!req.auth?.tenantId) return {};
+  const tenantId = objectId(req.auth.tenantId);
+  return tenantId ? { tenantId } : { _id: null };
 }
 async function tenantLimits(req: express.Request) {
   if (!req.auth?.tenantId) return { maxRiders: 100000, maxDailySlots: 100000, maxSlotsPerRiderPerDay: 3 };
@@ -242,18 +156,24 @@ async function employeeScope(req: express.Request) {
   return await EmployeeAccount.findOne({ _id: req.auth.employeeId, ...tenantScope(req) }).select("email fleetId zoneSlugs restaurantId portfolioId jobRole apiRole tenantId").lean().exec() as any;
 }
 async function fleetRiderFilter(req: express.Request): Promise<Record<string, unknown>> {
+  if (req.auth?.role !== "fleet") return {};
   const employee = await employeeScope(req);
-  return buildFleetEntityScope({ tenantId: req.auth?.tenantId, role: req.auth?.role, fleetId: employee?.fleetId });
+  // Newly enabled rider accounts start unassigned. Fleet must be able to see
+  // those accounts so the first slot reservation can link them to this fleet.
+  const realRiderFilter = { isTestRider: { $ne: true } };
+  return employee?.fleetId
+    ? { ...realRiderFilter, $or: [{ fleetId: employee.fleetId }, { fleetId: null }, { fleetId: { $exists: false } }] }
+    : { ...realRiderFilter, $or: [{ fleetId: null }, { fleetId: { $exists: false } }] };
 }
 async function fleetCanAccessRider(req: express.Request, riderId: mongoose.Types.ObjectId | null) {
   if (!riderId) return false;
+  if (req.auth?.role !== "fleet") return true;
   const employee = await employeeScope(req);
-  return Boolean(await Rider.exists({ _id: riderId, ...buildFleetEntityScope({ tenantId: req.auth?.tenantId, role: req.auth?.role, fleetId: employee?.fleetId }) }));
+  return Boolean(employee?.fleetId && await Rider.exists({ _id: riderId, fleetId: employee.fleetId }));
 }
-const locationSchema = z.object({ latitude: z.number().min(-90).max(90), longitude: z.number().min(-180).max(180), accuracy: z.number().min(0).max(10_000).optional() });
-const customerModifierSelectionSchema = z.object({ groupId: z.string().min(1).max(80), optionIds: z.array(z.string().min(1).max(80)).max(12) });
-const orderItemSchema = z.object({ itemId: z.string().min(1), quantity: z.number().int().min(1).max(20), selections: z.array(customerModifierSelectionSchema).max(12).optional() });
-const createOrderSchema = z.object({ restaurantId: z.string().min(1), deliveryAddress: z.string().min(5).max(280), deliveryNote: z.string().trim().max(500).default(""), deliveryLocation: locationSchema, items: z.array(orderItemSchema).min(1).max(50), paymentMethod: z.string().optional().default("cash") });
+const locationSchema = z.object({ latitude: z.number().min(-90).max(90), longitude: z.number().min(-180).max(180) });
+const orderItemSchema = z.object({ itemId: z.string().min(1), quantity: z.number().int().min(1).max(20) });
+const createOrderSchema = z.object({ restaurantId: z.string().min(1), deliveryAddress: z.string().min(5).max(280), deliveryLocation: locationSchema, items: z.array(orderItemSchema).min(1).max(50), paymentMethod: z.string().optional().default("cash") });
 const deliveryQrSecret = String(process.env.DELIVERY_QR_SECRET || "").trim();
 if (process.env.NODE_ENV === "production" && !deliveryQrSecret) throw new Error("DELIVERY_QR_SECRET is required in production");
 const deliveryQrSignature = (orderCode: string) => createHmac("sha256", deliveryQrSecret || "development-only-delivery-qr-secret").update(`delivery:${orderCode}`).digest("hex").slice(0, 24);
@@ -277,30 +197,14 @@ const pickupQrIsValid = (orderCode: string, raw: unknown) => {
   if (value.toUpperCase() === pickupQrPin(orderCode)) return true;
   try { const url = new URL(value); return url.searchParams.get("order_id") === orderCode && url.searchParams.get("pickup_token") === pickupQrSignature(orderCode); } catch { return false; }
 };
-const riderLocationSchema = locationSchema.extend({ riderId: z.string().min(1) });
-const trackingSessionCreateSchema = z.object({ shiftId: z.string().regex(/^[a-f\d]{24}$/).optional(), platform: z.enum(["ios", "android", "web"]), appVersion: z.string().trim().min(1).max(80).default("unknown"), consentVersion: z.string().trim().min(1).max(80) });
-const trackingSampleSchema = z.object({ sampleId: z.string().trim().min(8).max(160), latitude: z.number().min(-90).max(90), longitude: z.number().min(-180).max(180), accuracyMeters: z.number().min(0).max(10_000), recordedAt: z.coerce.date() });
-const trackingBatchSchema = z.object({ sessionId: z.string().regex(/^[a-f\d]{24}$/), samples: z.array(trackingSampleSchema).min(1).max(100) });
+const riderLocationSchema = locationSchema.extend({ riderId: z.string().min(1), accuracy: z.number().finite().min(0).max(100000).optional() });
 const zoneSchema = z.object({ name: z.string().min(2).max(120), slug: z.string().regex(/^[a-z0-9-]+$/), serviceFeeCents: z.number().int().min(0).max(10000).default(0), maxEtaMinutes: z.number().int().min(1).max(240).default(60), polygon: z.object({ coordinates: z.array(z.array(z.array(z.number()))).min(1) }) });
-const dispatchSchema = z.object({ preparationMinutes: z.coerce.number().int().min(1).max(180).default(PARTNER_PREPARATION_LIMIT_MINUTES), offerSeconds: z.coerce.number().int().min(15).max(180).default(60), maxCustomerEtaMinutes: z.coerce.number().int().min(10).max(240).default(CUSTOMER_DELIVERY_TARGET_MINUTES) });
+const dispatchSchema = z.object({ preparationMinutes: z.coerce.number().int().min(1).max(180).default(15), offerSeconds: z.coerce.number().int().min(15).max(180).default(60), maxCustomerEtaMinutes: z.coerce.number().int().min(10).max(240).optional() });
 const riderIncidentSchema = z.object({ reason: z.enum(["late_acceptance", "late_delivery", "no_show", "unsafe_driving", "fraud_signal", "customer_complaint", "document_expired", "other"]), evidence: z.array(z.string().url()).max(10).default([]), occurredAt: z.coerce.date().optional() });
 const riderSlotSchema = z.object({ zoneSlug: z.string().regex(/^[a-z0-9-]+$/), date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/), startTime: z.string().regex(/^(?:[01]\d|2[0-3]):[0-5]\d$/), endTime: z.string().regex(/^(?:[01]\d|2[0-3]):[0-5]\d$/), status: z.enum(["planned", "active", "completed", "cancelled"]).default("planned"), notes: z.string().max(500).default("") });
 const riderSlotCreateSchema = riderSlotSchema.extend({ riderId: z.string().regex(/^[a-f\d]{24}$/) });
-const riderSlotWeekSchema = riderSlotCreateSchema.extend({ weekdays: z.array(z.number().int().min(0).max(6)).min(1).max(7).default([0, 1, 2, 3, 4, 5, 6]) });
-const riderDocumentInputSchema = z.object({ type: z.enum(["identity", "residence_permit", "social_security_number", "bank_certificate", "profile_photo", "driving_license", "insurance", "vehicle_registration", "vehicle_technical_sheet", "scooter_responsible_declaration", "dgt_mvp_homologation", "work_authorization_confirmation", "ppe_and_safety", "other"]), fileName: z.string().min(1).max(180), mimeType: z.literal("application/pdf"), sizeBytes: z.number().int().min(1).max(2_500_000), sha256: z.string().regex(/^[a-f0-9]{64}$/i), contentBase64: z.string().min(1).max(3_500_000) });
+const riderDocumentInputSchema = z.object({ type: z.enum(["identity", "residence_permit", "social_security_number", "bank_certificate", "driving_license", "insurance", "vehicle_registration", "vehicle_technical_sheet", "scooter_responsible_declaration", "dgt_mvp_homologation", "other"]), fileName: z.string().min(1).max(180), mimeType: z.string().min(1).max(120), sizeBytes: z.number().int().min(1).max(2_500_000), sha256: z.string().regex(/^[a-f0-9]{64}$/i), contentBase64: z.string().min(1).max(3_500_000) });
 const riderApplicationSchema = z.object({ name: z.string().min(2).max(160), email: z.string().email(), phone: z.string().min(6).max(40), city: z.string().min(2).max(120), vehicle: z.enum(["bike", "electric_bike", "electric_scooter", "motorcycle", "scooter", "car"]), availability: z.string().min(2).max(160), socialSecurityNumber: z.string().min(4).max(40), identityVerificationMethod: z.literal("online_scan"), safetyDeclarationAccepted: z.literal(true), documents: z.array(riderDocumentInputSchema).min(3).max(12), website: z.string().max(0).optional() });
-const documentRequestSubjectSchema = z.enum(["rider_application", "restaurant", "rider_lead", "partner_lead"]);
-const documentRequestRequirementInputSchema = z.object({ type: z.string().regex(/^[a-z0-9_]{2,80}$/), inputMode: z.enum(["file", "form"]).default("file"), label: z.string().trim().min(2).max(160), description: z.string().trim().max(500).default("") });
-const documentRequestCreateSchema = z.object({ subjectType: documentRequestSubjectSchema, subjectId: z.string().regex(/^[a-f\d]{24}$/), message: z.string().trim().min(10).max(2000), dueAt: z.coerce.date().nullable().optional(), requirements: z.array(documentRequestRequirementInputSchema).min(1).max(12), sendEmail: z.boolean().default(true) });
-const publicDocumentUploadSchema = z.object({
-  responses: z.array(z.object({ type: z.string().regex(/^[a-z0-9_]{2,80}$/), value: z.string().trim().min(1).max(500) })).max(12).default([]),
-  documents: z.array(z.object({ type: z.string().regex(/^[a-z0-9_]{2,80}$/), fileName: z.string().trim().min(1).max(180), mimeType: z.literal("application/pdf"), sizeBytes: z.number().int().min(1).max(2_500_000), sha256: z.string().regex(/^[a-f0-9]{64}$/i), contentBase64: z.string().min(1).max(3_500_000) })).max(5).default([]),
-}).superRefine((value, ctx) => {
-  if (!value.documents.length && !value.responses.length) ctx.addIssue({ code: "custom", path: ["documents"], message: "documents_or_responses_required" });
-});
-const riderDocumentRequestTypes = new Set(["identity", "residence_permit", "social_security_number", "bank_certificate", "profile_photo", "driving_license", "insurance", "vehicle_registration", "vehicle_technical_sheet", "scooter_responsible_declaration", "dgt_mvp_homologation", "work_authorization_confirmation", "ppe_and_safety", "other"]);
-const partnerDocumentRequestTypes = new Set(["tax_id", "bank_certificate", "insurance", "activity_license", "food_sanitary_authorization", "identity", "other"]);
-const leadDocumentInputSchema = z.object({ type: z.string().trim().min(2).max(80), fileName: z.string().trim().min(1).max(180), mimeType: z.literal("application/pdf"), sizeBytes: z.number().int().min(1).max(2_500_000), sha256: z.string().regex(/^[a-f0-9]{64}$/i), contentBase64: z.string().min(20).max(3_500_000) });
 const riderApplicationAttempts = new Map<string, { count: number; resetAt: number }>();
 const ownerEmail = "rrhh.milchollos@gmail.com";
 const MAX_MENU_IMAGE_BYTES = 200 * 1024;
@@ -321,11 +225,6 @@ async function nextRiderCode() {
   throw new Error("RIDER_CODE_CAPACITY_REACHED");
 }
 
-function onboardingCode(prefix: "P" | "R", id: unknown): string | null {
-  const rawId = String(id || "").trim();
-  return /^[a-f\d]{24}$/i.test(rawId) ? `PIKI-${prefix}-${rawId.toUpperCase()}` : null;
-}
-
 function allowRiderApplication(ip: string) {
   const now = Date.now(); const current = riderApplicationAttempts.get(ip);
   if (!current || current.resetAt <= now) { riderApplicationAttempts.set(ip, { count: 1, resetAt: now + 15 * 60_000 }); return true; }
@@ -339,13 +238,6 @@ async function createDailyDisplayCode() {
     if (!(await Order.exists({ displayCodeDate: today, displayCode }))) return { displayCode, displayCodeDate: today };
   }
   throw new Error("DAILY_ORDER_CODE_CAPACITY_REACHED");
-}
-async function createRandomOrderCode() {
-  for (let attempt = 0; attempt < 50; attempt += 1) {
-    const publicCode = String(randomInt(10_000_000, 100_000_000));
-    if (!(await Order.exists({ publicCode }))) return publicCode;
-  }
-  throw new Error("ORDER_CODE_CAPACITY_REACHED");
 }
 
 async function dispatchLoadPolicy() {
@@ -541,131 +433,13 @@ app.patch("/api/v1/notifications/:id/read", rateLimit(60, 60_000, "notifications
   return res.json({ updated: true });
 });
 app.get("/api/v1/realtime/events", serveRealtimeEvents);
-const customerPasskeyEmailSchema = z.object({ email: z.string().trim().email().max(320) });
-app.post("/api/v1/passkeys/customer/register/options", rateLimit(8, 15 * 60_000, "customer-passkey-register"), async (req, res) => {
-  const customer = await currentCustomer(req) as any;
-  if (!customer) return res.status(401).json({ error: "AUTHENTICATION_REQUIRED" });
-  return registrationOptions(req, res, "customer", { _id: customer._id, name: String(customer.name || "Cliente PIKI"), email: String(customer.email || "").toLowerCase() });
-});
-app.post("/api/v1/passkeys/customer/register/verify", rateLimit(12, 15 * 60_000, "customer-passkey-register"), async (req, res) => {
-  const customer = await currentCustomer(req) as any;
-  if (!customer) return res.status(401).json({ error: "AUTHENTICATION_REQUIRED" });
-  return verifyRegistration(req, res, "customer", { _id: customer._id });
-});
-app.post("/api/v1/passkeys/customer/auth/options", rateLimit(8, 15 * 60_000, "customer-passkey-auth"), async (req, res) => {
-  const parsed = customerPasskeyEmailSchema.safeParse(req.body);
-  if (!parsed.success) return res.status(400).json({ error: "EMAIL_REQUIRED" });
-  const customer = await CustomerAccount.findOne({ email: parsed.data.email.toLowerCase() }).select("_id").lean().exec() as any;
-  if (!customer) return res.status(404).json({ error: "PASSKEY_NOT_REGISTERED" });
-  return authenticationOptions(req, res, "customer", String(customer._id));
-});
-app.post("/api/v1/passkeys/customer/auth/verify", rateLimit(12, 15 * 60_000, "customer-passkey-auth"), async (req, res) => {
-  const parsed = customerPasskeyEmailSchema.safeParse({ email: req.body?.email });
-  if (!parsed.success) return res.status(400).json({ error: "EMAIL_REQUIRED" });
-  const customer = await CustomerAccount.findOne({ email: parsed.data.email.toLowerCase() }).select("_id name email createdAt lastSignedIn").lean().exec() as any;
-  if (!customer) return res.status(404).json({ error: "PASSKEY_NOT_REGISTERED" });
-  const verification = await verifyAuthentication(req, res, "customer", String(customer._id));
-  if (!verification) return;
-  await issueCustomerSession(res, String(customer._id));
-  res.setHeader("Cache-Control", "no-store, max-age=0");
-  return res.json({ verified: true, user: { id: String(customer._id), name: customer.name, email: customer.email, role: "user", createdAt: customer.createdAt, lastSignedIn: new Date() } });
-});
 app.use("/api/trpc/auth.login", rateLimit(3, 60_000, "customer-auth"));
-app.all("/api/trpc/customer.support.create", rateLimit(5, 60 * 60_000, "customer-support-create"), handleCustomerTrpc);
 app.all("/api/trpc/:procedure", handleCustomerTrpc);
 
 app.get("/api/v1/auth/status", (_req, res) => res.json({ authentication: "bearer" }));
 const employeeSessionRoles = ["admin", "partner", "rider", "fleet", "commercial", "gerente_comercial_zona", "finance", "support"] as const;
 const partnerOperationalRoles = ["partner_admin", "area_manager", "zone_manager", "store_manager", "manager", "cashier", "cajero", "kitchen", "cocina", "cook", "catalog", "catalogue", "menu_manager", "viewer", "read_only", "solo_lectura"] as const;
 const employeeLoginSchema = z.object({ email: z.string().email(), password: z.string().min(8).max(200), role: z.enum(employeeSessionRoles).optional() });
-const employeePasswordResetRequestSchema = z.object({ email: z.string().email().max(254) });
-const employeePasswordResetConfirmSchema = z.object({ token: z.string().min(40).max(200), newPassword: z.string().min(12).max(200).regex(/[A-Z]/).regex(/[a-z]/).regex(/[0-9]/) });
-const employeeCredentialSurfaces = ["admin", "partner", "rider", "fleet"] as const;
-type EmployeeCredentialSurface = (typeof employeeCredentialSurfaces)[number];
-const employeeCredentialAppUrls: Record<EmployeeCredentialSurface, string> = {
-  admin: String(process.env.ADMIN_APP_URL || "https://admin.pikidelivery.com").replace(/\/$/, ""),
-  partner: String(process.env.PARTNER_APP_URL || "https://partners.pikidelivery.com").replace(/\/$/, ""),
-  rider: String(process.env.RIDER_APP_URL || "https://riders.pikidelivery.com").replace(/\/$/, ""),
-  fleet: String(process.env.FLEET_APP_URL || "https://fleet.pikidelivery.com").replace(/\/$/, ""),
-};
-const employeeCredentialLabels: Record<EmployeeCredentialSurface, string> = {
-  admin: "PIKI Administración",
-  partner: "PIKI Partner Orders",
-  rider: "PIKI Riders",
-  fleet: "PIKI Fleet",
-};
-const passwordResetMessage = "Si el correo corresponde a una cuenta PIKI activa, recibirás un enlace para crear una contraseña nueva.";
-
-function employeeCredentialSurface(value: unknown): EmployeeCredentialSurface | null {
-  const normalized = String(value || "").trim().toLowerCase();
-  if (normalized === "partners") return "partner";
-  return (employeeCredentialSurfaces as readonly string[]).includes(normalized) ? normalized as EmployeeCredentialSurface : null;
-}
-
-function employeeCanUseCredentialSurface(employee: any, surface: EmployeeCredentialSurface) {
-  return Boolean(employee && sessionRole(employee, surface));
-}
-
-function preferredCredentialSurface(employee: any): EmployeeCredentialSurface | null {
-  const candidates = [employee?.primaryRole, employee?.apiRole, employee?.jobRole, ...(Array.isArray(employee?.roles) ? employee.roles : [])];
-  for (const candidate of candidates) {
-    const surface = employeeCredentialSurface(candidate);
-    if (surface && employeeCanUseCredentialSurface(employee, surface)) return surface;
-  }
-  return employeeCanUseCredentialSurface(employee, "admin") ? "admin" : null;
-}
-
-async function createEmployeePasswordReset(employee: any, surface: EmployeeCredentialSurface, ttlMs = 30 * 60_000) {
-  const rawToken = randomBytes(32).toString("hex");
-  const tokenHash = createHash("sha256").update(rawToken).digest("hex");
-  const expiresAt = new Date(Date.now() + ttlMs);
-  await EmployeePasswordReset.updateMany({ employeeId: employee._id, usedAt: null }, { $set: { usedAt: new Date() } }).exec();
-  await EmployeePasswordReset.create({ employeeId: employee._id, email: String(employee.email).trim().toLowerCase(), tokenHash, expiresAt });
-  return { tokenHash, expiresAt, resetUrl: `${employeeCredentialAppUrls[surface]}/?reset=${encodeURIComponent(rawToken)}` };
-}
-
-async function sendEmployeePasswordLink(employee: any, surface: EmployeeCredentialSurface, purpose: "recovery" | "activation") {
-  const reset = await createEmployeePasswordReset(employee, surface, purpose === "activation" ? 24 * 60 * 60_000 : 30 * 60_000);
-  const appLabel = employeeCredentialLabels[surface];
-  const safeName = escapeCorporateHtml(String(employee.name || "equipo PIKI"));
-  const expiryText = purpose === "activation" ? "24 horas" : "30 minutos";
-  const action = purpose === "activation" ? "Crear acceso" : "Crear contraseña nueva";
-  const delivery = await sendCorporateEmail({
-    recipientEmail: String(employee.email).trim().toLowerCase(),
-    subject: `${appLabel} · ${purpose === "activation" ? "Activa tu acceso" : "Recupera tu contraseña"}`,
-    idempotencyKey: `piki-employee-password-${purpose}-${reset.tokenHash}`,
-    text: `Hola ${employee.name || "equipo PIKI"},\n\n${purpose === "activation" ? `Tu acceso a ${appLabel} ha sido autorizado.` : `Hemos recibido una solicitud para recuperar tu acceso a ${appLabel}.`}\n\n${action}: ${reset.resetUrl}\n\nEl enlace caduca en ${expiryText} y solo puede utilizarse una vez. Si no esperabas este correo, ignóralo y avisa a RRHH.\n\nEquipo PIKI`,
-    html: `<div style="font-family:Arial,sans-serif;line-height:1.6;color:#171717"><h2>${escapeCorporateHtml(appLabel)}</h2><p>Hola ${safeName}:</p><p>${purpose === "activation" ? "Tu acceso ha sido autorizado por Administración." : "Hemos recibido una solicitud para crear una contraseña nueva."}</p><p><a href="${reset.resetUrl}" style="display:inline-block;padding:13px 20px;border-radius:10px;background:#ffd400;color:#171717;text-decoration:none;font-weight:700">${action}</a></p><p style="font-size:13px;color:#666">El enlace caduca en ${expiryText} y solo puede utilizarse una vez. Si no esperabas este correo, ignóralo y avisa a RRHH.</p></div>`,
-  });
-  return { delivery, reset };
-}
-
-app.post("/api/v1/auth/employee/password-reset/request", rateLimit(3, 15 * 60_000, "employee-password-reset"), async (req, res) => {
-  const parsed = employeePasswordResetRequestSchema.safeParse(req.body);
-  const surface = employeeCredentialSurface(req.header("x-piki-surface"));
-  if (!parsed.success || !surface) return res.status(202).json({ message: passwordResetMessage });
-  const email = parsed.data.email.trim().toLowerCase();
-  const employee = await EmployeeAccount.findOne({ email, active: true, authorizationStatus: "approved" }).select("_id email name jobRole apiRole roles primaryRole ownerProtected authorizationStatus").lean().exec() as any;
-  if (employee && employeeCanUseCredentialSurface(employee, surface)) {
-    const { delivery } = await sendEmployeePasswordLink(employee, surface, "recovery");
-    if (!delivery.sent) console.warn("Employee password reset email was not delivered", { error: delivery.error });
-  }
-  return res.status(202).json({ message: passwordResetMessage });
-});
-app.post("/api/v1/auth/employee/password-reset/confirm", rateLimit(8, 15 * 60_000, "employee-password-reset-confirm"), async (req, res) => {
-  const parsed = employeePasswordResetConfirmSchema.safeParse(req.body);
-  const surface = employeeCredentialSurface(req.header("x-piki-surface"));
-  if (!parsed.success || !surface) return res.status(400).json({ error: "INVALID_PASSWORD_CHANGE", message: "La nueva contraseña debe tener 12 caracteres e incluir mayúscula, minúscula y número." });
-  const tokenHash = createHash("sha256").update(parsed.data.token).digest("hex");
-  const reset = await EmployeePasswordReset.findOne({ tokenHash, usedAt: null, expiresAt: { $gt: new Date() } }).exec() as any;
-  if (!reset) return res.status(400).json({ error: "PASSWORD_RESET_INVALID", message: "El enlace no es válido o ya ha caducado. Solicita otro enlace." });
-  const employee = await EmployeeAccount.findOne({ _id: reset.employeeId, active: true, authorizationStatus: "approved" }).select("+passwordHash email jobRole apiRole roles primaryRole ownerProtected authorizationStatus").exec() as any;
-  if (!employee || !employeeCanUseCredentialSurface(employee, surface)) return res.status(400).json({ error: "PASSWORD_RESET_INVALID", message: "El enlace no es válido o ya ha caducado. Solicita otro enlace." });
-  employee.passwordHash = hashPassword(parsed.data.newPassword); employee.mustChangePassword = false; employee.passwordChangedAt = new Date(); employee.sessionHash = null; await employee.save();
-  await EmployeeSession.deleteMany({ employeeId: employee._id }).exec();
-  reset.usedAt = new Date(); await reset.save();
-  return res.json({ changed: true });
-});
 app.post("/api/v1/auth/employee/login", async (req, res) => {
   const parsed = employeeLoginSchema.safeParse(req.body); if (!parsed.success) return res.status(400).json({ error: "INVALID_LOGIN" });
   if (String(req.headers["x-piki-surface"] || "").toLowerCase() === "admin" && parsed.data.email.toLowerCase() !== ownerEmail) { /* subadmins are allowed; destructive operations remain superadmin-only */ }
@@ -679,6 +453,13 @@ app.post("/api/v1/auth/employee/login", async (req, res) => {
   const requestedRole = parsed.data.role;
   const role = sessionRole(employee, surface, requestedRole);
   if (!role) return res.status(403).json({ error: "SURFACE_ROLE_MISMATCH", message: "Esta cuenta no tiene acceso a esta aplicación." });
+  // The authenticated owner explicitly uses an independent test Rider profile.
+  // No password or admin role is changed, and no shift starts automatically.
+  if (role === "rider" && employee.email === ownerEmail && employee.ownerProtected) {
+    if (!(await Rider.exists({ email: employee.email }))) {
+      await Rider.findOneAndUpdate({ email: employee.email }, { $setOnInsert: { name: "PIKI · Rider propietario (QA)", email: employee.email, riderCode: await nextRiderCode(), status: "offline", isTestRider: true } }, { upsert: true, new: true, setDefaultsOnInsert: true });
+    }
+  }
   const issued = await issueEmployeeSession(employee, surface, requestedRole);
   if (!issued) return res.status(403).json({ error: "SURFACE_ROLE_MISMATCH" });
   return res.json({ accessToken: issued.token, requiresPasswordChange: Boolean(employee.mustChangePassword), employee: { id: employee.id, name: employee.name, email: employee.email, jobRole: role === "rider" ? "rider" : employee.jobRole, roles: employee.roles?.length ? employee.roles : [employee.apiRole], primaryRole: employee.primaryRole || employee.apiRole, apiRole: issued.role, accessLevel: employee.accessLevel || (employee.email === ownerEmail ? "superadmin" : "subadmin"), authorizationStatus: employee.authorizationStatus || "approved", portfolioId: employee.portfolioId, fleetId: employee.fleetId, zoneSlugs: employee.zoneSlugs } });
@@ -686,7 +467,7 @@ app.post("/api/v1/auth/employee/login", async (req, res) => {
 app.post("/api/v1/auth/employee/switch-role", requireRole("admin", "partner", "rider", "fleet", "commercial", "gerente_comercial_zona", "finance", "support"), async (req, res) => {
   const parsed = z.object({ role: z.enum(employeeSessionRoles) }).safeParse(req.body);
   const requestedRole = parsed.success ? parsed.data.role : "";
-  const employee = req.auth?.employeeId ? await EmployeeAccount.findOne({ _id: req.auth.employeeId, ...tenantScope(req) }).select("email tenantId accessLevel apiRole roles primaryRole ownerProtected authorizationStatus").lean().exec() as any : null;
+  const employee = req.auth?.employeeId ? await EmployeeAccount.findById(req.auth.employeeId).select("email apiRole roles primaryRole ownerProtected authorizationStatus").lean().exec() as any : null;
   if (!employee || !requestedRole) return res.status(400).json({ error: "INVALID_ROLE" });
   const surface = String(req.headers["x-piki-surface"] || "admin").toLowerCase();
   const issued = await issueEmployeeSession(employee, surface, requestedRole);
@@ -701,7 +482,7 @@ app.post("/api/v1/auth/employee/logout", requireRole("admin", "partner", "rider"
   return res.status(204).end();
 });
 app.get("/api/v1/auth/employee/me", requireRole("admin", "partner", "rider", "fleet", "commercial", "gerente_comercial_zona", "finance", "support"), async (req, res) => {
-  const employee = req.auth?.employeeId ? await EmployeeAccount.findOne({ _id: req.auth.employeeId, ...tenantScope(req) }).select("name email tenantId ownerProtected accessLevel authorizationStatus jobRole apiRole roles partnerRoles primaryRole zoneSlugs restaurantId restaurantIds").lean().exec() as any : null;
+  const employee = req.auth?.employeeId ? await EmployeeAccount.findById(req.auth.employeeId).select("name email ownerProtected accessLevel authorizationStatus jobRole apiRole roles partnerRoles primaryRole zoneSlugs restaurantId restaurantIds").lean().exec() as any : null;
   const roles = partnerRolesForEmployee(employee);
   const permissions = [...permissionsForPartnerRoles(roles)];
   const locations = employee ? await partnerLocationsFor(employee, roles, permissions) : [];
@@ -724,25 +505,12 @@ app.post("/api/v1/admin/employees", requireOwner(), async (req, res) => {
   const parsed = employeeCreateSchema.safeParse(req.body); if (!parsed.success) return res.status(400).json({ error: "INVALID_EMPLOYEE", details: parsed.error.flatten() });
   const apiRole = parsed.data.apiRole || (parsed.data.jobRole === "gerente_comercial_zona" ? "gerente_comercial_zona" : parsed.data.jobRole === "commercial" ? "commercial" : parsed.data.jobRole === "zone_manager" ? "fleet" : parsed.data.jobRole);
   const roles = parsed.data.roles?.length ? parsed.data.roles : [apiRole];
-  const isFleetAccount = apiRole === "fleet" || roles.includes("fleet") || parsed.data.jobRole === "zone_manager";
-  if (parsed.data.fleetId && !isFleetAccount) return res.status(400).json({ error: "FLEET_ID_REQUIRES_FLEET_ROLE", message: "Asigna una flota solo a una cuenta con permisos Fleet." });
-  if (parsed.data.fleetId) {
-    const fleet = await Fleet.findOne({ _id: objectId(parsed.data.fleetId), isActive: true, ...tenantScope(req) }).select("_id").lean().exec();
-    if (!fleet) return res.status(404).json({ error: "FLEET_NOT_FOUND_OR_INACTIVE", message: "La flota seleccionada no existe o no está activa." });
-  }
   const primaryRole = parsed.data.primaryRole || roles[0];
   const temporaryPassword = generateTemporaryPassword();
   try {
     const employee = await EmployeeAccount.create({ ...parsed.data, roles, primaryRole, accessLevel: "subadmin", authorizationStatus: "approved", authorizedAt: new Date(), authorizedBy: req.auth?.employeeId ? objectId(req.auth.employeeId) : null, restaurantId: parsed.data.restaurantId ? objectId(parsed.data.restaurantId) : null, fleetId: parsed.data.fleetId ? objectId(parsed.data.fleetId) : null, apiRole, passwordHash: hashPassword(temporaryPassword), mustChangePassword: true, active: true });
     await AccessAuthorization.create({ employeeId: employee._id, action: "created", previousStatus: null, nextStatus: "approved", previousRole: null, nextRole: apiRole, accessLevel: "subadmin", actorEmployeeId: objectId(req.auth!.employeeId!), reason: "Cuenta creada y autorizada por RRHH superadmin." });
-    const surface = preferredCredentialSurface(employee);
-    let activationEmail: { sent: boolean; error?: string; surface?: EmployeeCredentialSurface } = { sent: false };
-    if (surface) {
-      const { delivery } = await sendEmployeePasswordLink(employee, surface, "activation");
-      activationEmail = { sent: delivery.sent, error: delivery.error, surface };
-      if (delivery.sent) await AccessAuthorization.create({ employeeId: employee._id, action: "credentials_sent", previousStatus: "approved", nextStatus: "approved", previousRole: apiRole, nextRole: apiRole, accessLevel: "subadmin", actorEmployeeId: objectId(req.auth!.employeeId!), reason: `Enlace de activación enviado para ${employeeCredentialLabels[surface]}.` });
-    }
-    return res.status(201).json({ employee: { id: employee.id, name: employee.name, email: employee.email, jobRole: employee.jobRole, apiRole: employee.apiRole, roles: employee.roles?.length ? employee.roles : [employee.apiRole], primaryRole: employee.primaryRole || employee.apiRole, portfolioId: employee.portfolioId, fleetId: employee.fleetId, zoneSlugs: employee.zoneSlugs, active: employee.active }, activationEmail, warning: activationEmail.sent ? undefined : "La cuenta se creó, pero no se pudo confirmar el envío del enlace. Usa “Enviar activación” cuando el correo corporativo esté disponible." });
+    return res.status(201).json({ employee: { id: employee.id, name: employee.name, email: employee.email, jobRole: employee.jobRole, apiRole: employee.apiRole, roles: employee.roles?.length ? employee.roles : [employee.apiRole], primaryRole: employee.primaryRole || employee.apiRole, portfolioId: employee.portfolioId, fleetId: employee.fleetId, zoneSlugs: employee.zoneSlugs, active: employee.active }, temporaryPassword, warning: "Mostrar esta contraseña una sola vez y entregarla por un canal seguro." });
   } catch (error) { if ((error as any)?.code === 11000) return res.status(409).json({ error: "EMPLOYEE_EMAIL_ALREADY_EXISTS" }); throw error; }
 });
 const onboardingRequestSchema = z.object({
@@ -827,31 +595,6 @@ app.post("/api/v1/admin/employees/:id/reset-password", requireOwner(), async (re
   await revokeEmployeeSessions(id);
   return res.json({ employee, reset: true });
 });
-app.post("/api/v1/admin/employees/:id/send-activation", requireOwner(), async (req, res) => {
-  const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
-  if (!id) return res.status(400).json({ error: "INVALID_EMPLOYEE_ID" });
-  const target = await EmployeeAccount.findById(id).select("_id name email jobRole apiRole roles primaryRole ownerProtected authorizationStatus active accessLevel tenantId").lean().exec() as any;
-  if (!target) return res.status(404).json({ error: "EMPLOYEE_NOT_FOUND" });
-  if (target.ownerProtected || target.email === ownerEmail) return res.status(403).json({ error: "OWNER_ACCOUNT_PROTECTED" });
-  if (!target.active || target.authorizationStatus !== "approved") return res.status(409).json({ error: "EMPLOYEE_NOT_APPROVED", message: "Aprueba la cuenta antes de enviar sus credenciales." });
-  const surface = preferredCredentialSurface(target);
-  if (!surface) return res.status(409).json({ error: "EMPLOYEE_SURFACE_NOT_CONFIGURED", message: "La cuenta no tiene un panel operativo configurado para recibir el enlace." });
-  const { delivery } = await sendEmployeePasswordLink(target, surface, "activation");
-  if (!delivery.sent) return res.status(503).json({ error: "CREDENTIAL_EMAIL_NOT_SENT", message: "No se pudo enviar el correo corporativo. Comprueba la configuración de correo y vuelve a intentarlo." });
-  await AccessAuthorization.create({
-    tenantId: target.tenantId || null,
-    employeeId: target._id,
-    action: "credentials_sent",
-    previousStatus: target.authorizationStatus,
-    nextStatus: target.authorizationStatus,
-    previousRole: target.apiRole,
-    nextRole: target.apiRole,
-    accessLevel: target.accessLevel || "subadmin",
-    actorEmployeeId: objectId(req.auth!.employeeId!),
-    reason: `Enlace de activación enviado para ${employeeCredentialLabels[surface]}.`,
-  });
-  return res.json({ sent: true, surface, recipient: target.email, message: `Se ha enviado un enlace de activación a ${target.email}.` });
-});
 app.patch("/api/v1/admin/employees/:id/authorization", requireOwner(), async (req, res) => {
   const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id); if (!id) return res.status(400).json({ error: "INVALID_EMPLOYEE_ID" });
   const parsed = z.object({
@@ -867,19 +610,12 @@ app.patch("/api/v1/admin/employees/:id/authorization", requireOwner(), async (re
     reason: z.string().max(500).default(""),
   }).safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_AUTHORIZATION", details: parsed.error.flatten() });
-  const target = await EmployeeAccount.findById(id).select("email ownerProtected jobRole apiRole roles primaryRole partnerRoles restaurantId restaurantIds accessLevel authorizationStatus fleetId").lean().exec() as any;
+  const target = await EmployeeAccount.findById(id).select("email ownerProtected jobRole apiRole roles primaryRole partnerRoles restaurantId restaurantIds accessLevel authorizationStatus").lean().exec() as any;
   if (!target) return res.status(404).json({ error: "EMPLOYEE_NOT_FOUND" });
   if (target.ownerProtected || target.email === ownerEmail) return res.status(403).json({ error: "OWNER_ACCOUNT_PROTECTED" });
   const effectiveRoles = parsed.data.roles || (target.roles?.length ? target.roles : [parsed.data.apiRole || target.apiRole]);
-  const effectiveApiRole = parsed.data.apiRole || target.apiRole;
   const effectivePrimaryRole = parsed.data.primaryRole || target.primaryRole || effectiveRoles[0];
   if (!effectiveRoles.includes(effectivePrimaryRole)) return res.status(400).json({ error: "PRIMARY_ROLE_NOT_ASSIGNED" });
-  if (parsed.data.fleetId) {
-    const isFleetAccount = effectiveApiRole === "fleet" || effectiveRoles.includes("fleet") || parsed.data.jobRole === "zone_manager" || target.jobRole === "zone_manager";
-    if (!isFleetAccount) return res.status(400).json({ error: "FLEET_ID_REQUIRES_FLEET_ROLE", message: "Asigna una flota solo a una cuenta con permisos Fleet." });
-    const fleet = await Fleet.findOne({ _id: objectId(parsed.data.fleetId), isActive: true, ...tenantScope(req) }).select("_id").lean().exec();
-    if (!fleet) return res.status(404).json({ error: "FLEET_NOT_FOUND_OR_INACTIVE", message: "La flota seleccionada no existe o no está activa." });
-  }
   const update: Record<string, unknown> = { authorizationStatus: parsed.data.status, active: parsed.data.status === "approved", authorizedAt: parsed.data.status === "approved" ? new Date() : null, authorizedBy: objectId(req.auth!.employeeId!), authorizationReason: parsed.data.reason };
   if (parsed.data.apiRole) update.apiRole = parsed.data.apiRole;
   if (parsed.data.jobRole) update.jobRole = parsed.data.jobRole;
@@ -895,10 +631,10 @@ app.patch("/api/v1/admin/employees/:id/authorization", requireOwner(), async (re
   }
   if (parsed.data.fleetId !== undefined) update.fleetId = parsed.data.fleetId ? objectId(parsed.data.fleetId) : null;
   if (parsed.data.zoneSlugs) update.zoneSlugs = parsed.data.zoneSlugs;
-  const accessChanged = Boolean(parsed.data.apiRole || parsed.data.jobRole || parsed.data.roles || parsed.data.primaryRole || parsed.data.partnerRoles || parsed.data.restaurantIds || parsed.data.fleetId !== undefined || parsed.data.status !== "approved");
+  const accessChanged = Boolean(parsed.data.apiRole || parsed.data.jobRole || parsed.data.roles || parsed.data.primaryRole || parsed.data.partnerRoles || parsed.data.restaurantIds || parsed.data.status !== "approved");
   if (accessChanged) update.sessionHash = null;
   const employee = await EmployeeAccount.findByIdAndUpdate(id, { $set: update }, { new: true }).select("name email jobRole apiRole roles primaryRole partnerRoles restaurantId restaurantIds accessLevel authorizationStatus authorizedAt authorizedBy authorizationReason fleetId zoneSlugs active mustChangePassword").lean().exec() as any;
-  await AccessAuthorization.create({ employeeId: id, action: parsed.data.apiRole || parsed.data.jobRole || parsed.data.roles || parsed.data.partnerRoles || parsed.data.restaurantIds || parsed.data.fleetId !== undefined ? "role_changed" : parsed.data.status, previousStatus: target.authorizationStatus || null, nextStatus: parsed.data.status, previousRole: JSON.stringify({ apiRole: target.apiRole, roles: target.roles || [], partnerRoles: target.partnerRoles || [], restaurantIds: assignedRestaurantIds(target), fleetId: target.fleetId || null }), nextRole: JSON.stringify({ apiRole: employee.apiRole, roles: employee.roles || [], partnerRoles: employee.partnerRoles || [], restaurantIds: assignedRestaurantIds(employee), fleetId: employee.fleetId || null }), accessLevel: employee.accessLevel || "subadmin", actorEmployeeId: objectId(req.auth!.employeeId!), reason: parsed.data.reason });
+  await AccessAuthorization.create({ employeeId: id, action: parsed.data.apiRole || parsed.data.jobRole || parsed.data.roles || parsed.data.partnerRoles || parsed.data.restaurantIds ? "role_changed" : parsed.data.status, previousStatus: target.authorizationStatus || null, nextStatus: parsed.data.status, previousRole: JSON.stringify({ apiRole: target.apiRole, roles: target.roles || [], partnerRoles: target.partnerRoles || [], restaurantIds: assignedRestaurantIds(target) }), nextRole: JSON.stringify({ apiRole: employee.apiRole, roles: employee.roles || [], partnerRoles: employee.partnerRoles || [], restaurantIds: assignedRestaurantIds(employee) }), accessLevel: employee.accessLevel || "subadmin", actorEmployeeId: objectId(req.auth!.employeeId!), reason: parsed.data.reason });
   if (accessChanged) await revokeEmployeeSessions(id);
   return res.json({ employee, authorization: { status: parsed.data.status, persisted: true } });
 });
@@ -954,75 +690,47 @@ app.post("/api/v1/signatures/signaturit/events", rateLimit(100, 60_000, "signatu
 app.get("/api/v1/catalog/restaurants", async (req, res) => {
   const query = typeof req.query.q === "string" ? req.query.q.trim().slice(0, 120).replace(/[.*+?^${}()|[\]\\]/g, "\\$&") : "";
   const category = typeof req.query.category === "string" ? req.query.category.trim() : "";
-  const cacheKey = `${query}|${category}`;
-  const cached = catalogCache.get(cacheKey);
-  if (cached && cached.expiresAt > Date.now()) { res.setHeader("Cache-Control", "public, max-age=30, s-maxage=30, stale-while-revalidate=60, stale-if-error=120"); return res.json(cached.body); }
-  const shared = await sharedCacheGet<{ restaurants: unknown[] }>(`piki:catalog:${cacheKey}`);
-  if (shared) { catalogCache.set(cacheKey, { expiresAt: Date.now() + CATALOG_CACHE_MS, body: shared }); res.setHeader("Cache-Control", "public, max-age=30, s-maxage=30, stale-while-revalidate=60, stale-if-error=120"); return res.json(shared); }
-  const clauses: Record<string, unknown>[] = [CUSTOMER_CATALOG_RESTAURANT_FILTER];
-  if (category && category !== "Todos") clauses.push({ category });
-  if (query) clauses.push({ $or: [{ name: { $regex: query, $options: "i" } }, { cuisine: { $regex: query, $options: "i" } }, { category: { $regex: query, $options: "i" } }] });
-  const filter: Record<string, unknown> = clauses.length === 1 ? clauses[0] : { $and: clauses };
+  const filter: Record<string, unknown> = { isActive: true, onboardingStatus: "approved" };
+  if (category && category !== "Todos") filter.category = category;
+  if (query) filter.$or = [{ name: { $regex: query, $options: "i" } }, { cuisine: { $regex: query, $options: "i" } }, { category: { $regex: query, $options: "i" } }];
   const restaurants = await Restaurant.find(filter)
     // Explicit inclusion avoids MongoDB path-collision errors caused by
     // partnerProfile.documents having select:false nested fields.
-    .select("slug name cuisine category locality partnerGroupKey tagline etaMinutes deliveryFeeCents rating reviews promoted image accent phone address location menu isActive onboardingStatus availabilityStatus upcomingAt upcomingMessage")
+    .select("slug name cuisine category locality partnerGroupKey tagline etaMinutes deliveryFeeCents rating reviews promoted image accent phone address location menu isActive onboardingStatus")
     .sort({ promoted: -1, rating: -1, reviews: -1 }).lean().exec();
-  const body = { restaurants: restaurants.map((restaurant: any) => presentCustomerCatalogRestaurant(restaurant)) };
-  catalogCache.set(cacheKey, { expiresAt: Date.now() + CATALOG_CACHE_MS, body });
-  void sharedCacheSet(`piki:catalog:${cacheKey}`, body, 30);
-  res.setHeader("Cache-Control", "public, max-age=30, s-maxage=30, stale-while-revalidate=60, stale-if-error=120");
-  res.json(body);
+  res.json({ restaurants });
 });
 
 app.get("/api/v1/locations/search", async (req, res) => {
   const query = typeof req.query.q === "string" ? req.query.q.trim() : "";
   if (query.length < 3) return res.status(400).json({ error: "QUERY_TOO_SHORT" });
-  const cacheKey = `search:${query.toLowerCase()}`;
-  const cached = geocodeCache.get(cacheKey);
-  if (cached && cached.expiresAt > Date.now()) { res.setHeader("Cache-Control", "public, max-age=300, s-maxage=300, stale-while-revalidate=600, stale-if-error=900"); return res.json(cached.body); }
-  const shared = await sharedCacheGet<{ results: unknown[] }>(`piki:geocode:${cacheKey}`);
-  if (shared) { geocodeCache.set(cacheKey, { expiresAt: Date.now() + GEOCODE_CACHE_MS, body: shared }); res.setHeader("Cache-Control", "public, max-age=300, s-maxage=300, stale-while-revalidate=600, stale-if-error=900"); return res.json(shared); }
   const url = new URL("https://nominatim.openstreetmap.org/search");
   url.searchParams.set("q", `${query}, Comunitat Valenciana, España`);
   url.searchParams.set("format", "jsonv2");
   url.searchParams.set("addressdetails", "1");
   url.searchParams.set("limit", "8");
   try {
-    const response = await boundedFetch(url, { headers: { "User-Agent": "PIKI-Delivery/0.2 (+https://pikidelivery.com)" } });
-    if (!response.ok) return res.json({ results: [], degraded: true });
+    const response = await fetch(url, { headers: { "User-Agent": "PIKI-Delivery/0.2 (+https://pikidelivery.com)" } });
+    if (!response.ok) return res.status(502).json({ error: "GEOCODER_UNAVAILABLE" });
     const rows = await response.json() as Array<{ place_id: number; display_name: string; lat: string; lon: string; type?: string; address?: Record<string, string> }>;
-    const body = { results: rows.map((row) => ({ id: row.place_id, label: row.display_name, latitude: Number(row.lat), longitude: Number(row.lon), type: row.type || "address", address: row.address || {} })) };
-    geocodeCache.set(cacheKey, { expiresAt: Date.now() + GEOCODE_CACHE_MS, body });
-    void sharedCacheSet(`piki:geocode:${cacheKey}`, body, 300);
-    res.setHeader("Cache-Control", "public, max-age=300, s-maxage=300, stale-while-revalidate=600, stale-if-error=900");
-    return res.json(body);
-  } catch {
-    return res.json({ results: [], degraded: true, message: "Geocoder temporalmente no disponible" });
+    return res.json({ results: rows.map((row) => ({ id: row.place_id, label: row.display_name, latitude: Number(row.lat), longitude: Number(row.lon), type: row.type || "address", address: row.address || {} })) });
+  } catch (error) {
+    return res.status(502).json({ error: "GEOCODER_UNAVAILABLE", message: error instanceof Error ? error.message : "Geocoder unavailable" });
   }
 });
 
 app.get("/api/v1/locations/reverse", async (req, res) => {
   const latitude = Number(req.query.latitude); const longitude = Number(req.query.longitude);
   if (!validateCoordinates(latitude, longitude)) return res.status(400).json({ error: "INVALID_COORDINATES" });
-  const cacheKey = `reverse:${latitude.toFixed(5)}:${longitude.toFixed(5)}`;
-  const cached = geocodeCache.get(cacheKey);
-  if (cached && cached.expiresAt > Date.now()) { res.setHeader("Cache-Control", "public, max-age=300, s-maxage=300, stale-while-revalidate=600, stale-if-error=900"); return res.json(cached.body); }
-  const shared = await sharedCacheGet<{ label: string; latitude: number; longitude: number }>(`piki:geocode:${cacheKey}`);
-  if (shared) { geocodeCache.set(cacheKey, { expiresAt: Date.now() + GEOCODE_CACHE_MS, body: shared }); res.setHeader("Cache-Control", "public, max-age=300, s-maxage=300, stale-while-revalidate=600, stale-if-error=900"); return res.json(shared); }
   const url = new URL("https://nominatim.openstreetmap.org/reverse");
   url.searchParams.set("lat", String(latitude)); url.searchParams.set("lon", String(longitude));
   url.searchParams.set("format", "jsonv2"); url.searchParams.set("zoom", "18");
   try {
-    const response = await boundedFetch(url, { headers: { "User-Agent": "PIKI-Delivery/0.2 (+https://pikidelivery.com)" } });
-    if (!response.ok) return res.json({ label: `Ubicación GPS ${latitude.toFixed(5)}, ${longitude.toFixed(5)}`, latitude, longitude, degraded: true });
+    const response = await fetch(url, { headers: { "User-Agent": "PIKI-Delivery/0.2 (+https://pikidelivery.com)" } });
+    if (!response.ok) return res.status(502).json({ error: "GEOCODER_UNAVAILABLE" });
     const row = await response.json() as { display_name?: string };
-    const body = { label: String(row.display_name || `Ubicación GPS ${latitude.toFixed(5)}, ${longitude.toFixed(5)}`), latitude, longitude };
-    geocodeCache.set(cacheKey, { expiresAt: Date.now() + GEOCODE_CACHE_MS, body });
-    void sharedCacheSet(`piki:geocode:${cacheKey}`, body, 300);
-    res.setHeader("Cache-Control", "public, max-age=300, s-maxage=300, stale-while-revalidate=600, stale-if-error=900");
-    return res.json(body);
-  } catch { return res.json({ label: `Ubicación GPS ${latitude.toFixed(5)}, ${longitude.toFixed(5)}`, latitude, longitude, degraded: true }); }
+    return res.json({ label: String(row.display_name || `Ubicación GPS ${latitude.toFixed(5)}, ${longitude.toFixed(5)}`), latitude, longitude });
+  } catch { return res.status(502).json({ error: "GEOCODER_UNAVAILABLE" }); }
 });
 
 app.get("/api/v1/coverage", async (req, res) => {
@@ -1033,12 +741,11 @@ app.get("/api/v1/coverage", async (req, res) => {
   let catalogAvailable = true;
   if (coverage.covered) {
     try {
-      const rows = await Restaurant.find(CUSTOMER_ORDERABLE_RESTAURANT_FILTER)
+      restaurants = await Restaurant.find({ isActive: true, onboardingStatus: "approved" })
         // Inclusive projection avoids a MongoDB path collision with the
         // select:false document payload nested under partnerProfile.
-        .select("slug name cuisine category locality tagline etaMinutes deliveryFeeCents rating reviews promoted image accent phone address location menu availabilityStatus upcomingAt upcomingMessage")
+        .select("slug name cuisine category locality tagline etaMinutes deliveryFeeCents rating reviews promoted image accent phone address location menu")
         .sort({ promoted: -1, rating: -1, reviews: -1 }).lean().exec();
-      restaurants = rows.map((restaurant: any) => presentCustomerCatalogRestaurant(restaurant));
     } catch (error) {
       // The price decision is deterministic and must never disappear because a
       // catalogue/index query is temporarily unavailable. The storefront has
@@ -1086,7 +793,7 @@ app.get("/api/v1/admin/partner-leads", requireRole("admin", "commercial", "geren
   const rawStatus = typeof req.query.status === "string" ? req.query.status : undefined;
   const parsedStatus = rawStatus && rawStatus !== "all" ? webLeadStatusSchema.safeParse(rawStatus) : null;
   if (parsedStatus && !parsedStatus.success) return res.status(400).json({ error: "INVALID_LEAD_STATUS" });
-  const leads = await PartnerLead.find({ ...await onboardingScope(req), ...(parsedStatus?.success ? { status: parsedStatus.data } : {}) }).sort({ createdAt: -1 }).limit(200).lean().exec();
+  const leads = await PartnerLead.find(parsedStatus?.success ? { status: parsedStatus.data } : {}).sort({ createdAt: -1 }).limit(200).lean().exec();
   return res.json({ leads });
 });
 
@@ -1098,12 +805,12 @@ app.patch("/api/v1/admin/partner-leads/:id", requireRole("admin", "commercial", 
   if (!parsed.success) return res.status(400).json({ error: "INVALID_LEAD_REVIEW", details: parsed.error.flatten() });
   if (parsed.data.status === "info_requested" && !parsed.data.notes) return res.status(400).json({ error: "INFO_REQUEST_NOTES_REQUIRED" });
   const actor = req.auth?.employeeId ? objectId(req.auth.employeeId) : null;
-  const lead = await PartnerLead.findOneAndUpdate({ _id: id, ...await onboardingScope(req) }, { $set: { status: parsed.data.status, notes: parsed.data.notes, reviewedBy: actor, reviewedAt: new Date() }, $push: { history: { status: parsed.data.status, notes: parsed.data.notes, actorEmployeeId: actor, changedAt: new Date() } } }, { new: true }).lean().exec();
+  const lead = await PartnerLead.findByIdAndUpdate(id, { $set: { status: parsed.data.status, notes: parsed.data.notes, reviewedBy: actor, reviewedAt: new Date() }, $push: { history: { status: parsed.data.status, notes: parsed.data.notes, actorEmployeeId: actor, changedAt: new Date() } } }, { new: true }).lean().exec();
   if (!lead) return res.status(404).json({ error: "PARTNER_LEAD_NOT_FOUND" });
   return res.json({ lead });
 });
 
-const partnerDocumentSchema = z.object({ type: z.enum(["tax_id", "bank_certificate", "insurance", "activity_license", "food_sanitary_authorization", "identity", "other"]), fileName: z.string().min(1).max(180), mimeType: z.literal("application/pdf"), sizeBytes: z.number().int().positive().max(2_500_000), sha256: z.string().regex(/^[a-f0-9]{64}$/), contentBase64: z.string().min(20).max(3_500_000) });
+const partnerDocumentSchema = z.object({ type: z.enum(["tax_id", "bank_certificate", "insurance", "activity_license", "food_sanitary_authorization", "identity", "other"]), fileName: z.string().min(1).max(180), mimeType: z.enum(["application/pdf", "image/jpeg", "image/png"]), sizeBytes: z.number().int().positive().max(2_500_000), sha256: z.string().regex(/^[a-f0-9]{64}$/), contentBase64: z.string().min(20).max(3_500_000) });
 const openingHoursSchema = z.record(z.string().min(2).max(15), z.object({ open: z.string().regex(/^\d{2}:\d{2}$/), close: z.string().regex(/^\d{2}:\d{2}$/), closed: z.boolean() }));
 const partnerSchema = z.object({ name: z.string().min(2).max(160), email: z.string().email(), password: z.string().min(12).max(200).regex(/[A-Z]/).regex(/[a-z]/).regex(/[0-9]/), phone: z.string().min(6).max(40), address: z.string().min(5).max(280), legalName: z.string().min(2).max(180), taxId: z.string().regex(/^[A-Za-z0-9-]{5,20}$/), legalForm: z.enum(["autonomo", "sl", "sa", "cooperativa", "otra"]), representativeName: z.string().min(2).max(160), representativeRole: z.string().min(2).max(100), representativeDocument: z.string().min(5).max(30), fiscalAddress: z.string().min(5).max(280), operatingAddress: z.string().min(5).max(280), postalCode: z.string().regex(/^\d{5}$/), city: z.string().min(2).max(100), province: z.string().min(2).max(100), iban: z.string().regex(/^[A-Z]{2}\d{2}[A-Z0-9]{10,30}$/), bankAccountHolder: z.string().min(2).max(180), cuisine: z.string().min(2).max(100), vatRate: z.union([z.literal(4), z.literal(10), z.literal(21)]), commissionAccepted: z.literal(true), termsAcceptedAt: z.coerce.date(), contractAccepted: z.literal(true), privacyAccepted: z.literal(true), dataProcessingAccepted: z.literal(true), pdaUnits: z.number().int().min(1).max(50), pdaUnitCostCents: z.literal(30000), pdaCostAccepted: z.literal(true), pdaCostAcceptedAt: z.coerce.date(), privacyAcceptedAt: z.coerce.date(), dataProcessingAcceptedAt: z.coerce.date(), openingHours: openingHoursSchema, documents: z.array(partnerDocumentSchema).length(5) });
 app.post("/api/v1/partners/onboarding", async (req, res) => {
@@ -1111,34 +818,29 @@ app.post("/api/v1/partners/onboarding", async (req, res) => {
   if (!parsed.success) return res.status(400).json({ error: "INVALID_PARTNER", details: parsed.error.flatten() });
   const requiredDocumentTypes = new Set(["tax_id", "bank_certificate", "activity_license", "insurance", "food_sanitary_authorization"]);
   if (![...requiredDocumentTypes].every((type) => parsed.data.documents.some((document) => document.type === type))) return res.status(400).json({ error: "REQUIRED_PARTNER_DOCUMENTS_MISSING", required: [...requiredDocumentTypes] });
-  let documents: Array<typeof parsed.data.documents[number]>;
-  try {
-    documents = await normalizeAndScanOnboardingDocuments(parsed.data.documents) as Array<typeof parsed.data.documents[number]>;
-  } catch (error) {
-    if (error instanceof MalwareDetectedError) return res.status(422).json({ error: "MALWARE_DETECTED" });
-    if (error instanceof MalwareScannerUnavailableError) return res.status(503).json({ error: "MALWARE_SCANNER_UNAVAILABLE" });
-    return res.status(400).json({ error: error instanceof Error ? error.message : "DOCUMENT_VALIDATION_FAILED" });
+  for (const document of parsed.data.documents) {
+    const digest = createHash("sha256").update(Buffer.from(document.contentBase64, "base64")).digest("hex");
+    if (digest !== document.sha256) return res.status(400).json({ error: "PARTNER_DOCUMENT_CHECKSUM_MISMATCH", fileName: document.fileName });
   }
-  const publicTenant = await publicOnboardingTenantScope();
-  const existingTaxId = await Restaurant.findOne({ ...publicTenant, "partnerProfile.taxId": parsed.data.taxId.toUpperCase() }).select("_id").lean().exec();
+  const existingTaxId = await Restaurant.findOne({ "partnerProfile.taxId": parsed.data.taxId.toUpperCase() }).select("_id").lean().exec();
   if (existingTaxId) return res.status(409).json({ error: "PARTNER_TAX_ID_ALREADY_EXISTS" });
   const normalizedEmail = parsed.data.email.toLowerCase();
   if (await EmployeeAccount.exists({ email: normalizedEmail })) return res.status(409).json({ error: "PARTNER_EMAIL_ALREADY_EXISTS", message: "Ya existe una solicitud o cuenta con este correo." });
   const slug = `${parsed.data.name.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "")}-${Date.now().toString(36)}`;
-  const { legalName, taxId, legalForm, representativeName, representativeRole, representativeDocument, fiscalAddress, operatingAddress, postalCode, city, province, iban, bankAccountHolder, cuisine, vatRate, commissionAccepted, termsAcceptedAt, contractAccepted, privacyAccepted, dataProcessingAccepted, pdaUnits, pdaUnitCostCents, pdaCostAccepted, pdaCostAcceptedAt, privacyAcceptedAt, dataProcessingAcceptedAt, openingHours, documents: _incomingDocuments, password: _password, ...contact } = parsed.data;
+  const { legalName, taxId, legalForm, representativeName, representativeRole, representativeDocument, fiscalAddress, operatingAddress, postalCode, city, province, iban, bankAccountHolder, cuisine, vatRate, commissionAccepted, termsAcceptedAt, contractAccepted, privacyAccepted, dataProcessingAccepted, pdaUnits, pdaUnitCostCents, pdaCostAccepted, pdaCostAcceptedAt, privacyAcceptedAt, dataProcessingAcceptedAt, openingHours, documents, password: _password, ...contact } = parsed.data;
   const locality = city.trim();
   const groupKey = localityKey(locality);
-  const partner = await Restaurant.create({ ...publicTenant, slug, name: contact.name, cuisine, category: cuisine, locality, partnerGroupKey: groupKey, address: operatingAddress, tagline: "Solicitud recibida por PIKI", onboardingStatus: "pending_review", isActive: false, email: contact.email, phone: contact.phone, partnerProfile: { legalName, taxId: taxId.toUpperCase(), legalForm, representativeName, representativeRole, representativeDocument, fiscalAddress, operatingAddress, postalCode, city, province, iban: iban.toUpperCase(), bankAccountHolder, cuisine, vatRate, commissionAccepted, termsAcceptedAt, contractAcceptedAt: contractAccepted ? termsAcceptedAt : null, privacyAcceptedAt, dataProcessingAcceptedAt, pdaUnits, pdaUnitCostCents, pdaCostAcceptedAt: pdaCostAccepted ? pdaCostAcceptedAt : null, openingHours, documents: documents.map(({ contentBase64, ...metadata }) => ({ ...metadata, contentBase64, status: "received" })) } });
+  const partner = await Restaurant.create({ slug, name: contact.name, cuisine, category: cuisine, locality, partnerGroupKey: groupKey, address: operatingAddress, tagline: "Solicitud recibida por PIKI", onboardingStatus: "pending_review", isActive: false, email: contact.email, phone: contact.phone, partnerProfile: { legalName, taxId: taxId.toUpperCase(), legalForm, representativeName, representativeRole, representativeDocument, fiscalAddress, operatingAddress, postalCode, city, province, iban: iban.toUpperCase(), bankAccountHolder, cuisine, vatRate, commissionAccepted, termsAcceptedAt, contractAcceptedAt: contractAccepted ? termsAcceptedAt : null, privacyAcceptedAt, dataProcessingAcceptedAt, pdaUnits, pdaUnitCostCents, pdaCostAcceptedAt: pdaCostAccepted ? pdaCostAcceptedAt : null, openingHours, documents: documents.map(({ contentBase64, ...metadata }) => ({ ...metadata, contentBase64, status: "received" })) } });
   try {
-    await EmployeeAccount.create({ ...publicTenant, name: contact.name, email: normalizedEmail, jobRole: "partner", apiRole: "partner", roles: ["partner"], partnerRoles: ["partner_admin"], accessLevel: "subadmin", authorizationStatus: "pending", restaurantId: partner._id, restaurantIds: [partner._id], passwordHash: hashPassword(parsed.data.password), mustChangePassword: false, active: false });
+    await EmployeeAccount.create({ name: contact.name, email: normalizedEmail, jobRole: "partner", apiRole: "partner", roles: ["partner"], partnerRoles: ["partner_admin"], accessLevel: "subadmin", authorizationStatus: "pending", restaurantId: partner._id, restaurantIds: [partner._id], passwordHash: hashPassword(parsed.data.password), mustChangePassword: false, active: false });
   } catch (error) {
     await Restaurant.findByIdAndDelete(partner._id).exec();
     if ((error as any)?.code === 11000) return res.status(409).json({ error: "PARTNER_EMAIL_ALREADY_EXISTS", message: "Ya existe una solicitud o cuenta con este correo." });
     throw error;
   }
-  await PartnerLocalityGroup.findOneAndUpdate({ ...publicTenant, localityKey: groupKey }, { $set: { localityName: locality, province, isActive: true }, $setOnInsert: publicTenant, $addToSet: { restaurantIds: partner._id } }, { upsert: true, new: true });
+  await PartnerLocalityGroup.findOneAndUpdate({ localityKey: groupKey }, { $set: { localityName: locality, province, isActive: true }, $addToSet: { restaurantIds: partner._id } }, { upsert: true, new: true });
   await notifyOnboarding({ channel: "admin", type: "onboarding.partner_application.created", entityId: String(partner._id), tenantId: (partner as any).tenantId });
-  res.status(201).json({ message: "Solicitud recibida para revisión.", partner: { id: partner.id, partnerCode: onboardingCode("P", partner._id), name: partner.name, email: partner.email, phone: partner.phone, locality, partnerGroupKey: groupKey, onboarding_status: partner.onboardingStatus } });
+  res.status(201).json({ message: "Solicitud recibida para revisión.", partner: { id: partner.id, name: partner.name, email: partner.email, phone: partner.phone, locality, partnerGroupKey: groupKey, onboarding_status: partner.onboardingStatus } });
 });
 
 function assignedRestaurantIds(employee: any): string[] {
@@ -1151,23 +853,11 @@ function assignedRestaurantIds(employee: any): string[] {
 
 async function partnerLocationsFor(employee: any, roles = partnerRolesForEmployee(employee), permissions = [...permissionsForPartnerRoles(roles)]) {
   const ids = assignedRestaurantIds(employee);
-  if (!employee?.tenantId) return [];
-  const tenantFilter = { tenantId: employee.tenantId };
-  let restaurants = ids.length
-    ? await Restaurant.find({ _id: { $in: ids }, ...tenantFilter }).select("_id name address email isActive onboardingStatus").lean().exec() as any[]
-    : [];
-  // Compatibilidad con cuentas de prueba/legacy creadas antes de guardar restaurantIds.
-  // Solo se acepta una coincidencia exacta de correo entre la cuenta y el comercio.
-  if (!restaurants.length && employee?.email) {
-    const email = String(employee.email).trim().toLowerCase();
-    if (email) restaurants = await Restaurant.find({ email, ...tenantFilter }).select("_id name address email isActive onboardingStatus").limit(10).lean().exec() as any[];
-  }
-  if (!restaurants.length) return [];
+  if (!ids.length) return [];
+  const restaurants = await Restaurant.find({ _id: { $in: ids } }).select("_id name address isActive onboardingStatus").lean().exec() as any[];
   const byId = new Map(restaurants.map((restaurant) => [String(restaurant._id), restaurant]));
-  const ordered = ids.length ? ids.map((id) => byId.get(id)).filter(Boolean) : restaurants;
-  return ordered.map((restaurant: any) => ({
+  return ids.map((id) => byId.get(id)).filter(Boolean).map((restaurant: any) => ({
     id: String(restaurant._id),
-    partnerCode: onboardingCode("P", restaurant._id),
     name: restaurant.name,
     address: restaurant.address || "",
     isOpen: Boolean(restaurant.isActive && restaurant.onboardingStatus === "approved"),
@@ -1178,7 +868,7 @@ async function partnerLocationsFor(employee: any, roles = partnerRolesForEmploye
 
 async function partnerAccessForRequest(req: express.Request) {
   if (!req.auth?.employeeId) return null;
-  const employee = await EmployeeAccount.findById(req.auth.employeeId).select("restaurantId restaurantIds tenantId jobRole apiRole roles partnerRoles").lean().exec() as any;
+  const employee = await EmployeeAccount.findById(req.auth.employeeId).select("restaurantId restaurantIds jobRole apiRole roles partnerRoles").lean().exec() as any;
   if (!employee) return null;
   const roles = partnerRolesForEmployee(employee);
   return { employee, restaurantIds: assignedRestaurantIds(employee), roles, permissions: [...permissionsForPartnerRoles(roles)] };
@@ -1200,8 +890,7 @@ async function partnerRequestAccess(req: express.Request, permission: PartnerPer
   const access = await partnerAccessForRequest(req);
   return { access, allowed: Boolean(access && partnerCan(access.roles, permission)) };
 }
-const menuModifierOptionSchema = z.union([z.string().max(120), z.object({ id: z.string().min(1).max(80), name: z.string().min(1).max(120), price: z.number().min(0).max(1000) })]);
-const menuModifierSchema = z.object({ id: z.string().min(1).max(80), name: z.string().min(1).max(120), description: z.string().max(240).default(""), price: z.number().min(0).max(1000).default(0), required: z.boolean().default(false), minSelections: z.number().int().min(0).max(30).default(0), maxSelections: z.number().int().min(1).max(30).default(1), options: z.array(menuModifierOptionSchema).max(30).default([]) });
+const menuModifierSchema = z.object({ id: z.string().min(1).max(80), name: z.string().min(1).max(120), price: z.number().min(0).max(1000), required: z.boolean().default(false), options: z.array(z.string().max(120)).max(30).default([]) });
 const partnerMenuItemSchema = z.object({ id: z.string().min(1).max(80), name: z.string().min(1).max(160), description: z.string().max(500).default(""), price: z.number().min(0).max(1000), category: z.string().max(100).default("General"), image: z.string().max(1200).refine((value) => value === "" || value.startsWith("https://api.pikidelivery.com/api/v1/catalog/assets/"), "La imagen debe proceder del almacenamiento de PIKI").default(""), allergens: z.array(z.string().max(80)).max(30).default([]), modifiers: z.array(menuModifierSchema).max(20).default([]), available: z.boolean().default(true), vegetarian: z.boolean().default(false), popular: z.boolean().default(false) });
 function detectedMenuMime(bytes: Buffer): string | null {
   if (bytes.length >= 12 && bytes.subarray(0, 3).equals(Buffer.from([0xff, 0xd8, 0xff]))) return "image/jpeg";
@@ -1268,93 +957,6 @@ app.post("/api/v1/partners/menu/assets", requireRole("partner"), async (req, res
   await PartnerLocalityGroup.findOneAndUpdate({ localityKey: groupKey }, { $set: { localityName: locality, province: "Valencia", isActive: true }, $addToSet: { restaurantIds: objectId(restaurantId) } }, { upsert: true, new: true });
   return res.status(201).json({ asset: assetResponse(asset) });
 });
-function menuImportResponse(draft: any) {
-  return {
-    id: String(draft._id),
-    sourceAssetId: String(draft.sourceAssetId),
-    sourceFileName: draft.sourceFileName,
-    extractionMethod: draft.extractionMethod,
-    extractedLines: draft.extractedLines,
-    warnings: draft.warnings || [],
-    textPreview: draft.textPreview || "",
-    items: draft.items || [],
-    status: draft.status,
-    createdAt: draft.createdAt,
-    publishedAt: draft.publishedAt || null,
-  };
-}
-const importedMenuItemsSchema = z.array(partnerMenuItemSchema).max(500);
-app.post("/api/v1/partners/menu/imports", requireRole("partner"), async (req, res) => {
-  const { access, allowed } = await partnerRequestAccess(req, "menu:write");
-  if (!allowed) return res.status(403).json({ error: "PARTNER_PERMISSION_DENIED", permission: "menu:write" });
-  const restaurantId = await employeeRestaurant(req, access);
-  const parsed = z.object({ assetId: z.string().min(1) }).safeParse(req.body);
-  const assetId = parsed.success ? objectId(parsed.data.assetId) : null;
-  const createdBy = objectId(String(req.auth?.employeeId || ""));
-  if (!parsed.success || !assetId || !createdBy) return res.status(400).json({ error: "INVALID_MENU_IMPORT" });
-  if (!restaurantId) return res.status(403).json({ error: "PARTNER_RESTAURANT_NOT_ASSIGNED" });
-  const asset = await PartnerAsset.findOne({ _id: assetId, restaurantId: objectId(restaurantId), kind: { $in: MENU_ASSET_KINDS }, scanStatus: "clean" }).select("+contentBase64 fileName mimeType sizeBytes").lean().exec() as any;
-  if (!asset) return res.status(404).json({ error: "MENU_ASSET_NOT_FOUND" });
-  try {
-    const parsedMenu = await extractAndParseMenu(readAssetBytes(asset.contentBase64), asset.mimeType);
-    const draft = await MenuImportDraft.create({ restaurantId: objectId(restaurantId), sourceAssetId: asset._id, sourceFileName: asset.fileName, extractionMethod: parsedMenu.extractionMethod, extractedLines: parsedMenu.extractedLines, warnings: parsedMenu.warnings, textPreview: parsedMenu.textPreview, items: parsedMenu.items, createdBy, status: "draft" });
-    return res.status(201).json({ draft: menuImportResponse(draft) });
-  } catch (error) {
-    console.error("Menu import extraction failed", error instanceof Error ? error.message : error);
-    return res.status(422).json({ error: "MENU_EXTRACTION_FAILED", message: "No se ha podido extraer texto de la carta. Comprueba que el PDF sea legible o que el OCR esté disponible." });
-  }
-});
-app.get("/api/v1/partners/menu/imports/:id", requireRole("partner"), async (req, res) => {
-  const { access, allowed } = await partnerRequestAccess(req, "menu:read");
-  if (!allowed) return res.status(403).json({ error: "PARTNER_PERMISSION_DENIED", permission: "menu:read" });
-  const restaurantId = await employeeRestaurant(req, access);
-  const id = objectId(String(req.params.id));
-  if (!restaurantId || !id) return res.status(400).json({ error: "INVALID_MENU_IMPORT_ID" });
-  const draft = await MenuImportDraft.findOne({ _id: id, restaurantId: objectId(restaurantId) }).lean().exec();
-  if (!draft) return res.status(404).json({ error: "MENU_IMPORT_NOT_FOUND" });
-  return res.json({ draft: menuImportResponse(draft) });
-});
-app.put("/api/v1/partners/menu/imports/:id", requireRole("partner"), async (req, res) => {
-  const { access, allowed } = await partnerRequestAccess(req, "menu:write");
-  if (!allowed) return res.status(403).json({ error: "PARTNER_PERMISSION_DENIED", permission: "menu:write" });
-  const restaurantId = await employeeRestaurant(req, access);
-  const id = objectId(String(req.params.id));
-  const parsed = z.object({ items: importedMenuItemsSchema }).safeParse(req.body);
-  if (!restaurantId || !id || !parsed.success) return res.status(400).json({ error: "INVALID_MENU_IMPORT_ITEMS", details: parsed.success ? undefined : parsed.error.flatten() });
-  const draft = await MenuImportDraft.findOneAndUpdate({ _id: id, restaurantId: objectId(restaurantId), status: "draft" }, { $set: { items: parsed.data.items, reviewedBy: objectId(String(req.auth?.employeeId || "")) } }, { new: true }).lean().exec();
-  if (!draft) return res.status(404).json({ error: "MENU_IMPORT_NOT_FOUND_OR_CLOSED" });
-  return res.json({ draft: menuImportResponse(draft) });
-});
-app.post("/api/v1/partners/menu/imports/:id/publish", requireRole("partner"), async (req, res) => {
-  const { access, allowed } = await partnerRequestAccess(req, "menu:write");
-  if (!allowed) return res.status(403).json({ error: "PARTNER_PERMISSION_DENIED", permission: "menu:write" });
-  const restaurantId = await employeeRestaurant(req, access);
-  const id = objectId(String(req.params.id));
-  if (!restaurantId || !id) return res.status(400).json({ error: "INVALID_MENU_IMPORT_ID" });
-  const draft = await MenuImportDraft.findOne({ _id: id, restaurantId: objectId(restaurantId), status: "draft" }).lean().exec() as any;
-  if (!draft) return res.status(404).json({ error: "MENU_IMPORT_NOT_FOUND_OR_CLOSED" });
-  if (!Array.isArray(draft.items) || !draft.items.length) return res.status(409).json({ error: "MENU_IMPORT_EMPTY", message: "Añade al menos un producto antes de publicar." });
-  const session = await mongoose.startSession();
-  try {
-    let restaurant: any = null;
-    let published: any = null;
-    await session.withTransaction(async () => {
-      restaurant = await Restaurant.findOneAndUpdate({ _id: objectId(restaurantId), onboardingStatus: "approved" }, { $set: { menu: draft.items } }, { new: true, session }).select("name menu").lean().exec() as any;
-      if (!restaurant) throw new Error("RESTAURANT_NOT_APPROVED");
-      published = await MenuImportDraft.findOneAndUpdate({ _id: id, restaurantId: objectId(restaurantId), status: "draft" }, { $set: { status: "published", publishedAt: new Date(), reviewedBy: objectId(String(req.auth?.employeeId || "")) } }, { new: true, session }).lean().exec();
-      if (!published) throw new Error("MENU_IMPORT_NOT_FOUND_OR_CLOSED");
-    });
-    return res.json({ published: true, restaurant, draft: menuImportResponse(published) });
-  } catch (error) {
-    const code = error instanceof Error ? error.message : "MENU_IMPORT_PUBLISH_FAILED";
-    if (code === "RESTAURANT_NOT_APPROVED") return res.status(409).json({ error: code });
-    if (code === "MENU_IMPORT_NOT_FOUND_OR_CLOSED") return res.status(404).json({ error: code });
-    console.error("Menu import publish transaction failed", code);
-    return res.status(503).json({ error: "MENU_IMPORT_PUBLISH_FAILED", message: "No se pudo publicar la carta; no se han aplicado cambios parciales." });
-  } finally {
-    await session.endSession();
-  }
-});
 app.delete("/api/v1/partners/menu/assets/:id", requireRole("partner"), async (req, res) => {
   const restaurantId = await employeeRestaurant(req);
   const assetId = objectId(String(req.params.id));
@@ -1388,7 +990,7 @@ app.get("/api/v1/partners/menu", requireRole("partner"), async (req, res) => {
   if (!allowed) return res.status(403).json({ error: "PARTNER_PERMISSION_DENIED", permission: "menu:read" });
   const restaurantId = await employeeRestaurant(req, access);
   if (!restaurantId) return res.status(403).json({ error: access?.restaurantIds.length ? "PARTNER_RESTAURANT_ACCESS_DENIED" : "PARTNER_RESTAURANT_NOT_ASSIGNED" });
-  const restaurant = await Restaurant.findById(restaurantId).select("name slug internalDemo menu").lean().exec() as any;
+  const restaurant = await Restaurant.findById(restaurantId).select("name menu").lean().exec() as any;
   if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
   return res.json({ restaurant, menu: restaurant.menu || [] });
 });
@@ -1403,83 +1005,17 @@ app.put("/api/v1/partners/menu", requireRole("partner"), async (req, res) => {
   if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
   return res.json({ restaurant, menu: restaurant.menu || [] });
 });
-
-app.put("/api/v1/admin/restaurants/:id/menu", requireOwner(), async (req, res) => {
-  const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
-  if (!id) return res.status(400).json({ error: "INVALID_RESTAURANT_ID" });
-  const parsed = z.object({ items: z.array(partnerMenuItemSchema).max(500) }).safeParse(req.body);
-  if (!parsed.success) return res.status(400).json({ error: "INVALID_MENU", details: parsed.error.flatten() });
-  const restaurant = await Restaurant.findOneAndUpdate(
-    { _id: id, slug: "piki-prueba", onboardingStatus: "approved" },
-    { $set: { menu: parsed.data.items } },
-    { new: true },
-  ).select("_id slug name menu").lean().exec() as any;
-  if (!restaurant) return res.status(404).json({ error: "PIKI_PRUEBA_NOT_FOUND_OR_NOT_APPROVED" });
-  return res.json({ updated: true, restaurant, menu: restaurant.menu || [] });
-});
-
 app.get("/api/v1/partners/kitchen/orders", requireRole("partner"), async (req, res) => {
   const { access, allowed } = await partnerRequestAccess(req, "orders:read");
   if (!allowed) return res.status(403).json({ error: "PARTNER_PERMISSION_DENIED", permission: "orders:read" });
   const restaurantId = await employeeRestaurant(req, access);
   if (!restaurantId) return res.status(403).json({ error: access?.restaurantIds.length ? "PARTNER_RESTAURANT_ACCESS_DENIED" : "PARTNER_RESTAURANT_NOT_ASSIGNED" });
-  const orders = await Order.find({ restaurantId, ...tenantScope(req), ...dispatchablePaymentFilter, status: { $in: ["pending", "accepted", "preparing", "ready_for_pickup"] } }).sort({ createdAt: 1 }).lean().exec() as any[];
-  const [restaurantRecord, customers] = await Promise.all([Restaurant.findOne({ _id: restaurantId, ...tenantScope(req) }).select("name address phone cuisine").lean().exec(), CustomerAccount.find({ _id: { $in: orders.map((order) => order.customerId).filter(Boolean) }, ...tenantScope(req) }).select("name email").lean().exec()]);
+  const orders = await Order.find({ restaurantId, ...dispatchablePaymentFilter, status: { $in: ["pending", "accepted", "preparing", "ready_for_pickup"] } }).sort({ createdAt: 1 }).lean().exec() as any[];
+  const [restaurantRecord, customers] = await Promise.all([Restaurant.findById(restaurantId).select("name address phone cuisine").lean().exec(), CustomerAccount.find({ _id: { $in: orders.map((order) => order.customerId).filter(Boolean) } }).select("name email").lean().exec()]);
   const restaurant = restaurantRecord as any;
   const customerMap = new Map(customers.map((customer: any) => [String(customer._id), customer]));
-  return res.json({ orders: orders.map((order: any) => {
-    const linkedCustomer = order.customerId ? customerMap.get(String(order.customerId)) : null;
-    const customerName = String(linkedCustomer?.name || order.customerName || "").trim();
-    return {
-      ...order,
-      restaurant: restaurant ? { name: restaurant.name, address: restaurant.address || "", phone: restaurant.phone || "", cuisine: restaurant.cuisine || "" } : null,
-      customer: customerName ? { name: customerName, email: linkedCustomer?.email || "" } : null,
-      pickupQrUrl: order.status === "ready_for_pickup" ? pickupQrUrl(order.publicCode) : null,
-      pickupPin: order.status === "ready_for_pickup" ? pickupQrPin(order.publicCode) : null,
-      partnerPrepDeadlineAt: order.partnerPrepDeadlineAt || null,
-      partnerPrepOverdue: Boolean(order.partnerPrepDeadlineAt && new Date(order.partnerPrepDeadlineAt).getTime() < Date.now()),
-    };
-  }) });
+  return res.json({ orders: orders.map((order: any) => ({ ...order, restaurant: restaurant ? { name: restaurant.name, address: restaurant.address || "", phone: restaurant.phone || "", cuisine: restaurant.cuisine || "" } : null, customer: order.customerId ? customerMap.get(String(order.customerId)) || null : null, pickupQrUrl: order.status === "ready_for_pickup" ? pickupQrUrl(order.publicCode) : null, pickupPin: order.status === "ready_for_pickup" ? pickupQrPin(order.publicCode) : null })) });
 });
-const partnerPaymentSchema = z.object({
-  required: z.boolean(),
-  amountCents: z.number().int().min(0).max(1_000_000).nullable().optional(),
-});
-app.patch("/api/v1/partners/kitchen/orders/:id/partner-payment", requireRole("partner"), async (req, res) => {
-  const parsed = partnerPaymentSchema.safeParse(req.body);
-  if (!parsed.success) return res.status(400).json({ error: "INVALID_PARTNER_PAYMENT", details: parsed.error.flatten() });
-  const { access, allowed } = await partnerRequestAccess(req, "orders:write");
-  if (!allowed) return res.status(403).json({ error: "PARTNER_PERMISSION_DENIED", permission: "orders:write" });
-  const restaurantId = await employeeRestaurant(req, access);
-  if (!restaurantId) return res.status(403).json({ error: "PARTNER_RESTAURANT_ACCESS_DENIED" });
-  const orderId = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
-  if (!orderId) return res.status(400).json({ error: "INVALID_ORDER_ID" });
-  const order = await Order.findOne({ _id: orderId, restaurantId, ...tenantScope(req), status: { $in: ["pending", "accepted", "preparing", "ready_for_pickup"] } });
-  if (!order) return res.status(404).json({ error: "ORDER_NOT_FOUND_OR_NOT_EDITABLE" });
-  order.partnerPaymentRequired = parsed.data.required;
-  order.partnerPaymentCents = parsed.data.required ? (parsed.data.amountCents ?? order.totalCents ?? 0) : null;
-  order.statusHistory.push({ status: order.status, actorRole: "partner", reason: parsed.data.required ? `Pago al Partner configurado: ${order.partnerPaymentCents} céntimos` : "Pago al Partner desactivado" } as any);
-  await order.save();
-  return res.json({ updated: true, partnerPaymentRequired: order.partnerPaymentRequired, partnerPaymentCents: order.partnerPaymentCents });
-});
-app.get("/api/v1/partners/kitchen/orders/archive", requireRole("partner"), async (req, res) => {
-  const { access, allowed } = await partnerRequestAccess(req, "orders:read");
-  if (!allowed) return res.status(403).json({ error: "PARTNER_PERMISSION_DENIED", permission: "orders:read" });
-  const restaurantId = await employeeRestaurant(req, access);
-  if (!restaurantId) return res.status(403).json({ error: access?.restaurantIds.length ? "PARTNER_RESTAURANT_ACCESS_DENIED" : "PARTNER_RESTAURANT_NOT_ASSIGNED" });
-  const requestedLimit = Number(req.query.limit || 50);
-  const limit = Number.isFinite(requestedLimit) ? Math.min(100, Math.max(1, Math.trunc(requestedLimit))) : 50;
-  const before = typeof req.query.before === "string" && !Number.isNaN(Date.parse(req.query.before)) ? new Date(req.query.before) : null;
-  const filter: Record<string, unknown> = { restaurantId, ...tenantScope(req), status: { $in: ["delivered", "cancelled"] } };
-  if (before) filter.$or = [{ archivedAt: { $lt: before } }, { archivedAt: null, deliveredAt: { $lt: before } }, { archivedAt: null, cancelledAt: { $lt: before } }];
-  const orders = await Order.find(filter).sort({ archivedAt: -1, deliveredAt: -1, cancelledAt: -1 }).limit(limit + 1).lean().exec() as any[];
-  const hasMore = orders.length > limit;
-  const page = orders.slice(0, limit);
-  const customers = await CustomerAccount.find({ _id: { $in: page.map((order) => order.customerId).filter(Boolean) }, ...tenantScope(req) }).select("name email").lean().exec() as any[];
-  const customerMap = new Map(customers.map((customer: any) => [String(customer._id), customer]));
-  return res.json({ orders: page.map((order: any) => ({ ...order, customer: order.customerId ? customerMap.get(String(order.customerId)) || null : null })), nextBefore: hasMore && page.length ? (page[page.length - 1].archivedAt || page[page.length - 1].deliveredAt || page[page.length - 1].cancelledAt || null) : null, hasMore });
-});
-
 app.patch("/api/v1/partners/kitchen/orders/:id/status", requireRole("partner"), async (req, res) => {
   const parsed = z.object({ status: z.enum(["accepted", "preparing", "ready_for_pickup", "cancelled"]) }).safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_KITCHEN_STATUS" });
@@ -1490,57 +1026,19 @@ app.patch("/api/v1/partners/kitchen/orders/:id/status", requireRole("partner"), 
   if (!restaurantId) return res.status(403).json({ error: access?.restaurantIds.length ? "PARTNER_RESTAURANT_ACCESS_DENIED" : "PARTNER_RESTAURANT_NOT_ASSIGNED" });
   const orderId = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
   if (!orderId) return res.status(400).json({ error: "INVALID_ORDER_ID" });
-  const order = await Order.findOne({ _id: orderId, restaurantId, ...tenantScope(req) });
+  const order = await Order.findOne({ _id: orderId, restaurantId });
   if (!order) return res.status(404).json({ error: "ORDER_NOT_FOUND" });
   const current = order.status as any;
   const target = parsed.data.status;
   const allowedTransitions: Record<string, string[]> = { pending: ["accepted", "cancelled"], accepted: ["preparing", "cancelled"], preparing: ["ready_for_pickup", "cancelled"] };
   if (!allowedTransitions[current]?.includes(target)) return res.status(409).json({ error: "INVALID_ORDER_TRANSITION", from: current, to: target });
-  if (target === "accepted" && !( ["authorized", "paid"] as string[]).includes(order.paymentState) && order.paymentMethod !== "cash") return res.status(409).json({ error: "PAYMENT_NOT_CONFIRMED" });
+  if (target === "accepted" && order.paymentState !== "paid" && order.paymentMethod !== "cash") return res.status(409).json({ error: "PAYMENT_NOT_CONFIRMED" });
   order.status = target as any;
-  if (target === "accepted") order.partnerPrepDeadlineAt = new Date(Date.now() + PARTNER_PREPARATION_LIMIT_MINUTES * 60_000);
-  if (["ready_for_pickup", "cancelled"].includes(target)) order.partnerPrepDeadlineAt = null;
   order.statusHistory.push({ status: target, actorRole: "partner", reason: "Actualización desde pantalla de cocina" } as any);
   await order.save();
   await publishOrderStatusEvents(order, target).catch((error) => console.warn("Realtime partner status event failed", error instanceof Error ? error.message : error));
   scheduleCustomerOrderPush(order, target);
   return res.json({ order });
-});
-const partnerSupportTicketSchema = z.object({ orderId: z.string().optional(), priority: z.enum(["low", "normal", "high", "urgent"]).default("normal"), subject: z.string().trim().min(3).max(180), description: z.string().trim().min(3).max(4000) });
-app.post("/api/v1/partners/support/tickets", requireRole("partner"), async (req, res) => {
-  const parsed = partnerSupportTicketSchema.safeParse(req.body);
-  if (!parsed.success) return res.status(400).json({ error: "INVALID_PARTNER_SUPPORT_TICKET", details: parsed.error.flatten() });
-  const { access, allowed } = await partnerRequestAccess(req, "orders:read");
-  if (!allowed || !access) return res.status(403).json({ error: "PARTNER_PERMISSION_DENIED", permission: "orders:read" });
-  const restaurantId = await employeeRestaurant(req, access);
-  if (!restaurantId) return res.status(403).json({ error: "PARTNER_RESTAURANT_ACCESS_DENIED" });
-  const employee = access.employee as any;
-  const restaurant = await Restaurant.findById(restaurantId).select("name").lean().exec() as any;
-  if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
-  let order: any = null;
-  if (parsed.data.orderId) {
-    const id = objectId(parsed.data.orderId);
-    if (!id) return res.status(400).json({ error: "INVALID_ORDER_ID" });
-    order = await Order.findOne({ _id: id, restaurantId }).select("_id publicCode displayCode status").lean().exec();
-    if (!order) return res.status(404).json({ error: "PARTNER_ORDER_NOT_FOUND" });
-  }
-  const ticket = await SupportTicket.create({
-    tenantId: employee.tenantId || null,
-    sourceSurface: "partner",
-    sourceRole: "partner",
-    reporterEmail: employee.email,
-    category: "partner",
-    priority: parsed.data.priority,
-    subject: parsed.data.subject,
-    description: `[${restaurant.name}] ${parsed.data.description}`,
-    orderId: order?._id || null,
-    orderReference: order?.publicCode || "",
-    ticketNumber: `SUP-${new Date().toISOString().slice(0, 10).replace(/-/g, "")}-${randomInt(1000, 9999)}`,
-    messages: [{ senderRole: "partner", body: parsed.data.description }],
-    actions: [{ action: "partner_ticket_created", metadata: { restaurantId: String(restaurantId), restaurantName: restaurant.name, employeeId: String(req.auth?.employeeId || ""), orderRef: order?.publicCode || order?.displayCode || null } }],
-  });
-  await publishRealtimeEvent({ channel: "admin", audienceKey: "role:admin", type: "support.ticket_created", payload: { ticketId: String(ticket._id), ticketNumber: ticket.ticketNumber, sourceSurface: "partner", restaurantId: String(restaurantId), orderId: order?._id ? String(order._id) : null, priority: ticket.priority, subject: ticket.subject } });
-  return res.status(201).json({ ticket: { id: String(ticket._id), ticketNumber: ticket.ticketNumber, status: ticket.status, sourceSurface: "partner" } });
 });
 app.get("/api/v1/partners/metrics/overview", requireRole("partner"), async (req, res) => {
   const { access, allowed } = await partnerRequestAccess(req, "metrics:read");
@@ -1599,24 +1097,9 @@ app.patch("/api/v1/admin/employees/:id/partner-locations", requireOwner(), async
 
 app.get("/api/v1/admin/restaurants", requireRole("admin"), async (req, res) => {
   const status = typeof req.query.status === "string" ? req.query.status : undefined;
-  const filter = { ...tenantScope(req), ...(status ? { onboardingStatus: status } : {}) };
+  const filter = status ? { onboardingStatus: status } : {};
   const restaurants = await Restaurant.find(filter).sort({ createdAt: -1 }).limit(200).lean().exec();
-  return res.json({ restaurants: restaurants.map((restaurant: any) => ({ ...restaurant, partnerCode: onboardingCode("P", restaurant._id) })) });
-});
-
-app.patch("/api/v1/admin/restaurants/:id/customer-name", requireOwner(), async (req, res) => {
-  const idParam = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
-  const id = objectId(idParam);
-  if (!id) return res.status(400).json({ error: "INVALID_RESTAURANT_ID" });
-  const parsed = z.object({ name: z.literal("PIKI-PRUEBA") }).safeParse(req.body);
-  if (!parsed.success) return res.status(400).json({ error: "INVALID_CUSTOMER_RESTAURANT_NAME", details: parsed.error.flatten() });
-  const restaurant = await Restaurant.findOneAndUpdate(
-    { _id: id, slug: "piki-prueba" },
-    { $set: { name: parsed.data.name } },
-    { new: true },
-  ).select("_id slug name").lean().exec() as any;
-  if (!restaurant) return res.status(404).json({ error: "TARGET_RESTAURANT_NOT_FOUND" });
-  return res.json({ restaurant: { id: String(restaurant._id), slug: restaurant.slug, name: restaurant.name } });
+  return res.json({ restaurants });
 });
 
 app.patch("/api/v1/admin/restaurants/:id/status", requireRole("admin"), async (req, res) => {
@@ -1624,25 +1107,24 @@ app.patch("/api/v1/admin/restaurants/:id/status", requireRole("admin"), async (r
   const id = objectId(idParam); if (!id) return res.status(400).json({ error: "INVALID_RESTAURANT_ID" });
   const parsed = z.object({ status: z.enum(["pending_review", "approved", "rejected", "suspended"]) }).safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_RESTAURANT_STATUS", details: parsed.error.flatten() });
-  const scope = tenantScope(req);
-  const existing = await Restaurant.findOne({ _id: id, ...scope }).select("partnerProfile onboardingStatus").lean().exec() as any;
+  const existing = await Restaurant.findById(id).select("partnerProfile onboardingStatus").lean().exec() as any;
   if (!existing) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
   if (["approved", "rejected"].includes(parsed.data.status)) {
     const documents = existing.partnerProfile?.documents || [];
     if (!documents.length || documents.some((document: any) => document.status === "received")) return res.status(409).json({ error: "PARTNER_DOCUMENT_REVIEW_REQUIRED", message: "Debes revisar todos los documentos del partner antes de aprobar o rechazar la solicitud." });
     if (parsed.data.status === "approved" && documents.some((document: any) => document.status !== "approved")) return res.status(409).json({ error: "PARTNER_DOCUMENTS_NOT_APPROVED", message: "No se puede aprobar: existe documentación del partner rechazada." });
   }
-  const restaurant = await Restaurant.findOneAndUpdate({ _id: id, ...scope }, { $set: { onboardingStatus: parsed.data.status, isActive: parsed.data.status === "approved", onboardingReviewedBy: objectId(req.auth!.employeeId!), onboardingReviewedAt: new Date() } }, { new: true }).lean().exec() as any;
+  const restaurant = await Restaurant.findByIdAndUpdate(id, { $set: { onboardingStatus: parsed.data.status, isActive: parsed.data.status === "approved", onboardingReviewedBy: objectId(req.auth!.employeeId!), onboardingReviewedAt: new Date() } }, { new: true }).lean().exec() as any;
   if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
-  const partnerAccount = await EmployeeAccount.findOne({ restaurantId: restaurant._id, apiRole: "partner", ...scope }).select("_id authorizationStatus").exec() as any;
+  const partnerAccount = await EmployeeAccount.findOne({ restaurantId: restaurant._id, apiRole: "partner" }).select("_id authorizationStatus").exec() as any;
   if (parsed.data.status === "approved" && !partnerAccount) {
-    await Restaurant.updateOne({ _id: id, ...scope }, { $set: { onboardingStatus: "pending_review", isActive: false } }).exec();
+    await Restaurant.findByIdAndUpdate(id, { $set: { onboardingStatus: "pending_review", isActive: false } }).exec();
     return res.status(409).json({ error: "PARTNER_ACCOUNT_MISSING", message: "La solicitud no tiene una cuenta Partner asociada." });
   }
   if (partnerAccount) {
     const approved = parsed.data.status === "approved";
     const nextStatus = approved ? "approved" : parsed.data.status === "rejected" ? "revoked" : "suspended";
-    await EmployeeAccount.findOneAndUpdate({ _id: partnerAccount._id, ...scope }, { $set: { authorizationStatus: nextStatus, active: approved, authorizedAt: approved ? new Date() : null, authorizedBy: approved ? objectId(req.auth!.employeeId!) : null, authorizationReason: `Estado del comercio: ${parsed.data.status}`, ...(approved ? {} : { sessionHash: null }) } }).exec();
+    await EmployeeAccount.findByIdAndUpdate(partnerAccount._id, { $set: { authorizationStatus: nextStatus, active: approved, authorizedAt: approved ? new Date() : null, authorizedBy: approved ? objectId(req.auth!.employeeId!) : null, authorizationReason: `Estado del comercio: ${parsed.data.status}`, ...(approved ? {} : { sessionHash: null }) } }).exec();
     if (!approved) await revokeEmployeeSessions(String(partnerAccount._id));
     await AccessAuthorization.create({ employeeId: partnerAccount._id, action: parsed.data.status, previousStatus: partnerAccount.authorizationStatus || "pending", nextStatus, previousRole: "partner", nextRole: "partner", accessLevel: "subadmin", actorEmployeeId: objectId(req.auth!.employeeId!), reason: `Estado del comercio: ${parsed.data.status}` });
   }
@@ -1652,41 +1134,21 @@ app.patch("/api/v1/admin/restaurants/:id/status", requireRole("admin"), async (r
   return res.json({ restaurant, partnerAccount: partnerAccount ? { id: String(partnerAccount._id), access: parsed.data.status === "approved" ? "enabled" : "disabled" } : null });
 });
 
-app.patch("/api/v1/admin/restaurants/:id/demo-visibility", requireOwner(), async (req, res) => {
-  const idParam = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
-  const id = objectId(idParam);
-  if (!id) return res.status(400).json({ error: "INVALID_RESTAURANT_ID" });
-  const parsed = z.object({ name: z.string().trim().min(2).max(160), isActive: z.boolean() }).safeParse(req.body);
-  if (!parsed.success) return res.status(400).json({ error: "INVALID_DEMO_VISIBILITY", details: parsed.error.flatten() });
-  const restaurant = await Restaurant.findOneAndUpdate(
-    { _id: id, slug: "piki-prueba", onboardingStatus: "approved" },
-    { $set: { name: parsed.data.name, isActive: parsed.data.isActive } },
-    { new: true },
-  ).select("_id slug name isActive onboardingStatus category cuisine locality menu").lean().exec() as any;
-  if (!restaurant) return res.status(404).json({ error: "PIKI_PRUEBA_NOT_FOUND_OR_NOT_APPROVED" });
-  return res.json({ updated: true, restaurant });
-});
-
 app.get("/api/v1/admin/restaurants/:id/documents", requireRole("admin"), async (req, res) => {
   const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
   if (!id) return res.status(400).json({ error: "INVALID_RESTAURANT_ID" });
-  const restaurant = await Restaurant.findOne({ _id: id, ...tenantScope(req) }).lean().exec() as any;
+  const restaurant = await Restaurant.findById(id).lean().exec() as any;
   if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
   const profile = restaurant.partnerProfile || {};
-  return res.json({ restaurantId: restaurant._id, partnerCode: onboardingCode("P", restaurant._id), legalName: profile.legalName || null, taxId: profile.taxId || null, documents: (profile.documents || []).map(({ contentBase64, ...metadata }: any) => metadata) });
+  return res.json({ restaurantId: restaurant._id, legalName: profile.legalName || null, taxId: profile.taxId || null, documents: (profile.documents || []).map(({ contentBase64, ...metadata }: any) => metadata) });
 });
 app.get("/api/v1/admin/restaurants/:id/documents/:documentId/content", requireRole("admin"), async (req, res) => {
   const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
   if (!id) return res.status(400).json({ error: "INVALID_RESTAURANT_ID" });
-  const restaurant = await Restaurant.findOne({ _id: id, ...tenantScope(req), "partnerProfile.documents._id": req.params.documentId }).select("+partnerProfile.documents.contentBase64").lean().exec() as any;
+  const restaurant = await Restaurant.findOne({ _id: id, "partnerProfile.documents._id": req.params.documentId }).select("+partnerProfile.documents.contentBase64").lean().exec() as any;
   const document = restaurant?.partnerProfile?.documents?.find((item: any) => String(item._id) === req.params.documentId);
   if (!document) return res.status(404).json({ error: "DOCUMENT_NOT_FOUND" });
-  if (document.mimeType !== "application/pdf") return res.status(415).json({ error: "DOCUMENT_PDF_REQUIRED", message: "Este expediente contiene un archivo antiguo no PDF. Solicita que se vuelva a subir en PDF." });
-  const viewedAt = new Date();
-  const viewedBy = objectId(req.auth!.employeeId!);
-  const result = await Restaurant.updateOne({ _id: id, ...tenantScope(req), "partnerProfile.documents._id": req.params.documentId }, { $set: { "partnerProfile.documents.$.viewedAt": viewedAt, "partnerProfile.documents.$.viewedBy": viewedBy } }).exec();
-  if (!result.matchedCount) return res.status(404).json({ error: "DOCUMENT_NOT_FOUND" });
-  return res.json({ fileName: sanitizePdfFileName(document.fileName), mimeType: "application/pdf", sizeBytes: document.sizeBytes, sha256: document.sha256, contentBase64: document.contentBase64, viewedAt: viewedAt.toISOString() });
+  return res.json({ fileName: document.fileName, mimeType: document.mimeType, sizeBytes: document.sizeBytes, sha256: document.sha256, contentBase64: document.contentBase64 });
 });
 
 app.patch("/api/v1/admin/restaurants/:id/documents/:documentId/status", requireRole("admin"), async (req, res) => {
@@ -1694,7 +1156,7 @@ app.patch("/api/v1/admin/restaurants/:id/documents/:documentId/status", requireR
   if (!restaurantId) return res.status(400).json({ error: "INVALID_RESTAURANT_ID" });
   const parsed = z.object({ status: z.enum(["received", "approved", "rejected"]), reviewNotes: z.string().max(1000).default("") }).safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_DOCUMENT_STATUS", details: parsed.error.flatten() });
-  const restaurant = await Restaurant.findOneAndUpdate({ _id: restaurantId, ...tenantScope(req), "partnerProfile.documents._id": req.params.documentId }, { $set: { "partnerProfile.documents.$.status": parsed.data.status, "partnerProfile.documents.$.reviewNotes": parsed.data.reviewNotes, "partnerProfile.documents.$.reviewedAt": new Date(), "partnerProfile.documents.$.reviewedBy": objectId(req.auth!.employeeId!) } }, { new: true }).lean().exec() as any;
+  const restaurant = await Restaurant.findOneAndUpdate({ _id: restaurantId, "partnerProfile.documents._id": req.params.documentId }, { $set: { "partnerProfile.documents.$.status": parsed.data.status, "partnerProfile.documents.$.reviewNotes": parsed.data.reviewNotes, "partnerProfile.documents.$.reviewedAt": new Date(), "partnerProfile.documents.$.reviewedBy": objectId(req.auth!.employeeId!) } }, { new: true }).lean().exec() as any;
   if (!restaurant) return res.status(404).json({ error: "DOCUMENT_NOT_FOUND" });
   const document = (restaurant.partnerProfile?.documents || []).find((item: any) => String(item._id) === req.params.documentId);
   return res.json({ restaurantId, document: document ? { _id: document._id, type: document.type, fileName: document.fileName, status: document.status } : null });
@@ -1715,69 +1177,11 @@ app.post("/api/v1/public/rider-leads", async (req, res) => {
   }
 });
 
-const leadDocumentTypes: Record<"partner" | "rider", string[]> = {
-  partner: ["identity", "tax_id", "bank_certificate", "activity_license", "insurance", "food_sanitary_authorization"],
-  rider: ["identity", "residence_permit", "social_security_number", "bank_certificate", "driving_license", "insurance", "vehicle_registration", "vehicle_technical_sheet", "scooter_responsible_declaration", "dgt_mvp_homologation"],
-};
-function leadModel(kind: string) { return kind === "partner" ? PartnerLead : kind === "rider" ? RiderLead : null; }
-app.post("/api/v1/admin/:kind-leads/:id/documents", requireRole("admin", "commercial", "gerente_comercial_zona"), async (req, res) => {
-  const kind = req.params.kind as "partner" | "rider";
-  const Model = leadModel(kind) as any;
-  const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
-  if (!Model || !id) return res.status(400).json({ error: "INVALID_LEAD_DOCUMENT_TARGET" });
-  const parsed = leadDocumentInputSchema.safeParse(req.body);
-  if (!parsed.success) return res.status(400).json({ error: "INVALID_LEAD_DOCUMENT", details: parsed.error.flatten() });
-  if (!leadDocumentTypes[kind].includes(parsed.data.type)) return res.status(400).json({ error: "INVALID_LEAD_DOCUMENT_TYPE", allowed: leadDocumentTypes[kind] });
-  let normalized: ReturnType<typeof normalizeDocumentUpload>;
-  try {
-    normalized = normalizeDocumentUpload(parsed.data);
-    await scanUploadBuffers([{ buffer: normalized.bytes, originalName: sanitizePdfFileName(parsed.data.fileName) }]);
-  } catch (error) {
-    if (error instanceof MalwareDetectedError) return res.status(422).json({ error: "MALWARE_DETECTED" });
-    if (error instanceof MalwareScannerUnavailableError) return res.status(503).json({ error: "MALWARE_SCANNER_UNAVAILABLE" });
-    return res.status(400).json({ error: error instanceof Error ? error.message : "DOCUMENT_VALIDATION_FAILED" });
-  }
-  const lead = await Model.findOneAndUpdate({ _id: id, ...await adminOnboardingScope(req) }, { $push: { documents: { ...parsed.data, fileName: sanitizePdfFileName(parsed.data.fileName), sha256: parsed.data.sha256.toLowerCase(), contentBase64: normalized.contentBase64, status: "received" } } }, { new: true }).select("name email documents").lean().exec() as any;
-  if (!lead) return res.status(404).json({ error: "LEAD_NOT_FOUND" });
-  return res.status(201).json({ leadId: lead._id, documents: (lead.documents || []).map(({ contentBase64, ...metadata }: any) => metadata) });
-});
-app.get("/api/v1/admin/:kind-leads/:id/documents", requireRole("admin", "commercial", "gerente_comercial_zona"), async (req, res) => {
-  const Model = leadModel(Array.isArray(req.params.kind) ? req.params.kind[0] : req.params.kind) as any;
-  const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
-  if (!Model || !id) return res.status(400).json({ error: "INVALID_LEAD_DOCUMENT_TARGET" });
-  const lead = await Model.findOne({ _id: id, ...await onboardingScope(req) }).lean().exec() as any;
-  if (!lead) return res.status(404).json({ error: "LEAD_NOT_FOUND" });
-  return res.json({ leadId: lead._id, name: lead.name, email: lead.email, documents: lead.documents || [] });
-});
-app.get("/api/v1/admin/:kind-leads/:id/documents/:documentId/content", requireRole("admin", "commercial", "gerente_comercial_zona"), async (req, res) => {
-  const Model = leadModel(Array.isArray(req.params.kind) ? req.params.kind[0] : req.params.kind) as any;
-  const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
-  if (!Model || !id) return res.status(400).json({ error: "INVALID_LEAD_DOCUMENT_TARGET" });
-  const lead = await Model.findOne({ _id: id, ...await onboardingScope(req), "documents._id": req.params.documentId }).select("+documents.contentBase64").lean().exec() as any;
-  const document = lead?.documents?.find((item: any) => String(item._id) === req.params.documentId);
-  if (!document) return res.status(404).json({ error: "DOCUMENT_NOT_FOUND" });
-  if (document.mimeType !== "application/pdf") return res.status(415).json({ error: "DOCUMENT_PDF_REQUIRED", message: "Este expediente contiene un archivo antiguo no PDF. Solicita que se vuelva a subir en PDF." });
-  const viewedAt = new Date();
-  const viewedBy = objectId(req.auth!.employeeId!);
-  const result = await Model.updateOne({ _id: id, ...await onboardingScope(req), "documents._id": req.params.documentId }, { $set: { "documents.$.viewedAt": viewedAt, "documents.$.viewedBy": viewedBy } }).exec();
-  if (!result.matchedCount) return res.status(404).json({ error: "DOCUMENT_NOT_FOUND" });
-  return res.json({ fileName: sanitizePdfFileName(document.fileName), mimeType: "application/pdf", sizeBytes: document.sizeBytes, sha256: document.sha256, contentBase64: document.contentBase64, viewedAt: viewedAt.toISOString() });
-});
-app.patch("/api/v1/admin/:kind-leads/:id/documents/:documentId/status", requireRole("admin", "commercial", "gerente_comercial_zona"), async (req, res) => {
-  const Model = leadModel(Array.isArray(req.params.kind) ? req.params.kind[0] : req.params.kind) as any;
-  const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
-  if (!Model || !id) return res.status(400).json({ error: "INVALID_LEAD_DOCUMENT_TARGET" });
-  const parsed = z.object({ status: z.enum(["received", "approved", "rejected"]), reviewNotes: z.string().max(1000).default("") }).safeParse(req.body);
-  if (!parsed.success) return res.status(400).json({ error: "INVALID_DOCUMENT_STATUS", details: parsed.error.flatten() });
-  const lead = await Model.findOneAndUpdate({ _id: id, ...await onboardingScope(req), "documents._id": req.params.documentId }, { $set: { "documents.$.status": parsed.data.status, "documents.$.reviewNotes": parsed.data.reviewNotes, "documents.$.reviewedAt": new Date(), "documents.$.reviewedBy": objectId(req.auth!.employeeId!) } }, { new: true }).lean().exec() as any;
-  if (!lead) return res.status(404).json({ error: "DOCUMENT_NOT_FOUND" });
-  return res.json({ leadId: lead._id, documents: (lead.documents || []).map(({ contentBase64, ...metadata }: any) => metadata) });
-});
 app.get("/api/v1/admin/rider-leads", requireRole("admin", "commercial", "gerente_comercial_zona"), async (req, res) => {
   const rawStatus = typeof req.query.status === "string" ? req.query.status : undefined;
   const parsedStatus = rawStatus && rawStatus !== "all" ? webLeadStatusSchema.safeParse(rawStatus) : null;
   if (parsedStatus && !parsedStatus.success) return res.status(400).json({ error: "INVALID_LEAD_STATUS" });
-  const leads = await RiderLead.find({ ...await onboardingScope(req), ...(parsedStatus?.success ? { status: parsedStatus.data } : {}) }).sort({ createdAt: -1 }).limit(200).lean().exec();
+  const leads = await RiderLead.find(parsedStatus?.success ? { status: parsedStatus.data } : {}).sort({ createdAt: -1 }).limit(200).lean().exec();
   return res.json({ leads });
 });
 
@@ -1789,7 +1193,7 @@ app.patch("/api/v1/admin/rider-leads/:id", requireRole("admin", "commercial", "g
   if (!parsed.success) return res.status(400).json({ error: "INVALID_LEAD_REVIEW", details: parsed.error.flatten() });
   if (parsed.data.status === "info_requested" && !parsed.data.notes) return res.status(400).json({ error: "INFO_REQUEST_NOTES_REQUIRED" });
   const actor = req.auth?.employeeId ? objectId(req.auth.employeeId) : null;
-  const lead = await RiderLead.findOneAndUpdate({ _id: id, ...await onboardingScope(req) }, { $set: { status: parsed.data.status, notes: parsed.data.notes, reviewedBy: actor, reviewedAt: new Date() }, $push: { history: { status: parsed.data.status, notes: parsed.data.notes, actorEmployeeId: actor, changedAt: new Date() } } }, { new: true }).lean().exec();
+  const lead = await RiderLead.findByIdAndUpdate(id, { $set: { status: parsed.data.status, notes: parsed.data.notes, reviewedBy: actor, reviewedAt: new Date() }, $push: { history: { status: parsed.data.status, notes: parsed.data.notes, actorEmployeeId: actor, changedAt: new Date() } } }, { new: true }).lean().exec();
   if (!lead) return res.status(404).json({ error: "RIDER_LEAD_NOT_FOUND" });
   return res.json({ lead });
 });
@@ -1807,67 +1211,40 @@ app.post("/api/v1/riders/applications", async (req, res) => {
   }
   if (parsed.data.vehicle === "electric_scooter") for (const required of ["scooter_responsible_declaration", "dgt_mvp_homologation"]) if (!documentTypes.has(required)) missing.push(required);
   if (missing.length) return res.status(400).json({ error: "REQUIRED_RIDER_DOCUMENTS_MISSING", required: missing });
-  let documents: Array<typeof parsed.data.documents[number]>;
-  try {
-    documents = await normalizeAndScanOnboardingDocuments(parsed.data.documents) as Array<typeof parsed.data.documents[number]>;
-  } catch (error) {
-    if (error instanceof MalwareDetectedError) return res.status(422).json({ error: "MALWARE_DETECTED" });
-    if (error instanceof MalwareScannerUnavailableError) return res.status(503).json({ error: "MALWARE_SCANNER_UNAVAILABLE" });
-    return res.status(400).json({ error: error instanceof Error ? error.message : "DOCUMENT_VALIDATION_FAILED" });
-  }
-  const publicTenant = await publicOnboardingTenantScope();
-  const duplicate = await RiderApplication.findOne({ ...publicTenant, email: parsed.data.email.toLowerCase(), status: { $in: ["pending", "contacted", "approved"] } }).lean().exec();
+  const duplicate = await RiderApplication.findOne({ email: parsed.data.email.toLowerCase(), status: { $in: ["pending", "contacted", "approved"] } }).lean().exec();
   if (duplicate) return res.status(409).json({ error: "APPLICATION_ALREADY_EXISTS" });
-  const application = await RiderApplication.create({ ...parsed.data, ...publicTenant, documents, email: parsed.data.email.toLowerCase(), status: "pending", source: "rider_landing" });
+  const application = await RiderApplication.create({ ...parsed.data, email: parsed.data.email.toLowerCase(), status: "pending", source: "rider_landing" });
   await notifyOnboarding({ channel: "admin", type: "onboarding.rider_application.created", entityId: String(application._id), tenantId: (application as any).tenantId });
-  return res.status(201).json({ message: "Solicitud recibida. El equipo Fleet se pondrá en contacto contigo.", application: { id: application.id, applicationCode: onboardingCode("R", application._id), status: application.status } });
+  return res.status(201).json({ message: "Solicitud recibida. El equipo Fleet se pondrá en contacto contigo.", application: { id: application.id, status: application.status } });
 });
 
 app.get("/api/v1/rider-applications", requireRole("admin"), async (req, res) => {
   const status = typeof req.query.status === "string" ? req.query.status : undefined;
-  const leadStatus = status === "pending" ? "new" : status === "contacted" ? "info_requested" : status === "approved" ? "qualified" : status === "rejected" ? "rejected" : undefined;
-  const scope = await adminOnboardingScope(req);
-  const [applications, leads] = await Promise.all([
-    RiderApplication.find({ ...scope, ...(status ? { status } : {}) }).sort({ createdAt: -1 }).limit(200).lean().exec(),
-    RiderLead.find({ ...scope, ...(leadStatus ? { status: leadStatus } : {}) }).sort({ createdAt: -1 }).limit(200).lean().exec(),
-  ]);
-  const normalizedLeads = leads.map((lead: any) => ({
-    ...lead,
-    source: "web_lead",
-    status: lead.status === "new" ? "pending" : lead.status === "info_requested" ? "contacted" : lead.status === "qualified" ? "approved" : "rejected",
-    documents: [],
-  }));
-  const normalizedApplications = applications.map((application: any) => ({ ...application, applicationCode: onboardingCode("R", application._id), source: application.source || "rider_landing" }));
-  const combined = [...normalizedApplications, ...normalizedLeads].sort((a: any, b: any) => new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime()).slice(0, 200);
-  return res.json({ applications: combined, counts: { applications: applications.length, webLeads: leads.length, total: combined.length } });
+  const applications = await RiderApplication.find(status ? { status } : {}).sort({ createdAt: -1 }).limit(200).lean().exec();
+  return res.json({ applications });
 });
 
 app.get("/api/v1/rider-applications/:id/documents", requireRole("admin"), async (req, res) => {
   const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
   if (!id) return res.status(400).json({ error: "INVALID_APPLICATION_ID" });
-  const application = await RiderApplication.findOne({ _id: id, ...await adminOnboardingScope(req) }).select("name email documents").lean().exec() as any;
+  const application = await RiderApplication.findById(id).select("name email documents").lean().exec() as any;
   if (!application) return res.status(404).json({ error: "APPLICATION_NOT_FOUND" });
-  return res.json({ applicationId: application._id, applicationCode: onboardingCode("R", application._id), name: application.name, email: application.email, documents: (application.documents || []).map(({ contentBase64, ...metadata }: any) => metadata) });
+  return res.json({ applicationId: application._id, name: application.name, email: application.email, documents: (application.documents || []).map(({ contentBase64, ...metadata }: any) => metadata) });
 });
 app.get("/api/v1/rider-applications/:id/documents/:documentId/content", requireRole("admin"), async (req, res) => {
   const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
   if (!id) return res.status(400).json({ error: "INVALID_APPLICATION_ID" });
-  const application = await RiderApplication.findOne({ _id: id, ...await adminOnboardingScope(req), "documents._id": req.params.documentId }).select("+documents.contentBase64").lean().exec() as any;
+  const application = await RiderApplication.findOne({ _id: id, "documents._id": req.params.documentId }).select("+documents.contentBase64").lean().exec() as any;
   const document = application?.documents?.find((item: any) => String(item._id) === req.params.documentId);
   if (!document) return res.status(404).json({ error: "DOCUMENT_NOT_FOUND" });
-  if (document.mimeType !== "application/pdf") return res.status(415).json({ error: "DOCUMENT_PDF_REQUIRED", message: "Este expediente contiene un archivo antiguo no PDF. Solicita que se vuelva a subir en PDF." });
-  const viewedAt = new Date();
-  const viewedBy = objectId(req.auth!.employeeId!);
-  const result = await RiderApplication.updateOne({ _id: id, ...await adminOnboardingScope(req), "documents._id": req.params.documentId }, { $set: { "documents.$.viewedAt": viewedAt, "documents.$.viewedBy": viewedBy } }).exec();
-  if (!result.matchedCount) return res.status(404).json({ error: "DOCUMENT_NOT_FOUND" });
-  return res.json({ fileName: sanitizePdfFileName(document.fileName), mimeType: "application/pdf", sizeBytes: document.sizeBytes, sha256: document.sha256, contentBase64: document.contentBase64, viewedAt: viewedAt.toISOString() });
+  return res.json({ fileName: document.fileName, mimeType: document.mimeType, sizeBytes: document.sizeBytes, sha256: document.sha256, contentBase64: document.contentBase64 });
 });
 app.patch("/api/v1/rider-applications/:id/documents/:documentId/status", requireRole("admin"), async (req, res) => {
   const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
   if (!id) return res.status(400).json({ error: "INVALID_APPLICATION_ID" });
   const parsed = z.object({ status: z.enum(["approved", "rejected"]), reviewNotes: z.string().max(1000).default("") }).safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_DOCUMENT_STATUS", details: parsed.error.flatten() });
-  const application = await RiderApplication.findOneAndUpdate({ _id: id, ...await adminOnboardingScope(req), "documents._id": req.params.documentId }, { $set: { "documents.$.status": parsed.data.status, "documents.$.reviewNotes": parsed.data.reviewNotes, "documents.$.reviewedAt": new Date(), "documents.$.reviewedBy": objectId(req.auth!.employeeId!) } }, { new: true }).select("name email documents").lean().exec() as any;
+  const application = await RiderApplication.findOneAndUpdate({ _id: id, "documents._id": req.params.documentId }, { $set: { "documents.$.status": parsed.data.status, "documents.$.reviewNotes": parsed.data.reviewNotes, "documents.$.reviewedAt": new Date(), "documents.$.reviewedBy": objectId(req.auth!.employeeId!) } }, { new: true }).select("name email documents").lean().exec() as any;
   if (!application) return res.status(404).json({ error: "DOCUMENT_NOT_FOUND" });
   return res.json({ applicationId: application._id, documents: (application.documents || []).map(({ contentBase64, ...metadata }: any) => metadata) });
 });
@@ -1876,8 +1253,7 @@ app.patch("/api/v1/rider-applications/:id/status", requireRole("admin"), async (
   const id = objectId(idParam); if (!id) return res.status(400).json({ error: "INVALID_APPLICATION_ID" });
   const parsed = z.object({ status: z.enum(["pending", "contacted", "approved", "rejected"]), notes: z.string().max(1000).optional(), assignedFleetId: z.string().regex(/^[a-f\d]{24}$/).nullable().optional() }).safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_APPLICATION_STATUS", details: parsed.error.flatten() });
-  const scope = await adminOnboardingScope(req);
-  const existing = await RiderApplication.findOne({ _id: id, ...scope }).select("documents status tenantId").lean().exec() as any;
+  const existing = await RiderApplication.findById(id).select("documents status tenantId").lean().exec() as any;
   if (!existing) return res.status(404).json({ error: "APPLICATION_NOT_FOUND" });
   if (parsed.data.status === "approved") {
     const documents = existing.documents || [];
@@ -1888,14 +1264,12 @@ app.patch("/api/v1/rider-applications/:id/status", requireRole("admin"), async (
   const update: Record<string, unknown> = { status: parsed.data.status, notes: parsed.data.notes, reviewedBy: objectId(req.auth!.employeeId!), reviewedAt: new Date() };
   if (parsed.data.status === "approved") update.identityVerificationStatus = "verified";
   if (parsed.data.assignedFleetId !== undefined) update.assignedFleetId = parsed.data.assignedFleetId ? objectId(parsed.data.assignedFleetId) : null;
-  const application = await RiderApplication.findOneAndUpdate({ _id: id, ...scope }, { $set: update }, { new: true }).lean().exec() as any;
+  const application = await RiderApplication.findByIdAndUpdate(id, { $set: update }, { new: true }).lean().exec() as any;
   if (!application) return res.status(404).json({ error: "APPLICATION_NOT_FOUND" });
   let approvedRiderId = "";
   if (parsed.data.status === "approved") {
-    const applicationTenantScope = application.tenantId ? { tenantId: application.tenantId } : { tenantId: null };
-    const existingRider = await Rider.findOne({ email: application.email }).select("_id tenantId riderCode").lean().exec() as any;
-    if (existingRider && String(existingRider.tenantId || "") !== String(application.tenantId || "")) return res.status(409).json({ error: "RIDER_EMAIL_OWNED_BY_ANOTHER_TENANT" });
-    const approvedRider = await Rider.findOneAndUpdate({ email: application.email, ...applicationTenantScope }, { $set: { tenantId: application.tenantId || null, ...buildApprovedRiderOperationalProfile(application), fleetId: application.assignedFleetId || null, status: "offline" }, $setOnInsert: { riderCode: existingRider?.riderCode || await nextRiderCode() } }, { upsert: true, new: true }).select("_id").lean().exec() as any;
+    const existingRider = await Rider.findOne({ email: application.email }).select("_id riderCode").lean().exec() as any;
+    const approvedRider = await Rider.findOneAndUpdate({ email: application.email }, { $set: { tenantId: application.tenantId || null, ...buildApprovedRiderOperationalProfile(application), fleetId: application.assignedFleetId || null, status: "offline" }, $setOnInsert: { riderCode: existingRider?.riderCode || await nextRiderCode() } }, { upsert: true, new: true }).select("_id").lean().exec() as any;
     approvedRiderId = approvedRider ? String(approvedRider._id) : "";
   }
   if (existing.status !== parsed.data.status && ["approved", "rejected"].includes(parsed.data.status)) {
@@ -1905,299 +1279,13 @@ app.patch("/api/v1/rider-applications/:id/status", requireRole("admin"), async (
     if (parsed.data.status === "approved") await notifyOnboarding({ channel: "fleet", type, entityId: approvedRiderId || String(application._id), tenantId: (application as any).tenantId, payload });
   }
   const documentReviewPending = (application.documents || []).some((document: any) => document.status !== "approved");
-  return res.json({ application: { ...application, applicationCode: onboardingCode("R", application._id) }, documentReviewPending, warning: documentReviewPending ? "La solicitud se ha gestionado; el expediente documental continúa pendiente de revisión." : undefined });
-});
-
-
-function normalizedZoneSlug(value: string) { return String(value || "").trim().toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, ""); }
-const leadRoutingSchema = z.object({ zoneSlug: z.string().regex(/^[a-z0-9-]+$/).optional() });
-app.post("/api/v1/admin/rider-leads/:id/prl-request", requireRole("admin"), async (req, res) => {
-  const id = objectId(String(req.params.id));
-  if (!id) return res.status(400).json({ error: "INVALID_LEAD_ID" });
-  const lead = await RiderLead.findOne({ _id: id, ...await onboardingScope(req) }).lean().exec() as any;
-  if (!lead) return res.status(404).json({ error: "RIDER_LEAD_NOT_FOUND" });
-  const courseUrl = process.env.PRL_COURSE_URL || "https://app.pikidelivery.com/formacion-prl";
-  const result = await sendCorporateEmail({ recipientEmail: lead.email, subject: "PIKI · Formación PRL obligatoria", idempotencyKey: `piki-prl-${id}`, text: `Hola ${lead.name},\n\nComo siguiente paso de tu incorporación a PIKI, debes completar el curso breve de Prevención de Riesgos Laborales (PRL).\n\nAccede aquí: ${courseUrl}\n\nCuando lo termines, confirma la finalización desde PIKI o responde a este correo.\n\nEquipo PIKI`, html: `<p>Hola ${lead.name},</p><p>Como siguiente paso de tu incorporación a PIKI, debes completar el curso breve de <strong>Prevención de Riesgos Laborales (PRL)</strong>.</p><p><a href="${courseUrl}">Acceder al curso PRL</a></p><p>Cuando lo termines, confirma la finalización desde PIKI o responde a este correo.</p><p>Equipo PIKI</p>` });
-  const updated = await RiderLead.findOneAndUpdate({ _id: id, ...await onboardingScope(req) }, { $set: { prlStatus: "requested", prlRequestedAt: new Date(), prlRequestedBy: objectId(String(req.auth?.employeeId || "")) }, $push: { history: { status: "qualified", notes: "Curso PRL solicitado como proceso separado del expediente documental.", actorEmployeeId: objectId(String(req.auth?.employeeId || "")), changedAt: new Date() } } }, { new: true }).lean().exec();
-  return res.json({ lead: updated, training: { type: "prl", courseUrl, emailSent: result.sent } });
-});
-app.post("/api/v1/admin/:kind-leads/:id/route", requireRole("admin"), async (req, res) => {
-  const kind = String(req.params.kind) as "rider" | "partner";
-  const Model = leadModel(kind) as any;
-  const id = objectId(String(req.params.id));
-  const parsed = leadRoutingSchema.safeParse(req.body || {});
-  if (!Model || !id || !parsed.success) return res.status(400).json({ error: "INVALID_LEAD_ROUTING" });
-  const scope = await onboardingScope(req);
-  const lead = await Model.findOne({ _id: id, ...scope }).lean().exec() as any;
-  if (!lead) return res.status(404).json({ error: "LEAD_NOT_FOUND" });
-  if (lead.status !== "qualified") return res.status(409).json({ error: "LEAD_MUST_BE_QUALIFIED", message: "Cualifica primero la solicitud antes de derivarla a operaciones." });
-  const zoneSlug = parsed.data.zoneSlug || normalizedZoneSlug(kind === "rider" ? lead.city : lead.city || lead.address);
-  if (!zoneSlug) return res.status(409).json({ error: "LEAD_ZONE_REQUIRED", message: "No se ha podido identificar la zona operativa." });
-  const tenant = tenantScope(req);
-  let target: any = null;
-  if (kind === "rider") {
-    target = await Fleet.findOne({ ...tenant, isActive: true, serviceZones: zoneSlug }).select("_id name managerName contactEmail contactPhone serviceZones").lean().exec();
-    if (!target) return res.status(409).json({ error: "ZONE_FLEET_NOT_FOUND", message: `No hay una Fleet activa configurada para ${zoneSlug}.` });
-  } else {
-    target = await EmployeeAccount.findOne({ ...tenant, active: true, authorizationStatus: "approved", jobRole: "gerente_comercial_zona", zoneSlugs: zoneSlug }).select("_id name email zoneSlugs").lean().exec();
-    if (!target) return res.status(409).json({ error: "ZONE_MANAGER_NOT_FOUND", message: `No hay gerente comercial de zona configurado para ${zoneSlug}.` });
-  }
-  const update: Record<string, unknown> = { assignedZoneSlug: zoneSlug, routedAt: new Date(), routedBy: objectId(String(req.auth?.employeeId || "")) };
-  if (kind === "rider") update.assignedFleetId = target._id;
-  else update.assignedManagerId = target._id;
-  const routed = await Model.findOneAndUpdate({ _id: id, ...scope }, { $set: update, $push: { history: { status: "qualified", notes: kind === "rider" ? `Derivado a Fleet ${target.name} (${zoneSlug}).` : `Derivado al gerente de zona ${target.name} (${zoneSlug}).`, actorEmployeeId: objectId(String(req.auth?.employeeId || "")), changedAt: new Date() } } }, { new: true }).lean().exec();
-  const targetEmail = kind === "rider" ? String(target.contactEmail || "").trim().toLowerCase() : String(target.email || "").trim().toLowerCase();
-  let emailSent = false;
-  if (targetEmail) {
-    const result = await sendCorporateEmail({ recipientEmail: targetEmail, subject: kind === "rider" ? `PIKI · Nuevo rider cualificado · ${lead.name}` : `PIKI · Nuevo Partner Orders cualificado · ${lead.name}`, idempotencyKey: `piki-lead-route-${kind}-${id}-${zoneSlug}`, text: `Hola ${kind === "rider" ? target.managerName || target.name : target.name},\n\nSe ha cualificado una nueva alta para tu zona (${zoneSlug}).\n\nNombre: ${lead.name}\nCorreo: ${lead.email}\nTeléfono: ${lead.phone}\nCiudad: ${lead.city}\n${kind === "rider" ? `Vehículo: ${lead.vehicle}\nDisponibilidad: ${lead.availability}` : `Dirección: ${lead.address || "Pendiente"}`}\n\nAccede a PIKI ${kind === "rider" ? "Fleet" : "Partner Orders"} para continuar con slots, horarios y activación operativa.\n\nEquipo PIKI`, html: `<p>Se ha cualificado una nueva alta para tu zona <strong>${zoneSlug}</strong>.</p><p><strong>${lead.name}</strong> · ${lead.email} · ${lead.phone}</p><p>${kind === "rider" ? `Vehículo: ${lead.vehicle}<br>Disponibilidad: ${lead.availability}` : `Dirección: ${lead.address || "Pendiente"}`}</p><p>Accede a PIKI para continuar con la gestión operativa.</p>` });
-    emailSent = result.sent;
-  }
-  await notifyOnboarding({ channel: kind === "rider" ? "fleet" : "admin", type: kind === "rider" ? "onboarding.rider_lead.routed" : "onboarding.partner_lead.routed", entityId: String(id), tenantId: (routed as any)?.tenantId, payload: { leadId: String(id), zoneSlug, targetId: String(target._id), targetEmail, targetName: target.name, kind } });
-  return res.json({ lead: routed, routing: { kind, zoneSlug, targetId: String(target._id), targetName: kind === "rider" ? target.name : target.name, targetEmail, emailSent } });
-});
-function documentRequestTokenHash(token: string) { return createHash("sha256").update(token).digest("hex"); }
-function documentRequestUploadUrl(token: string) { return `${String(process.env.ADMIN_APP_URL || "https://admin.pikidelivery.com").replace(/\/$/, "")}/#document-request=${encodeURIComponent(token)}`; }
-function documentRequestMetadata(document: { type: string; fileName: string; mimeType: string; sizeBytes: number; sha256: string }) { return { type: document.type, fileName: document.fileName, mimeType: document.mimeType, sizeBytes: document.sizeBytes, sha256: document.sha256.toLowerCase(), uploadedAt: new Date() }; }
-function normalizeDocumentBytes(contentBase64: string, sizeBytes: number, mimeType: string, sha256: string) {
-  const rawBase64 = contentBase64.replace(/^data:[^;]+;base64,/, "");
-  if (!/^[A-Za-z0-9+/]*={0,2}$/.test(rawBase64) || rawBase64.length % 4 === 1) throw new Error("DOCUMENT_BASE64_INVALID");
-  const bytes = Buffer.from(rawBase64, "base64");
-  if (bytes.length !== sizeBytes) throw new Error("DOCUMENT_SIZE_MISMATCH");
-  if (detectedMenuMime(bytes) !== mimeType) throw new Error("DOCUMENT_CONTENT_TYPE_MISMATCH");
-  const digest = createHash("sha256").update(bytes).digest("hex");
-  if (digest !== sha256.toLowerCase()) throw new Error("DOCUMENT_CHECKSUM_MISMATCH");
-  return { bytes, contentBase64: rawBase64 };
-}
-type IncomingOnboardingDocument = {
-  type: string;
-  fileName: string;
-  mimeType: string;
-  sizeBytes: number;
-  sha256: string;
-  contentBase64: string;
-};
-async function normalizeAndScanOnboardingDocuments<T extends IncomingOnboardingDocument>(documents: readonly T[]): Promise<T[]> {
-  const normalized = documents.map((document) => {
-    const upload = normalizeDocumentUpload(document);
-    return {
-      document: { ...document, fileName: sanitizePdfFileName(document.fileName), mimeType: "application/pdf", sha256: document.sha256.toLowerCase(), contentBase64: upload.contentBase64 } as T,
-      bytes: upload.bytes,
-    };
-  });
-  if (normalized.length) await scanUploadBuffers(normalized.map(({ document, bytes }) => ({ buffer: bytes, originalName: document.fileName })));
-  return normalized.map(({ document }) => document);
-}
-type DocumentRequestSubjectType = "rider_application" | "restaurant" | "rider_lead" | "partner_lead";
-async function documentRequestSubject(subjectType: DocumentRequestSubjectType, subjectId: mongoose.Types.ObjectId, scope: Record<string, unknown>) {
-  if (subjectType === "rider_application") {
-    const subject = await RiderApplication.findOne({ _id: subjectId, ...scope }).select("name email tenantId").lean().exec() as any;
-    return subject ? { id: subject._id as mongoose.Types.ObjectId, tenantId: subject.tenantId || null, recipientName: String(subject.name || "Rider"), recipientEmail: String(subject.email || "").toLowerCase() } : null;
-  }
-  if (subjectType === "rider_lead" || subjectType === "partner_lead") {
-    const Model = subjectType === "rider_lead" ? RiderLead : PartnerLead;
-    const subject = await Model.findOne({ _id: subjectId, ...scope }).select("name email tenantId").lean().exec() as any;
-    return subject ? { id: subject._id as mongoose.Types.ObjectId, tenantId: subject.tenantId || null, recipientName: String(subject.name || (subjectType === "rider_lead" ? "Rider" : "Partner")), recipientEmail: String(subject.email || "").toLowerCase() } : null;
-  }
-  const subject = await Restaurant.findOne({ _id: subjectId, ...scope }).select("name email tenantId partnerProfile").lean().exec() as any;
-  return subject ? { id: subject._id as mongoose.Types.ObjectId, tenantId: subject.tenantId || null, recipientName: String(subject.name || "Comercio"), recipientEmail: String(subject.email || "").toLowerCase(), hasProfile: Boolean(subject.partnerProfile) } : null;
-}
-function publicDocumentRequestResponse(request: any) {
-  return { request: { id: String(request._id), recipientName: request.recipientName, message: request.message, requirements: (request.requirements || []).map((item: any) => ({ type: item.type, inputMode: item.inputMode || "file", label: item.label, description: item.description || "" })), dueAt: request.dueAt || null, expiresAt: request.expiresAt, status: request.status, uploadedTypes: [...new Set((request.documents || []).map((item: any) => item.type))] } };
-}
-async function openDocumentRequest(rawToken: string) {
-  if (!/^[A-Za-z0-9_-]{40,100}$/.test(rawToken)) return null;
-  const request = await DocumentRequest.findOne({ tokenHash: documentRequestTokenHash(rawToken) }).lean().exec() as any;
-  if (!request) return null;
-  if (request.status === "revoked") return { request, unavailable: "revoked" as const };
-  if (new Date(request.expiresAt).getTime() <= Date.now()) {
-    if (request.status !== "expired") await DocumentRequest.updateOne({ _id: request._id }, { $set: { status: "expired" } }).exec();
-    return { request: { ...request, status: "expired" }, unavailable: "expired" as const };
-  }
-  return { request, unavailable: null };
-}
-
-app.post("/api/v1/admin/document-requests", requireRole("admin"), async (req, res) => {
-  const parsed = documentRequestCreateSchema.safeParse(req.body);
-  if (!parsed.success) return res.status(400).json({ error: "INVALID_DOCUMENT_REQUEST", details: parsed.error.flatten() });
-  const subjectId = objectId(parsed.data.subjectId);
-  const createdBy = objectId(String(req.auth?.employeeId || ""));
-  if (!subjectId || !createdBy) return res.status(401).json({ error: "AUTH_REQUIRED" });
-  const allowedTypes = parsed.data.subjectType === "rider_application" || parsed.data.subjectType === "rider_lead" ? riderDocumentRequestTypes : partnerDocumentRequestTypes;
-  const requestedTypes = parsed.data.requirements.map((item) => item.type);
-  if (requestedTypes.some((type) => !allowedTypes.has(type)) || new Set(requestedTypes).size !== requestedTypes.length) return res.status(400).json({ error: "INVALID_DOCUMENT_REQUIREMENTS" });
-  const subject = await documentRequestSubject(parsed.data.subjectType, subjectId, parsed.data.subjectType.endsWith("_lead") ? await adminOnboardingScope(req) : tenantScope(req));
-  if (!subject) return res.status(404).json({ error: "DOCUMENT_REQUEST_SUBJECT_NOT_FOUND", message: "No se ha encontrado el aspirante dentro de tu ámbito de administración. Actualiza la bandeja y selecciona de nuevo su solicitud." });
-  if (!subject.recipientEmail || !z.string().email().safeParse(subject.recipientEmail).success) return res.status(409).json({ error: "SUBJECT_EMAIL_REQUIRED", message: "Añade un correo de contacto válido antes de solicitar documentación." });
-  if (parsed.data.subjectType === "restaurant" && !subject.hasProfile) return res.status(409).json({ error: "PARTNER_PROFILE_REQUIRED", message: "Este comercio no tiene expediente de partner para recibir documentación." });
-  const token = randomBytes(32).toString("base64url");
-  const expiresAt = new Date(Date.now() + 14 * 24 * 60 * 60_000);
-  const request = await DocumentRequest.create({ tenantId: subject.tenantId, subjectType: parsed.data.subjectType, subjectId, recipientName: subject.recipientName, recipientEmail: subject.recipientEmail, createdBy, message: parsed.data.message, requirements: parsed.data.requirements, dueAt: parsed.data.dueAt || null, expiresAt, tokenHash: documentRequestTokenHash(token), tokenPrefix: token.slice(0, 8) });
-  await notifyOnboarding({ channel: "admin", type: "onboarding.document_request.created", entityId: String(request._id), tenantId: (request as any).tenantId, payload: { subjectType: request.subjectType, subjectId: String(subjectId) } });
-  const uploadUrl = documentRequestUploadUrl(token);
-  const mailtoUrl = `mailto:${encodeURIComponent(subject.recipientEmail)}?subject=${encodeURIComponent("PIKI · Documentación pendiente")}&body=${encodeURIComponent(`Hola ${subject.recipientName},\n\n${parsed.data.message}\n\nPuedes subir la documentación solicitada mediante este enlace seguro (válido hasta ${expiresAt.toLocaleDateString("es-ES")}):\n${uploadUrl}\n\nEquipo PIKI`)}`;
-  const emailSent = parsed.data.sendEmail ? await sendDocumentRequestEmail({ requestId: String(request._id), subjectType: request.subjectType, recipientName: subject.recipientName, recipientEmail: subject.recipientEmail, message: parsed.data.message, uploadUrl, expiresAt }) : false;
-  if (emailSent) await DocumentRequest.updateOne({ _id: request._id }, { $set: { emailSentAt: new Date() } }).exec();
-  return res.status(201).json({ request: { id: String(request._id), subjectType: request.subjectType, recipientName: request.recipientName, recipientEmail: request.recipientEmail, status: request.status, dueAt: request.dueAt, expiresAt: request.expiresAt }, delivery: { uploadUrl, mailtoUrl, emailSent } });
-});
-
-app.get("/api/v1/admin/corporate-email/status", requireRole("admin"), (_req, res) => res.json(corporateEmailConfiguration()));
-app.post("/api/v1/admin/:kind-leads/:id/contact-email", requireRole("admin"), async (req, res) => {
-  const kind = String(req.params.kind);
-  const Model = leadModel(kind) as any;
-  const id = objectId(String(req.params.id));
-  const parsed = z.object({ subject: z.string().trim().min(3).max(180), message: z.string().trim().min(10).max(2000), requestKey: z.string().regex(/^[a-zA-Z0-9_-]{8,80}$/) }).safeParse(req.body);
-  if (!Model || !id || !parsed.success) return res.status(400).json({ error: "INVALID_CONTACT_EMAIL", message: "Revisa el asunto y el mensaje antes de enviar." });
-  const lead = await Model.findOne({ _id: id, ...await onboardingScope(req) }).select("name email status").lean().exec();
-  if (!lead) return res.status(404).json({ error: "LEAD_NOT_FOUND", message: "No se ha encontrado esta solicitud de alta en tu ámbito de administración." });
-  if (!z.string().email().safeParse(lead.email).success) return res.status(409).json({ error: "SUBJECT_EMAIL_REQUIRED", message: "La solicitud no tiene un correo válido." });
-  const result = await sendLeadContactEmail({ leadId: String(id), recipientEmail: lead.email, recipientName: lead.name, kind: kind as "rider" | "partner", subject: parsed.data.subject, message: parsed.data.message, key: parsed.data.requestKey });
-  if (!result.sent) return res.status(503).json({ error: result.error, message: result.error === "CORPORATE_EMAIL_NOT_CONFIGURED" ? "El envío corporativo no está configurado en el API. No se ha enviado el correo." : "El proveedor corporativo no ha aceptado el envío. No se ha confirmado la entrega; revisa la configuración del correo." });
-  const actor = req.auth?.employeeId ? objectId(req.auth.employeeId) : null;
-  const updated = await Model.findOneAndUpdate({ _id: id, ...await onboardingScope(req) }, { $set: { status: "info_requested", notes: parsed.data.message.slice(0, 1000), reviewedBy: actor, reviewedAt: new Date() }, $push: { history: { status: "info_requested", notes: `Correo corporativo enviado: ${parsed.data.subject}`, actorEmployeeId: actor, changedAt: new Date() } } }, { new: true }).lean().exec();
-  return res.json({ emailSent: true, recipientEmail: lead.email, providerId: result.providerId, lead: updated });
-});
-app.post("/api/v1/admin/document-requests/:id/send-email", requireRole("admin"), async (req, res) => {
-  const id = objectId(String(req.params.id));
-  const parsed = z.object({ token: z.string().regex(/^[A-Za-z0-9_-]{40,100}$/) }).safeParse(req.body);
-  if (!id || !parsed.success) return res.status(400).json({ error: "INVALID_DOCUMENT_REQUEST_LINK", message: "El enlace documental no es válido." });
-  const request = await DocumentRequest.findOne({ _id: id, ...await adminOnboardingScope(req) }).select("+tokenHash").lean().exec() as any;
-  if (!request || request.tokenHash !== documentRequestTokenHash(parsed.data.token)) return res.status(404).json({ error: "DOCUMENT_REQUEST_NOT_FOUND", message: "El enlace no pertenece a esta solicitud." });
-  if (request.status === "revoked" || new Date(request.expiresAt).getTime() <= Date.now()) return res.status(410).json({ error: "DOCUMENT_REQUEST_UNAVAILABLE", message: "El enlace ha caducado o ha sido revocado. Genera uno nuevo." });
-  if (request.emailSentAt) return res.json({ emailSent: true, recipientEmail: request.recipientEmail, alreadySent: true });
-  if (!corporateEmailConfiguration().configured) return res.status(503).json({ error: "CORPORATE_EMAIL_NOT_CONFIGURED", message: "El envío corporativo no está configurado en el API. El enlace sigue disponible, pero no se ha enviado ningún correo." });
-  const lock = randomBytes(16).toString("hex");
-  const claimed = await DocumentRequest.findOneAndUpdate({ _id: request._id, emailSentAt: null, status: { $in: ["open", "partially_submitted", "submitted"] }, expiresAt: { $gt: new Date() }, $or: [{ emailSendingAt: null }, { emailSendingAt: { $lt: new Date(Date.now() - 120_000) } }] }, { $set: { emailSendingAt: new Date(), emailSendLock: lock } }, { new: true }).select("_id").lean().exec();
-  if (!claimed) {
-    const latest = await DocumentRequest.findById(request._id).select("emailSentAt status expiresAt").lean().exec() as any;
-    if (latest?.status === "revoked" || !latest || new Date(latest.expiresAt).getTime() <= Date.now()) return res.status(410).json({ error: "DOCUMENT_REQUEST_UNAVAILABLE", message: "El enlace ya no está disponible." });
-    if (latest.emailSentAt) return res.json({ emailSent: true, recipientEmail: request.recipientEmail, alreadySent: true });
-    return res.status(409).json({ error: "CORPORATE_EMAIL_SEND_IN_PROGRESS", message: "Este correo ya se está enviando. Espera unos segundos antes de comprobarlo de nuevo." });
-  }
-  try {
-    const emailSent = await sendDocumentRequestEmail({ requestId: String(request._id), subjectType: request.subjectType, recipientName: request.recipientName, recipientEmail: request.recipientEmail, message: request.message, uploadUrl: documentRequestUploadUrl(parsed.data.token), expiresAt: new Date(request.expiresAt) });
-    if (!emailSent) return res.status(503).json({ error: "CORPORATE_EMAIL_DELIVERY_FAILED", message: "El proveedor de correo no ha aceptado el envío. Conserva el enlace y revisa el remitente corporativo." });
-    await DocumentRequest.updateOne({ _id: request._id, emailSendLock: lock }, { $set: { emailSentAt: new Date() } }).exec();
-    return res.json({ emailSent: true, recipientEmail: request.recipientEmail });
-  } finally {
-    await DocumentRequest.updateOne({ _id: request._id, emailSendLock: lock }, { $set: { emailSendingAt: null, emailSendLock: null } }).exec().catch(() => console.warn("Corporate email lock release failed"));
-  }
-});
-
-app.get("/api/v1/admin/document-requests", requireRole("admin"), async (req, res) => {
-  const subjectType = typeof req.query.subjectType === "string" ? documentRequestSubjectSchema.safeParse(req.query.subjectType) : null;
-  if (subjectType && !subjectType.success) return res.status(400).json({ error: "INVALID_DOCUMENT_REQUEST_SUBJECT" });
-  const subjectId = typeof req.query.subjectId === "string" ? objectId(req.query.subjectId) : null;
-  if (req.query.subjectId !== undefined && !subjectId) return res.status(400).json({ error: "INVALID_DOCUMENT_REQUEST_SUBJECT_ID" });
-  const requests = await DocumentRequest.find({ ...await adminOnboardingScope(req), ...(subjectType?.success ? { subjectType: subjectType.data } : {}), ...(subjectId ? { subjectId } : {}) }).sort({ createdAt: -1 }).limit(200).lean().exec();
-  return res.json({ requests: requests.map((request: any) => ({ id: String(request._id), subjectType: request.subjectType, subjectId: String(request.subjectId), recipientName: request.recipientName, recipientEmail: request.recipientEmail, status: request.status, requirements: request.requirements, documents: request.documents, dueAt: request.dueAt, expiresAt: request.expiresAt, createdAt: request.createdAt, emailSentAt: request.emailSentAt || null, submittedAt: request.submittedAt, revokedAt: request.revokedAt })) });
-});
-
-app.post("/api/v1/admin/document-requests/:id/revoke", requireRole("admin"), async (req, res) => {
-  const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
-  if (!id) return res.status(400).json({ error: "INVALID_DOCUMENT_REQUEST_ID" });
-  const request = await DocumentRequest.findOneAndUpdate({ _id: id, ...await adminOnboardingScope(req), status: { $in: ["open", "partially_submitted", "submitted"] } }, { $set: { status: "revoked", revokedAt: new Date() } }, { new: true }).lean().exec() as any;
-  if (!request) return res.status(404).json({ error: "DOCUMENT_REQUEST_NOT_FOUND_OR_CLOSED" });
-  return res.json({ request: { id: String(request._id), status: request.status, revokedAt: request.revokedAt } });
-});
-
-app.get("/api/v1/public/document-requests/:token", async (req, res) => {
-  const requestState = await openDocumentRequest(String(req.params.token || ""));
-  if (!requestState) return res.status(404).json({ error: "DOCUMENT_REQUEST_NOT_FOUND" });
-  if (requestState.unavailable) return res.status(410).json({ error: requestState.unavailable === "revoked" ? "DOCUMENT_REQUEST_REVOKED" : "DOCUMENT_REQUEST_EXPIRED" });
-  await DocumentRequest.updateOne({ _id: requestState.request._id }, { $set: { lastAccessedAt: new Date() } }).exec();
-  return res.json(publicDocumentRequestResponse(requestState.request));
-});
-
-app.post("/api/v1/public/document-requests/:token/documents", async (req, res) => {
-  const requestState = await openDocumentRequest(String(req.params.token || ""));
-  if (!requestState) return res.status(404).json({ error: "DOCUMENT_REQUEST_NOT_FOUND" });
-  if (requestState.unavailable) return res.status(410).json({ error: requestState.unavailable === "revoked" ? "DOCUMENT_REQUEST_REVOKED" : "DOCUMENT_REQUEST_EXPIRED" });
-  const parsed = publicDocumentUploadSchema.safeParse(req.body);
-  if (!parsed.success) return res.status(400).json({ error: "INVALID_DOCUMENT_UPLOAD", details: parsed.error.flatten() });
-  const submission = validateDocumentRequestSubmission(requestState.request.requirements || [], parsed.data);
-  if (!submission.ok) return res.status(400).json({ error: submission.error });
-  const uploaded = [] as Array<{ type: string; fileName: string; mimeType: string; sizeBytes: number; sha256: string; contentBase64: string }>;
-  try {
-    const normalizedDocuments = parsed.data.documents.map((document) => ({ document, normalized: normalizeDocumentUpload(document) }));
-    if (normalizedDocuments.length) await scanUploadBuffers(normalizedDocuments.map(({ document, normalized }) => ({ buffer: normalized.bytes, originalName: sanitizePdfFileName(document.fileName) })));
-    for (const { document, normalized } of normalizedDocuments) {
-      uploaded.push({ ...document, fileName: sanitizePdfFileName(document.fileName), mimeType: "application/pdf", sha256: document.sha256.toLowerCase(), contentBase64: normalized.contentBase64 });
-    }
-  } catch (error) {
-    if (error instanceof MalwareDetectedError) return res.status(422).json({ error: "MALWARE_DETECTED", message: "Uno de los archivos ha sido rechazado por seguridad." });
-    if (error instanceof MalwareScannerUnavailableError) return res.status(503).json({ error: "MALWARE_SCANNER_UNAVAILABLE", message: "La carga está temporalmente bloqueada hasta completar el análisis de seguridad." });
-    return res.status(400).json({ error: error instanceof Error ? error.message : "DOCUMENT_VALIDATION_FAILED" });
-  }
-  const subjectDocuments = uploaded.map((document) => ({ ...document, _id: new mongoose.Types.ObjectId(), documentRequestId: requestState.request._id, status: "received", reviewNotes: "", reviewedAt: null, reviewedBy: null, viewedAt: null, viewedBy: null }));
-  const formResponses = parsed.data.responses.map((response) => ({ type: response.type, value: response.value, completedAt: new Date() }));
-  const targetScope = requestState.request.tenantId ? { tenantId: requestState.request.tenantId } : { tenantId: null };
-  if (requestState.request.subjectType === "rider_application") {
-    const result = await RiderApplication.updateOne({ _id: requestState.request.subjectId, ...targetScope }, [{ $set: { documents: { $concatArrays: [{ $filter: { input: { $ifNull: ["$documents", []] }, as: "doc", cond: { $not: [{ $in: ["$$doc.type", { $literal: submission.uploadedTypes }] }] } } }, { $literal: subjectDocuments }] } } }] as any).exec();
-    if (!result.matchedCount) return res.status(410).json({ error: "DOCUMENT_REQUEST_SUBJECT_GONE" });
-  } else if (requestState.request.subjectType === "restaurant") {
-    const result = await Restaurant.updateOne({ _id: requestState.request.subjectId, ...targetScope, "partnerProfile": { $exists: true } }, [{ $set: { "partnerProfile.documents": { $concatArrays: [{ $filter: { input: { $ifNull: ["$partnerProfile.documents", []] }, as: "doc", cond: { $not: [{ $in: ["$$doc.type", { $literal: submission.uploadedTypes }] }] } } }, { $literal: subjectDocuments }] } } }] as any).exec();
-    if (!result.matchedCount) return res.status(410).json({ error: "DOCUMENT_REQUEST_SUBJECT_GONE" });
-  } else {
-    const Model = requestState.request.subjectType === "rider_lead" ? RiderLead : PartnerLead;
-    const result = await Model.updateOne({ _id: requestState.request.subjectId, ...targetScope }, [{ $set: { documents: { $concatArrays: [{ $filter: { input: { $ifNull: ["$documents", []] }, as: "doc", cond: { $not: [{ $in: ["$$doc.type", { $literal: submission.uploadedTypes }] }] } } }, { $literal: subjectDocuments }] } } }] as any).exec();
-    if (!result.matchedCount) return res.status(410).json({ error: "DOCUMENT_REQUEST_SUBJECT_GONE" });
-  }
-  const existingMetadata = (requestState.request.documents || []).filter((document: any) => !submission.uploadedTypes.includes(document.type));
-  const metadata = [...existingMetadata, ...uploaded.map(documentRequestMetadata)];
-  const updatedFormResponses = [...(requestState.request.formResponses || []).filter((response: any) => !submission.responseTypes.includes(response.type)), ...formResponses];
-  const completedDocumentTypes = new Set(metadata.map((document: any) => document.type));
-  const completedResponseTypes = new Set(updatedFormResponses.map((response: any) => response.type));
-  const completed = (requestState.request.requirements || []).every((requirement: any) => (requirement.inputMode || "file") === "form" ? completedResponseTypes.has(requirement.type) : completedDocumentTypes.has(requirement.type));
-  const updated = await DocumentRequest.findOneAndUpdate({ _id: requestState.request._id, ...targetScope }, { $set: { documents: metadata, formResponses: updatedFormResponses, status: completed ? "submitted" : "partially_submitted", submittedAt: new Date(), lastAccessedAt: new Date() } }, { new: true }).lean().exec() as any;
-  if (!updated) return res.status(410).json({ error: "DOCUMENT_REQUEST_SUBJECT_GONE" });
-  void Promise.allSettled([
-    notifyOnboarding({ channel: "admin", type: "onboarding.document_request.uploaded", entityId: String(updated._id), tenantId: updated.tenantId, payload: { subjectType: updated.subjectType, subjectId: String(updated.subjectId), uploadedTypes: submission.uploadedTypes } }),
-    sendDocumentUploadEmail({ requestId: String(updated._id), subjectType: updated.subjectType, subjectName: requestState.request.recipientName, subjectEmail: requestState.request.recipientEmail, uploadedTypes: submission.uploadedTypes, uploadedFiles: uploaded.map((document) => document.fileName), completed }),
-  ]);
-  return res.status(201).json({ message: completed ? "Documentación enviada para revisión." : "Documentación parcial recibida. Puedes continuar con los requisitos pendientes.", ...publicDocumentRequestResponse(updated) });
+  return res.json({ application, documentReviewPending, warning: documentReviewPending ? "La solicitud se ha gestionado; el expediente documental continúa pendiente de revisión." : undefined });
 });
 
 app.get("/api/v1/riders", requireRole("admin", "fleet"), async (req, res) => {
   const status = typeof req.query.status === "string" ? req.query.status : undefined;
   const riders = await Rider.find({ ...(status ? { status } : {}), ...(await fleetRiderFilter(req)) }).sort({ name: 1 }).limit(200).lean().exec();
   return res.json({ riders });
-});
-
-const riderLifecycleStatuses = ["pending_documents", "active", "suspended", "terminated"] as const;
-app.get("/api/v1/admin/riders/directory", requireRole("admin", "fleet"), async (req, res) => {
-  const lifecycle = typeof req.query.lifecycleStatus === "string" && riderLifecycleStatuses.includes(req.query.lifecycleStatus as typeof riderLifecycleStatuses[number]) ? req.query.lifecycleStatus : undefined;
-  const riderFilter = { ...(await fleetRiderFilter(req)), isTestRider: { $ne: true }, ...(lifecycle ? { lifecycleStatus: lifecycle } : {}) };
-  const riders = await Rider.find(riderFilter).select("riderCode name email phone city availability fleetId zoneSlug status lifecycleStatus lifecycleReason lifecycleChangedAt vehicle location lastLocationAt activeOrderId reliabilityScore createdAt").sort({ name: 1 }).limit(500).lean().exec() as any[];
-  const riderIds = riders.map((rider) => rider._id);
-  const [orders, incidents] = await Promise.all([
-    Order.find({ riderId: { $in: riderIds }, status: { $in: [...activeOperationalOrderStatuses] } }).select("_id riderId publicCode displayCode status assignmentState deliveryAddress restaurantId").lean().exec(),
-    RiderIncident.find({ riderId: { $in: riderIds }, resolved: { $ne: true } }).sort({ occurredAt: -1 }).lean().exec(),
-  ]);
-  const orderByRider = new Map<string, any>();
-  for (const order of orders as any[]) orderByRider.set(String(order.riderId), order);
-  const incidentsByRider = new Map<string, any[]>();
-  for (const incident of incidents as any[]) { const key = String(incident.riderId); incidentsByRider.set(key, [...(incidentsByRider.get(key) || []), incident]); }
-  const now = Date.now();
-  const result = riders.map((rider) => {
-    const activeIncidents = incidentsByRider.get(String(rider._id)) || [];
-    const sanction = calculateSanctionDecision(activeIncidents.map((item: any) => ({ id: String(item._id), riderId: String(item.riderId), reason: item.reason, occurredAt: item.occurredAt, evidence: item.evidence, acknowledged: item.acknowledged, resolved: item.resolved })), new Date(), defaultSanctionPolicy);
-    const gpsAgeSeconds = rider.lastLocationAt ? Math.max(0, Math.round((now - new Date(rider.lastLocationAt).getTime()) / 1000)) : null;
-    const gpsState = gpsAgeSeconds !== null && gpsAgeSeconds <= 90 && rider.location?.coordinates?.length === 2 ? "fresh" : gpsAgeSeconds !== null && gpsAgeSeconds <= 600 ? "stale" : "missing";
-    const effectiveLifecycleStatus = rider.lifecycleStatus === "active" && ["review", "temporary_restriction"].includes(sanction.severity) ? "suspended" : rider.lifecycleStatus || "active";
-    return { ...rider, id: String(rider._id), activeOrder: orderByRider.get(String(rider._id)) || null, incidentCount: activeIncidents.length, sanction, gpsState, gpsAgeSeconds, effectiveLifecycleStatus };
-  });
-  return res.json({ generatedAt: new Date().toISOString(), total: result.length, statuses: riderLifecycleStatuses.map((status) => ({ status, count: result.filter((rider) => rider.effectiveLifecycleStatus === status).length })), riders: result });
-});
-
-app.patch("/api/v1/admin/riders/:id/lifecycle", requireRole("admin"), async (req, res) => {
-  const id = objectId(String(req.params.id));
-  if (!id) return res.status(400).json({ error: "INVALID_RIDER_ID" });
-  const parsed = z.object({ status: z.enum(riderLifecycleStatuses), reason: z.string().trim().max(500).default("") }).safeParse(req.body);
-  if (!parsed.success) return res.status(400).json({ error: "INVALID_RIDER_LIFECYCLE" });
-  const rider = await Rider.findOneAndUpdate({ _id: id, ...(await fleetRiderFilter(req)) }, { $set: { lifecycleStatus: parsed.data.status, lifecycleReason: parsed.data.reason, lifecycleChangedAt: new Date(), lifecycleChangedBy: objectId(String(req.auth?.employeeId || "")), ...(parsed.data.status === "suspended" || parsed.data.status === "terminated" ? { status: "offline", activeOrderId: null } : {}) } }, { new: true }).lean().exec() as any;
-  if (!rider) return res.status(404).json({ error: "RIDER_NOT_FOUND" });
-  await publishRealtimeEvent({ channel: "admin", audienceKey: tenantAudienceKey(rider.tenantId, "admin"), tenantId: rider.tenantId, type: "rider.lifecycle_changed", payload: { riderId: String(rider._id), lifecycleStatus: rider.lifecycleStatus, reason: rider.lifecycleReason }, dedupeKey: `rider:lifecycle:${String(rider._id)}:${String(rider.lifecycleChangedAt)}` });
-  return res.json({ rider });
 });
 
 const riderZoneSchema = z.object({ zoneSlug: z.string().regex(/^[a-z0-9-]+$/).nullable() });
@@ -2207,7 +1295,7 @@ app.patch("/api/v1/riders/:id/zone", requireRole("admin", "fleet"), async (req, 
   const parsed = riderZoneSchema.safeParse({ zoneSlug: req.body?.zoneSlug ?? req.body?.zone ?? null });
   if (!parsed.success) return res.status(400).json({ error: "INVALID_RIDER_ZONE" });
   const employee = req.auth?.role === "fleet" ? await employeeScope(req) : null;
-  if (req.auth?.role === "fleet" && !employee?.fleetId) return res.status(403).json({ error: "FLEET_NOT_ASSIGNED", message: "Esta cuenta Fleet no está vinculada a una flota activa. Un superadmin debe asignarle una flota en PIKI Admin → Equipo." });
+  if (req.auth?.role === "fleet" && !employee?.fleetId) return res.status(403).json({ error: "FLEET_NOT_ASSIGNED" });
   const rider = await Rider.findOne({ _id: riderId, ...tenantScope(req), ...(await fleetRiderFilter(req)) }).lean().exec() as any;
   if (!rider) return res.status(404).json({ error: "RIDER_NOT_FOUND" });
   let zone = null;
@@ -2239,70 +1327,43 @@ app.post("/api/v1/rider-slots", requireRole("admin", "fleet"), async (req, res) 
   const rider = await Rider.findOne({ _id: riderId, ...tenantScope(req) }).lean().exec() as any; if (!rider) return res.status(404).json({ error: "RIDER_NOT_FOUND" });
   if (req.auth?.role === "fleet") {
     const employee = await employeeScope(req);
-    if (!employee?.fleetId) return res.status(403).json({ error: "FLEET_NOT_ASSIGNED", message: "Esta cuenta Fleet no está vinculada a una flota activa. Un superadmin debe asignarle una flota en PIKI Admin → Equipo." });
+    if (!employee?.fleetId) return res.status(403).json({ error: "FLEET_NOT_ASSIGNED" });
     if (rider.fleetId && String(rider.fleetId) !== String(employee.fleetId)) return res.status(403).json({ error: "FLEET_RIDER_ACCESS_DENIED" });
     if (!rider.fleetId) await Rider.updateOne({ _id: riderId, fleetId: null }, { $set: { fleetId: employee.fleetId } }).exec();
   }
   const zone = await Zone.findOne({ ...tenantScope(req), slug: parsed.data.zoneSlug, isActive: true }).lean().exec() as any; if (!zone) return res.status(404).json({ error: "ZONE_NOT_FOUND" });
   const { riderId: _riderId, ...slotData } = parsed.data;
   const slot = await RiderSlot.findOneAndUpdate({ riderId, ...tenantScope(req), date: parsed.data.date, startTime: parsed.data.startTime }, { $set: { ...slotData, ...tenantScope(req), riderId, zoneSlug: zone.slug } }, { upsert: true, new: true }).lean().exec();
-  await publishRiderScheduleEvent({ riderId: String(riderId), tenantId: (slot as any)?.tenantId, action: "updated" });
   return res.status(201).json({ slot });
 });
 app.post("/api/v1/rider-slots/week", requireRole("admin", "fleet"), async (req, res) => {
-  const parsed = riderSlotWeekSchema.safeParse(req.body);
+  const parsed = riderSlotCreateSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_RIDER_SLOT", details: parsed.error.flatten() });
   if (parsed.data.startTime === parsed.data.endTime) return res.status(400).json({ error: "INVALID_SLOT_TIME_RANGE" });
   const riderId = objectId(parsed.data.riderId); if (!riderId) return res.status(400).json({ error: "INVALID_RIDER_ID" });
   const rider = await Rider.findOne({ _id: riderId, ...tenantScope(req) }).lean().exec() as any;
   if (!rider) return res.status(404).json({ error: "RIDER_NOT_FOUND" });
-  let fleetEmployee: any = null;
   if (req.auth?.role === "fleet") {
-    fleetEmployee = await employeeScope(req);
-    if (!fleetEmployee?.fleetId) return res.status(403).json({ error: "FLEET_NOT_ASSIGNED", message: "Esta cuenta Fleet no está vinculada a una flota activa. Un superadmin debe asignarle una flota en PIKI Admin → Equipo." });
-    if (rider.fleetId && String(rider.fleetId) !== String(fleetEmployee.fleetId)) return res.status(403).json({ error: "FLEET_RIDER_ACCESS_DENIED" });
+    const employee = await employeeScope(req);
+    if (!employee?.fleetId) return res.status(403).json({ error: "FLEET_NOT_ASSIGNED" });
+    if (rider.fleetId && String(rider.fleetId) !== String(employee.fleetId)) return res.status(403).json({ error: "FLEET_RIDER_ACCESS_DENIED" });
+    if (!rider.fleetId) await Rider.updateOne({ _id: riderId, fleetId: null }, { $set: { fleetId: employee.fleetId } }).exec();
   }
   const zone = await Zone.findOne({ ...tenantScope(req), slug: parsed.data.zoneSlug, isActive: true }).select("slug").lean().exec() as any;
   if (!zone) return res.status(404).json({ error: "ZONE_NOT_FOUND" });
-  if (fleetEmployee) {
-    const fleet = await Fleet.findById(fleetEmployee.fleetId).select("serviceZones").lean().exec() as any;
-    const allowedZones = Array.isArray(fleetEmployee.zoneSlugs) && fleetEmployee.zoneSlugs.length ? fleetEmployee.zoneSlugs : fleet?.serviceZones || [];
-    if (allowedZones.length && !allowedZones.includes(zone.slug)) return res.status(403).json({ error: "ZONE_ACCESS_DENIED", message: "La flota no tiene habilitada la zona seleccionada." });
-  }
   const start = new Date(`${parsed.data.date}T12:00:00Z`);
-  const session = await mongoose.startSession();
-  const slots: any[] = [];
-  try {
-    await session.withTransaction(async () => {
-      if (fleetEmployee) {
-        const assigned = await Rider.findOneAndUpdate(
-          { _id: riderId, ...tenantScope(req), $or: [{ fleetId: fleetEmployee.fleetId }, { fleetId: null }, { fleetId: { $exists: false } }] },
-          { $set: { fleetId: fleetEmployee.fleetId } },
-          { new: true, session },
-        ).select("_id").lean().exec();
-        if (!assigned) throw new Error("FLEET_RIDER_ACCESS_DENIED");
-      }
-      for (const day of parsed.data.weekdays) {
-        const date = new Date(start); date.setUTCDate(start.getUTCDate() + day);
-        const dateString = date.toISOString().slice(0, 10);
-        const slot = await RiderSlot.findOneAndUpdate(
-          { riderId, ...tenantScope(req), date: dateString, startTime: parsed.data.startTime },
-          { $set: { zoneSlug: zone.slug, date: dateString, startTime: parsed.data.startTime, endTime: parsed.data.endTime, status: parsed.data.status, notes: parsed.data.notes, ...tenantScope(req), riderId } },
-          { upsert: true, new: true, setDefaultsOnInsert: true, session },
-        ).lean().exec();
-        slots.push(slot);
-      }
-    });
-    await publishRiderScheduleEvent({ riderId: String(riderId), tenantId: (slots[0] as any)?.tenantId, action: "weekly_updated" });
-    return res.status(201).json({ slots, count: slots.length, weekdays: parsed.data.weekdays, message: `${slots.length} turnos semanales guardados.` });
-  } catch (error: any) {
-    slots.length = 0;
-    if (error?.message === "FLEET_RIDER_ACCESS_DENIED") return res.status(403).json({ error: "FLEET_RIDER_ACCESS_DENIED" });
-    if (error?.code === 11000) return res.status(409).json({ error: "RIDER_SLOT_ALREADY_EXISTS", message: "Ya existe un turno con esa fecha y hora de inicio." });
-    throw error;
-  } finally {
-    await session.endSession();
+  const slots = [];
+  for (let day = 0; day < 7; day += 1) {
+    const date = new Date(start); date.setUTCDate(start.getUTCDate() + day);
+    const dateString = date.toISOString().slice(0, 10);
+    const slot = await RiderSlot.findOneAndUpdate(
+      { riderId, ...tenantScope(req), date: dateString, startTime: parsed.data.startTime },
+      { $set: { zoneSlug: zone.slug, date: dateString, startTime: parsed.data.startTime, endTime: parsed.data.endTime, status: parsed.data.status, notes: parsed.data.notes, ...tenantScope(req), riderId } },
+      { upsert: true, new: true, setDefaultsOnInsert: true },
+    ).lean().exec();
+    slots.push(slot);
   }
+  return res.status(201).json({ slots, count: slots.length });
 });
 app.patch("/api/v1/rider-slots/:id", requireRole("admin", "fleet"), async (req, res) => {
   const slotId = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
@@ -2317,7 +1378,6 @@ app.patch("/api/v1/rider-slots/:id", requireRole("admin", "fleet"), async (req, 
   if (!zone) return res.status(404).json({ error: "ZONE_NOT_FOUND" });
   try {
     const slot = await RiderSlot.findOneAndUpdate({ _id: slotId, ...tenantScope(req) }, { $set: { ...parsed.data, zoneSlug: zone.slug } }, { new: true }).lean().exec();
-    await publishRiderScheduleEvent({ riderId: String(existing.riderId), tenantId: (slot as any)?.tenantId, action: "updated" });
     return res.json({ slot });
   } catch (error: any) {
     if (error?.code === 11000) return res.status(409).json({ error: "RIDER_SLOT_ALREADY_EXISTS", message: "Ya existe otro turno para ese rider, fecha y hora de inicio." });
@@ -2331,31 +1391,20 @@ app.delete("/api/v1/rider-slots/:id", requireRole("admin", "fleet"), async (req,
   if (!existing) return res.status(404).json({ error: "RIDER_SLOT_NOT_FOUND" });
   if (req.auth?.role === "fleet" && !(await fleetCanAccessRider(req, existing.riderId))) return res.status(403).json({ error: "FLEET_RIDER_ACCESS_DENIED" });
   const slot = await RiderSlot.findOneAndUpdate({ _id: slotId, ...tenantScope(req) }, { $set: { status: "cancelled" } }, { new: true }).lean().exec();
-  await publishRiderScheduleEvent({ riderId: String(existing.riderId), tenantId: (slot as any)?.tenantId, action: "cancelled" });
   return res.json({ slot, message: "Turno eliminado" });
 });
 
 app.post("/api/v1/orders", rateLimit(20, 60_000, "orders-create"), async (req, res) => {
   const parsed = createOrderSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_ORDER", details: parsed.error.flatten() });
-  if (!["cash", "stripe"].includes(parsed.data.paymentMethod)) return res.status(409).json({ error: "PAYMENT_METHOD_UNAVAILABLE", message: "Método de pago no disponible." });
+  if (parsed.data.paymentMethod !== "cash") return res.status(409).json({ error: "PAYMENT_METHOD_UNAVAILABLE", message: "Tarjeta y Bizum todavía no están disponibles. Selecciona efectivo al recibir." });
   const restaurantObjectId = objectId(parsed.data.restaurantId);
   if (!restaurantObjectId) return res.status(400).json({ error: "INVALID_RESTAURANT_ID" });
   const restaurant = await Restaurant.findOne({ _id: restaurantObjectId, isActive: true, onboardingStatus: "approved" }).lean().exec() as any;
   if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_AVAILABLE" });
-  const useReferenceFallback = usesReferenceAddOns(restaurant);
-  const items = parsed.data.items.map((requested) => {
-    const item = restaurant.menu.find((candidate: any) => candidate.id === requested.itemId);
-    if (!item) return null;
-    try {
-      const quote = quoteMenuItem(item, requested.selections, useReferenceFallback);
-      return { itemId: item.id, name: quote.name, quantity: requested.quantity, unitPriceCents: quote.unitPriceCents, selectedOptions: quote.selectedOptions };
-    } catch {
-      return null;
-    }
-  });
+  const items = parsed.data.items.map((requested) => { const item = restaurant.menu.find((candidate: any) => candidate.id === requested.itemId); return item ? { itemId: item.id, name: item.name, quantity: requested.quantity, unitPriceCents: Math.round(item.price * 100) } : null; });
   if (items.some((item) => !item)) return res.status(400).json({ error: "INVALID_MENU_ITEM" });
-  const normalizedItems = items as Array<{ itemId: string; name: string; quantity: number; unitPriceCents: number; selectedOptions: Array<{ groupId: string; groupName: string; optionId: string; optionName: string; unitPriceCents: number }> }>;
+  const normalizedItems = items as Array<{ itemId: string; name: string; quantity: number; unitPriceCents: number }>;
   const deliveryPoint: [number, number] = [parsed.data.deliveryLocation.longitude, parsed.data.deliveryLocation.latitude];
   const coverage = evaluateXativaCoverage(deliveryPoint);
   if (!coverage.covered || coverage.deliveryFeeCents === null || coverage.serviceFeeCents === null) {
@@ -2368,19 +1417,18 @@ app.post("/api/v1/orders", rateLimit(20, 60_000, "orders-create"), async (req, r
   const deliveryFeeCents = coverage.deliveryFeeCents;
   const serviceFeeCents = coverage.serviceFeeCents;
   const totalCents = subtotalCents + deliveryFeeCents + serviceFeeCents;
-  if (!isCashOrderWithinLimit(parsed.data.paymentMethod, totalCents)) return res.status(422).json(cashOrderLimitError(totalCents));
-  const publicCode = await createRandomOrderCode();
+  const publicCode = `PIKI-${Date.now().toString(36).toUpperCase()}`;
   const dailyCode = await createDailyDisplayCode();
   const authenticatedCustomer = await currentCustomer(req) as any;
-  const order = await Order.create({ tenantId: restaurant.tenantId || null, publicCode, ...dailyCode, restaurantId: restaurant._id, customerId: authenticatedCustomer?._id || null, customerName: String(authenticatedCustomer?.name || "").trim(), items: normalizedItems, deliveryAddress: parsed.data.deliveryAddress, deliveryNote: parsed.data.deliveryNote, deliveryLocation: { type: "Point", coordinates: deliveryPoint }, coveragePolicySlug: coverage.policySlug, coveragePolicyVersion: coverage.policyVersion, coverageDecision: coverage.reason, straightLineDistanceKm: coverage.straightLineDistanceKm, withinMunicipality: coverage.withinMunicipality, deliveryBaseFeeCents: coverage.deliveryBaseFeeCents, outsideMunicipalitySurchargeCents: coverage.outsideMunicipalitySurchargeCents, routeDistanceKm: route.routeDistanceKm, routeDurationMinutes: route.routeDurationMinutes, routeProvider: route.routeProvider, routingDegraded: route.routingDegraded, requiredVehicleClasses: route.requiredVehicleClasses, subtotalCents, deliveryFeeCents, serviceFeeCents, totalCents, paymentMethod: parsed.data.paymentMethod, paymentState: "pending", statusHistory: [{ status: "pending", actorRole: "customer", reason: parsed.data.paymentMethod === "cash" ? "Pedido a contrarreembolso; cobro pendiente hasta la entrega" : "Pedido creado con política de cobertura Xàtiva" }] });
+  const order = await Order.create({ tenantId: restaurant.tenantId || null, publicCode, ...dailyCode, restaurantId: restaurant._id, customerId: authenticatedCustomer?._id || null, items: normalizedItems, deliveryAddress: parsed.data.deliveryAddress, deliveryLocation: { type: "Point", coordinates: deliveryPoint }, coveragePolicySlug: coverage.policySlug, coveragePolicyVersion: coverage.policyVersion, coverageDecision: coverage.reason, straightLineDistanceKm: coverage.straightLineDistanceKm, withinMunicipality: coverage.withinMunicipality, deliveryBaseFeeCents: coverage.deliveryBaseFeeCents, outsideMunicipalitySurchargeCents: coverage.outsideMunicipalitySurchargeCents, routeDistanceKm: route.routeDistanceKm, routeDurationMinutes: route.routeDurationMinutes, routeProvider: route.routeProvider, routingDegraded: route.routingDegraded, requiredVehicleClasses: route.requiredVehicleClasses, subtotalCents, deliveryFeeCents, serviceFeeCents, totalCents, paymentMethod: parsed.data.paymentMethod, paymentState: "pending", statusHistory: [{ status: "pending", actorRole: "customer", reason: parsed.data.paymentMethod === "cash" ? "Pedido a contrarreembolso; cobro pendiente hasta la entrega" : "Pedido creado con política de cobertura Xàtiva" }] });
   if (parsed.data.paymentMethod === "cash") {
-    const dispatch = enqueueOrderForDispatch(order._id as mongoose.Types.ObjectId).catch((error) => console.warn("Dispatch outbox enqueue failed", error instanceof Error ? error.message : error));
+    const dispatch = queueAutomaticDispatch(order._id as mongoose.Types.ObjectId).catch((error) => console.warn("Immediate cash-order dispatch failed", error instanceof Error ? error.message : error));
     await Promise.all([dispatch, publishOrderIntakeEvents(order, { settlement: "cash_due", message: "Contrarreembolso: el Rider cobrará en efectivo al entregar." })]);
   }
-  res.status(201).json({ order: { id: order.id, publicCode, displayCode: order.displayCode, displayCodeDate: order.displayCodeDate, status: order.status, paymentState: parsed.data.paymentMethod === "cash" ? "pending_cash_collection" : order.paymentState, paymentMethod: parsed.data.paymentMethod, cashDueAtDelivery: parsed.data.paymentMethod === "cash", deliveryQrUrl: deliveryQrUrl(publicCode), subtotalCents, deliveryFeeCents, serviceFeeCents, totalCents, coverage, route, partnerPreparationLimitMinutes: PARTNER_PREPARATION_LIMIT_MINUTES, customerDeliveryTargetMinutes: CUSTOMER_DELIVERY_TARGET_MINUTES, etaMinutes: calculateEtaRange([PARTNER_PREPARATION_LIMIT_MINUTES, PARTNER_PREPARATION_LIMIT_MINUTES], [5, 15]) } });
+  res.status(201).json({ order: { id: order.id, publicCode, displayCode: order.displayCode, displayCodeDate: order.displayCodeDate, status: order.status, paymentState: parsed.data.paymentMethod === "cash" ? "pending_cash_collection" : order.paymentState, paymentMethod: parsed.data.paymentMethod, cashDueAtDelivery: parsed.data.paymentMethod === "cash", deliveryQrUrl: deliveryQrUrl(publicCode), subtotalCents, deliveryFeeCents, serviceFeeCents, totalCents, coverage, route, etaMinutes: calculateEtaRange([restaurant.etaMinutes[0] || 20, restaurant.etaMinutes[1] || 35], [5, 20]) } });
 });
 
-const customerOrderSyncSchema = z.object({ publicCode: z.string().trim().min(6).max(64), restaurantSlug: z.string().trim().min(1).max(120), customerId: z.string().nullable().optional(), customerName: z.string().trim().max(160).nullable().optional(), deliveryAddress: z.string().trim().min(5).max(1000), deliveryNote: z.string().trim().max(500).default(""), deliveryLocation: z.object({ latitude: z.number().finite(), longitude: z.number().finite() }).nullable().optional(), items: z.array(z.object({ itemId: z.string().min(1), name: z.string().min(1), quantity: z.number().int().min(1).max(20), unitPriceCents: z.number().int().min(0), totalCents: z.number().int().min(0).optional() })).min(1), subtotalCents: z.number().int().min(0), deliveryFeeCents: z.number().int().min(0), serviceFeeCents: z.number().int().min(0), totalCents: z.number().int().min(0), paymentMethod: z.enum(["stripe", "cash"]).default("stripe"), paymentState: z.enum(["pending", "authorized", "paid", "failed", "refunded"]).default("pending"), stripeCheckoutSessionId: z.string().nullable().optional(), stripePaymentIntentId: z.string().nullable().optional() });
+const customerOrderSyncSchema = z.object({ publicCode: z.string().trim().min(6).max(64), restaurantSlug: z.string().trim().min(1).max(120), customerId: z.string().nullable().optional(), deliveryAddress: z.string().trim().min(5).max(1000), deliveryLocation: z.object({ latitude: z.number().finite(), longitude: z.number().finite() }).nullable().optional(), items: z.array(z.object({ itemId: z.string().min(1), name: z.string().min(1), quantity: z.number().int().min(1).max(20), unitPriceCents: z.number().int().min(0), totalCents: z.number().int().min(0).optional() })).min(1), subtotalCents: z.number().int().min(0), deliveryFeeCents: z.number().int().min(0), serviceFeeCents: z.number().int().min(0), totalCents: z.number().int().min(0), paymentMethod: z.enum(["stripe", "cash"]).default("stripe"), paymentState: z.enum(["pending", "paid", "failed", "refunded"]).default("pending"), stripeCheckoutSessionId: z.string().nullable().optional(), stripePaymentIntentId: z.string().nullable().optional() });
 app.post("/api/v1/internal/customer-orders/sync", async (req, res) => {
   const expected = process.env.PIKI_CUSTOMER_SYNC_SECRET;
   if (!expected || req.header("x-piki-customer-sync-secret") !== expected) return res.status(401).json({ error: "INVALID_SYNC_AUTH" });
@@ -2392,15 +1440,14 @@ app.post("/api/v1/internal/customer-orders/sync", async (req, res) => {
   const existing = await Order.findOne({ publicCode: input.publicCode }).lean().exec() as any;
   const location = input.deliveryLocation ? { type: "Point", coordinates: [input.deliveryLocation.longitude, input.deliveryLocation.latitude] } : restaurant.location;
   if (!location?.coordinates?.length) return res.status(409).json({ error: "DELIVERY_LOCATION_REQUIRED" });
-  if (!isCashOrderWithinLimit(input.paymentMethod, input.totalCents)) return res.status(422).json(cashOrderLimitError(input.totalCents));
   // Customer is the source of truth: never rebuild lines from a second menu copy.
   // This prevents price/name drift between Customer, Partner and Rider screens.
   const canonicalItems = input.items.map(({ itemId, name, quantity, unitPriceCents, totalCents }) => ({ itemId, name, quantity, unitPriceCents, ...(totalCents == null ? {} : { totalCents }) }));
-  const order = await Order.findOneAndUpdate({ publicCode: input.publicCode }, { $set: { tenantId: restaurant.tenantId || null, restaurantId: restaurant._id, customerId: input.customerId || null, ...(input.customerName !== undefined ? { customerName: input.customerName || "" } : {}), items: canonicalItems, deliveryAddress: input.deliveryAddress, deliveryNote: input.deliveryNote, deliveryLocation: location, subtotalCents: input.subtotalCents, deliveryFeeCents: input.deliveryFeeCents, serviceFeeCents: input.serviceFeeCents, totalCents: input.totalCents, paymentMethod: input.paymentMethod, paymentState: input.paymentState, ...(input.stripeCheckoutSessionId !== undefined ? { stripeCheckoutSessionId: input.stripeCheckoutSessionId } : {}), ...(input.stripePaymentIntentId !== undefined ? { stripePaymentIntentId: input.stripePaymentIntentId } : {}), ...(["authorized", "paid"].includes(input.paymentState) && !["authorized", "paid"].includes(existing?.paymentState || "") ? { status: "pending", assignmentState: "unassigned" } : {}) }, $setOnInsert: { publicCode: input.publicCode, status: "pending", assignmentState: "unassigned", statusHistory: [{ status: "pending", actorRole: "system", reason: "Pedido sincronizado desde PIKI Customer" }] } }, { upsert: true, new: true, setDefaultsOnInsert: true }).lean().exec() as any;
-  const newlyPaid = ["authorized", "paid"].includes(input.paymentState) && !["authorized", "paid"].includes(existing?.paymentState || "");
+  const order = await Order.findOneAndUpdate({ publicCode: input.publicCode }, { $set: { tenantId: restaurant.tenantId || null, restaurantId: restaurant._id, customerId: input.customerId || null, items: canonicalItems, deliveryAddress: input.deliveryAddress, deliveryLocation: location, subtotalCents: input.subtotalCents, deliveryFeeCents: input.deliveryFeeCents, serviceFeeCents: input.serviceFeeCents, totalCents: input.totalCents, paymentMethod: input.paymentMethod, paymentState: input.paymentState, ...(input.stripeCheckoutSessionId !== undefined ? { stripeCheckoutSessionId: input.stripeCheckoutSessionId } : {}), ...(input.stripePaymentIntentId !== undefined ? { stripePaymentIntentId: input.stripePaymentIntentId } : {}), ...(input.paymentState === "paid" && existing?.paymentState !== "paid" ? { status: "pending", assignmentState: "unassigned" } : {}) }, $setOnInsert: { publicCode: input.publicCode, status: "pending", assignmentState: "unassigned", statusHistory: [{ status: "pending", actorRole: "system", reason: "Pedido sincronizado desde PIKI Customer" }] } }, { upsert: true, new: true, setDefaultsOnInsert: true }).lean().exec() as any;
+  const newlyPaid = input.paymentState === "paid" && existing?.paymentState !== "paid";
   const newCashOrder = input.paymentMethod === "cash" && !existing;
   if (newlyPaid || newCashOrder) {
-    const dispatch = enqueueOrderForDispatch(order._id as mongoose.Types.ObjectId).catch((error) => console.warn("Dispatch outbox enqueue failed", error instanceof Error ? error.message : error));
+    const dispatch = queueAutomaticDispatch(order._id as mongoose.Types.ObjectId).catch((error) => console.warn("Immediate order dispatch failed", error instanceof Error ? error.message : error));
     const settlement = newCashOrder
       ? { settlement: "cash_due" as const, message: "Contrarreembolso recibido desde PIKI Customer: el Rider cobrará al entregar." }
       : { settlement: "paid" as const, message: "Pago confirmado desde PIKI Customer." };
@@ -2423,12 +1470,11 @@ app.post("/api/v1/internal/customer-support/tickets", async (req, res) => {
   const input = parsed.data;
   let orderId: mongoose.Types.ObjectId | null = null;
   if (input.orderRef) {
-    const order = await Order.findOne({ ...supportOrderFilter(input.orderRef), customerId: input.customerId }).select("_id publicCode").lean().exec() as any;
+    const order = await Order.findOne({ ...supportOrderFilter(input.orderRef), customerId: input.customerId }).select("_id").lean().exec() as any;
     if (!order) return res.status(404).json({ error: "CUSTOMER_ORDER_NOT_FOUND" });
     orderId = order._id;
   }
-  const linkedOrder = orderId ? await Order.findById(orderId).select("publicCode").lean().exec() as any : null;
-  const ticket = await SupportTicket.create({ customerId: input.customerId, reporterEmail: input.customerEmail, sourceSurface: "customer", sourceRole: "customer", category: input.category, priority: input.priority, subject: input.subject, description: input.description, orderId, orderReference: linkedOrder?.publicCode || "", ticketNumber: `SUP-${new Date().toISOString().slice(0, 10).replace(/-/g, "")}-${randomInt(1000, 9999)}`, actions: [{ action: "ticket_created", metadata: { sourceSurface: "customer", customerId: input.customerId, customerName: input.customerName, orderRef: linkedOrder?.publicCode || input.orderRef || null } }] });
+  const ticket = await SupportTicket.create({ customerId: input.customerId, reporterEmail: input.customerEmail, sourceSurface: "customer", sourceRole: "customer", category: input.category, priority: input.priority, subject: input.subject, description: input.description, orderId, ticketNumber: `SUP-${new Date().toISOString().slice(0, 10).replace(/-/g, "")}-${randomInt(1000, 9999)}`, actions: [{ action: "ticket_created", metadata: { sourceSurface: "customer", customerId: input.customerId, customerName: input.customerName, orderRef: input.orderRef || null } }] });
   return res.status(201).json({ ticket: { _id: ticket._id, ticketNumber: ticket.ticketNumber, subject: ticket.subject, description: ticket.description, category: ticket.category, priority: ticket.priority, status: ticket.status, reporterEmail: ticket.reporterEmail, messages: ticket.messages, createdAt: ticket.createdAt, updatedAt: ticket.updatedAt } });
 });
 app.post("/api/v1/internal/customer-support/tickets/list", async (req, res) => {
@@ -2442,14 +1488,12 @@ app.get("/api/v1/internal/customer-orders/:publicCode/tracking", async (req, res
   if (!requireCustomerSyncSecret(req, res)) return;
   const order = await Order.findOne({ publicCode: String(req.params.publicCode) }).lean().exec() as any;
   if (!order) return res.status(404).json({ error: "ORDER_NOT_FOUND" });
-  const active = order.assignmentState === "assigned" && ["picked_up", "on_the_way"].includes(order.status);
-  // Once delivered/cancelled, do not return rider identity, vehicle or coordinates.
-  // The client cannot rediscover the private delivery relationship from this endpoint.
-  const rider = active && order.riderId ? await Rider.findById(order.riderId).select("name vehicle location lastLocationAt photoUrl").lean().exec() as any : null;
+  const rider = order.riderId ? await Rider.findById(order.riderId).select("name vehicle location lastLocationAt photoUrl").lean().exec() as any : null;
   const coordinates = rider?.location?.coordinates;
   const updatedAt = rider?.lastLocationAt ? new Date(rider.lastLocationAt).getTime() : 0;
-  const fresh = active && Array.isArray(coordinates) && coordinates.length >= 2 && updatedAt >= Date.now() - 120_000;
-  return res.json({ publicCode: order.publicCode, status: order.status, assignmentState: order.assignmentState, paymentMethod: order.paymentMethod, paymentState: order.paymentState, cashDueAtDelivery: order.paymentMethod === "cash" && order.paymentState !== "paid", riderId: rider?._id ? String(rider._id) : null, riderName: rider?.name || null, riderPhotoUrl: rider?.photoUrl || null, vehicle: rider?.vehicle || null, chatAvailable: active, locationAvailable: fresh, latitude: fresh ? Number(coordinates[1]) : null, longitude: fresh ? Number(coordinates[0]) : null, updatedAt: fresh ? updatedAt : null });
+  const fresh = Array.isArray(coordinates) && coordinates.length >= 2 && updatedAt >= Date.now() - 120_000;
+  const active = order.assignmentState === "assigned" && ["picked_up", "on_the_way"].includes(order.status);
+  return res.json({ publicCode: order.publicCode, status: order.status, assignmentState: order.assignmentState, paymentMethod: order.paymentMethod, paymentState: order.paymentState, cashDueAtDelivery: order.paymentMethod === "cash" && order.paymentState !== "paid", riderId: rider?._id ? String(rider._id) : null, riderName: rider?.name || null, riderPhotoUrl: rider?.photoUrl || null, vehicle: rider?.vehicle || "bike", chatAvailable: active, locationAvailable: active && fresh, latitude: fresh ? Number(coordinates[1]) : null, longitude: fresh ? Number(coordinates[0]) : null, updatedAt: fresh ? updatedAt : null });
 });
 app.post("/api/v1/internal/customer-orders/:publicCode/messages", async (req, res) => {
   if (!requireCustomerSyncSecret(req, res)) return;
@@ -2460,17 +1504,7 @@ app.post("/api/v1/internal/customer-orders/:publicCode/messages", async (req, re
     const body = String(req.body?.body || "").trim();
     if (!body || body.length > 500) return res.status(400).json({ error: "INVALID_MESSAGE" });
     const message = await RiderOrderMessage.create({ orderId: order._id, riderId: order.riderId, senderRole: "customer", body });
-    // The Rider receives an encrypted device push (when enabled) and a durable
-    // realtime signal. The notification deliberately excludes message text and
-    // contact details; the authenticated order chat remains the only place to read it.
-    void publishRealtimeEvent({
-      channel: "rider",
-      audienceKey: `rider:${String(order.riderId)}`,
-      tenantId: order.tenantId || null,
-      type: "order.message",
-      payload: { orderId: String(order._id), publicCode: order.publicCode, status: order.status, senderRole: "customer" },
-      dedupeKey: `order:message:customer:${String(message._id)}`,
-    }).catch((error) => console.warn("Customer-to-rider message notification failed", error instanceof Error ? error.message : "unknown error"));
+    void publishRealtimeEvent({ channel: "rider", audienceKey: `rider:${String(order.riderId)}`, tenantId: order.tenantId, type: "order.message_created", payload: { orderId: String(order._id), publicCode: order.publicCode } }).catch(() => undefined);
     return res.status(201).json({ id: String(message._id), senderRole: message.senderRole, body: message.body, createdAt: message.createdAt });
   }
   const messages = await RiderOrderMessage.find({ orderId: order._id }).sort({ createdAt: 1 }).limit(100).lean().exec();
@@ -2486,14 +1520,19 @@ app.post("/api/v1/payments/checkout", rateLimit(20, 60_000, "payments-checkout")
   if (!order) return res.status(404).json({ error: "ORDER_NOT_FOUND" });
   if (!checkoutTokenIsValid(order.publicCode, parsed.data.checkoutToken)) return res.status(403).json({ error: "INVALID_CHECKOUT_TOKEN" });
   if (order.paymentMethod !== "stripe") return res.status(409).json({ error: "ORDER_USES_CASH", message: "Este pedido está configurado para pago en efectivo." });
-  if (["authorized", "paid"].includes(order.paymentState)) return res.status(409).json({ error: "ORDER_ALREADY_PAID" });
+  if (order.paymentState === "paid") return res.status(409).json({ error: "ORDER_ALREADY_PAID" });
   try {
+    const items = (order.items || []).map((item: any) => ({ name: item.name, quantity: Number(item.quantity), unitPriceCents: Number(item.unitPriceCents) }));
+    const pricing = buildStripePricing({ items, deliveryFeeCents: Number(order.deliveryFeeCents || 0) });
+    if (Number(order.serviceFeeCents || 0) !== CUSTOMER_SERVICE_FEE_CENTS || Number(order.totalCents || 0) !== pricing.totalCents) {
+      await Order.updateOne({ _id: order._id, paymentState: "pending" }, { $set: { subtotalCents: pricing.subtotalCents, serviceFeeCents: pricing.serviceFeeCents, totalCents: pricing.totalCents }, $inc: { version: 1 } }).exec();
+    }
     const session = await createCheckoutSession({
       orderId: String(order._id),
       publicCode: order.publicCode,
       origin: parsed.data.origin,
       customerEmail: parsed.data.customerEmail,
-      items: (order.items || []).map((item: any) => ({ name: item.name, quantity: Number(item.quantity), unitPriceCents: Number(item.unitPriceCents) })),
+      items,
       deliveryFeeCents: Number(order.deliveryFeeCents || 0),
       serviceFeeCents: Number(order.serviceFeeCents || 0),
       preferredPaymentMethod: "stripe",
@@ -2506,66 +1545,71 @@ app.post("/api/v1/payments/checkout", rateLimit(20, 60_000, "payments-checkout")
   }
 });
 
-
+app.post("/api/v1/admin/orders/cleanup-test-data", requireOwner(), async (_req, res) => {
+  const testOrders = await Order.find({ isTestOrder: true }).sort({ createdAt: -1 }).select("_id publicCode").lean().exec() as any[];
+  const keep = testOrders[0] || null;
+  const removeIds = testOrders.slice(1).map((order) => order._id);
+  if (removeIds.length) {
+    await Rider.updateMany({ activeOrderId: { $in: removeIds } }, { $set: { activeOrderId: null, status: "available" } }).exec();
+    await DispatchDecision.deleteMany({ orderId: { $in: removeIds } }).exec();
+    await Order.deleteMany({ _id: { $in: removeIds } }).exec();
+  }
+  return res.json({ deletedTestOrders: removeIds.length, keptTestOrder: keep ? { id: keep._id, publicCode: keep.publicCode } : null, productionOrdersPreserved: true });
+});
 const supportTicketInput = z.object({ orderRef: z.string().trim().max(120).optional(), reporterEmail: z.string().email().optional(), category: z.enum(["order", "rider", "partner", "account", "technical", "billing", "finance", "other"]).default("order"), priority: z.enum(["low", "normal", "high", "urgent"]).default("normal"), subject: z.string().trim().min(3).max(180), description: z.string().trim().min(3).max(4000) });
 const supportMessageInput = z.object({ body: z.string().trim().min(1).max(2000) });
 const supportStatusInput = z.object({ status: z.enum(["open", "in_progress", "waiting", "resolved", "closed"]) });
 const supportCancelInput = z.object({ reason: z.string().trim().min(10).max(500), ticketId: z.string().optional() });
-const supportReassignInput = z.object({ reason: z.string().trim().min(10).max(500), ticketId: z.string().optional() });
 function supportOrderFilter(ref: string): Record<string, unknown> { const id = objectId(ref); return id ? { _id: id } : { $or: [{ publicCode: ref }, { displayCode: ref }] }; }
 async function enrichSupportTickets(tickets: any[]) {
   const orderIds = tickets.map((ticket) => ticket.orderId?._id || ticket.orderId).filter((id) => id && mongoose.isValidObjectId(id));
   if (!orderIds.length) return tickets;
-  const orders = await Order.find({ _id: { $in: orderIds } }).select("_id publicCode displayCode status paymentState paymentMethod customerId customerPhone riderId restaurantId items deliveryAddress deliveryNote deliveryLocation subtotalCents deliveryFeeCents serviceFeeCents totalCents createdAt updatedAt statusHistory assignmentState assignedAt deliveredAt cancelledAt").select("+customerPhone").populate("riderId", "name riderCode email phone").populate("restaurantId", "name address phone email").lean().exec() as any[];
+  const orders = await Order.find({ _id: { $in: orderIds } }).select("_id publicCode displayCode status paymentState paymentMethod customerId customerPhone riderId restaurantId items deliveryAddress deliveryLocation subtotalCents deliveryFeeCents serviceFeeCents totalCents createdAt updatedAt statusHistory assignmentState assignedAt deliveredAt cancelledAt").select("+customerPhone").populate("riderId", "name riderCode email phone").populate("restaurantId", "name address phone email").lean().exec() as any[];
   const customerIds = orders.map((order) => order.customerId).filter((id) => mongoose.isValidObjectId(String(id))).map((id) => new mongoose.Types.ObjectId(String(id)));
   const customers = customerIds.length ? await CustomerAccount.find({ _id: { $in: customerIds } }).select("name email deliveryAddress").lean().exec() as any[] : [];
   const customerMap = new Map(customers.map((customer) => [String(customer._id), customer]));
-  const orderMap = new Map(orders.map((order) => { const linkedCustomer = order.customerId ? customerMap.get(String(order.customerId)) : null; const customerName = String(linkedCustomer?.name || order.customerName || "").trim(); return [String(order._id), { ...order, customer: customerName ? { name: customerName, email: linkedCustomer?.email || "" } : null, customerPhone: order.customerPhone || null }]; }));
+  const orderMap = new Map(orders.map((order) => [String(order._id), { ...order, customer: order.customerId ? customerMap.get(String(order.customerId)) || null : null, customerPhone: order.customerPhone || null }]));
   return tickets.map((ticket) => { const orderId = ticket.orderId?._id || ticket.orderId; const order = orderMap.get(String(orderId)); return order ? { ...ticket, orderId: order } : ticket; });
 }
 const supportRoles = ["admin", "partner", "rider", "fleet", "commercial", "gerente_comercial_zona", "support"] as const;
-// A person may hold an Admin account while operating from the separate PIKI Support surface.
-// This grants the Support workflow only; the Admin UI no longer exposes the inbox.
-const supportOperatorRoles = ["support", "admin"] as const;
-const supportInboxRoles = ["support", "admin", "finance"] as const;
 const financeTicketCategories = ["billing", "finance"] as const;
 const isFinanceTicketCategory = (category: string) => financeTicketCategories.includes(category as typeof financeTicketCategories[number]);
 const ticketRoleScope = (req: express.Request): Record<string, unknown> => req.auth?.role === "finance" ? { category: { $in: financeTicketCategories } } : req.auth?.role === "support" ? { category: { $nin: financeTicketCategories } } : {};
 app.post("/api/v1/support/tickets", requireRole(...supportRoles), async (req, res) => {
   const parsed = supportTicketInput.safeParse(req.body); if (!parsed.success) return res.status(400).json({ error: "INVALID_SUPPORT_TICKET", details: parsed.error.flatten() });
   if (req.auth?.role === "support" && isFinanceTicketCategory(parsed.data.category)) return res.status(403).json({ error: "SUPPORT_TICKET_CATEGORY_RESTRICTED" });
-  const order = parsed.data.orderRef ? await Order.findOne({ ...supportTenantScope(req), ...supportOrderFilter(parsed.data.orderRef) }).select("_id").lean().exec() as any : null;
+  const order = parsed.data.orderRef ? await Order.findOne({ ...tenantScope(req), ...supportOrderFilter(parsed.data.orderRef) }).select("_id").lean().exec() as any : null;
   if (parsed.data.orderRef && !order) return res.status(404).json({ error: "ORDER_NOT_FOUND" });
   const actorEmployeeId = objectId(String(req.auth?.employeeId || ""));
   const sourceSurface = String(req.header("x-piki-surface") || "admin").toLowerCase();
-  const ticket = await SupportTicket.create({ ...parsed.data, reporterEmail: parsed.data.reporterEmail || "", sourceSurface, sourceRole: req.auth?.role || "", orderId: order?._id || null, orderReference: order?.publicCode || parsed.data.orderRef || "", ticketNumber: `SUP-${new Date().toISOString().slice(0, 10).replace(/-/g, "")}-${randomInt(1000, 9999)}`, createdBy: actorEmployeeId, actions: [{ action: "ticket_created", actorEmployeeId, metadata: { orderRef: order?.publicCode || parsed.data.orderRef || null, sourceSurface, sourceRole: req.auth?.role || null } }] });
+  const ticket = await SupportTicket.create({ ...parsed.data, reporterEmail: parsed.data.reporterEmail || "", sourceSurface, sourceRole: req.auth?.role || "", orderId: order?._id || null, ticketNumber: `SUP-${new Date().toISOString().slice(0, 10).replace(/-/g, "")}-${randomInt(1000, 9999)}`, createdBy: actorEmployeeId, actions: [{ action: "ticket_created", actorEmployeeId, metadata: { orderRef: parsed.data.orderRef || null, sourceSurface, sourceRole: req.auth?.role || null } }] });
   return res.status(201).json({ ticket });
 });
 app.get("/api/v1/support/tickets/mine", requireRole(...supportRoles), async (req, res) => {
-  const tickets = await SupportTicket.find({ ...supportTenantScope(req), ...ticketRoleScope(req), $or: [{ createdBy: objectId(String(req.auth?.employeeId || "")) }, { reporterEmail: String(req.query.email || "").toLowerCase() }] }).sort({ updatedAt: -1 }).limit(100).lean().exec();
+  const tickets = await SupportTicket.find({ ...tenantScope(req), ...ticketRoleScope(req), $or: [{ createdBy: objectId(String(req.auth?.employeeId || "")) }, { reporterEmail: String(req.query.email || "").toLowerCase() }] }).sort({ updatedAt: -1 }).limit(100).lean().exec();
   return res.json({ tickets });
 });
-app.get("/api/v1/admin/support/orders/search", requireRole(...supportOperatorRoles), async (req, res) => {
+app.get("/api/v1/admin/support/orders/search", requireRole("admin", "support"), async (req, res) => {
   const q = typeof req.query.q === "string" ? req.query.q.trim() : "";
   if (q.length < 2) return res.json({ orders: [] });
-  const orders = await Order.find({ ...supportTenantScope(req), ...supportOrderFilter(q) }).sort({ createdAt: -1 }).limit(25).select("_id publicCode displayCode status paymentState paymentMethod riderId restaurantId customerId totalCents createdAt statusHistory").populate("riderId", "name riderCode email").populate("restaurantId", "name").lean().exec();
+  const orders = await Order.find({ ...tenantScope(req), ...supportOrderFilter(q) }).sort({ createdAt: -1 }).limit(25).select("_id publicCode displayCode status paymentState paymentMethod riderId restaurantId customerId totalCents createdAt statusHistory").populate("riderId", "name riderCode email").populate("restaurantId", "name").lean().exec();
   return res.json({ orders });
 });
-app.get("/api/v1/admin/support/tickets", requireRole(...supportInboxRoles), async (req, res) => {
-  const filter: Record<string, unknown> = { ...supportTenantScope(req), ...ticketRoleScope(req) };
+app.get("/api/v1/admin/support/tickets", requireRole("admin", "support", "finance"), async (req, res) => {
+  const filter: Record<string, unknown> = { ...tenantScope(req), ...ticketRoleScope(req) };
   if (typeof req.query.status === "string" && req.query.status !== "all") filter.status = req.query.status;
   if (typeof req.query.q === "string" && req.query.q.trim()) { const q = req.query.q.trim(); filter.$or = [{ ticketNumber: q }, { reporterEmail: { $regex: q, $options: "i" } }, { subject: { $regex: q, $options: "i" } }]; }
   const tickets = await SupportTicket.find(filter).sort({ updatedAt: -1 }).limit(500).populate("assignedTo", "name email").lean().exec();
   return res.json({ tickets: await enrichSupportTickets(tickets) });
 });
-app.post("/api/v1/admin/support/tickets", requireRole(...supportInboxRoles), async (req, res) => {
+app.post("/api/v1/admin/support/tickets", requireRole("admin", "support", "finance"), async (req, res) => {
   const parsed = supportTicketInput.safeParse(req.body); if (!parsed.success) return res.status(400).json({ error: "INVALID_SUPPORT_TICKET", details: parsed.error.flatten() });
   if (req.auth?.role === "finance" && !isFinanceTicketCategory(parsed.data.category)) return res.status(403).json({ error: "FINANCE_TICKET_CATEGORY_REQUIRED" });
   if (req.auth?.role === "support" && isFinanceTicketCategory(parsed.data.category)) return res.status(403).json({ error: "SUPPORT_TICKET_CATEGORY_RESTRICTED" });
-  const order = parsed.data.orderRef ? await Order.findOne({ ...supportTenantScope(req), ...supportOrderFilter(parsed.data.orderRef) }).select("_id").lean().exec() as any : null;
+  const order = parsed.data.orderRef ? await Order.findOne({ ...tenantScope(req), ...supportOrderFilter(parsed.data.orderRef) }).select("_id").lean().exec() as any : null;
   if (parsed.data.orderRef && !order) return res.status(404).json({ error: "ORDER_NOT_FOUND" });
   const actorEmployeeId = objectId(String(req.auth?.employeeId || ""));
-  const ticket = await SupportTicket.create({ ...parsed.data, sourceSurface: "support", sourceRole: req.auth?.role || "support", orderId: order?._id || null, orderReference: order?.publicCode || parsed.data.orderRef || "", ticketNumber: `SUP-${new Date().toISOString().slice(0, 10).replace(/-/g, "")}-${randomInt(1000, 9999)}`, createdBy: actorEmployeeId, actions: [{ action: "ticket_created", actorEmployeeId, metadata: { orderRef: order?.publicCode || parsed.data.orderRef || null, sourceSurface: "support" } }] });
+  const ticket = await SupportTicket.create({ ...parsed.data, orderId: order?._id || null, ticketNumber: `SUP-${new Date().toISOString().slice(0, 10).replace(/-/g, "")}-${randomInt(1000, 9999)}`, createdBy: actorEmployeeId, actions: [{ action: "ticket_created", actorEmployeeId, metadata: { orderRef: parsed.data.orderRef || null } }] });
   return res.status(201).json({ ticket });
 });
 async function supportAgent(req: express.Request) {
@@ -2576,175 +1620,105 @@ async function riderForSupportTicket(ticket: any) {
   const rider = ticket.reporterEmail ? await Rider.findOne({ email: ticket.reporterEmail }).select("_id").lean().exec() as any : null;
   return rider ? String(rider._id) : null;
 }
-app.post("/api/v1/admin/support/tickets/:id/messages", requireRole(...supportInboxRoles), async (req, res) => {
+app.post("/api/v1/admin/support/tickets/:id/messages", requireRole("admin", "support", "finance"), async (req, res) => {
   const parsed = supportMessageInput.safeParse(req.body); if (!parsed.success) return res.status(400).json({ error: "INVALID_SUPPORT_MESSAGE" });
   const id = objectId(String(req.params.id)); if (!id) return res.status(400).json({ error: "INVALID_TICKET_ID" });
   const agent = await supportAgent(req); if (!agent) return res.status(403).json({ error: "SUPPORT_AGENT_NOT_FOUND" });
-  const agentDisplayName = String(agent.name || agent.email || "Agente de soporte").trim().slice(0, 160);
-  const current = await SupportTicket.findOne({ _id: id, ...supportTenantScope(req), ...ticketRoleScope(req) }).lean().exec() as any;
+  const agentDisplayName = String(agent.name || agent.email || "Agente de soporte").trim().split(/\s+/).slice(0, 2).join(" ");
+  const current = await SupportTicket.findOne({ _id: id, ...tenantScope(req), ...ticketRoleScope(req) }).lean().exec() as any;
   if (!current) return res.status(404).json({ error: "TICKET_NOT_FOUND" });
   if (["resolved", "closed"].includes(current.status)) return res.status(409).json({ error: "SUPPORT_CHAT_CLOSED" });
   if (current.assignedTo && String(current.assignedTo) !== String(agent._id)) return res.status(409).json({ error: "SUPPORT_TICKET_ASSIGNED", assignedTo: String(current.assignedTo) });
-  const hasSupportReply = Array.isArray(current.messages) && current.messages.some((message: any) => message?.senderRole === "support");
-  const messages = [
-    ...(hasSupportReply ? [] : [{ senderRole: "support", senderEmployeeId: agent._id, senderName: agentDisplayName, body: `¡Hola!\n\nSoy ${agentDisplayName}, la persona que te ayudará hoy.` }]),
-    { senderRole: "support", senderEmployeeId: agent._id, senderName: agentDisplayName, body: parsed.data.body },
-  ];
-  const ticket = await SupportTicket.findOneAndUpdate({ _id: id, ...supportTenantScope(req), ...ticketRoleScope(req), $or: [{ assignedTo: null }, { assignedTo: agent._id }] }, { $push: { messages: { $each: messages } }, $set: { status: "in_progress", assignedTo: agent._id, agentTypingAt: null } }, { new: true }).populate("assignedTo", "name email").lean().exec() as any;
+  const ticket = await SupportTicket.findOneAndUpdate({ _id: id, ...tenantScope(req), ...ticketRoleScope(req), $or: [{ assignedTo: null }, { assignedTo: agent._id }] }, { $push: { messages: { senderRole: "support", senderEmployeeId: agent._id, senderName: agentDisplayName, body: parsed.data.body } }, $set: { status: "in_progress", assignedTo: agent._id, agentTypingAt: null } }, { new: true }).populate("assignedTo", "name email").lean().exec() as any;
   const riderId = await riderForSupportTicket(current);
   if (riderId) void publishRealtimeEvent({ channel: "rider", audienceKey: `rider:${riderId}`, tenantId: current.tenantId, type: "support.message", payload: { ticketId: String(id), status: ticket?.status, senderRole: "support" } });
-  void publishRealtimeEvent({ channel: "admin", audienceKey: tenantAudienceKey(current.tenantId, "admin"), tenantId: current.tenantId, type: "support.message", payload: { ticketId: String(id), status: ticket?.status, senderRole: "support" } }).catch(() => undefined);
   return res.json({ ticket });
 });
-app.patch("/api/v1/admin/support/tickets/:id/status", requireRole(...supportInboxRoles), async (req, res) => {
+app.patch("/api/v1/admin/support/tickets/:id/status", requireRole("admin", "support", "finance"), async (req, res) => {
   const parsed = supportStatusInput.safeParse(req.body); if (!parsed.success) return res.status(400).json({ error: "INVALID_SUPPORT_STATUS" });
   const id = objectId(String(req.params.id)); if (!id) return res.status(400).json({ error: "INVALID_TICKET_ID" });
   const actorEmployeeId = objectId(String(req.auth?.employeeId || ""));
   const agent = await supportAgent(req); if (!agent) return res.status(403).json({ error: "SUPPORT_AGENT_NOT_FOUND" });
-  const current = await SupportTicket.findOne({ _id: id, ...supportTenantScope(req), ...ticketRoleScope(req) }).select("assignedTo category").lean().exec() as any;
+  const current = await SupportTicket.findOne({ _id: id, ...tenantScope(req), ...ticketRoleScope(req) }).select("assignedTo category").lean().exec() as any;
   if (!current) return res.status(404).json({ error: "TICKET_NOT_FOUND" });
   if (current.assignedTo && String(current.assignedTo) !== String(agent._id)) return res.status(409).json({ error: "SUPPORT_TICKET_ASSIGNED", assignedTo: String(current.assignedTo) });
-  const ticket = await SupportTicket.findOneAndUpdate({ _id: id, ...supportTenantScope(req), ...ticketRoleScope(req) }, { $set: { status: parsed.data.status, assignedTo: agent._id, ...(parsed.data.status === "resolved" || parsed.data.status === "closed" ? { resolvedAt: new Date() } : {}) }, $push: { actions: { action: "status_changed", actorEmployeeId, reason: parsed.data.status === "closed" ? `Conversación cerrada por ${String(agent.name || agent.email || "Agente de soporte").trim().split(/\s+/).slice(0, 2).join(" ")}.` : "", metadata: { status: parsed.data.status, agentName: String(agent.name || agent.email || "Agente de soporte").trim().split(/\s+/).slice(0, 2).join(" ") } } } }, { new: true }).populate("assignedTo", "name email").lean().exec();
+  const ticket = await SupportTicket.findOneAndUpdate({ _id: id, ...tenantScope(req), ...ticketRoleScope(req) }, { $set: { status: parsed.data.status, assignedTo: agent._id, ...(parsed.data.status === "resolved" || parsed.data.status === "closed" ? { resolvedAt: new Date() } : {}) }, $push: { actions: { action: "status_changed", actorEmployeeId, reason: parsed.data.status === "closed" ? `Conversación cerrada por ${String(agent.name || agent.email || "Agente de soporte").trim().split(/\s+/).slice(0, 2).join(" ")}.` : "", metadata: { status: parsed.data.status, agentName: String(agent.name || agent.email || "Agente de soporte").trim().split(/\s+/).slice(0, 2).join(" ") } } } }, { new: true }).populate("assignedTo", "name email").lean().exec();
   if (!ticket) return res.status(404).json({ error: "TICKET_NOT_FOUND" });
-  void publishRealtimeEvent({ channel: "admin", audienceKey: tenantAudienceKey((ticket as any).tenantId, "admin"), tenantId: (ticket as any).tenantId, type: "support.ticket_updated", payload: { ticketId: String(id), status: (ticket as any).status, senderRole: "support" } }).catch(() => undefined);
   return res.json({ ticket });
 });
-app.post("/api/v1/admin/support/orders/:id/cancel", requireRole(...supportOperatorRoles), async (req, res) => {
+app.post("/api/v1/admin/support/orders/:id/cancel", requireRole("admin", "support"), async (req, res) => {
   const parsed = supportCancelInput.safeParse(req.body); if (!parsed.success) return res.status(400).json({ error: "INVALID_SUPPORT_CANCELLATION", details: parsed.error.flatten() });
   const orderId = objectId(String(req.params.id)); if (!orderId) return res.status(400).json({ error: "INVALID_ORDER_ID" });
-  const order = await Order.findOne({ _id: orderId, ...supportTenantScope(req) }).lean().exec() as any;
+  const order = await Order.findOne({ _id: orderId, ...tenantScope(req) }).lean().exec() as any;
   if (!order) return res.status(404).json({ error: "ORDER_NOT_FOUND" });
   if (["delivered", "cancelled"].includes(order.status)) return res.status(409).json({ error: "ORDER_ALREADY_CLOSED", status: order.status });
   const updated = await Order.findOneAndUpdate({ _id: orderId, status: order.status, version: order.version }, { $set: { status: "cancelled", cancelledAt: new Date() }, $inc: { version: 1 }, $push: { statusHistory: { status: "cancelled", actorRole: "admin", reason: parsed.data.reason } } }, { new: true }).lean().exec();
   if (!updated) return res.status(409).json({ error: "ORDER_CHANGED_RETRY" });
   await releaseRiderOrderSlot(orderId, order.riderId);
   const actorEmployeeId = objectId(String(req.auth?.employeeId || ""));
-  if (parsed.data.ticketId) await SupportTicket.updateOne({ _id: objectId(parsed.data.ticketId), ...supportTenantScope(req) }, { $push: { actions: { action: "order_cancelled", actorEmployeeId, reason: parsed.data.reason, metadata: { orderId: String(orderId) } } } }).exec();
+  if (parsed.data.ticketId) await SupportTicket.updateOne({ _id: objectId(parsed.data.ticketId), ...tenantScope(req) }, { $push: { actions: { action: "order_cancelled", actorEmployeeId, reason: parsed.data.reason, metadata: { orderId: String(orderId) } } } }).exec();
   scheduleCustomerOrderPush(updated, "cancelled");
   return res.json({ order: updated, audit: { action: "order_cancelled", reason: parsed.data.reason } });
 });
-app.post("/api/v1/admin/support/orders/:id/reassign", requireRole(...supportOperatorRoles), async (req, res) => {
-  const parsed = supportReassignInput.safeParse(req.body); if (!parsed.success) return res.status(400).json({ error: "INVALID_SUPPORT_REASSIGNMENT", details: parsed.error.flatten() });
-  const orderId = objectId(String(req.params.id)); if (!orderId) return res.status(400).json({ error: "INVALID_ORDER_ID" });
-  const order = await Order.findOne({ _id: orderId, ...supportTenantScope(req) }).lean().exec() as any;
-  if (!order) return res.status(404).json({ error: "ORDER_NOT_FOUND" });
-  if (!order.riderId || !["offered", "assigned"].includes(order.assignmentState)) return res.status(409).json({ error: "ORDER_NOT_ASSIGNED", assignmentState: order.assignmentState });
-  if (!["pending", "accepted", "preparing", "ready_for_pickup"].includes(order.status) || order.riderArrivedAt) {
-    return res.status(409).json({ error: "SUPPORT_REASSIGNMENT_NOT_ALLOWED", message: "La reasignación solo puede hacerse antes de que el Rider llegue al establecimiento." });
-  }
-  const previousRiderId = order.riderId as mongoose.Types.ObjectId;
-  const released = await Order.findOneAndUpdate(
-    { _id: orderId, ...supportTenantScope(req), riderId: previousRiderId, assignmentState: order.assignmentState, version: order.version },
-    {
-      $set: { riderId: null, assignmentState: "expired", offerId: null, assignmentExpiresAt: null, pickupDeadlineAt: null },
-      $inc: { dispatchAttempts: 1, version: 1 },
-      $push: { statusHistory: { status: order.status, actorRole: "support", reason: parsed.data.reason } },
-    },
-    { new: false },
-  ).lean().exec() as any;
-  if (!released?.riderId) return res.status(409).json({ error: "ORDER_CHANGED_RETRY" });
-  await releaseRiderOrderSlot(orderId, previousRiderId);
-  await DispatchDecision.updateMany({ orderId, riderId: previousRiderId, outcome: { $in: ["accepted", "offered"] } }, { $set: { outcome: "expired", actorRole: "support" } }).exec();
-  const actorEmployeeId = objectId(String(req.auth?.employeeId || ""));
-  if (parsed.data.ticketId) await SupportTicket.updateOne({ _id: objectId(parsed.data.ticketId), ...supportTenantScope(req) }, { $push: { actions: { action: "order_reassigned", actorEmployeeId, reason: parsed.data.reason, metadata: { orderId: String(orderId), previousRiderId: String(previousRiderId), qaScenario: Boolean(order.isTestOrder) } } } }).exec();
-  await publishOrderStatusEvents(released, released.status);
-  // A QA order must never fall back to the live candidate pool. Reuse only its
-  // dedicated test rider, preserving the non-commercial boundary of this scenario.
-  const preferredQaRiderId = order.isTestOrder && order.qaRiderId ? objectId(String(order.qaRiderId)) || undefined : undefined;
-  const assignment = await enqueueOrderForDispatch(orderId, preferredQaRiderId, "support_reassign");
-  return res.json({ assignment, audit: { action: "order_reassigned", reason: parsed.data.reason, previousRiderId: String(previousRiderId), qaScenario: Boolean(order.isTestOrder) } });
-});
-
-function riderSupportTicketFilter(req: express.Request, riderId: mongoose.Types.ObjectId, reporterEmail: string, ticketId?: mongoose.Types.ObjectId) {
-  const scope = tenantScope(req);
-  if (req.auth?.tenantId && !("tenantId" in scope)) return { _id: null };
-  if (scope.tenantId) return buildRiderSupportTicketFilter({ tenantId: scope.tenantId, riderId: String(riderId), reporterEmail, ticketId });
-  return { ...scope, ...(ticketId ? { _id: ticketId } : {}), reporterEmail };
-}
-
-async function findOrRepairRiderSupportTicket(req: express.Request, riderId: mongoose.Types.ObjectId, rider: any, ticketId: mongoose.Types.ObjectId) {
-  const current = await SupportTicket.findOne(riderSupportTicketFilter(req, riderId, rider.email, ticketId)).lean().exec() as any;
-  if (!current || current.tenantId || !rider.tenantId) return { ticket: current, repaired: false };
-  const repaired = await SupportTicket.findOneAndUpdate(
-    buildLegacyRiderSupportTicketFilter({ riderId: String(riderId), reporterEmail: rider.email, ticketId }),
-    { $set: { tenantId: rider.tenantId } },
-    { new: true },
-  ).lean().exec() as any;
-  return { ticket: repaired, repaired: Boolean(repaired) };
-}
-
 app.post("/api/v1/riders/:id/support/tickets", requireRole("rider"), async (req, res) => {
   const parsed = z.object({ subject: z.string().trim().min(3).max(180), description: z.string().trim().min(3).max(4000), priority: z.enum(["low", "normal", "high", "urgent"]).default("normal"), orderId: z.string().optional() }).safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_RIDER_SUPPORT_TICKET", details: parsed.error.flatten() });
   const riderId = objectId(String(req.params.id)); if (!riderId) return res.status(400).json({ error: "INVALID_RIDER_ID" });
   if (!(await canAccessRiderShift(riderId, req))) return res.status(403).json({ error: "RIDER_ACCESS_DENIED" });
-  const rider = await Rider.findOne({ _id: riderId, ...tenantScope(req) }).select("email name tenantId").lean().exec() as any;
+  const rider = await Rider.findOne({ _id: riderId, ...tenantScope(req) }).select("email name status").lean().exec() as any;
   if (!rider) return res.status(404).json({ error: "RIDER_NOT_FOUND" });
-  let orderId: mongoose.Types.ObjectId | null = null;
-  if (parsed.data.orderId) {
-    orderId = objectId(parsed.data.orderId);
-    if (!orderId || !(await Order.exists({ _id: orderId, riderId, ...tenantScope(req) }))) return res.status(404).json({ error: "RIDER_ORDER_NOT_FOUND" });
-  }
-  const linkedOrder = orderId ? await Order.findById(orderId).select("publicCode").lean().exec() as any : null;
-  const ticket = await SupportTicket.create({ tenantId: (rider as any).tenantId || null, orderId, orderReference: linkedOrder?.publicCode || "", reporterEmail: rider.email, sourceSurface: "rider", sourceRole: "rider", category: "rider", priority: parsed.data.priority, subject: parsed.data.subject, description: parsed.data.description, ticketNumber: `SUP-${new Date().toISOString().slice(0, 10).replace(/-/g, "")}-${randomInt(1000, 9999)}`, messages: [{ senderRole: "rider", senderName: rider.name, body: parsed.data.description }, { senderRole: "system", senderName: "PIKI Soporte", body: `Hemos recibido tu incidencia${orderId ? " vinculada al pedido" : ""}. Un agente de Soporte PIKI revisará el caso y te responderá por este chat. Si existe riesgo para tu seguridad, detén el reparto en un lugar seguro y contacta con emergencias.` }], actions: [{ action: "rider_ticket_created", metadata: { riderId: String(riderId) } }] });
-  void publishRealtimeEvent({ channel: "admin", audienceKey: tenantAudienceKey((rider as any).tenantId, "admin"), tenantId: (rider as any).tenantId, type: "support.ticket_created", payload: { ticketId: String(ticket._id), priority: ticket.priority, orderId: orderId ? String(orderId) : null } });
+  const orderId = objectId(parsed.data.orderId || "");
+  if (!orderId) return res.status(409).json({ error: "RIDER_SUPPORT_ACTIVE_ORDER_REQUIRED", message: "Solo puedes solicitar asistencia si estás online y tienes un pedido asignado." });
+  const supportOrder = await Order.findOne({ _id: orderId, riderId, assignmentState: "assigned", status: { $nin: ["delivered", "cancelled"] }, ...tenantScope(req) }).select("_id riderId assignmentState status").lean().exec() as any;
+  if (!canRiderOpenSupportCase({ riderStatus: rider.status, order: supportOrder ? { orderId: String(supportOrder._id), riderId: String(supportOrder.riderId), assignmentState: supportOrder.assignmentState, status: supportOrder.status } : null, requestedOrderId: String(orderId) })) return res.status(409).json({ error: "RIDER_SUPPORT_ACTIVE_ORDER_REQUIRED", message: "Solo puedes solicitar asistencia si estás online y tienes un pedido asignado activo." });
+  const ticket = await SupportTicket.create({ tenantId: (rider as any).tenantId || null, orderId, reporterEmail: rider.email, sourceSurface: "rider", sourceRole: "rider", category: "rider", priority: parsed.data.priority, subject: parsed.data.subject, description: parsed.data.description, ticketNumber: `SUP-${new Date().toISOString().slice(0, 10).replace(/-/g, "")}-${randomInt(1000, 9999)}`, messages: [{ senderRole: "rider", senderName: rider.name, body: parsed.data.description }], actions: [{ action: "rider_ticket_created", metadata: { riderId: String(riderId) } }] });
+  void publishRealtimeEvent({ channel: "admin", audienceKey: tenantAudienceKey((rider as any).tenantId, "admin"), tenantId: (rider as any).tenantId, type: "support.ticket_created", payload: { ticketId: String(ticket._id), ticketNumber: ticket.ticketNumber, riderName: rider.name, priority: ticket.priority, orderId: orderId ? String(orderId) : null }, dedupeKey: `support:created:${String(ticket._id)}` });
   return res.status(201).json({ ticket: { id: ticket._id, ticketNumber: ticket.ticketNumber, status: ticket.status, messages: ticket.messages } });
 });
 app.get("/api/v1/riders/:riderId/support/tickets", requireRole("rider"), async (req, res) => {
   const riderId = objectId(String(req.params.riderId)); if (!riderId || !(await canAccessRiderShift(riderId, req))) return res.status(403).json({ error: "RIDER_ACCESS_DENIED" });
-  const rider = await Rider.findOne({ _id: riderId, ...tenantScope(req) }).select("email tenantId").lean().exec() as any; if (!rider) return res.status(404).json({ error: "RIDER_NOT_FOUND" });
-  const tickets = await SupportTicket.find(riderSupportTicketFilter(req, riderId, rider.email)).sort({ updatedAt: -1 }).limit(50).populate("assignedTo", "name email").lean().exec();
+  const rider = await Rider.findOne({ _id: riderId, ...tenantScope(req) }).select("email").lean().exec() as any; if (!rider) return res.status(404).json({ error: "RIDER_NOT_FOUND" });
+  const tickets = await SupportTicket.find({ ...tenantScope(req), reporterEmail: rider.email }).sort({ updatedAt: -1 }).limit(50).populate("assignedTo", "name email").lean().exec();
   return res.json({ tickets });
 });
-app.post("/api/v1/admin/support/tickets/:id/typing", requireRole(...supportInboxRoles), async (req, res) => {
+app.post("/api/v1/admin/support/tickets/:id/typing", requireRole("admin", "support", "finance"), async (req, res) => {
   const agent = await supportAgent(req); if (!agent) return res.status(403).json({ error: "SUPPORT_AGENT_NOT_FOUND" });
   const active = Boolean(req.body?.active);
   const ticket = await SupportTicket.findOneAndUpdate({ _id: req.params.id, ...tenantScope(req), ...ticketRoleScope(req), $or: [{ assignedTo: null }, { assignedTo: agent._id }] }, { $set: { agentTypingAt: active ? new Date() : null, ...(active ? { assignedTo: agent._id, status: "in_progress" } : {}) } }, { new: true }).lean().exec() as any;
   if (!ticket) return res.status(404).json({ error: "TICKET_NOT_FOUND_OR_ASSIGNED" });
-  void publishRealtimeEvent({ channel: "admin", audienceKey: tenantAudienceKey(ticket.tenantId, "admin"), tenantId: ticket.tenantId, type: "support.typing", payload: { ticketId: String(req.params.id), active, senderRole: "support" } }).catch(() => undefined);
   return res.json({ ok: true, agentTypingAt: ticket.agentTypingAt });
 });
 
 app.post("/api/v1/riders/:riderId/support/tickets/:ticketId/typing", requireRole("rider"), async (req, res) => {
-  const riderId = objectId(String(req.params.riderId)); const ticketId = objectId(String(req.params.ticketId));
-  if (!riderId || !ticketId || !(await canAccessRiderShift(riderId, req))) return res.status(403).json({ error: "RIDER_ACCESS_DENIED" });
-  const rider = await Rider.findOne({ _id: riderId, ...tenantScope(req) }).select("email tenantId").lean().exec() as any; if (!rider) return res.status(404).json({ error: "RIDER_NOT_FOUND" });
-  const { ticket: current, repaired } = await findOrRepairRiderSupportTicket(req, riderId, rider, ticketId); if (!current) return res.status(404).json({ error: "TICKET_NOT_FOUND" });
+  const rider = await Rider.findById(req.params.riderId).lean().exec() as any; if (!rider) return res.status(404).json({ error: "RIDER_NOT_FOUND" });
   const active = Boolean(req.body?.active);
-  const ticket = await SupportTicket.findOneAndUpdate({ ...riderSupportTicketFilter(req, riderId, rider.email, ticketId), status: { $nin: ["resolved", "closed"] } }, { $set: { riderTypingAt: active ? new Date() : null } }, { new: true }).lean().exec() as any;
+  const ticket = await SupportTicket.findOneAndUpdate({ _id: req.params.ticketId, reporterEmail: rider.email, ...tenantScope(req), status: { $nin: ["resolved", "closed"] } }, { $set: { riderTypingAt: active ? new Date() : null } }, { new: true }).lean().exec() as any;
   if (!ticket) return res.status(404).json({ error: "TICKET_NOT_FOUND" });
-  if (repaired) void publishRealtimeEvent({ channel: "admin", audienceKey: tenantAudienceKey(rider.tenantId, "admin"), tenantId: rider.tenantId, type: "support.ticket_created", payload: { ticketId: String(ticket._id), priority: ticket.priority, orderId: ticket.orderId ? String(ticket.orderId) : null } }).catch(() => undefined);
   return res.json({ ok: true, riderTypingAt: ticket.riderTypingAt });
 });
 
 app.post("/api/v1/riders/:riderId/support/tickets/:ticketId/messages", requireRole("rider"), async (req, res) => {
   const parsed = supportMessageInput.safeParse(req.body); if (!parsed.success) return res.status(400).json({ error: "INVALID_SUPPORT_MESSAGE" });
-  const riderId = objectId(String(req.params.riderId)); const ticketId = objectId(String(req.params.ticketId)); if (!riderId || !ticketId || !(await canAccessRiderShift(riderId, req))) return res.status(403).json({ error: "RIDER_ACCESS_DENIED" });
-  const rider = await Rider.findOne({ _id: riderId, ...tenantScope(req) }).select("email name tenantId").lean().exec() as any; if (!rider) return res.status(404).json({ error: "RIDER_NOT_FOUND" });
-  const { ticket: current, repaired } = await findOrRepairRiderSupportTicket(req, riderId, rider, ticketId); if (!current) return res.status(404).json({ error: "TICKET_NOT_FOUND" });
+  const riderId = objectId(String(req.params.riderId)); const ticketId = objectId(String(req.params.ticketId)); if (!riderId || !ticketId) return res.status(400).json({ error: "INVALID_SUPPORT_TICKET_REFERENCE" });
+  const rider = await Rider.findOne({ _id: riderId, ...tenantScope(req) }).select("email name").lean().exec() as any; if (!rider) return res.status(404).json({ error: "RIDER_NOT_FOUND" });
+  const current = await SupportTicket.findOne({ _id: ticketId, reporterEmail: rider.email, ...tenantScope(req) }).lean().exec() as any; if (!current) return res.status(404).json({ error: "TICKET_NOT_FOUND" });
   if (["resolved", "closed"].includes(current.status)) return res.status(409).json({ error: "SUPPORT_CHAT_CLOSED" });
-  const ticket = await SupportTicket.findOneAndUpdate(riderSupportTicketFilter(req, riderId, rider.email, ticketId), { $push: { messages: { senderRole: "rider", senderName: rider.name, body: parsed.data.body } }, $set: { status: current.assignedTo ? "in_progress" : "open", riderTypingAt: null } }, { new: true }).populate("assignedTo", "name email").lean().exec() as any;
-  if (!ticket) return res.status(404).json({ error: "TICKET_NOT_FOUND" });
-  if (repaired) void publishRealtimeEvent({ channel: "admin", audienceKey: tenantAudienceKey(rider.tenantId, "admin"), tenantId: rider.tenantId, type: "support.ticket_created", payload: { ticketId: String(ticket._id), priority: ticket.priority, orderId: ticket.orderId ? String(ticket.orderId) : null } }).catch(() => undefined);
-  void publishRealtimeEvent({ channel: "admin", audienceKey: tenantAudienceKey((rider as any).tenantId, "admin"), tenantId: (rider as any).tenantId, type: "support.message", payload: { ticketId: String(ticketId), status: (ticket as any)?.status, senderRole: "rider" } }).catch(() => undefined);
+  const ticket = await SupportTicket.findOneAndUpdate({ _id: ticketId, reporterEmail: rider.email, ...tenantScope(req) }, { $push: { messages: { senderRole: "rider", senderName: rider.name, body: parsed.data.body } }, $set: { status: current.assignedTo ? "in_progress" : "open", riderTypingAt: null } }, { new: true }).populate("assignedTo", "name email").lean().exec();
+  if (ticket) { const updatedTicket = ticket as any; void publishRealtimeEvent({ channel: "admin", audienceKey: tenantAudienceKey((rider as any).tenantId, "admin"), tenantId: (rider as any).tenantId, type: "support.message_created", payload: { ticketId: String(updatedTicket._id), ticketNumber: updatedTicket.ticketNumber, riderName: rider.name }, dedupeKey: `support:message:${String(updatedTicket._id)}:${String((updatedTicket.messages || []).at(-1)?._id || Date.now())}` }); }
   return res.json({ ticket });
 });
-app.post("/api/v1/admin/orders/cleanup-test-data", requireOwner(), async (_req, res) => {
-  const testOrders = await Order.find({ isTestOrder: true }).select("_id publicCode displayCode").lean().exec() as any[];
-  const orderIds = testOrders.map((order) => order._id);
-  if (!orderIds.length) return res.json({ deleted: false, message: "No quedan pedidos de prueba en producción.", counts: { orders: 0, messages: 0, dispatchDecisions: 0, reservations: 0, supportTickets: 0, cashEntries: 0, realtimeEvents: 0, notifications: 0 } });
-  const orderIdFilter = { orderId: { $in: orderIds } };
-  const [messages, dispatchDecisions, reservations, supportTickets, cashEntries, realtimeEvents, notifications, orders] = await Promise.all([
-    RiderOrderMessage.deleteMany(orderIdFilter).exec(),
-    DispatchDecision.deleteMany(orderIdFilter).exec(),
-    RiderAssignmentReservation.deleteMany(orderIdFilter).exec(),
-    SupportTicket.deleteMany(orderIdFilter).exec(),
-    CashLedgerEntry.deleteMany(orderIdFilter).exec(),
-    RealtimeEvent.deleteMany({ "payload.orderId": { $in: orderIds.map(String) } }).exec(),
-    Notification.deleteMany({ entityType: "order", entityId: { $in: orderIds.map(String) } }).exec(),
-    Order.deleteMany({ _id: { $in: orderIds }, isTestOrder: true }).exec(),
-  ]);
-  return res.json({ deleted: true, orderCodes: testOrders.map((order) => order.displayCode || order.publicCode), counts: { orders: orders.deletedCount, messages: messages.deletedCount, dispatchDecisions: dispatchDecisions.deletedCount, reservations: reservations.deletedCount, supportTickets: supportTickets.deletedCount, cashEntries: cashEntries.deletedCount, realtimeEvents: realtimeEvents.deletedCount, notifications: notifications.deletedCount } });
+app.post("/api/v1/riders/:riderId/support/tickets/:ticketId/rating", requireRole("rider"), async (req, res) => {
+  const parsed = z.object({ rating: z.number().int().min(1).max(5), comment: z.string().trim().max(500).default("") }).safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "INVALID_SUPPORT_RATING", details: parsed.error.flatten() });
+  const riderId = objectId(String(req.params.riderId)); const ticketId = objectId(String(req.params.ticketId)); if (!riderId || !ticketId) return res.status(400).json({ error: "INVALID_SUPPORT_TICKET_REFERENCE" });
+  const rider = await Rider.findOne({ _id: riderId, ...tenantScope(req) }).select("email").lean().exec() as any; if (!rider) return res.status(404).json({ error: "RIDER_NOT_FOUND" });
+  const current = await SupportTicket.findOne({ _id: ticketId, reporterEmail: rider.email, ...tenantScope(req) }).lean().exec() as any;
+  if (!current) return res.status(404).json({ error: "TICKET_NOT_FOUND" });
+  if (current.status !== "resolved") return res.status(409).json({ error: "SUPPORT_TICKET_NOT_READY_FOR_RATING" });
+  if (current.agentRating) return res.status(409).json({ error: "SUPPORT_TICKET_ALREADY_RATED" });
+  const ticket = await SupportTicket.findOneAndUpdate({ _id: ticketId, reporterEmail: rider.email, status: "resolved", agentRating: null }, { $set: { agentRating: parsed.data.rating, agentRatingComment: parsed.data.comment, agentRatedAt: new Date(), closedByRiderAt: new Date(), status: "closed", resolvedAt: current.resolvedAt || new Date() }, $push: { actions: { action: "rider_rated_and_closed", reason: parsed.data.comment, metadata: { rating: parsed.data.rating } } } }, { new: true }).populate("assignedTo", "name email").lean().exec();
+  if (!ticket) return res.status(409).json({ error: "SUPPORT_TICKET_ALREADY_RATED" });
+  return res.json({ ticket, ratingSaved: true, closed: true });
 });
 app.get("/api/v1/orders", requireRole("admin", "partner", "rider", "fleet"), async (req, res) => {
   const filter: Record<string, unknown> = { ...tenantScope(req) };
@@ -2858,30 +1832,27 @@ app.post("/api/v1/orders/:id/transitions", requireRole("admin", "partner", "ride
     if (parsed.data.status === "cancelled") {
       return res.status(403).json({ error: "RIDER_CANCELLATION_NOT_ALLOWED", message: "Los Riders no pueden cancelar pedidos. Deben abrir una incidencia en Soporte PIKI para que Operaciones agote las vías de contacto con el Customer antes de cancelar." });
     }
-    if (parsed.data.status === "picked_up") {
-      return res.status(409).json({ error: "PICKUP_CONFIRMATION_REQUIRED", message: "La recogida debe confirmarse desde el flujo seguro del Rider después de registrar la llegada al Partner." });
-    }
     if (parsed.data.status === "delivered") {
       return res.status(409).json({ error: "DELIVERY_QR_REQUIRED", message: "El Rider debe confirmar la entrega usando el QR o PIN que proporciona el Customer." });
     }
   }
   try { assertTransition(order.status, parsed.data.status, actorRole); } catch (error) { return res.status(409).json({ error: "INVALID_ORDER_TRANSITION", message: error instanceof Error ? error.message : "Transition not allowed" }); }
   if (parsed.data.status === "delivered" && order.paymentMethod === "cash") return res.status(409).json({ error: "DELIVERY_QR_REQUIRED", message: "Un pedido a contrarreembolso debe cerrarse con el QR del Customer para registrar el cobro en efectivo una sola vez." });
-  const update: Record<string, unknown> = { $set: { status: parsed.data.status, ...(actorRole === "partner" && parsed.data.status === "accepted" ? { partnerPrepDeadlineAt: new Date(Date.now() + PARTNER_PREPARATION_LIMIT_MINUTES * 60_000) } : {}), ...(actorRole === "partner" && ["ready_for_pickup", "cancelled"].includes(parsed.data.status) ? { partnerPrepDeadlineAt: null } : {}), ...(actorRole === "rider" && parsed.data.status === "picked_up" && order.assignmentState === "offered" ? { assignmentState: "assigned", assignmentExpiresAt: null, pickupDeadlineAt: null } : {}) }, $inc: { version: 1 }, $push: { statusHistory: { status: parsed.data.status, actorRole, reason: parsed.data.reason || "" } } };
-  if (parsed.data.status === "delivered") update.$set = { status: "delivered", deliveredAt: new Date(), archivedAt: new Date() };
-  if (parsed.data.status === "cancelled") update.$set = { status: "cancelled", cancelledAt: new Date(), archivedAt: new Date() };
+  const update: Record<string, unknown> = { $set: { status: parsed.data.status, ...(actorRole === "rider" && parsed.data.status === "picked_up" && order.assignmentState === "offered" ? { assignmentState: "assigned", assignmentExpiresAt: null } : {}) }, $inc: { version: 1 }, $push: { statusHistory: { status: parsed.data.status, actorRole, reason: parsed.data.reason || "" } } };
+  if (parsed.data.status === "delivered") update.$set = { status: "delivered", deliveredAt: new Date() };
+  if (parsed.data.status === "cancelled") update.$set = { status: "cancelled", cancelledAt: new Date() };
   const updated = await Order.findOneAndUpdate({ _id: id, version: order.version, status: order.status }, update, { new: true }).lean().exec();
   if (!updated) return res.status(409).json({ error: "ORDER_CHANGED_RETRY" });
   if (actorRole === "rider" && parsed.data.status === "picked_up" && order.assignmentState === "offered" && order.riderId) {
     await RiderAssignmentReservation.updateOne({ orderId: order._id, riderId: order.riderId, status: "reserved" }, { $set: { expiresAt: null } }).exec();
   }
   if (["delivered", "cancelled"].includes(parsed.data.status)) await RiderOrderMessage.deleteMany({ orderId: order._id }).exec();
+  if (["delivered", "cancelled"].includes(parsed.data.status) && order.riderId) await Rider.updateOne({ _id: order.riderId }, { $unset: { location: 1, lastLocationAt: 1 }, $set: { activeOrderId: null } }).exec();
   scheduleCustomerOrderPush(updated, parsed.data.status);
   if (["delivered", "cancelled"].includes(parsed.data.status) && order.riderId) {
     await releaseRiderOrderSlot(order._id, order.riderId);
   }
   await publishOrderStatusEvents(updated, parsed.data.status);
-  if (parsed.data.status === "delivered" && order.riderId && !order.isTestOrder) await awardRiderRecruitmentMilestones(new mongoose.Types.ObjectId(String(order.riderId))).catch((error) => console.error("Rider incentive milestone evaluation failed", error instanceof Error ? error.message : error));
   return res.json({ order: updated });
 });
 
@@ -2898,33 +1869,13 @@ async function riderAccessForRequest(riderId: any, req: express.Request) {
     : null;
 }
 
-const riderReferralClaimSchema = z.object({ code: z.string().trim().min(1).max(32) });
-app.get("/api/v1/riders/:id/incentives", requireRole("rider"), async (req, res) => {
-  const riderId = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
-  if (!riderId) return res.status(400).json({ error: "INVALID_RIDER_ID" });
-  const rider = await Rider.findOne({ _id: riderId, ...tenantScope(req) }).lean().exec() as any;
-  if (!rider || !(await riderAccessForRequest(riderId, req))) return res.status(403).json({ error: "RIDER_ACCESS_DENIED" });
-  return res.json(await loadRiderIncentiveSnapshot(rider));
-});
-app.post("/api/v1/riders/:id/referrals/claim", requireRole("rider"), async (req, res) => {
-  const riderId = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
-  if (!riderId) return res.status(400).json({ error: "INVALID_RIDER_ID" });
-  const parsed = riderReferralClaimSchema.safeParse(req.body);
-  if (!parsed.success) return res.status(400).json({ error: "INVALID_REFERRAL_CODE" });
-  const rider = await Rider.findOne({ _id: riderId, ...tenantScope(req) }).lean().exec() as any;
-  if (!rider || !(await riderAccessForRequest(riderId, req))) return res.status(403).json({ error: "RIDER_ACCESS_DENIED" });
-  const result = await claimRiderReferralCode(rider, parsed.data.code);
-  if (!result.ok) return res.status(409).json({ error: result.error });
-  return res.status(201).json({ claimed: true });
-});
-
 const riderMessageSchema = z.object({ body: z.string().trim().min(1).max(500) });
 async function riderOrderAccess(riderIdParam: string, orderIdParam: string, req: express.Request) {
   const riderId = objectId(riderIdParam); const orderId = objectId(orderIdParam);
   if (!riderId || !orderId) return null;
   const rider = await riderAccessForRequest(riderId, req);
   if (!rider) return null;
-  return await Order.findOne({ _id: orderId, riderId, assignmentState: "assigned", status: { $nin: ["delivered", "cancelled"] } }).select("_id riderId customerId tenantId publicCode status").lean().exec() as any;
+  return await Order.findOne({ _id: orderId, riderId, assignmentState: "assigned", status: { $nin: ["delivered", "cancelled"] } }).select("_id riderId status").lean().exec() as any;
 }
 app.get("/api/v1/riders/:riderId/orders/:orderId/messages", requireRole("rider"), async (req, res) => {
   const order = await riderOrderAccess(String(req.params.riderId), String(req.params.orderId), req);
@@ -2938,79 +1889,34 @@ app.post("/api/v1/riders/:riderId/orders/:orderId/messages", requireRole("rider"
   const parsed = riderMessageSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_MESSAGE", details: parsed.error.flatten() });
   const message = await RiderOrderMessage.create({ orderId: order._id, riderId: order.riderId, senderRole: "rider", body: parsed.data.body });
-  await publishRiderCustomerMessageEvent(order, message).catch((error) => console.warn("Rider customer message notification failed", error instanceof Error ? error.message : error));
+  if (order.customerId && mongoose.isValidObjectId(order.customerId)) void publishRealtimeEvent({ channel: "customer", audienceKey: `customer:${String(order.customerId)}`, tenantId: order.tenantId, type: "order.message_created", payload: { orderId: String(order._id), publicCode: order.publicCode } }).catch(() => undefined);
   return res.status(201).json({ message });
 });
-app.post("/api/v1/riders/:riderId/orders/:orderId/accept-offer", requireRole("rider"), async (req, res) => {
-  const riderId = objectId(Array.isArray(req.params.riderId) ? req.params.riderId[0] : req.params.riderId);
-  const orderId = objectId(Array.isArray(req.params.orderId) ? req.params.orderId[0] : req.params.orderId);
-  if (!riderId || !orderId) return res.status(400).json({ error: "INVALID_RIDER_ASSIGNMENT" });
-  if (!(await riderAccessForRequest(riderId, req))) return res.status(403).json({ error: "RIDER_ACCESS_DENIED" });
-  const order = await Order.findOne({ _id: orderId, riderId, assignmentState: "offered" }).lean().exec() as any;
-  if (!order) return res.status(404).json({ error: "RIDER_OFFER_NOT_FOUND" });
-  if (order.assignmentExpiresAt && new Date(order.assignmentExpiresAt).getTime() <= Date.now()) return res.status(409).json({ error: "RIDER_OFFER_EXPIRED", message: "La oferta ha caducado y PIKI ya busca otro rider." });
-  const pickupDeadlineAt = new Date(Date.now() + PICKUP_REASSIGN_AFTER_MS);
-  const updated = await Order.findOneAndUpdate(
-    { _id: orderId, riderId, assignmentState: "offered", version: order.version },
-    { $set: { assignmentState: "assigned", assignmentExpiresAt: null, pickupDeadlineAt, riderArrivedAt: null, riderArrivalDistanceMeters: null }, $inc: { version: 1 }, $push: { statusHistory: { status: order.status, actorRole: "rider", reason: `Rider acepta la oferta; llegada al Partner requerida antes de ${pickupDeadlineAt.toISOString()}.` } } },
-    { new: true },
-  ).lean().exec() as any;
-  if (!updated) return res.status(409).json({ error: "ORDER_CHANGED_RETRY" });
-  await RiderAssignmentReservation.updateOne({ orderId, riderId, status: "reserved" }, { $set: { expiresAt: null } }).exec();
-  await DispatchDecision.updateMany({ orderId, riderId, outcome: "offered" }, { $set: { outcome: "accepted", actorRole: "rider" } }).exec();
-  await publishOrderStatusEvents(updated, updated.status);
-  return res.json({ message: "Pedido aceptado. Llegar al Partner en un máximo de 10 minutos.", pickupDeadlineAt, order: updated });
-});
-
-app.post("/api/v1/riders/:riderId/orders/:orderId/confirm-arrival", requireRole("rider"), async (req, res) => {
-  const riderId = objectId(Array.isArray(req.params.riderId) ? req.params.riderId[0] : req.params.riderId);
-  const orderId = objectId(Array.isArray(req.params.orderId) ? req.params.orderId[0] : req.params.orderId);
-  if (!riderId || !orderId) return res.status(400).json({ error: "INVALID_ARRIVAL_CONFIRMATION" });
-  if (!(await riderAccessForRequest(riderId, req))) return res.status(403).json({ error: "RIDER_ACCESS_DENIED" });
-  const [order, rider] = await Promise.all([
-    Order.findOne({ _id: orderId, riderId, assignmentState: "assigned", status: { $in: ["pending", "accepted", "preparing", "ready_for_pickup"] } }).lean().exec() as Promise<any>,
-    Rider.findById(riderId).select("_id location lastLocationAt").lean().exec() as Promise<any>,
-  ]);
-  if (!order) return res.status(404).json({ error: "ACTIVE_RIDER_ORDER_NOT_FOUND" });
-  if (order.riderArrivedAt) return res.json({ message: "La llegada al Partner ya estaba registrada.", order });
-  if (!rider?.lastLocationAt || new Date(rider.lastLocationAt).getTime() < Date.now() - 90_000) return res.status(409).json({ error: "FRESH_LOCATION_REQUIRED", message: "Actualiza tu GPS antes de confirmar la llegada." });
-  const restaurant = await Restaurant.findById(order.restaurantId).select("_id location").lean().exec() as any;
-  const distanceMeters = pointDistanceMeters(rider.location, restaurant?.location);
-  if (distanceMeters == null) return res.status(409).json({ error: "PARTNER_LOCATION_REQUIRED", message: "No se puede verificar la llegada: falta la ubicación GPS del Partner." });
-  if (distanceMeters > PICKUP_ARRIVAL_RADIUS_METERS) return res.status(409).json({ error: "PARTNER_TOO_FAR", message: `Aún estás a ${Math.round(distanceMeters)} m del Partner. Acércate para confirmar la llegada.`, distanceMeters, arrivalRadiusMeters: PICKUP_ARRIVAL_RADIUS_METERS });
-  const updated = await Order.findOneAndUpdate(
-    { _id: orderId, riderId, assignmentState: "assigned", riderArrivedAt: null, version: order.version },
-    { $set: { riderArrivedAt: new Date(), riderArrivalDistanceMeters: distanceMeters, pickupDeadlineAt: null }, $inc: { version: 1 }, $push: { statusHistory: { status: order.status, actorRole: "rider", reason: `Llegada al Partner verificada por GPS (${Math.round(distanceMeters)} m).` } } },
-    { new: true },
-  ).lean().exec() as any;
-  if (!updated) return res.status(409).json({ error: "ORDER_CHANGED_RETRY" });
-  await publishRiderArrivalEvent(updated, rider, distanceMeters, "rider");
-  await publishOrderStatusEvents(updated, updated.status);
-  return res.json({ message: updated.status === "ready_for_pickup" ? "Llegada verificada. Ya puedes recoger el pedido." : "Llegada verificada. Espera a que el Partner termine la preparación.", order: updated });
-});
-
 app.post("/api/v1/riders/:riderId/orders/:orderId/confirm-pickup", requireRole("rider"), async (req, res) => {
   const riderId = objectId(Array.isArray(req.params.riderId) ? req.params.riderId[0] : req.params.riderId);
   const orderId = objectId(Array.isArray(req.params.orderId) ? req.params.orderId[0] : req.params.orderId);
   if (!riderId || !orderId) return res.status(400).json({ error: "INVALID_PICKUP_CONFIRMATION" });
   const riderAccess = await riderAccessForRequest(riderId, req);
   if (!riderAccess) return res.status(403).json({ error: "RIDER_ACCESS_DENIED" });
-  const order = await Order.findOne({ _id: orderId, riderId, assignmentState: "assigned" }).lean().exec() as any;
+  const order = await Order.findOne({ _id: orderId, riderId, assignmentState: { $in: ["offered", "assigned"] } }).lean().exec() as any;
   if (!order) return res.status(404).json({ error: "ACTIVE_RIDER_ORDER_NOT_FOUND" });
-  if (!order.riderArrivedAt) return res.status(409).json({ error: "PARTNER_ARRIVAL_REQUIRED", message: "Confirma primero tu llegada al Partner con GPS." });
-  if (order.status !== "ready_for_pickup") return res.status(409).json({ error: "PARTNER_NOT_READY", message: "El Partner todavía no ha marcado el pedido como listo para recoger." });
+  try {
+    assertTransition(order.status, "picked_up", "rider");
+  } catch {
+    return res.status(409).json({ error: "INVALID_PICKUP_STATUS", message: "Este pedido ya no puede confirmarse como recogido." });
+  }
   const pickupCode = String(req.body?.pickupQr || req.body?.pickupPin || "").trim();
-  if (!pickupCode) return res.status(422).json({ error: "PICKUP_QR_REQUIRED", message: "Escanea el QR o introduce el PIN que proporciona el Partner antes de confirmar la recogida." });
-  if (!pickupQrIsValid(order.publicCode, pickupCode)) return res.status(422).json({ error: "PICKUP_QR_INVALID", message: "El QR o PIN de recogida no es válido." });
+  if (pickupCode && !pickupQrIsValid(order.publicCode, pickupCode)) return res.status(422).json({ error: "PICKUP_QR_INVALID", message: "El QR o PIN de recogida no es válido." });
   const updated = await Order.findOneAndUpdate(
-    { _id: orderId, riderId, assignmentState: "assigned", riderArrivedAt: { $ne: null }, status: "ready_for_pickup", version: order.version },
-    { $set: { status: "picked_up", pickupDeadlineAt: null }, $inc: { version: 1 }, $push: { statusHistory: { status: "picked_up", actorRole: "rider", reason: "Recogida confirmada por Rider con QR/PIN" } } },
+    { _id: orderId, riderId, assignmentState: { $in: ["offered", "assigned"] }, status: order.status, version: order.version },
+    { $set: { status: "picked_up", assignmentState: "assigned", assignmentExpiresAt: null }, $inc: { version: 1 }, $push: { statusHistory: { status: "picked_up", actorRole: "rider", reason: pickupCode ? "Recogida confirmada por Rider con QR/PIN" : order.status === "ready_for_pickup" ? "Recogida confirmada por Rider" : "Recogida confirmada antes de que Partner marcara el pedido como listo" } } },
     { new: true },
-  ).lean().exec() as any;
+  ).lean().exec();
   if (!updated) return res.status(409).json({ error: "ORDER_CHANGED_RETRY" });
+  if (order.assignmentState === "offered") await RiderAssignmentReservation.updateOne({ orderId: order._id, riderId, status: "reserved" }, { $set: { expiresAt: null } }).exec();
   scheduleCustomerOrderPush(updated, "picked_up");
   await publishOrderStatusEvents(updated, "picked_up");
-  return res.json({ message: "Recogida confirmada. Ya puedes iniciar la ruta hacia el cliente.", order: updated });
+  return res.json({ message: order.status === "ready_for_pickup" ? "Recogida confirmada. Ya puedes iniciar la ruta hacia el cliente." : "Recogida confirmada aunque el Partner todavía no haya marcado el pedido como listo.", order: updated });
 });
 app.post("/api/v1/riders/:riderId/orders/:orderId/confirm-delivery", requireRole("rider"), async (req, res) => {
   const riderId = objectId(Array.isArray(req.params.riderId) ? req.params.riderId[0] : req.params.riderId);
@@ -3022,27 +1928,18 @@ app.post("/api/v1/riders/:riderId/orders/:orderId/confirm-delivery", requireRole
   if (!order) return res.status(404).json({ error: "ASSIGNED_ORDER_NOT_FOUND" });
   if (order.status !== "on_the_way") return res.status(409).json({ error: "ORDER_NOT_ON_THE_WAY", message: "Primero confirma que has recogido el pedido e iniciado la ruta." });
   if (!deliveryQrIsValid(order.publicCode, req.body?.deliveryQr)) return res.status(422).json({ error: "DELIVERY_QR_INVALID", message: "Escanea el QR o introduce el PIN que proporciona el Customer antes de confirmar la entrega." });
-  if (order.paymentMethod === "stripe") {
-    if (!order.stripePaymentIntentId || order.paymentState !== "authorized") return res.status(409).json({ error: "PAYMENT_NOT_AUTHORIZED", message: "El pago online todavía no está autorizado para capturarse." });
-    try { await captureStripePaymentIntent(order.stripePaymentIntentId); }
-    catch (error) { return res.status(409).json({ error: "PAYMENT_CAPTURE_FAILED", message: error instanceof Error ? error.message : "No se pudo capturar el pago." }); }
-  }
   if (order.paymentMethod === "cash") {
     const cashEntry = await recordCashCollection(order, riderId, "rider");
     if (cashEntry) await publishCashWalletEvent({ riderId, amountCents: Number(order.totalCents || 0), type: "cash.wallet_changed", reference: String(order.publicCode || "") });
   }
-  // Stripe may emit payment_intent.succeeded between capture() and this write.
-  // Webhooks are payment-only, but they still increment version; do not reject
-  // a successfully captured delivery merely because that benign event won the
-  // version race. Status/rider/assignment predicates remain the concurrency
-  // guard, and Stripe orders must be authorized or already marked paid.
-  const updated = await Order.findOneAndUpdate({ _id: orderId, riderId, assignmentState: "assigned", status: "on_the_way", ...(order.paymentMethod === "stripe" ? { paymentState: { $in: ["authorized", "paid"] } } : {}) }, { $set: { status: "delivered", deliveredAt: new Date(), archivedAt: new Date(), ...(order.paymentMethod === "stripe" ? { paymentState: "paid" } : {}) }, $inc: { version: 1 }, $push: { statusHistory: { status: "delivered", actorRole: "rider", reason: order.paymentMethod === "cash" ? "Entrega confirmada y cobro en efectivo registrado" : "Entrega confirmada por el Rider" } } }, { new: true }).lean().exec();
+  const updated = await Order.findOneAndUpdate({ _id: orderId, riderId, status: "on_the_way", version: order.version }, { $set: { status: "delivered", deliveredAt: new Date() }, $inc: { version: 1 }, $push: { statusHistory: { status: "delivered", actorRole: "rider", reason: order.paymentMethod === "cash" ? "Entrega confirmada y cobro en efectivo registrado" : "Entrega confirmada por el Rider" } } }, { new: true }).lean().exec();
   if (!updated) return res.status(409).json({ error: "ORDER_CHANGED_RETRY" });
   const deliveredOrder = updated as any;
   await RiderOrderMessage.deleteMany({ orderId, riderId }).exec();
+  await Rider.updateOne({ _id: riderId }, { $unset: { location: 1, lastLocationAt: 1 }, $set: { activeOrderId: null } }).exec();
   await releaseRiderOrderSlot(orderId, riderId);
-  if (!order.isTestOrder) await awardRiderRecruitmentMilestones(riderId).catch((error) => console.error("Rider referral milestone evaluation failed", error instanceof Error ? error.message : error));
   scheduleCustomerOrderPush(deliveredOrder, "delivered");
+  await publishOrderStatusEvents(deliveredOrder, "delivered");
   return res.json({ message: order.paymentMethod === "cash" ? "Entrega confirmada y efectivo registrado en cartera." : "Entrega confirmada.", chatPurged: true, order: { id: deliveredOrder._id, publicCode: deliveredOrder.publicCode, status: deliveredOrder.status, deliveredAt: deliveredOrder.deliveredAt, paymentMethod: deliveredOrder.paymentMethod, cashCollected: Boolean(deliveredOrder.cashCollectedAt) } });
 });
 
@@ -3078,73 +1975,6 @@ app.get("/api/v1/ops/cash-wallets", requireRole("admin", "fleet", "finance"), as
   return res.json({ wallets: rows.map((row: any) => ({ riderId: String(row._id), rider: names.get(String(row._id)) || null, collectedCents: Number(row.collectedCents || 0), handedOverCents: Number(row.handedOverCents || 0), availableCents: Number(row.collectedCents || 0) - Number(row.handedOverCents || 0), entries: Number(row.entries || 0) })) });
 });
 
-app.post("/api/v1/riders/:id/tracking/sessions", requireRole("admin", "rider", "fleet"), async (req, res) => {
-  const riderId = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
-  if (!riderId) return res.status(400).json({ error: "INVALID_RIDER_ID" });
-  if (req.auth?.role === "rider" && !(await riderAccessForRequest(riderId, req))) return res.status(403).json({ error: "RIDER_ACCESS_DENIED" });
-  if (req.auth?.role === "fleet" && !(await fleetCanAccessRider(req, riderId))) return res.status(403).json({ error: "FLEET_RIDER_ACCESS_DENIED" });
-  const parsed = trackingSessionCreateSchema.safeParse(req.body);
-  if (!parsed.success) return res.status(400).json({ error: "INVALID_TRACKING_SESSION", details: parsed.error.flatten() });
-  const current = await TrackingSession.findOne({ riderId, status: "active" }).sort({ startedAt: -1 }).lean().exec() as any;
-  if (current) return res.status(200).json({ session: current, reused: true });
-  const currentSlot = (await findCurrentRiderSlot(riderId)).slot as any;
-  const session = await TrackingSession.create({ riderId, tenantId: req.auth?.tenantId ? objectId(req.auth.tenantId) : null, shiftId: parsed.data.shiftId ? objectId(parsed.data.shiftId) : currentSlot?._id || null, platform: parsed.data.platform, appVersion: parsed.data.appVersion, consentVersion: parsed.data.consentVersion, status: "active" });
-  return res.status(201).json({ session: session.toObject(), reused: false });
-});
-
-app.patch("/api/v1/riders/:id/tracking/sessions/:sessionId/stop", requireRole("admin", "rider", "fleet"), async (req, res) => {
-  const riderId = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
-  const sessionId = objectId(Array.isArray(req.params.sessionId) ? req.params.sessionId[0] : req.params.sessionId);
-  if (!riderId || !sessionId) return res.status(400).json({ error: "INVALID_TRACKING_SESSION" });
-  if (req.auth?.role === "rider" && !(await riderAccessForRequest(riderId, req))) return res.status(403).json({ error: "RIDER_ACCESS_DENIED" });
-  if (req.auth?.role === "fleet" && !(await fleetCanAccessRider(req, riderId))) return res.status(403).json({ error: "FLEET_RIDER_ACCESS_DENIED" });
-  const session = await TrackingSession.findOneAndUpdate({ _id: sessionId, riderId, status: { $in: ["active", "degraded"] } }, { $set: { status: "stopped", stoppedAt: new Date() } }, { new: true }).lean().exec();
-  if (!session) return res.status(404).json({ error: "TRACKING_SESSION_NOT_FOUND" });
-  return res.json({ session });
-});
-
-app.get("/api/v1/riders/:id/tracking/health", requireRole("admin", "rider", "fleet"), async (req, res) => {
-  const riderId = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
-  if (!riderId) return res.status(400).json({ error: "INVALID_RIDER_ID" });
-  if (req.auth?.role === "rider" && !(await riderAccessForRequest(riderId, req))) return res.status(403).json({ error: "RIDER_ACCESS_DENIED" });
-  const session = await TrackingSession.findOne({ riderId, status: { $in: ["active", "degraded"] } }).sort({ startedAt: -1 }).lean().exec() as any;
-  const rider = await Rider.findById(riderId).select("lastLocationAt status").lean().exec() as any;
-  const ageSeconds = rider?.lastLocationAt ? Math.max(0, Math.round((Date.now() - new Date(rider.lastLocationAt).getTime()) / 1000)) : null;
-  return res.json({ healthy: Boolean(session && ageSeconds !== null && ageSeconds <= 90), session, rider: { status: rider?.status || null, lastLocationAt: rider?.lastLocationAt || null, ageSeconds } });
-});
-
-app.post("/api/v1/riders/:id/location/batch", requireRole("admin", "rider", "fleet"), async (req, res) => {
-  const riderId = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
-  if (!riderId) return res.status(400).json({ error: "INVALID_RIDER_ID" });
-  if (req.auth?.role === "rider" && !(await riderAccessForRequest(riderId, req))) return res.status(403).json({ error: "RIDER_ACCESS_DENIED" });
-  if (req.auth?.role === "fleet" && !(await fleetCanAccessRider(req, riderId))) return res.status(403).json({ error: "FLEET_RIDER_ACCESS_DENIED" });
-  const parsed = trackingBatchSchema.safeParse(req.body);
-  if (!parsed.success) return res.status(400).json({ error: "INVALID_LOCATION_BATCH", details: parsed.error.flatten() });
-  const session = await TrackingSession.findOne({ _id: objectId(parsed.data.sessionId), riderId, status: { $in: ["active", "degraded"] } }).lean().exec() as any;
-  if (!session) return res.status(409).json({ error: "TRACKING_SESSION_NOT_ACTIVE" });
-  const accepted: string[] = []; const duplicates: string[] = []; const rejected: string[] = [];
-  const sorted = [...parsed.data.samples].sort((a, b) => a.recordedAt.getTime() - b.recordedAt.getTime());
-  for (const sample of sorted) {
-    if (sample.recordedAt.getTime() > Date.now() + 60_000) { rejected.push(sample.sampleId); continue; }
-    try {
-      await LocationSample.create({ sampleId: sample.sampleId, sessionId: session._id, riderId, point: { type: "Point", coordinates: [sample.longitude, sample.latitude] }, accuracyMeters: sample.accuracyMeters, recordedAt: sample.recordedAt });
-      accepted.push(sample.sampleId);
-    } catch (error: any) {
-      if (error?.code === 11000) duplicates.push(sample.sampleId); else throw error;
-    }
-  }
-  const latest = sorted.at(-1);
-  if (latest && accepted.length) {
-    const rider = await Rider.findByIdAndUpdate(riderId, { $set: { location: { type: "Point", coordinates: [latest.longitude, latest.latitude] }, lastLocationAt: latest.recordedAt, ...( (await findCurrentRiderSlot(riderId)).slot as any)?.status === "active" ? { status: "available" } : {} } }, { new: true }).lean().exec() as any;
-    await TrackingSession.updateOne({ _id: session._id }, { $set: { lastSampleAt: latest.recordedAt, lastAckAt: new Date() } });
-    await trackRiderLocationForIncentive(riderId, [latest.longitude, latest.latitude]).catch(() => undefined);
-    void publishRealtimeEvent({ channel: "admin", audienceKey: tenantAudienceKey(rider.tenantId, "admin"), tenantId: rider.tenantId, type: "rider.location.updated", payload: { riderId: String(rider._id), riderCode: rider.riderCode, location: rider.location, lastLocationAt: rider.lastLocationAt, status: rider.status }, dedupeKey: `rider:location:${String(rider._id)}:${new Date(latest.recordedAt).getTime()}` }).catch(() => undefined);
-    const trackedOrders = await Order.find({ riderId, assignmentState: "assigned", status: { $in: ["picked_up", "on_the_way"] } }).select("_id publicCode restaurantId customerId tenantId status assignmentState").lean().exec() as any[];
-    await Promise.all(trackedOrders.map((order) => publishRiderLocationEvents(order, rider))).catch(() => undefined);
-  }
-  return res.status(202).json({ accepted, duplicates, rejected, serverTime: new Date().toISOString(), nextUploadAfterSeconds: 10 });
-});
-
 app.post("/api/v1/riders/:id/location", requireRole("admin", "rider", "fleet"), async (req, res) => {
   const parsed = riderLocationSchema.safeParse({ ...req.body, riderId: req.params.id });
   if (!parsed.success) return res.status(400).json({ error: "INVALID_LOCATION", details: parsed.error.flatten() });
@@ -3155,16 +1985,10 @@ app.post("/api/v1/riders/:id/location", requireRole("admin", "rider", "fleet"), 
   const statusUpdate = activeSlot?.status === "active" ? { status: "available" } : {};
   const rider = await Rider.findByIdAndUpdate(id, { $set: { location: { type: "Point", coordinates: [parsed.data.longitude, parsed.data.latitude] }, lastLocationAt: new Date(), ...statusUpdate } }, { new: true }).lean().exec() as any;
   if (!rider) return res.status(404).json({ error: "RIDER_NOT_FOUND" });
-  const nativeSessionId = objectId(req.header("x-piki-tracking-session") || "");
-  if (nativeSessionId) {
-    const recordedAt = new Date();
-    await LocationSample.create({ sampleId: `native:${nativeSessionId}:${recordedAt.getTime()}:${parsed.data.latitude}:${parsed.data.longitude}`, sessionId: nativeSessionId, riderId: id, point: { type: "Point", coordinates: [parsed.data.longitude, parsed.data.latitude] }, accuracyMeters: parsed.data.accuracy ?? 0, recordedAt }).catch((error: any) => { if (error?.code !== 11000) throw error; });
-    await TrackingSession.updateOne({ _id: nativeSessionId, riderId: id, status: { $in: ["active", "degraded"] } }, { $set: { lastSampleAt: recordedAt, lastAckAt: recordedAt } });
+  const activeOrder = await Order.findOne({ riderId: id, assignmentState: "assigned", status: { $in: ["picked_up", "on_the_way"] } }).select("_id publicCode tenantId customerId status").lean().exec() as any;
+  if (activeOrder?.customerId && mongoose.isValidObjectId(activeOrder.customerId)) {
+    void publishRealtimeEvent({ channel: "customer", audienceKey: `customer:${String(activeOrder.customerId)}`, tenantId: activeOrder.tenantId, type: "order.rider_location", payload: { orderId: String(activeOrder._id), publicCode: activeOrder.publicCode, status: activeOrder.status, refresh: true } }).catch((error) => console.warn("Realtime rider location event failed", error instanceof Error ? error.message : error));
   }
-  await trackRiderLocationForIncentive(id, [parsed.data.longitude, parsed.data.latitude]).catch((error) => console.error("Rider incentive location tracking failed", error instanceof Error ? error.message : error));
-  void publishRealtimeEvent({ channel: "admin", audienceKey: tenantAudienceKey(rider.tenantId, "admin"), tenantId: rider.tenantId, type: "rider.location.updated", payload: { riderId: String(rider._id), riderCode: rider.riderCode, location: rider.location, lastLocationAt: rider.lastLocationAt, status: rider.status }, dedupeKey: `rider:location:${String(rider._id)}:${new Date(rider.lastLocationAt).getTime()}` }).catch(() => undefined);
-  const trackedOrders = await Order.find({ riderId: id, assignmentState: "assigned", status: { $in: ["picked_up", "on_the_way"] } }).select("_id publicCode restaurantId customerId tenantId status assignmentState").lean().exec() as any[];
-  await Promise.all(trackedOrders.map((order) => publishRiderLocationEvents(order, rider))).catch((error) => console.warn("Realtime rider location event failed", error instanceof Error ? error.message : error));
   return res.json({ rider: { id: rider._id, riderCode: rider.riderCode, status: rider.status, location: rider.location, lastLocationAt: rider.lastLocationAt } });
 });
 app.patch("/api/v1/riders/:id/status", requireRole("admin", "rider", "fleet"), async (req, res) => {
@@ -3191,45 +2015,27 @@ app.get("/api/v1/riders/:id/slots", requireRole("admin", "rider", "fleet"), asyn
   if (req.auth?.role === "rider" && !(await riderAccessForRequest(riderId, req))) return res.status(403).json({ error: "RIDER_ACCESS_DENIED" });
   if (req.auth?.role === "fleet" && !(await fleetCanAccessRider(req, riderId))) return res.status(403).json({ error: "FLEET_RIDER_ACCESS_DENIED" });
   const slots = await RiderSlot.find({ riderId, ...tenantScope(req) }).sort({ date: 1, startTime: 1 }).limit(500).lean().exec();
-  res.setHeader("Cache-Control", "no-store, max-age=0");
-  return res.json({ riderId, slots });
+  return res.json({ riderId, slots: slots.map((slot: any) => ({ ...slot, day: new Intl.DateTimeFormat("es-ES", { timeZone: "Europe/Madrid", weekday: "long" }).format(new Date(`${slot.date}T12:00:00Z`)), start: slot.startTime, end: slot.endTime, zone: slot.zoneSlug })) });
 });
 
-function madridNow(instant = new Date()) {
-  const parts = new Intl.DateTimeFormat("en-CA", { timeZone: "Europe/Madrid", year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false }).formatToParts(instant);
+function madridNow() {
+  const parts = new Intl.DateTimeFormat("en-CA", { timeZone: "Europe/Madrid", year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false }).formatToParts(new Date());
   const values = Object.fromEntries(parts.filter((part) => part.type !== "literal").map((part) => [part.type, part.value]));
-  return { date: `${values.year}-${values.month}-${values.day}`, time: `${values.hour}:${values.minute}`, iso: instant.toISOString(), timeZone: "Europe/Madrid" };
+  return { date: `${values.year}-${values.month}-${values.day}`, time: `${values.hour}:${values.minute}` };
 }
 function previousCalendarDate(date: string) { const value = new Date(`${date}T12:00:00Z`); value.setUTCDate(value.getUTCDate() - 1); return value.toISOString().slice(0, 10); }
-function slotContainsTime(slot: { startTime: string; endTime: string }, time: string) { return slot.startTime < slot.endTime ? slot.startTime <= time && time < slot.endTime : time >= slot.startTime || time < slot.endTime; }
-
-async function expireRiderSlots(riderId: mongoose.Types.ObjectId, now: ReturnType<typeof madridNow>) {
-  const candidates = await RiderSlot.find({ riderId, date: { $in: [now.date, previousCalendarDate(now.date)] }, status: "active" }).select("_id date startTime endTime").lean().exec() as any[];
-  const expired = candidates.filter((slot) => {
-    if (slot.date === now.date) return slot.startTime < slot.endTime && now.time >= slot.endTime;
-    return slot.startTime < slot.endTime || now.time >= slot.endTime;
-  });
-  if (!expired.length) return false;
-  await RiderSlot.updateMany({ _id: { $in: expired.map((slot) => slot._id) }, status: "active" }, { $set: { status: "completed" } }).exec();
-  await Rider.findOneAndUpdate({ _id: riderId, activeOrderId: null }, { $set: { status: "offline" } }).exec();
-  return true;
-}
 async function findCurrentRiderSlot(riderId: mongoose.Types.ObjectId) {
   const now = madridNow();
-  await expireRiderSlots(riderId, now);
-  const candidates = await RiderSlot.find({ riderId, date: { $in: [now.date, previousCalendarDate(now.date)] }, status: { $in: ["planned", "active"] } }).sort({ date: 1, startTime: 1 }).lean().exec();
-  const slot = candidates.find((candidate: any) => slotContainsTime(candidate, now.time) && (candidate.date === now.date || candidate.startTime >= candidate.endTime));
+  const previousDate = previousCalendarDate(now.date);
+  const candidates = await RiderSlot.find({ riderId, date: { $in: [now.date, previousDate] }, status: { $in: ["planned", "active"] } }).sort({ date: 1, startTime: 1 }).lean().exec();
+  const slot = selectCurrentSlot(candidates as any[], now, previousDate);
   return { now, slot, selfStartAllowed: false };
-}
-async function findNextRiderSlot(riderId: mongoose.Types.ObjectId, now: ReturnType<typeof madridNow>) {
-  const slots = await RiderSlot.find({ riderId, date: { $gte: now.date }, status: { $in: ["planned", "active"] } }).sort({ date: 1, startTime: 1 }).limit(30).lean().exec();
-  return (slots as any[]).find((candidate) => candidate.date > now.date || candidate.startTime >= now.time) || null;
 }
 
 async function currentSlotRiderIds(scope: Record<string, unknown> = {}) {
   const now = madridNow();
   const candidates = await RiderSlot.find({ ...scope, date: { $in: [now.date, previousCalendarDate(now.date)] }, status: { $in: ["planned", "active"] } }).select("riderId date startTime endTime").lean().exec();
-  return [...new Set(candidates.filter((candidate: any) => slotContainsTime(candidate, now.time) && (candidate.date === now.date || candidate.startTime >= candidate.endTime)).map((candidate: any) => candidate.riderId))];
+  return [...new Set(candidates.filter((candidate: any) => Boolean(selectCurrentSlot([candidate], now, previousCalendarDate(now.date)))).map((candidate: any) => candidate.riderId))];
 }
 
 async function canAccessRiderShift(riderId: mongoose.Types.ObjectId, req: express.Request) {
@@ -3240,18 +2046,17 @@ async function canAccessRiderShift(riderId: mongoose.Types.ObjectId, req: expres
 app.get("/api/v1/riders/session", requireRole("rider"), async (req, res) => {
   const employeeId = req.auth?.employeeId;
   if (!employeeId) return res.status(403).json({ error: "RIDER_EMPLOYEE_SESSION_REQUIRED" });
-  const tenant = tenantScope(req);
-  const employee = await EmployeeAccount.findOne({ _id: employeeId, ...tenant }).lean().exec() as any;
-  const rider = employee ? await Rider.findOne({ email: employee.email, ...tenant }).lean().exec() as any : null;
+  const employee = await EmployeeAccount.findById(employeeId).lean().exec() as any;
+  const rider = employee ? await Rider.findOne({ email: employee.email }).lean().exec() as any : null;
   if (!rider) return res.status(404).json({ error: "RIDER_ACCOUNT_NOT_LINKED" });
   const { now, slot } = await findCurrentRiderSlot(rider._id);
   // A previous browser session must never keep a rider online after its slot ended.
-  await RiderSlot.updateMany({ ...tenant, riderId: rider._id, status: "active", date: { $lt: now.date } }, { $set: { status: "completed" } }).exec();
-  const hasActiveOrder = Boolean(await Order.exists({ ...tenant, riderId: rider._id, status: { $nin: ["delivered", "cancelled"] }, assignmentState: { $in: ["offered", "assigned"] } }));
-  const effectiveStatus = hasActiveOrder ? "busy" : (slot as any)?.status === "active" ? rider.status : "offline";
+  await RiderSlot.updateMany({ riderId: rider._id, status: "active", date: { $lt: now.date } }, { $set: { status: "completed" } }).exec();
+  const hasActiveOrder = Boolean(await Order.exists({ riderId: rider._id, status: { $nin: ["delivered", "cancelled"] }, assignmentState: { $in: ["offered", "assigned"] } }));
+  const effectiveStatus = effectiveRiderStatus({ riderStatus: rider.status, hasActiveOrder, slotStatus: (slot as any)?.status });
   const update: Record<string, unknown> = { status: effectiveStatus };
   if (!hasActiveOrder && effectiveStatus === "offline") update.activeOrderId = null;
-  if (effectiveStatus !== rider.status || update.activeOrderId === null) await Rider.updateOne({ _id: rider._id, ...tenant }, { $set: update }).exec();
+  if (effectiveStatus !== rider.status || update.activeOrderId === null) await Rider.updateOne({ _id: rider._id }, { $set: update }).exec();
   return res.json({ rider: { id: rider._id, riderCode: rider.riderCode, name: rider.name, email: rider.email, status: effectiveStatus, fleetId: rider.fleetId }, now, slot: slot || null });
 });
 
@@ -3262,9 +2067,8 @@ app.get("/api/v1/riders/:id/shift", requireRole("admin", "rider", "fleet"), asyn
   if (!rider) return res.status(404).json({ error: "RIDER_NOT_FOUND" });
   if (!(await canAccessRiderShift(riderId, req))) return res.status(403).json({ error: "RIDER_ACCESS_DENIED" });
   const { now, slot, selfStartAllowed } = await findCurrentRiderSlot(riderId);
-  const visibleSlot = slot || await findNextRiderSlot(riderId, now);
-  res.setHeader("Cache-Control", "no-store, max-age=0");
-  return res.json({ rider: { id: rider._id, riderCode: rider.riderCode, status: rider.status }, now, serverClock: now, eligible: Boolean(slot) || selfStartAllowed, selfStartAllowed, shift: visibleSlot });
+  const shift = slot ? { ...(slot as any), day: new Intl.DateTimeFormat("es-ES", { timeZone: "Europe/Madrid", weekday: "long" }).format(new Date(`${(slot as any).date}T12:00:00Z`)), start: (slot as any).startTime, end: (slot as any).endTime, zone: (slot as any).zoneSlug } : null;
+  return res.json({ rider: { id: rider._id, riderCode: rider.riderCode, status: rider.status }, now, eligible: Boolean(slot) || selfStartAllowed, selfStartAllowed, shift });
 });
 
 app.post("/api/v1/riders/:id/shift/start", requireRole("admin", "rider", "fleet"), async (req, res) => {
@@ -3274,34 +2078,25 @@ app.post("/api/v1/riders/:id/shift/start", requireRole("admin", "rider", "fleet"
   if (!rider) return res.status(404).json({ error: "RIDER_NOT_FOUND" });
   if (!(await canAccessRiderShift(riderId, req))) return res.status(403).json({ error: "RIDER_ACCESS_DENIED" });
   const { now, slot } = await findCurrentRiderSlot(riderId);
-if (!slot) {
+  if (!slot) {
     if (req.auth?.role === "rider") {
       const tenantId = req.auth?.tenantId ?? null;
       const eventId = `security:rider-shift-out-of-hours:${String(riderId)}:${now.date}:${now.time}`;
-      const payload = { riderId: String(riderId), riderName: rider.name, riderEmail: rider.email, riderCode: rider.riderCode, date: now.date, time: now.time, reason: "SHIFT_OUTSIDE_SCHEDULE" };
+      const payload = { riderId: String(riderId), riderName: rider.name, riderEmail: rider.email, riderCode: rider.riderCode, date: now.date, time: now.time, reason: "SHIFT_RESERVATION_REQUIRED" };
       await Promise.allSettled([
         publishRealtimeEvent({ channel: "fleet", audienceKey: tenantAudienceKey(tenantId, "fleet"), type: "security.rider_shift_out_of_hours", payload, tenantId, dedupeKey: `${eventId}:fleet` }),
         publishRealtimeEvent({ channel: "admin", audienceKey: tenantAudienceKey(tenantId, "admin"), type: "security.rider_shift_out_of_hours", payload, tenantId, dedupeKey: `${eventId}:admin` }),
       ]);
     }
-    return res.status(409).json({ error: "SHIFT_OUTSIDE_SCHEDULE", message: `Jornada bloqueada: solo puedes iniciar en la fecha y franja asignadas. Hora oficial: ${now.date} ${now.time} (${now.timeZone}).`, now, serverClock: now });
+    return res.status(409).json({ error: "SHIFT_RESERVATION_REQUIRED", message: "No tienes un slot asignado para esta franja. Contacta con Fleet para que te asigne día, horario y zona.", now });
   }
   const currentSlot = slot as any;
-  const hasFreshLocation = Boolean(rider.lastLocationAt && new Date(rider.lastLocationAt).getTime() >= Date.now() - 90_000);
-  if (!hasFreshLocation) {
-    return res.status(409).json({
-      error: "FRESH_LOCATION_REQUIRED",
-      message: "Jornada bloqueada: activa y comparte una posición GPS real antes de continuar.",
-      locationRequired: true,
-      serverClock: now,
-    });
-  }
   const updatedSlot = await RiderSlot.findOneAndUpdate({ _id: currentSlot._id, status: { $in: ["planned", "active"] } }, { $set: { status: "active" } }, { new: true }).lean().exec();
-  await trackRiderShiftStart(updatedSlot || currentSlot, rider).catch((error) => console.error("Rider incentive shift tracking start failed", error instanceof Error ? error.message : error));
   const hasOrders = await Order.exists({ riderId, status: { $nin: ["delivered", "cancelled"] }, assignmentState: { $in: ["offered", "assigned"] } });
-  const status = hasOrders ? "busy" : "available";
+  const hasFreshLocation = Boolean(rider.lastLocationAt && new Date(rider.lastLocationAt).getTime() >= Date.now() - 90_000);
+  const status = hasOrders ? "busy" : hasFreshLocation ? "available" : "paused";
   await Rider.findByIdAndUpdate(riderId, { $set: { status } }).exec();
-  return res.json({ message: "Jornada iniciada", warningSound: "start_shift", locationRequired: false, serverClock: now, rider: { id: riderId, riderCode: rider.riderCode, status }, shift: updatedSlot });
+  return res.json({ message: hasFreshLocation ? "Jornada iniciada" : "Jornada iniciada: comparte tu ubicación para quedar disponible.", warningSound: "start_shift", locationRequired: !hasFreshLocation, rider: { id: riderId, riderCode: rider.riderCode, status }, shift: updatedSlot });
 });
 
 app.post("/api/v1/riders/:id/shift/stop", requireRole("admin", "rider", "fleet"), async (req, res) => {
@@ -3309,13 +2104,8 @@ app.post("/api/v1/riders/:id/shift/stop", requireRole("admin", "rider", "fleet")
   if (!riderId) return res.status(400).json({ error: "INVALID_RIDER_ID" });
   if (!(await canAccessRiderShift(riderId, req))) return res.status(403).json({ error: "RIDER_ACCESS_DENIED" });
   if (await Order.exists({ riderId, status: { $nin: ["delivered", "cancelled"] }, assignmentState: { $in: ["offered", "assigned"] } })) return res.status(409).json({ error: "ACTIVE_DELIVERY_REQUIRES_SUPPORT", message: "Completa el reparto o contacta con Soporte antes de finalizar la jornada." });
-  const { slot, now } = await findCurrentRiderSlot(riderId);
-  const activeSlot = slot || await RiderSlot.findOne({ riderId, ...tenantScope(req), date: { $in: [now.date, previousCalendarDate(now.date)] }, status: "active" }).sort({ date: -1, startTime: -1 }).lean().exec();
-  if (activeSlot) {
-    const completedAt = new Date();
-    await RiderSlot.updateOne({ _id: (activeSlot as any)._id }, { $set: { status: "completed" } }).exec();
-    await completeRiderShiftIncentiveTracking(activeSlot, completedAt).catch((error) => console.error("Rider hourly guarantee settlement failed", error instanceof Error ? error.message : error));
-  }
+  const { slot } = await findCurrentRiderSlot(riderId);
+  if (slot) await RiderSlot.updateOne({ _id: (slot as any)._id }, { $set: { status: "completed" } }).exec();
   const rider = await Rider.findByIdAndUpdate(riderId, { $set: { status: "offline", activeOrderId: null } }, { new: true }).lean().exec() as any;
   if (!rider) return res.status(404).json({ error: "RIDER_NOT_FOUND" });
   return res.json({ message: "Jornada finalizada", rider: { id: rider._id, riderCode: rider.riderCode, status: rider.status } });
@@ -3340,7 +2130,6 @@ app.post("/api/v1/riders/:id/slots", requireRole("admin", "fleet"), async (req, 
   if (overlap) return res.status(409).json({ error: "RIDER_SLOT_OVERLAP", slot: overlap });
   try {
     const slot = await RiderSlot.create({ ...parsed.data, ...tenantScope(req), riderId });
-    await publishRiderScheduleEvent({ riderId: String(riderId), tenantId: (slot as any)?.tenantId, action: "updated" });
     return res.status(201).json({ slot });
   } catch (error: any) {
     if (error?.code === 11000) return res.status(409).json({ error: "RIDER_SLOT_ALREADY_EXISTS", message: "Ya existe un slot para ese rider, fecha y hora de inicio." });
@@ -3348,11 +2137,9 @@ app.post("/api/v1/riders/:id/slots", requireRole("admin", "fleet"), async (req, 
   }
 });
 
-app.get("/api/v1/fleet/heatmap", requireRole("admin", "fleet"), async (req, res) => {
+app.get("/api/v1/fleet/heatmap", requireRole("admin", "fleet"), async (_req, res) => {
   const since = new Date(Date.now() - 24 * 60 * 60 * 1000);
-  const tenant = tenantScope(req);
-  const fleetRiders = req.auth?.role === "fleet" ? await Rider.find(await fleetRiderFilter(req)).select("_id").lean().exec() : null;
-  const rows = await Order.find({ ...tenant, ...(fleetRiders ? { riderId: { $in: fleetRiders.map((rider: any) => rider._id) } } : {}), createdAt: { $gte: since }, deliveryLocation: { $exists: true }, status: { $ne: "cancelled" } }).select("deliveryLocation status createdAt").lean().exec();
+  const rows = await Order.find({ createdAt: { $gte: since }, deliveryLocation: { $exists: true }, status: { $ne: "cancelled" } }).select("deliveryLocation status createdAt").lean().exec();
   const bins = new Map<string, { latitude: number; longitude: number; demand: number; active: number }>();
   for (const row of rows as any[]) { const [longitude, latitude] = row.deliveryLocation.coordinates || []; if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) continue; const key = `${latitude.toFixed(3)}:${longitude.toFixed(3)}`; const current = bins.get(key) || { latitude: Number(latitude.toFixed(3)), longitude: Number(longitude.toFixed(3)), demand: 0, active: 0 }; current.demand += 1; if (row.status !== "delivered") current.active += 1; bins.set(key, current); }
   return res.json({ since, points: [...bins.values()].sort((a, b) => b.demand - a.demand) });
@@ -3382,73 +2169,7 @@ app.get("/api/v1/riders/:id/sanction-status", requireRole("admin", "fleet", "rid
 });
 
 const automaticDispatchInFlight = new Set<string>();
-const automaticDispatchSweepStats = {
-  runs: 0,
-  skippedDatabase: 0,
-  errors: 0,
-  reassigned: 0,
-  expiredOffers: 0,
-  queued: 0,
-  lastStartedAt: null as string | null,
-  lastCompletedAt: null as string | null,
-  lastDurationMs: null as number | null,
-  lastError: null as string | null,
-};
-const PICKUP_REASSIGN_AFTER_MS = Math.max(60_000, Number(process.env.PIKI_PICKUP_REASSIGN_AFTER_MINUTES || 10) * 60_000);
-const PICKUP_ARRIVAL_RADIUS_METERS = Math.max(50, Number(process.env.PIKI_PICKUP_ARRIVAL_RADIUS_METERS || 250));
-async function reassignLatePickupOrders() {
-  const now = new Date();
-  let reassigned = 0;
-  const legacyAssigned = await Order.find({ assignmentState: "assigned", riderId: { $ne: null }, riderArrivedAt: null, pickupDeadlineAt: null, status: { $in: ["pending", "accepted", "preparing", "ready_for_pickup"] } }).select("_id updatedAt").limit(100).lean().exec() as any[];
-  for (const order of legacyAssigned) {
-    const deadline = new Date(new Date(order.updatedAt || now).getTime() + PICKUP_REASSIGN_AFTER_MS);
-    await Order.updateOne({ _id: order._id, assignmentState: "assigned", riderArrivedAt: null, pickupDeadlineAt: null }, { $set: { pickupDeadlineAt: deadline } }).exec();
-  }
 
-  const lateOrders = await Order.find({ assignmentState: "assigned", riderId: { $ne: null }, riderArrivedAt: null, pickupDeadlineAt: { $ne: null, $lte: now }, status: { $in: ["pending", "accepted", "preparing", "ready_for_pickup"] } }).select("_id riderId restaurantId tenantId publicCode customerId status version assignmentState").limit(100).lean().exec() as any[];
-  for (const order of lateOrders) {
-    const [rider, restaurant] = await Promise.all([
-      Rider.findById(order.riderId).select("_id location lastLocationAt").lean().exec() as any,
-      Restaurant.findById(order.restaurantId).select("_id location").lean().exec() as any,
-    ]);
-    const decision = decideLatePickup({ riderLocation: rider?.location, partnerLocation: restaurant?.location, riderLastLocationAt: rider?.lastLocationAt, arrivalRadiusMeters: PICKUP_ARRIVAL_RADIUS_METERS, now });
-    if (decision.action === "mark_arrived") {
-      const arrived = await Order.findOneAndUpdate(
-        { _id: order._id, assignmentState: "assigned", riderId: order.riderId, riderArrivedAt: null, version: order.version },
-        { $set: { riderArrivedAt: now, riderArrivalDistanceMeters: decision.distanceMeters, pickupDeadlineAt: null }, $inc: { version: 1 }, $push: { statusHistory: { status: order.status, actorRole: "system", reason: `Llegada al Partner verificada automáticamente por GPS (${Math.round(decision.distanceMeters)} m).` } } },
-        { new: true },
-      ).lean().exec() as any;
-      if (arrived) await publishRiderArrivalEvent(arrived, rider, decision.distanceMeters, "gps_sweep");
-      continue;
-    }
-
-    const released = await Order.findOneAndUpdate(
-      { _id: order._id, assignmentState: "assigned", riderId: order.riderId, riderArrivedAt: null, version: order.version },
-      { $set: { riderId: null, assignmentState: "expired", assignmentExpiresAt: null, pickupDeadlineAt: null }, $inc: { dispatchAttempts: 1, version: 1 }, $push: { statusHistory: { status: order.status, actorRole: "system", reason: `Reasignación automática: rider sin llegada verificada al Partner tras ${Math.round(PICKUP_REASSIGN_AFTER_MS / 60_000)} minutos (${decision.distanceMeters == null ? "GPS no disponible" : `${Math.round(decision.distanceMeters)} m`}).` } } },
-      { new: false },
-    ).lean().exec() as any;
-    if (!released?.riderId) continue;
-    await releaseRiderOrderSlot(released._id, released.riderId);
-    await DispatchDecision.updateMany({ orderId: released._id, riderId: released.riderId, outcome: { $in: ["accepted", "offered"] } }, { $set: { outcome: "expired", actorRole: "system" } }).exec();
-    reassigned += 1;
-    await publishOrderStatusEvents(released, released.status).catch((error) => console.warn("Late pickup event failed", error instanceof Error ? error.message : error));
-    await enqueueDispatchOutbox({ orderId: released._id, tenantId: released.tenantId || null, idempotencyKey: dispatchRequeueIdempotencyKey(released._id, Number(released.version || 0) + 1), reason: "late_pickup" });
-  }
-  return reassigned;
-}
-/** Persist a dispatch intent; the dedicated worker owns actual offering. */
-async function enqueueOrderForDispatch(orderId: mongoose.Types.ObjectId, preferredRiderId?: mongoose.Types.ObjectId, reason = "initial") {
-  const order = await Order.findById(orderId).select("_id tenantId").lean().exec() as any;
-  if (!order) return { state: "not_found" as const };
-  const event = await enqueueDispatchOutbox({
-    orderId: order._id,
-    tenantId: order.tenantId || null,
-    idempotencyKey: reason === "initial" ? dispatchInitialIdempotencyKey(order._id) : dispatchRequeueIdempotencyKey(order._id, Number((await Order.findById(order._id).select("version").lean().exec() as any)?.version || 0)),
-    preferredRiderId,
-    reason,
-  });
-  return { state: "queued" as const, eventId: event?.eventId || null };
-}
 /**
  * Asignación automática idempotente. El algoritmo solo acepta riders con sesión
  * operativa, GPS reciente y capacidad disponible. preferredRiderId se reserva
@@ -3463,26 +2184,18 @@ async function assignOrderAutomatically(orderId: mongoose.Types.ObjectId, prefer
     const order = await Order.findById(orderId).lean().exec() as any;
     if (!order) return { state: "not_found" as const };
     const tenantFilter: Record<string, unknown> = order.tenantId ? { tenantId: order.tenantId } : {};
-    if (!isDispatchablePayment(order.paymentState, order.paymentMethod, Number(order.totalCents)) || !isDispatchableOrderStatus(order.status)) return { state: "not_dispatchable" as const };
+    if (!(order.paymentState === "paid" || order.paymentMethod === "cash") || !isDispatchableOrderStatus(order.status)) return { state: "not_dispatchable" as const };
     if (order.riderId || order.assignmentState === "assigned" || order.assignmentState === "offered") return { state: "already_assigned" as const, riderId: order.riderId };
     const restaurant = await Restaurant.findOne({ _id: order.restaurantId, ...tenantFilter }).lean().exec() as any;
     if (!restaurant?.location?.coordinates || !order.deliveryLocation?.coordinates) return { state: "missing_geolocation" as const };
     const policy = await dispatchLoadPolicy();
     const freshness = new Date(Date.now() - 90_000);
     const currentRiderIds = await currentSlotRiderIds(tenantFilter);
-    const useQaRider = Boolean(order.isTestOrder && preferredRiderId);
-    const riderFilter: Record<string, unknown> = {
-      ...tenantFilter,
-      isTestRider: useQaRider ? true : { $ne: true },
-      _id: { $in: currentRiderIds },
-      status: { $in: ["available", "busy"] },
-      lastLocationAt: { $gte: freshness },
-      location: { $exists: true },
-    };
+    const riderFilter: Record<string, unknown> = { ...tenantFilter, isTestRider: { $ne: true }, _id: { $in: currentRiderIds }, status: { $in: ["available", "busy"] }, lastLocationAt: { $gte: freshness }, location: { $exists: true } };
     if (preferredRiderId) riderFilter._id = { $in: currentRiderIds.filter((id) => String(id) === String(preferredRiderId)) };
     const riders = await Rider.find(riderFilter).limit(100).lean().exec() as any[];
     const counts = await activeOrderCounts(riders.map((rider) => rider._id));
-    const ranked = rankDispatchCandidates(riders.map((rider) => ({ id: String(rider._id), status: rider.status, vehicle: rider.vehicle, location: rider.location, lastLocationAt: rider.lastLocationAt, reliabilityScore: rider.reliabilityScore, ratingScore: rider.ratingScore ?? rider.reliabilityScore, activeOrderCount: counts.get(String(rider._id)) || 0, zoneFit: 1, servicePriority: preferredRiderId && String(rider._id) === String(preferredRiderId) ? 1 : 0.5 })), { restaurantLocation: [restaurant.location.coordinates[0], restaurant.location.coordinates[1]], customerLocation: [order.deliveryLocation.coordinates[0], order.deliveryLocation.coordinates[1]], routeDistanceKm: typeof order.routeDistanceKm === "number" ? order.routeDistanceKm : null, routeDurationMinutes: typeof order.routeDurationMinutes === "number" ? order.routeDurationMinutes : null, requiredVehicleClasses: Array.isArray(order.requiredVehicleClasses) ? order.requiredVehicleClasses : [], preparationMinutes: PARTNER_PREPARATION_LIMIT_MINUTES, maxCustomerEtaMinutes: CUSTOMER_DELIVERY_TARGET_MINUTES, maxConcurrentOrders: policy.maxConcurrentOrders });
+    const ranked = rankDispatchCandidates(riders.map((rider) => ({ id: String(rider._id), status: rider.status, vehicle: rider.vehicle, location: rider.location, lastLocationAt: rider.lastLocationAt, reliabilityScore: rider.reliabilityScore, activeOrderCount: counts.get(String(rider._id)) || 0, zoneFit: 1, servicePriority: preferredRiderId && String(rider._id) === String(preferredRiderId) ? 1 : 0.5 })), { restaurantLocation: [restaurant.location.coordinates[0], restaurant.location.coordinates[1]], customerLocation: [order.deliveryLocation.coordinates[0], order.deliveryLocation.coordinates[1]], routeDistanceKm: typeof order.routeDistanceKm === "number" ? order.routeDistanceKm : null, requiredVehicleClasses: Array.isArray(order.requiredVehicleClasses) ? order.requiredVehicleClasses : [], preparationMinutes: 15, maxConcurrentOrders: policy.maxConcurrentOrders });
     if (!ranked.length) return { state: "no_eligible_rider" as const, candidatesConsidered: riders.length };
     for (const decision of ranked) {
       const riderId = objectId(decision.riderId); if (!riderId) continue;
@@ -3490,7 +2203,7 @@ async function assignOrderAutomatically(orderId: mongoose.Types.ObjectId, prefer
       if (!assignmentReservation) continue;
       const rider = assignmentReservation.rider;
       const expiresAt = assignmentReservation.reservation.expiresAt;
-      const assigned = await Order.findOneAndUpdate({ _id: order._id, ...tenantFilter, riderId: null, assignmentState: { $in: ["unassigned", "expired", "rejected"] } }, { $set: { riderId: rider._id, assignmentState: "offered", offerId: randomUUID(), assignmentExpiresAt: expiresAt, pickupDeadlineAt: null, dispatchScore: decision.score }, $inc: { dispatchAttempts: 1, version: 1 } }, { new: true }).lean().exec() as any;
+      const assigned = await Order.findOneAndUpdate({ _id: order._id, ...tenantFilter, riderId: null, assignmentState: { $in: ["unassigned", "expired", "rejected"] } }, { $set: { riderId: rider._id, assignmentState: "offered", assignmentExpiresAt: expiresAt, dispatchScore: decision.score }, $inc: { dispatchAttempts: 1, version: 1 } }, { new: true }).lean().exec() as any;
       if (!assigned) { await releaseRiderOrderSlot(order._id, rider._id); continue; }
       await DispatchDecision.create({ ...tenantFilter, orderId: assigned._id, ...decision, riderId: rider._id, outcome: "offered", actorRole: "system" });
       await publishRiderOfferEvent(assigned, String(rider._id));
@@ -3502,7 +2215,7 @@ async function assignOrderAutomatically(orderId: mongoose.Types.ObjectId, prefer
   }
 }
 
-export async function queueAutomaticDispatch(orderId: mongoose.Types.ObjectId, preferredRiderId?: mongoose.Types.ObjectId) {
+async function queueAutomaticDispatch(orderId: mongoose.Types.ObjectId, preferredRiderId?: mongoose.Types.ObjectId) {
   // Reintenta la selección del Rider; el flujo de alta espera este resultado para sincronizar las apps.
   for (let attempt = 0; attempt < 3; attempt += 1) {
     const result = await assignOrderAutomatically(orderId, preferredRiderId);
@@ -3514,176 +2227,40 @@ export async function queueAutomaticDispatch(orderId: mongoose.Types.ObjectId, p
 
 setCustomerOrderDispatcher(async (orderId) => {
   if (!mongoose.Types.ObjectId.isValid(orderId)) return { state: "invalid_order_id" as const };
-  return enqueueOrderForDispatch(new mongoose.Types.ObjectId(orderId));
-});
-
-/**
- * Creates a short-lived, non-commercial dispatch scenario.  It can only target
- * a dedicated QA rider and is removed through the paired DELETE route, so test
- * traffic never reaches a real rider, partner settlement, or customer history.
- */
-app.post("/api/v1/admin/qa/dispatch-orders", requireRole("admin"), async (req, res) => {
-  const employee = await employeeScope(req);
-  const scope = tenantScope(req);
-  const requestedRestaurantSlug = typeof req.body?.restaurantSlug === "string" ? req.body.restaurantSlug.trim().toLowerCase() : "";
-  if (requestedRestaurantSlug && !/^[a-z0-9][a-z0-9-]{1,118}$/.test(requestedRestaurantSlug)) return res.status(400).json({ error: "INVALID_QA_RESTAURANT_SLUG" });
-  const requestedRestaurantName = requestedRestaurantSlug.replace(/-/g, " ");
-  const selectedRestaurant = requestedRestaurantSlug ? { $or: [{ slug: requestedRestaurantSlug }, { name: new RegExp(`^${requestedRestaurantName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, "i") }] } : {};
-  const restaurant = await Restaurant.findOne({ ...scope, ...selectedRestaurant, isActive: true, onboardingStatus: "approved" })
-    .select("_id tenantId name location menu").lean().exec() as any;
-  const coordinates = Array.isArray(restaurant?.location?.coordinates) && restaurant.location.coordinates.length >= 2
-    ? restaurant.location.coordinates
-    : [0, 0];
-  if (!restaurant) return res.status(409).json({ error: requestedRestaurantSlug ? "QA_REQUESTED_RESTAURANT_UNAVAILABLE" : "QA_RESTAURANT_LOCATION_UNAVAILABLE" });
-
-  const now = madridNow();
-  const expiresAt = new Date(Date.now() + 30 * 60_000);
-  const qaEmail = `dispatch-qa-${Date.now()}@qa.invalid`;
-  const qaRider = await Rider.create({
-    tenantId: restaurant.tenantId || null,
-    isTestRider: true,
-    riderCode: `QA-${Date.now().toString(36).toUpperCase()}`,
-    name: "PIKI Rider QA automático",
-    email: qaEmail,
-    city: "Xàtiva",
-    availability: "Simulación aislada",
-    status: "available",
-    lifecycleStatus: "active",
-    vehicle: "electric_bike",
-    location: { type: "Point", coordinates: [Number(coordinates[0]) + 0.0015, Number(coordinates[1]) + 0.0015] },
-    lastLocationAt: new Date(),
-    reliabilityScore: 0.95,
-    ratingScore: 0.95,
-  });
-  await RiderSlot.create({ tenantId: restaurant.tenantId || null, riderId: qaRider._id, zoneSlug: "qa-dispatch", date: now.date, startTime: now.time, endTime: "23:59", status: "active", notes: "PIKI QA dispatch automatico" });
-
-  const publicCode = await createRandomOrderCode();
-  const dailyCode = await createDailyDisplayCode();
-  const menuItem = Array.isArray(restaurant.menu) && restaurant.menu[0] ? restaurant.menu[0] : null;
-  const itemName = String(menuItem?.name || "Pedido de simulación QA");
-  const unitPriceCents = Math.max(0, Number(menuItem?.priceCents || 0));
-  const order = await Order.create({
-    tenantId: restaurant.tenantId || null,
-    qaRiderId: qaRider._id,
-    isTestOrder: true,
-    publicCode,
-    ...dailyCode,
-    restaurantId: restaurant._id,
-    customerName: "Cliente QA",
-    items: [{ itemId: String(menuItem?._id || "qa-dispatch"), name: itemName, quantity: 1, unitPriceCents }],
-    deliveryAddress: "SIMULACIÓN QA · No realizar entrega",
-    deliveryNote: "Pedido de prueba aislado. Se elimina al finalizar la comprobación.",
-    deliveryLocation: { type: "Point", coordinates: [Number(coordinates[0]) + 0.004, Number(coordinates[1]) + 0.004] },
-    subtotalCents: unitPriceCents,
-    deliveryFeeCents: 0,
-    serviceFeeCents: 0,
-    totalCents: unitPriceCents,
-    paymentMethod: "cash",
-    paymentState: "pending",
-    status: "ready_for_pickup",
-    assignmentState: "unassigned",
-    statusHistory: [{ status: "ready_for_pickup", actorRole: "system", reason: `Simulación QA solicitada por ${employee?.email || "admin"}. Sin cobro ni entrega real.` }],
-  });
-  const dispatch = await enqueueOrderForDispatch(order._id as mongoose.Types.ObjectId, qaRider._id as mongoose.Types.ObjectId);
-  const supportTicket = await SupportTicket.create({
-    tenantId: restaurant.tenantId || null,
-    orderId: order._id,
-    orderReference: order.publicCode,
-    reporterEmail: qaEmail,
-    sourceSurface: "support",
-    sourceRole: "qa",
-    category: "rider",
-    priority: "normal",
-    subject: "QA · Reasignación automática de Rider",
-    description: "Caso aislado creado para comprobar la reasignación de un pedido QA desde PIKI Support. No intervienen pedidos, Riders ni cobros comerciales.",
-    ticketNumber: `SUP-QA-${Date.now().toString(36).toUpperCase()}`,
-    messages: [{ senderRole: "rider", senderName: qaRider.name, body: "Prueba QA: solicito reasignación del pedido de simulación." }],
-    actions: [{ action: "qa_ticket_created", metadata: { qaScenario: true, orderId: String(order._id), riderId: String(qaRider._id) } }],
-  });
-  const current = await Order.findById(order._id).lean().exec();
-  return res.status(201).json({ order: current, qa: { riderId: String(qaRider._id), ticketId: String(supportTicket._id), ticketNumber: supportTicket.ticketNumber, expiresAt: expiresAt.toISOString(), dispatch } });
-});
-
-app.delete("/api/v1/admin/qa/dispatch-orders/:id", requireRole("admin"), async (req, res) => {
-  const orderId = objectId(String(req.params.id));
-  if (!orderId) return res.status(400).json({ error: "INVALID_ORDER_ID" });
-  const order = await Order.findOne({ _id: orderId, ...tenantScope(req), isTestOrder: true }).lean().exec() as any;
-  if (!order) return res.status(404).json({ error: "QA_ORDER_NOT_FOUND" });
-  if (order.riderId) await releaseRiderOrderSlot(order._id, order.riderId);
-  await Promise.all([
-    DispatchDecision.deleteMany({ orderId: order._id }),
-    RiderAssignmentReservation.deleteMany({ orderId: order._id }),
-    SupportTicket.deleteMany({ orderId: order._id }),
-    Order.deleteOne({ _id: order._id, isTestOrder: true }),
-  ]);
-  if (order.qaRiderId) {
-    await RiderSlot.deleteMany({ riderId: order.qaRiderId, notes: "PIKI QA dispatch automatico" });
-    await Rider.deleteOne({ _id: order.qaRiderId, isTestRider: true });
-  }
-  return res.status(204).end();
+  return queueAutomaticDispatch(new mongoose.Types.ObjectId(orderId));
 });
 
 async function expireStaleOffers() {
-  let expiredCount = 0;
   const expired = await Order.find({ assignmentState: "offered", assignmentExpiresAt: { $lte: new Date() } }).select("_id riderId").limit(100).lean().exec() as any[];
   for (const offer of expired) {
-    const released = await Order.findOneAndUpdate({ _id: offer._id, assignmentState: "offered", assignmentExpiresAt: { $lte: new Date() } }, { $set: { assignmentState: "expired", riderId: null, offerId: null, assignmentExpiresAt: null, pickupDeadlineAt: null }, $inc: { version: 1 } }, { new: false }).lean().exec() as any;
+    const released = await Order.findOneAndUpdate({ _id: offer._id, assignmentState: "offered", assignmentExpiresAt: { $lte: new Date() } }, { $set: { assignmentState: "expired", riderId: null, assignmentExpiresAt: null }, $inc: { version: 1 } }, { new: false }).lean().exec() as any;
     if (!released?.riderId) continue;
     await releaseRiderOrderSlot(released._id, released.riderId);
-    expiredCount += 1;
     await DispatchDecision.updateMany({ orderId: released._id, riderId: released.riderId, outcome: "offered" }, { $set: { outcome: "expired" } }).exec();
-    await enqueueDispatchOutbox({ orderId: released._id, tenantId: released.tenantId || null, idempotencyKey: dispatchRequeueIdempotencyKey(released._id, Number(released.version || 0) + 1), reason: "offer_expired" });
   }
-  return expiredCount;
 }
 
 async function runAutomaticDispatchSweep() {
-  if (!databaseReady || mongoose.connection.readyState !== 1) { automaticDispatchSweepStats.skippedDatabase += 1; return; }
-  const startedAt = Date.now();
-  automaticDispatchSweepStats.lastStartedAt = new Date(startedAt).toISOString();
-  try {
-    const reassigned = await reassignLatePickupOrders();
-    const expiredOffers = await expireStaleOffers();
-    const candidates = await Order.find({ riderId: null, assignmentState: { $in: ["unassigned", "expired", "rejected"] }, ...dispatchablePaymentFilter, status: { $in: [...dispatchableOrderStatuses] } }).select("_id").sort({ createdAt: 1 }).limit(25).lean().exec();
-    for (const order of candidates) void enqueueOrderForDispatch(order._id as mongoose.Types.ObjectId).catch((error) => console.error("Dispatch outbox enqueue failed", error));
-    automaticDispatchSweepStats.runs += 1;
-    automaticDispatchSweepStats.reassigned += reassigned;
-    automaticDispatchSweepStats.expiredOffers += expiredOffers;
-    automaticDispatchSweepStats.queued += candidates.length;
-    automaticDispatchSweepStats.lastCompletedAt = new Date().toISOString();
-    automaticDispatchSweepStats.lastDurationMs = Date.now() - startedAt;
-    automaticDispatchSweepStats.lastError = null;
-    if (automaticDispatchSweepStats.runs % 12 === 0) console.log(JSON.stringify({ event: "automatic_dispatch_sweep", intervalSeconds: 5, ...automaticDispatchSweepStats }));
-  } catch (error) {
-    automaticDispatchSweepStats.errors += 1;
-    automaticDispatchSweepStats.lastError = error instanceof Error ? error.message : String(error);
-    automaticDispatchSweepStats.lastDurationMs = Date.now() - startedAt;
-    console.error(JSON.stringify({ event: "automatic_dispatch_sweep_error", error: automaticDispatchSweepStats.lastError }));
-    throw error;
-  }
-}
-/** Called exclusively by the explicit dispatch worker process. */
-export async function runDispatchMaintenance() {
-  if (mongoose.connection.readyState !== 1) return { reassigned: 0, expiredOffers: 0 };
-  const [reassigned, expiredOffers] = await Promise.all([reassignLatePickupOrders(), expireStaleOffers()]);
-  return { reassigned, expiredOffers };
+  if (!databaseReady || mongoose.connection.readyState !== 1) return;
+  await expireStaleOffers();
+  const candidates = await Order.find({ riderId: null, assignmentState: { $in: ["unassigned", "expired", "rejected"] }, ...dispatchablePaymentFilter, status: { $in: [...dispatchableOrderStatuses] } }).select("_id").sort({ createdAt: 1 }).limit(25).lean().exec();
+  for (const order of candidates) void queueAutomaticDispatch(order._id as mongoose.Types.ObjectId).catch((error) => console.error("Automatic dispatch sweep failed", error));
 }
 async function findDispatchOrder(orderId: mongoose.Types.ObjectId, req: express.Request) {
   const scoped = await Order.findOne({ _id: orderId, ...tenantScope(req) }).lean().exec() as any;
-  if (scoped || req.auth?.role !== "admin") return scoped;
-  // Customer compatibility orders created before tenant propagation may have a
-  // null tenantId. Let superadmin dispatch that legacy order, but never use
-  // this fallback for fleet or partner accounts.
-  return await Order.findOne({ _id: orderId, tenantId: null }).lean().exec() as any;
+  if (scoped || req.auth?.role !== "fleet") return scoped;
+  // QA orders are intentionally created without tenant data so they can be
+  // used by the isolated Fleet test account. They remain explicitly marked
+  // as test orders and never grant access to production orders.
+  return await Order.findOne({ _id: orderId, isTestOrder: true }).lean().exec() as any;
 }
 function dispatchScope(req: express.Request, order: any) {
-  return tenantScope(req);
+  return req.auth?.role === "fleet" && order?.isTestOrder ? {} : tenantScope(req);
 }
 async function findDispatchRestaurant(order: any, req: express.Request, scope: Record<string, unknown>) {
-  // Never apply Rider-only filters (such as isTestRider) to the Partner restaurant.
-  const { isTestRider: _riderOnlyFilter, ...restaurantScope } = scope;
-  const scoped = await Restaurant.findOne({ _id: order.restaurantId, ...(order.tenantId == null ? {} : restaurantScope) }).lean().exec() as any;
-  return scoped;
+  const scoped = await Restaurant.findOne({ _id: order.restaurantId, ...scope }).lean().exec() as any;
+  if (scoped || !order.isTestOrder || req.auth?.role !== "fleet") return scoped;
+  return await Restaurant.findById(order.restaurantId).lean().exec() as any;
 }
 app.get("/api/v1/dispatch/orders/:id/preview", requireRole("admin", "fleet"), async (req, res) => {
   const parsed = dispatchSchema.safeParse(req.query);
@@ -3698,12 +2275,12 @@ app.get("/api/v1/dispatch/orders/:id/preview", requireRole("admin", "fleet"), as
   if (!restaurant?.location?.coordinates || !order.deliveryLocation?.coordinates) return res.status(409).json({ error: "MISSING_GEOLOCATION" });
   const freshness = new Date(Date.now() - 90_000);
   const policy = await dispatchLoadPolicy();
-  const maxConcurrentOrders = policy.maxConcurrentOrders;
+  const maxConcurrentOrders = order.isTestOrder ? 2 : policy.maxConcurrentOrders;
   const diagnosticPool = await Rider.find({ ...scope }).select("_id riderCode name status lastLocationAt location tenantId fleetId activeOrderId zoneSlug").limit(200).lean().exec() as any[];
   const currentRiderIds = new Set((await currentSlotRiderIds(scope)).map((id) => String(id)));
   const riders = diagnosticPool.filter((rider: any) => currentRiderIds.has(String(rider._id)) && ["available", "busy"].includes(rider.status) && rider.lastLocationAt && new Date(rider.lastLocationAt).getTime() >= freshness.getTime() && rider.location?.coordinates?.length >= 2).slice(0, 100);
   const counts = await activeOrderCounts(riders.map((rider) => rider._id));
-  const ranked = rankDispatchCandidates(riders.map((rider) => ({ id: String(rider._id), status: rider.status, vehicle: rider.vehicle, location: rider.location, lastLocationAt: rider.lastLocationAt, reliabilityScore: rider.reliabilityScore, ratingScore: rider.ratingScore ?? rider.reliabilityScore, activeOrderCount: counts.get(String(rider._id)) || 0, zoneFit: 1, servicePriority: 0.5 })), { restaurantLocation: [restaurant.location.coordinates[0], restaurant.location.coordinates[1]], customerLocation: [order.deliveryLocation.coordinates[0], order.deliveryLocation.coordinates[1]], routeDistanceKm: typeof order.routeDistanceKm === "number" ? order.routeDistanceKm : null, routeDurationMinutes: typeof order.routeDurationMinutes === "number" ? order.routeDurationMinutes : null, requiredVehicleClasses: Array.isArray(order.requiredVehicleClasses) ? order.requiredVehicleClasses : [], preparationMinutes: parsed.data.preparationMinutes, maxCustomerEtaMinutes: parsed.data.maxCustomerEtaMinutes, maxConcurrentOrders });
+  const ranked = rankDispatchCandidates(riders.map((rider) => ({ id: String(rider._id), status: rider.status, vehicle: rider.vehicle, location: rider.location, lastLocationAt: rider.lastLocationAt, reliabilityScore: rider.reliabilityScore, activeOrderCount: counts.get(String(rider._id)) || 0, zoneFit: 1, servicePriority: 0.5 })), { restaurantLocation: [restaurant.location.coordinates[0], restaurant.location.coordinates[1]], customerLocation: [order.deliveryLocation.coordinates[0], order.deliveryLocation.coordinates[1]], routeDistanceKm: typeof order.routeDistanceKm === "number" ? order.routeDistanceKm : null, requiredVehicleClasses: Array.isArray(order.requiredVehicleClasses) ? order.requiredVehicleClasses : [], preparationMinutes: parsed.data.preparationMinutes, maxCustomerEtaMinutes: parsed.data.maxCustomerEtaMinutes, maxConcurrentOrders });
   await DispatchDecision.insertMany(ranked.map((decision) => ({ orderId: order._id, ...decision, riderId: objectId(decision.riderId), outcome: "preview", actorRole: req.auth?.role || "system" })));
   const diagnostic = {
     totalRiders: diagnosticPool.length,
@@ -3713,7 +2290,7 @@ app.get("/api/v1/dispatch/orders/:id/preview", requireRole("admin", "fleet"), as
     eligibleRiders: riders.length,
     visibleRiders: diagnosticPool.map((rider) => ({ riderCode: rider.riderCode, name: rider.name, status: rider.status, lastLocationAt: rider.lastLocationAt, hasLocation: Boolean(rider.location?.coordinates?.length >= 2), hasFreshGps: Boolean(rider.lastLocationAt && new Date(rider.lastLocationAt).getTime() >= freshness.getTime()), hasActiveOrder: Boolean(rider.activeOrderId), sameTenant: !order.tenantId || String(rider.tenantId || "") === String(order.tenantId || ""), exclusion: !["available", "busy"].includes(rider.status) ? "not_available" : !rider.location?.coordinates?.length ? "missing_gps" : !rider.lastLocationAt || new Date(rider.lastLocationAt).getTime() < freshness.getTime() ? "gps_stale" : rider.activeOrderId ? "active_order" : null })),
   };
-  return res.json({ algorithmVersion: ranked[0]?.algorithmVersion || "piki-jarvis-v2-proximity-rating", orderId: order._id, policy, candidatesConsidered: riders.length, eligibleCandidates: ranked.length, candidates: ranked, diagnostic });
+  return res.json({ algorithmVersion: ranked[0]?.algorithmVersion || "piki-jarvis-v1", orderId: order._id, policy, candidatesConsidered: riders.length, eligibleCandidates: ranked.length, candidates: ranked, diagnostic });
 });
 
 app.get("/api/v1/dispatch/orders/:id/decisions", requireRole("admin", "fleet"), async (req, res) => {
@@ -3731,7 +2308,7 @@ app.post("/api/v1/dispatch/orders/:id/assign", requireRole("admin", "fleet"), as
   if (!orderId) return res.status(400).json({ error: "INVALID_ORDER_ID" });
   const order = await findDispatchOrder(orderId, req);
   if (!order) return res.status(404).json({ error: "ORDER_NOT_FOUND" });
-  if (!( ["authorized", "paid"] as string[]).includes(order.paymentState) && order.paymentMethod !== "cash") return res.status(409).json({ error: "ORDER_NOT_PAID" });
+  if (order.paymentState !== "paid" && order.paymentMethod !== "cash") return res.status(409).json({ error: "ORDER_NOT_PAID" });
   if (!isDispatchableOrderStatus(order.status)) return res.status(409).json({ error: "ORDER_NOT_DISPATCHABLE", status: order.status });
   if (order.riderId || order.assignmentState === "assigned") return res.status(409).json({ error: "ORDER_ALREADY_ASSIGNED" });
   const scope = dispatchScope(req, order);
@@ -3739,19 +2316,19 @@ app.post("/api/v1/dispatch/orders/:id/assign", requireRole("admin", "fleet"), as
   if (!restaurant?.location?.coordinates || !order.deliveryLocation?.coordinates) return res.status(409).json({ error: "MISSING_GEOLOCATION" });
   const freshness = new Date(Date.now() - 90_000);
   const policy = await dispatchLoadPolicy();
-  const maxConcurrentOrders = policy.maxConcurrentOrders;
+  const maxConcurrentOrders = order.isTestOrder ? 2 : policy.maxConcurrentOrders;
   const riderPool = await Rider.find({ ...scope }).select("_id riderCode name status lastLocationAt location tenantId fleetId activeOrderId zoneSlug vehicle reliabilityScore").limit(200).lean().exec() as any[];
   const currentRiderIds = new Set((await currentSlotRiderIds(scope)).map((id) => String(id)));
   const riders = riderPool.filter((rider: any) => currentRiderIds.has(String(rider._id)) && ["available", "busy"].includes(rider.status) && rider.lastLocationAt && new Date(rider.lastLocationAt).getTime() >= freshness.getTime() && rider.location?.coordinates?.length >= 2).slice(0, 100);
   const counts = await activeOrderCounts(riders.map((rider) => rider._id));
-  const ranked = rankDispatchCandidates(riders.map((rider) => ({ id: String(rider._id), status: rider.status, vehicle: rider.vehicle, location: rider.location, lastLocationAt: rider.lastLocationAt, reliabilityScore: rider.reliabilityScore, ratingScore: rider.ratingScore ?? rider.reliabilityScore, activeOrderCount: counts.get(String(rider._id)) || 0, zoneFit: 1, servicePriority: 0.5 })), { restaurantLocation: [restaurant.location.coordinates[0], restaurant.location.coordinates[1]], customerLocation: [order.deliveryLocation.coordinates[0], order.deliveryLocation.coordinates[1]], routeDistanceKm: typeof order.routeDistanceKm === "number" ? order.routeDistanceKm : null, routeDurationMinutes: typeof order.routeDurationMinutes === "number" ? order.routeDurationMinutes : null, requiredVehicleClasses: Array.isArray(order.requiredVehicleClasses) ? order.requiredVehicleClasses : [], preparationMinutes: parsed.data.preparationMinutes, maxConcurrentOrders });
+  const ranked = rankDispatchCandidates(riders.map((rider) => ({ id: String(rider._id), status: rider.status, vehicle: rider.vehicle, location: rider.location, lastLocationAt: rider.lastLocationAt, reliabilityScore: rider.reliabilityScore, activeOrderCount: counts.get(String(rider._id)) || 0, zoneFit: 1, servicePriority: 0.5 })), { restaurantLocation: [restaurant.location.coordinates[0], restaurant.location.coordinates[1]], customerLocation: [order.deliveryLocation.coordinates[0], order.deliveryLocation.coordinates[1]], routeDistanceKm: typeof order.routeDistanceKm === "number" ? order.routeDistanceKm : null, requiredVehicleClasses: Array.isArray(order.requiredVehicleClasses) ? order.requiredVehicleClasses : [], preparationMinutes: parsed.data.preparationMinutes, maxConcurrentOrders });
   if (!ranked.length) return res.status(409).json({ error: "NO_ELIGIBLE_RIDER", candidatesConsidered: riders.length });
   for (const decision of ranked) {
     const riderId = objectId(decision.riderId); if (!riderId) continue;
     const assignmentReservation = await reserveRiderOrderSlot(riderId, order._id, scope, maxConcurrentOrders);
     if (!assignmentReservation) continue;
     const rider = assignmentReservation.rider;
-    const assigned = await Order.findOneAndUpdate({ _id: order._id, ...scope, riderId: null, assignmentState: { $in: ["unassigned", "expired", "rejected"] } }, { $set: { riderId: rider._id, assignmentState: "assigned", assignmentExpiresAt: null, pickupDeadlineAt: new Date(Date.now() + PICKUP_REASSIGN_AFTER_MS), dispatchScore: decision.score }, $inc: { dispatchAttempts: 1, version: 1 } }, { new: true }).lean().exec() as any;
+    const assigned = await Order.findOneAndUpdate({ _id: order._id, ...scope, riderId: null, assignmentState: { $in: ["unassigned", "expired", "rejected"] } }, { $set: { riderId: rider._id, assignmentState: "assigned", assignmentExpiresAt: null, dispatchScore: decision.score }, $inc: { dispatchAttempts: 1, version: 1 } }, { new: true }).lean().exec() as any;
     if (!assigned) { await releaseRiderOrderSlot(order._id, rider._id); continue; }
     await RiderAssignmentReservation.updateOne({ orderId: assigned._id, riderId: rider._id, status: "reserved" }, { $set: { expiresAt: null } }).exec();
     await DispatchDecision.create({ ...scope, orderId: assigned._id, ...decision, riderId: rider._id, outcome: "accepted", actorRole: req.auth?.role || "system" });
@@ -3779,18 +2356,14 @@ app.post("/api/v1/dispatch/orders/:id/offer-response", requireRole("rider", "adm
     return res.status(409).json({ error: "OFFER_EXPIRED", message: "La oferta ha vencido y se ha devuelto a la cola de reparto." });
   }
   if (parsed.data.accept) {
-    const updated = await Order.findOneAndUpdate({ _id: orderId, ...tenantScope(req), assignmentState: "offered", riderId: order.riderId, offerId: order.offerId || null, version: order.version, assignmentExpiresAt: { $gt: new Date() } }, { $set: { assignmentState: "assigned", pickupDeadlineAt: new Date(Date.now() + PICKUP_REASSIGN_AFTER_MS) }, $inc: { version: 1 } }, { new: true }).lean().exec() as any;
+    const updated = await Order.findOneAndUpdate({ _id: orderId, ...tenantScope(req), assignmentState: "offered", riderId: order.riderId }, { $set: { assignmentState: "assigned" }, $inc: { version: 1 } }, { new: true }).lean().exec() as any;
     if (!updated) return res.status(409).json({ error: "OFFER_CHANGED_RETRY" });
     await RiderAssignmentReservation.updateOne({ orderId: updated._id, riderId: updated.riderId, status: "reserved" }, { $set: { expiresAt: null } }).exec();
-    await DispatchDecision.updateMany({ orderId: updated._id, riderId: updated.riderId, outcome: "offered" }, { $set: { outcome: "accepted", actorRole: "rider" } }).exec();
     await publishOrderStatusEvents(updated, updated.status);
     return res.json({ assignment: { state: "assigned", orderId: updated._id, riderId: updated.riderId } });
   }
-  const rejected = await Order.findOneAndUpdate({ _id: orderId, ...tenantScope(req), assignmentState: "offered", riderId: order.riderId, offerId: order.offerId || null, version: order.version, assignmentExpiresAt: { $gt: new Date() } }, { $set: { assignmentState: "rejected", riderId: null, offerId: null, assignmentExpiresAt: null }, $inc: { version: 1 } }, { new: true }).lean().exec() as any;
-  if (!rejected) return res.status(409).json({ error: "OFFER_CHANGED_RETRY" });
-  await DispatchDecision.updateMany({ orderId, riderId: order.riderId, outcome: "offered" }, { $set: { outcome: "rejected", actorRole: "rider" } }).exec();
+  await Order.findOneAndUpdate({ _id: orderId, ...tenantScope(req), assignmentState: "offered", riderId: order.riderId }, { $set: { assignmentState: "rejected", riderId: null, assignmentExpiresAt: null }, $inc: { version: 1 } }).exec();
   await releaseRiderOrderSlot(orderId, order.riderId);
-  await enqueueDispatchOutbox({ orderId: rejected._id, tenantId: rejected.tenantId || null, idempotencyKey: dispatchRequeueIdempotencyKey(rejected._id, Number(rejected.version || 0)), reason: "offer_rejected" });
   return res.json({ assignment: { state: "rejected", orderId } });
 });
 
@@ -3801,7 +2374,7 @@ app.get("/api/v1/riders/:id/offers", requireRole("rider"), async (req, res) => {
   const rider = await riderAccessForRequest(riderId, req);
   if (!rider) return res.status(403).json({ error: "RIDER_ACCESS_DENIED" });
   const offers = await Order.find({ riderId, assignmentState: { $in: ["offered", "assigned"] }, status: { $nin: ["delivered", "cancelled"] } })
-.select("_id publicCode displayCode displayCodeDate restaurantId customerId riderId status paymentState paymentMethod partnerPaymentRequired partnerPaymentCents subtotalCents deliveryFeeCents serviceFeeCents totalCents assignmentState assignmentExpiresAt pickupDeadlineAt partnerPrepDeadlineAt deliveryAddress deliveryNote deliveryLocation items createdAt")
+    .select("_id publicCode displayCode displayCodeDate restaurantId customerId riderId status paymentState paymentMethod totalCents assignmentState assignmentExpiresAt deliveryAddress deliveryLocation items createdAt +customerPhone")
     .sort({ createdAt: -1 }).limit(10).lean().exec() as any[];
   const riderProfile = await Rider.findById(riderId).select("vehicle").lean().exec() as any;
   const restaurantIds = offers.map((offer) => offer.restaurantId).filter(Boolean);
@@ -3826,33 +2399,18 @@ app.get("/api/v1/riders/:id/offers", requireRole("rider"), async (req, res) => {
       status: offer.status,
       paymentState: offer.paymentState,
       paymentMethod: offer.paymentMethod || "stripe",
-      partnerPaymentRequired: Boolean(offer.partnerPaymentRequired),
-      partnerPaymentCents: offer.partnerPaymentRequired && offer.partnerPaymentCents != null ? Number(offer.partnerPaymentCents) : null,
-      subtotalCents: Number(offer.subtotalCents || 0),
-      deliveryFeeCents: Number(offer.deliveryFeeCents || 0),
-      serviceFeeCents: Number(offer.serviceFeeCents || 0),
       totalCents: Number(offer.totalCents || 0),
       assignmentState: offer.assignmentState,
       assignmentExpiresAt: offer.assignmentExpiresAt,
-      pickupDeadlineAt: offer.pickupDeadlineAt,
-partnerPrepDeadlineAt: offer.partnerPrepDeadlineAt || null,
-      preparationMinutes: offer.status === "ready_for_pickup" ? 0 : PARTNER_PREPARATION_LIMIT_MINUTES,
-      items: (offer.items || []).map((item: any) => ({
-        name: item.name || "Producto",
-        quantity: Number(item.quantity || 1),
-        unitPriceCents: Number(item.unitPriceCents ?? item.priceCents ?? 0),
-        priceCents: Number(item.priceCents ?? item.unitPriceCents ?? 0),
-        totalCents: Number(item.totalCents ?? ((item.unitPriceCents ?? item.priceCents ?? 0) * (item.quantity || 1))),
-        modifiers: Array.isArray(item.modifiers) ? item.modifiers : [],
-      })),
+      items: offer.items,
       createdAt: offer.createdAt,
       vehicle: riderProfile?.vehicle || "unknown",
       phase: phase[offer.status] || "assigned",
       etaMinutes: offer.assignmentExpiresAt ? Math.max(0, Math.ceil((new Date(offer.assignmentExpiresAt).getTime() - now) / 60000)) : null,
       restaurant: restaurant ? { name: restaurant.name, address: restaurant.address || "", phone: restaurant.phone || "", cuisine: restaurant.cuisine || "", etaMinutes: restaurant.etaMinutes || [] } : null,
-      customerName: customerPhase ? customer?.name || offer.customerName || "Cliente" : null,
+      customerName: customerPhase ? customer?.name || "Cliente" : null,
+      customerPhone: customerPhase ? offer.customerPhone || null : null,
       deliveryAddress: customerPhase ? offer.deliveryAddress || "" : null,
-      deliveryNote: customerPhase ? offer.deliveryNote || null : null,
       deliveryLocation: customerPhase ? offer.deliveryLocation || null : null,
     };
   });
@@ -3860,10 +2418,9 @@ partnerPrepDeadlineAt: offer.partnerPrepDeadlineAt || null,
 });
 
 app.get("/api/v1/riders/operational-map", requireRole("rider"), async (req, res) => {
-  const tenant = tenantScope(req);
-  const employee = req.auth?.employeeId ? await EmployeeAccount.findOne({ _id: req.auth.employeeId, ...tenant }).select("zoneSlugs fleetId").lean().exec() as any : null;
+  const employee = req.auth?.employeeId ? await EmployeeAccount.findById(req.auth.employeeId).select("zoneSlugs fleetId").lean().exec() as any : null;
   const zoneSlugs = Array.isArray(employee?.zoneSlugs) ? employee.zoneSlugs.filter((value: unknown): value is string => typeof value === "string") : [];
-  const filter: Record<string, unknown> = { ...tenant, isActive: true };
+  const filter: Record<string, unknown> = { isActive: true };
   if (zoneSlugs.length) filter.slug = { $in: zoneSlugs };
   const zones = await Zone.find(filter).select("slug name isActive polygon").sort({ name: 1 }).lean().exec();
   return res.json({ zones, source: "piki-api", refreshedAt: new Date().toISOString() });
@@ -3871,21 +2428,20 @@ app.get("/api/v1/riders/operational-map", requireRole("rider"), async (req, res)
 app.get("/api/v1/riders/:id/mobility-advice", requireRole("rider"), async (req, res) => {
   const riderId = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
   if (!riderId || !req.auth?.employeeId) return res.status(400).json({ error: "INVALID_RIDER_SESSION" });
-  const tenant = tenantScope(req);
-  const employee = await EmployeeAccount.findOne({ _id: req.auth.employeeId, ...tenant }).select("email").lean().exec() as any;
-  const rider = employee ? await Rider.findOne({ _id: riderId, email: employee.email, ...tenant }).select("location").lean().exec() as any : null;
+  const employee = await EmployeeAccount.findById(req.auth.employeeId).select("email").lean().exec() as any;
+  const rider = employee ? await Rider.findOne({ _id: riderId, email: employee.email }).select("location").lean().exec() as any : null;
   if (!rider) return res.status(403).json({ error: "RIDER_ACCESS_DENIED" });
-  const zones = await Zone.find({ ...tenant, isActive: true }).select("slug name polygon").lean().exec() as any[];
+  const zones = await Zone.find({ isActive: true }).select("slug name polygon").lean().exec() as any[];
   const since = new Date(Date.now() - 45 * 60 * 1000);
   const zoneDemand = await Promise.all(zones.map(async (zone) => {
     const coordinates = zone.polygon?.coordinates?.[0]?.[0];
     const anchor: [number, number] = Array.isArray(coordinates) ? [Number(coordinates[0]), Number(coordinates[1])] : [0, 0];
-    const ordersLastWindow = await Order.countDocuments({ ...tenant, createdAt: { $gte: since }, status: { $nin: ["cancelled"] }, deliveryLocation: { $geoWithin: { $geometry: zone.polygon } } });
+    const ordersLastWindow = await Order.countDocuments({ createdAt: { $gte: since }, status: { $nin: ["cancelled"] }, deliveryLocation: { $geoWithin: { $geometry: zone.polygon } } });
     return { slug: zone.slug, name: zone.name, anchor, ordersLastWindow };
   }));
   const currentPoint = rider.location?.coordinates;
   const currentZoneRaw = Array.isArray(currentPoint) && currentPoint.length >= 2
-    ? await Zone.findOne({ ...tenant, isActive: true, polygon: { $geoIntersects: { $geometry: { type: "Point", coordinates: currentPoint } } } }).select("slug").lean().exec() as any
+    ? await Zone.findOne({ isActive: true, polygon: { $geoIntersects: { $geometry: { type: "Point", coordinates: currentPoint } } } }).select("slug").lean().exec() as any
     : null;
   const currentZone = currentZoneRaw ? zoneDemand.find((zone) => zone.slug === currentZoneRaw.slug) || null : null;
   const advice = computeMobilityAdvice({ currentZone, zones: zoneDemand, lowActivityMinutes: Number(req.query.lowActivityMinutes || 15) });
@@ -3916,128 +2472,65 @@ app.get("/api/v1/fleets", requireRole("admin", "fleet"), async (req, res) => {
   return res.json({ fleets });
 });
 
-const fleetInputSchema = z.object({ name: z.string().trim().min(2).max(120), managerName: z.string().trim().min(2).max(120), managerDni: z.string().trim().min(5).max(20), contactEmail: z.string().trim().email().or(z.literal("")), contactPhone: z.string().trim().min(6).max(40), address: z.string().trim().min(5).max(240), postalCode: z.string().trim().min(3).max(12), city: z.string().trim().min(2).max(120), vehicleTypes: z.array(z.enum(["bike", "electric_bike", "electric_scooter", "motorcycle", "scooter", "car"])).min(1).max(6), maxRiders: z.coerce.number().int().min(1).max(10000), serviceZones: z.array(z.string().regex(/^[a-z0-9-]+$/)).min(1).max(300), notes: z.string().trim().max(2000).default("") });
-app.post("/api/v1/fleets", requireRole("admin", "fleet"), async (req, res) => {
+const fleetInputSchema = z.object({ name: z.string().trim().min(2).max(120), legalName: z.string().trim().max(180).default(""), taxId: z.string().trim().max(32).default(""), managerName: z.string().trim().min(2).max(120), contactEmail: z.string().trim().email().or(z.literal("")), contactPhone: z.string().trim().min(6).max(40), address: z.string().trim().min(5).max(240), postalCode: z.string().trim().min(3).max(12), city: z.string().trim().min(2).max(120), vehicleTypes: z.array(z.enum(["bike", "electric_bike", "electric_scooter", "motorcycle", "scooter", "car"])).min(1).max(6), maxRiders: z.coerce.number().int().min(1).max(10000), serviceZones: z.array(z.string().regex(/^[a-z0-9-]+$/)).min(1).max(300), notes: z.string().trim().max(2000).default("") });
+app.post("/api/v1/fleets", requireRole("admin"), async (req, res) => {
   const parsed = fleetInputSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_FLEET", details: parsed.error.flatten() });
-  const employee = await employeeScope(req);
-  if (req.auth?.role === "fleet" && employee?.fleetId) return res.status(409).json({ error: "FLEET_ALREADY_ASSIGNED", message: "Tu cuenta ya está vinculada a una Fleet y no puede crear otra." });
-  const zoneCount = await Zone.countDocuments({ ...tenantScope(req), slug: { $in: parsed.data.serviceZones }, isActive: true });
-  if (zoneCount !== parsed.data.serviceZones.length) return res.status(400).json({ error: "INVALID_FLEET_ZONES", message: "Una o más zonas no existen o no están activas." });
-  const duplicate = await Fleet.exists({ ...tenantScope(req), name: parsed.data.name });
-  if (duplicate) return res.status(409).json({ error: "FLEET_NAME_ALREADY_EXISTS", message: "Ya existe una Fleet con ese nombre operativo." });
-  try {
-    const fleet = await Fleet.create({ ...parsed.data, ...tenantScope(req), managerDni: parsed.data.managerDni.toUpperCase(), createdBy: req.auth?.employeeId ? objectId(req.auth.employeeId) : null, createdByRole: req.auth?.role || null });
-    if (req.auth?.role === "fleet" && req.auth.employeeId) await EmployeeAccount.updateOne({ _id: req.auth.employeeId, fleetId: null }, { $set: { fleetId: fleet._id } }).exec();
-    return res.status(201).json({ created: true, fleet: fleet.toObject() });
-  } catch (error) {
-    if ((error as any)?.code === 11000) return res.status(409).json({ error: "FLEET_NAME_ALREADY_EXISTS", message: "Ya existe una Fleet con ese nombre operativo." });
-    throw error;
-  }
+  const fleet = await Fleet.findOneAndUpdate({ ...tenantScope(req), name: parsed.data.name }, { $set: { ...parsed.data, ...tenantScope(req), taxId: parsed.data.taxId.toUpperCase() } }, { upsert: true, new: true, runValidators: true }).lean().exec();
+  return res.status(201).json({ fleet });
 });
 
 app.patch("/api/v1/rider-applications/:id/assign-fleet", requireRole("admin", "fleet"), async (req, res) => {
   const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id); if (!id) return res.status(400).json({ error: "INVALID_APPLICATION_ID" });
   const fleetId = objectId(typeof req.body?.fleetId === "string" ? req.body.fleetId : ""); if (!fleetId) return res.status(400).json({ error: "INVALID_FLEET_ID" });
-  const tenant = tenantScope(req);
-  const fleet = await Fleet.findOne({ _id: fleetId, ...tenant, ...(req.auth?.role === "fleet" ? { _id: (await employeeScope(req))?.fleetId || null } : {}) }).lean() as any; if (!fleet) return res.status(404).json({ error: "FLEET_NOT_FOUND" });
-  const application = await RiderApplication.findOneAndUpdate({ _id: id, ...await adminOnboardingScope(req), ...(req.auth?.role === "fleet" ? { assignedFleetId: fleet._id } : {}) }, { $set: { assignedFleetId: fleetId } }, { new: true }).lean().exec() as any;
+  const fleet = await Fleet.findOne({ _id: fleetId, ...(req.auth?.role === "fleet" ? { _id: (await employeeScope(req))?.fleetId || null } : {}) }).lean() as any; if (!fleet) return res.status(404).json({ error: "FLEET_NOT_FOUND" });
+  const application = await RiderApplication.findOneAndUpdate({ _id: id, ...(req.auth?.role === "fleet" ? { assignedFleetId: fleet._id } : {}) }, { $set: { assignedFleetId: fleetId } }, { new: true }).lean().exec() as any;
   if (!application) return res.status(404).json({ error: "APPLICATION_NOT_FOUND" });
-  if (application.status === "approved") await Rider.updateOne({ email: application.email, ...(application.tenantId ? { tenantId: application.tenantId } : { tenantId: null }) }, { $set: { fleetId } }).exec();
-  return res.json({ application: { ...application, applicationCode: onboardingCode("R", application._id) }, fleet });
+  if (application.status === "approved") await Rider.updateOne({ email: application.email }, { $set: { fleetId } }).exec();
+  return res.json({ application, fleet });
 });
 
 app.get("/api/v1/fleets/pending-partner-orders", requireRole("admin", "fleet", "commercial"), async (req, res) => {
   const employee = await employeeScope(req);
-  const tenant = tenantScope(req);
-  const commercialRestaurants = req.auth?.role === "commercial" ? await Restaurant.find({ ...tenant, commercialEmployeeId: employee?._id }).select("_id").lean().exec() : [];
-  const orders = await Order.find({ ...tenant, ...dispatchablePaymentFilter, status: "pending", ...(req.auth?.role === "commercial" ? { restaurantId: { $in: commercialRestaurants.map((restaurant: any) => restaurant._id) } } : {}) }).select("publicCode restaurantId totalCents createdAt status paymentState paymentMethod assignmentState").sort({ createdAt: 1 }).limit(100).lean().exec() as any[];
-  const restaurants = await Restaurant.find({ ...tenant, _id: { $in: orders.map((order) => order.restaurantId) } }).select("name").lean().exec() as any[];
+  const commercialRestaurants = req.auth?.role === "commercial" ? await Restaurant.find({ commercialEmployeeId: employee?._id }).select("_id").lean().exec() : [];
+  const orders = await Order.find({ ...dispatchablePaymentFilter, status: "pending", ...(req.auth?.role === "commercial" ? { restaurantId: { $in: commercialRestaurants.map((restaurant: any) => restaurant._id) } } : {}) }).select("publicCode restaurantId totalCents createdAt status paymentState paymentMethod assignmentState").sort({ createdAt: 1 }).limit(100).lean().exec() as any[];
+  const restaurants = await Restaurant.find({ _id: { $in: orders.map((order) => order.restaurantId) } }).select("name").lean().exec() as any[];
   const names = new Map(restaurants.map((restaurant) => [String(restaurant._id), restaurant.name]));
   return res.json({ orders: orders.map((order) => ({ id: String(order._id), publicCode: order.publicCode, restaurant: names.get(String(order.restaurantId)) || "Restaurante", totalCents: order.totalCents, createdAt: order.createdAt, status: order.status, paymentState: order.paymentState, paymentMethod: order.paymentMethod || "stripe", cashDueAtDelivery: order.paymentMethod === "cash", assignmentState: order.assignmentState })) });
 });
-app.get("/api/v1/finance/overview", requireRole("admin", "finance"), async (req, res) => {
+app.get("/api/v1/finance/overview", requireRole("admin", "finance"), async (_req, res) => {
   const startOfDay = new Date(); startOfDay.setHours(0, 0, 0, 0);
-  const tenant = tenantScope(req);
   const [gmv, cashIn, cashOut, pendingCash] = await Promise.all([
-    Order.aggregate([{ $match: { ...tenant, paymentState: "paid", createdAt: { $gte: startOfDay } } }, { $group: { _id: null, totalCents: { $sum: "$totalCents" }, orders: { $sum: 1 } } }]),
-    CashLedgerEntry.aggregate([{ $match: { ...tenant, direction: "in", createdAt: { $gte: startOfDay } } }, { $group: { _id: null, totalCents: { $sum: "$amountCents" } } }]),
-    CashLedgerEntry.aggregate([{ $match: { ...tenant, direction: "out", createdAt: { $gte: startOfDay } } }, { $group: { _id: null, totalCents: { $sum: "$amountCents" } } }]),
-    CashLedgerEntry.aggregate([{ $match: tenant }, { $group: { _id: { riderId: "$riderId", direction: "$direction" }, totalCents: { $sum: "$amountCents" } } }]),
+    Order.aggregate([{ $match: { paymentState: "paid", createdAt: { $gte: startOfDay } } }, { $group: { _id: null, totalCents: { $sum: "$totalCents" }, orders: { $sum: 1 } } }]),
+    CashLedgerEntry.aggregate([{ $match: { direction: "in", createdAt: { $gte: startOfDay } } }, { $group: { _id: null, totalCents: { $sum: "$amountCents" } } }]),
+    CashLedgerEntry.aggregate([{ $match: { direction: "out", createdAt: { $gte: startOfDay } } }, { $group: { _id: null, totalCents: { $sum: "$amountCents" } } }]),
+    CashLedgerEntry.aggregate([{ $group: { _id: { riderId: "$riderId", direction: "$direction" }, totalCents: { $sum: "$amountCents" } } }]),
   ]);
   const balances = new Map<string, number>(); for (const row of pendingCash as any[]) { const key = String(row._id.riderId); balances.set(key, (balances.get(key) || 0) + (row._id.direction === "in" ? row.totalCents : -row.totalCents)); }
   return res.json({ service: "piki-api", overview: { gmv_today_cents: Number(gmv[0]?.totalCents || 0), paid_orders_today: Number(gmv[0]?.orders || 0), cash_collected_today_cents: Number(cashIn[0]?.totalCents || 0), cash_handed_over_today_cents: Number(cashOut[0]?.totalCents || 0), cash_pending_cents: Array.from(balances.values()).reduce((sum, value) => sum + Math.max(0, value), 0) } });
 });
 
-app.get("/api/v1/admin/overview", requireRole("admin"), async (req, res) => {
+app.get("/api/v1/admin/overview", requireRole("admin"), async (_req, res) => {
   const startOfDay = new Date(); startOfDay.setHours(0, 0, 0, 0);
-  const tenant = tenantScope(req);
   const [activeRestaurants, pendingRestaurants, riders, openOrders, deliveredToday, gmv] = await Promise.all([
-    Restaurant.countDocuments({ ...tenant, isActive: true, onboardingStatus: "approved" }),
-    Restaurant.countDocuments({ ...tenant, onboardingStatus: "pending_review" }),
-    Rider.countDocuments({ ...tenant, isTestRider: { $ne: true } }),
-    Order.countDocuments({ ...tenant, status: { $in: ["pending", "accepted", "preparing", "ready_for_pickup", "picked_up", "on_the_way"] } }),
-    Order.countDocuments({ ...tenant, status: "delivered", deliveredAt: { $gte: startOfDay } }),
-    Order.aggregate([{ $match: { ...tenant, paymentState: "paid", createdAt: { $gte: startOfDay } } }, { $group: { _id: null, totalCents: { $sum: "$totalCents" }, orders: { $sum: 1 } } }]),
+    Restaurant.countDocuments({ isActive: true, onboardingStatus: "approved" }),
+    Restaurant.countDocuments({ onboardingStatus: "pending_review" }),
+    Rider.countDocuments({ isTestRider: { $ne: true } }),
+    Order.countDocuments({ status: { $in: ["pending", "accepted", "preparing", "ready_for_pickup", "picked_up", "on_the_way"] } }),
+    Order.countDocuments({ status: "delivered", deliveredAt: { $gte: startOfDay } }),
+    Order.aggregate([{ $match: { paymentState: "paid", createdAt: { $gte: startOfDay } } }, { $group: { _id: null, totalCents: { $sum: "$totalCents" }, orders: { $sum: 1 } } }]),
   ]);
   res.json({ service: "piki-api", overview: { active_restaurants: activeRestaurants, pending_restaurants: pendingRestaurants, riders, open_orders: openOrders, delivered_today: deliveredToday, gmv_today_cents: Number(gmv[0]?.totalCents || 0), paid_orders_today: Number(gmv[0]?.orders || 0) } });
 });
 
-app.get("/api/v1/admin/operations/health", requireRole("admin", "fleet"), async (req, res) => {
-  const now = Date.now();
-  const freshCutoff = new Date(now - 90_000);
-  const staleCutoff = new Date(now - 10 * 60_000);
-  const tenant = tenantScope(req);
-  const [riders, dispatchQueue, activeOffers, activeOrders] = await Promise.all([
-    Rider.find({ ...await fleetRiderFilter(req), isTestRider: { $ne: true } }).select("status lastLocationAt location fleetId zoneSlug").lean().exec(),
-    Order.countDocuments({ ...tenant, riderId: null, assignmentState: { $in: ["unassigned", "expired", "rejected"] }, ...dispatchablePaymentFilter, status: { $in: [...dispatchableOrderStatuses] } }),
-    Order.countDocuments({ ...tenant, assignmentState: "offered", assignmentExpiresAt: { $gt: new Date() } }),
-    Order.countDocuments({ ...tenant, status: { $in: [...activeOperationalOrderStatuses] } }),
-  ]);
-  const summary = riders.reduce((acc: any, rider: any) => {
-    const hasGps = Array.isArray(rider.location?.coordinates) && rider.location.coordinates.length >= 2;
-    const last = rider.lastLocationAt ? new Date(rider.lastLocationAt) : null;
-    const freshGps = Boolean(last && last >= freshCutoff && hasGps);
-    const staleGps = Boolean(last && last < freshCutoff && last >= staleCutoff);
-    acc.total += 1;
-    if (["available", "busy"].includes(rider.status)) acc.online += 1;
-    if (rider.status === "offline") acc.offline += 1;
-    if (freshGps) acc.freshGps += 1;
-    else if (staleGps) acc.staleGps += 1;
-    else if (!hasGps || !last) acc.missingGps += 1;
-    return acc;
-  }, { total: 0, online: 0, offline: 0, freshGps: 0, staleGps: 0, missingGps: 0 });
-  return res.json({ service: "piki-api", generatedAt: new Date().toISOString(), riders: summary, dispatch: { queue: dispatchQueue, activeOffers, activeOrders }, automaticDispatchSweep: { ...automaticDispatchSweepStats, intervalSeconds: 5, healthy: automaticDispatchSweepStats.runs > 0 && automaticDispatchSweepStats.errors === 0 && Boolean(automaticDispatchSweepStats.lastCompletedAt) }, thresholds: { freshGpsSeconds: 90, staleGpsMinutes: 10, pickupReassignMinutes: 10, pickupArrivalRadiusMeters: PICKUP_ARRIVAL_RADIUS_METERS, partnerPreparationMinutes: PARTNER_PREPARATION_LIMIT_MINUTES, customerDeliveryTargetMinutes: CUSTOMER_DELIVERY_TARGET_MINUTES } });
-});
-
-app.get("/api/v1/admin/operations/live", requireRole("admin"), async (req, res) => {
-  const tenant = tenantScope(req);
-  const riders = await Rider.find({ ...tenant, isTestRider: { $ne: true } }).select("riderCode name email status lifecycleStatus lifecycleReason vehicle location lastLocationAt activeOrderId fleetId zoneSlug").lean().exec() as any[];
-  const riderIds = riders.map((rider) => rider._id);
-  const orders = await Order.find({ ...tenant, riderId: { $in: riderIds }, status: { $in: [...activeOperationalOrderStatuses] } }).select("publicCode displayCode status assignmentState deliveryAddress restaurantId customerId riderId").select("+customerPhone").lean().exec() as any[];
-  const restaurants = await Restaurant.find({ ...tenant, _id: { $in: orders.map((order) => order.restaurantId) } }).select("name address").lean().exec() as any[];
-  const restaurantMap = new Map(restaurants.map((restaurant) => [String(restaurant._id), restaurant]));
-  const orderMap = new Map(orders.map((order) => [String(order.riderId), { ...order, customerPhone: order.customerPhone || null, restaurant: restaurantMap.get(String(order.restaurantId)) || null }]));
-  const now = Date.now();
-  return res.json({ refreshedAt: new Date().toISOString(), riders: riders.map((rider) => { const age = rider.lastLocationAt ? Math.max(0, Math.round((now - new Date(rider.lastLocationAt).getTime()) / 1000)) : null; return { id: String(rider._id), riderCode: rider.riderCode, name: rider.name, status: rider.status, lifecycleStatus: rider.lifecycleStatus || "active", lifecycleReason: rider.lifecycleReason || "", vehicle: rider.vehicle, location: rider.location, lastLocationAt: rider.lastLocationAt, gpsState: age !== null && age <= 90 && rider.location?.coordinates?.length === 2 ? "fresh" : age !== null && age <= 600 ? "stale" : "missing", gpsAgeSeconds: age, activeOrder: orderMap.get(String(rider._id)) || null }; }) });
-});
-
-/**
- * Fleet sees only operationally valid positions: an active shift, a live GPS
- * heartbeat (<=90 seconds) and an available/busy Rider state. Historical or
- * offline coordinates never reach this response, so the map cannot present a
- * stale position as live.
- */
-app.get("/api/v1/fleet/operations/live", requireRole("admin", "fleet"), async (req, res) => {
-  const now = madridNow();
-  const freshSince = new Date(Date.now() - 90_000);
-  const tenant = tenantScope(req);
-  const activeRiderIds = await RiderSlot.distinct("riderId", { ...tenant, date: now.date, status: "active", startTime: { $lte: now.time }, endTime: { $gt: now.time } });
-  const riders = await Rider.find({ ...await fleetRiderFilter(req), _id: { $in: activeRiderIds }, status: { $in: ["available", "busy"] }, lastLocationAt: { $gte: freshSince }, location: { $exists: true } }).select("riderCode name status vehicle location lastLocationAt activeOrderId").lean().exec() as any[];
+app.get("/api/v1/admin/operations/live", requireRole("admin"), async (_req, res) => {
+  const riders = await Rider.find({ isTestRider: { $ne: true }, location: { $exists: true } }).select("riderCode name email status vehicle location lastLocationAt activeOrderId fleetId").lean().exec() as any[];
   const activeOrderIds = riders.map((rider) => rider.activeOrderId).filter(Boolean);
-  const orders = await Order.find({ ...tenant, _id: { $in: activeOrderIds } }).select("publicCode displayCode status assignmentState").lean().exec() as any[];
-  const orderMap = new Map(orders.map((order) => [String(order._id), order]));
-  return res.json({ refreshedAt: new Date().toISOString(), freshnessSeconds: 90, riders: riders.map((rider) => ({ _id: rider._id, id: rider._id, riderCode: rider.riderCode, name: rider.name, status: rider.status, vehicle: rider.vehicle, location: rider.location, lastLocationAt: rider.lastLocationAt, activeOrder: rider.activeOrderId ? orderMap.get(String(rider.activeOrderId)) || null : null })) });
+  const orders = await Order.find({ _id: { $in: activeOrderIds } }).select("publicCode displayCode status assignmentState deliveryAddress restaurantId customerId riderId").select("+customerPhone").lean().exec() as any[];
+  const restaurants = await Restaurant.find({ _id: { $in: orders.map((order) => order.restaurantId) } }).select("name address").lean().exec() as any[];
+  const restaurantMap = new Map(restaurants.map((restaurant) => [String(restaurant._id), restaurant]));
+  const orderMap = new Map(orders.map((order) => [String(order._id), { ...order, customerPhone: order.customerPhone || null, restaurant: restaurantMap.get(String(order.restaurantId)) || null }]));
+  return res.json({ refreshedAt: new Date().toISOString(), riders: riders.map((rider) => ({ id: rider._id, riderCode: rider.riderCode, name: rider.name, status: rider.status, vehicle: rider.vehicle, location: rider.location, lastLocationAt: rider.lastLocationAt, activeOrder: rider.activeOrderId ? orderMap.get(String(rider.activeOrderId)) || null : null })) });
 });
 
 app.get("/api/v1/riders/overview", requireRole("admin", "fleet"), async (_req, res) => {
@@ -4048,14 +2541,13 @@ app.get("/api/v1/riders/overview", requireRole("admin", "fleet"), async (_req, r
 
 app.get("/api/v1/riders/statistics", requireRole("rider"), async (req, res) => {
   if (!req.auth?.employeeId) return res.status(409).json({ error: "RIDER_EMPLOYEE_SESSION_REQUIRED" });
-  const tenant = tenantScope(req);
-  const employee = await EmployeeAccount.findOne({ _id: req.auth.employeeId, ...tenant }).select("email").lean().exec() as any;
-  const rider = employee ? await Rider.findOne({ email: employee.email, ...tenant }).select("_id reliabilityScore").lean().exec() as any : null;
+  const employee = await EmployeeAccount.findById(req.auth.employeeId).select("email").lean().exec() as any;
+  const rider = employee ? await Rider.findOne({ email: employee.email }).select("_id reliabilityScore").lean().exec() as any : null;
   if (!rider) return res.status(404).json({ error: "RIDER_NOT_FOUND" });
   const start = new Date(); start.setHours(0, 0, 0, 0); start.setDate(start.getDate() - 6);
   const [summary, daily] = await Promise.all([
-    Order.aggregate([{ $match: { ...tenant, riderId: rider._id } }, { $group: { _id: null, completed: { $sum: { $cond: [{ $eq: ["$status", "delivered"] }, 1, 0] } }, cancelled: { $sum: { $cond: [{ $eq: ["$status", "cancelled"] }, 1, 0] } }, accepted: { $sum: 1 } } }]),
-    Order.aggregate([{ $match: { ...tenant, riderId: rider._id, deliveredAt: { $gte: start }, status: "delivered" } }, { $group: { _id: { $dateToString: { format: "%Y-%m-%d", date: "$deliveredAt", timezone: "Europe/Madrid" } }, completed: { $sum: 1 } } }, { $sort: { _id: 1 } }]),
+    Order.aggregate([{ $match: { riderId: rider._id } }, { $group: { _id: null, completed: { $sum: { $cond: [{ $eq: ["$status", "delivered"] }, 1, 0] } }, cancelled: { $sum: { $cond: [{ $eq: ["$status", "cancelled"] }, 1, 0] } }, accepted: { $sum: 1 } } }]),
+    Order.aggregate([{ $match: { riderId: rider._id, deliveredAt: { $gte: start }, status: "delivered" } }, { $group: { _id: { $dateToString: { format: "%Y-%m-%d", date: "$deliveredAt", timezone: "Europe/Madrid" } }, completed: { $sum: 1 } } }, { $sort: { _id: 1 } }]),
   ]);
   const dailyMap = new Map(daily.map((item: any) => [item._id, item.completed]));
   const dailyDeliveries = Array.from({ length: 7 }, (_, index) => { const day = new Date(start); day.setDate(start.getDate() + index); const key = new Intl.DateTimeFormat("en-CA", { timeZone: "Europe/Madrid" }).format(day); return { date: key, completed: dailyMap.get(key) || 0 }; });
@@ -4081,157 +2573,30 @@ app.use((error: any, req: express.Request, res: express.Response, next: express.
 });
 
 async function repairConfiguredPartnerAccess() {
-  // Render does not retroactively synchronize Blueprint variables into this
-  // existing service. Keep this one explicitly authorised demonstration
-  // owner as a safe bootstrap fallback so its idempotent portfolio repair
-  // still runs after deployment.
-  const email = String(process.env.REPAIR_PARTNER_EMAIL || "rrhh.milchollos@gmail.com").trim().toLowerCase();
-  const configuredPartnerSlug = String(process.env.REPAIR_PARTNER_SLUG || "kfc-xativa-qa").trim().toLowerCase();
+  const email = String(process.env.REPAIR_PARTNER_EMAIL || "").trim().toLowerCase();
   if (!email) return;
-  const account = await EmployeeAccount.findOne({ email }).select("_id email tenantId restaurantId restaurantIds apiRole jobRole roles primaryRole active authorizationStatus ownerProtected").lean().exec() as any;
+  const account = await EmployeeAccount.findOne({ email }).select("_id email restaurantId apiRole jobRole active authorizationStatus").lean().exec() as any;
   if (!account) { console.log(JSON.stringify({ event: "partner_access_repair", email, result: "account_not_found" })); return; }
-
-  // The production Render service may retain an older Blueprint environment.
-  // Keep the explicitly allow-listed QA portfolio self-healing for the owner
-  // account, while all other partner repair paths remain opt-in.
-  const createOrUseTestRestaurant = process.env.REPAIR_PARTNER_CREATE_TEST === "true"
-    || (email === ownerEmail && configuredPartnerSlug === "kfc-xativa-qa");
-  let restaurant: any = null;
-  if (createOrUseTestRestaurant) {
-    // The exact test slug is unique; adopting a legacy record also ensures it
-    // lives in the same tenant as the account that will operate it.
-    restaurant = await Restaurant.findOneAndUpdate(
-      { slug: configuredPartnerSlug },
-      configuredPartnerRestaurantUpsert(account.tenantId, email, configuredPartnerSlug),
-      { upsert: true, new: true, setDefaultsOnInsert: true },
-    ).select("_id email slug name tenantId onboardingStatus isActive internalDemo demoMenuVersion").lean().exec();
-    console.log(JSON.stringify({ event: "partner_access_repair", email, result: "test_restaurant_created_or_reused", restaurantId: String(restaurant._id), restaurantName: restaurant.name, tenantId: restaurant.tenantId ? String(restaurant.tenantId) : null }));
-  } else {
-    const tenantFilter = account.tenantId ? { tenantId: account.tenantId } : { tenantId: null };
-    restaurant = account.restaurantId
-      ? await Restaurant.findOne({ _id: account.restaurantId, ...tenantFilter }).select("_id email slug name tenantId onboardingStatus isActive").lean().exec()
-      : await Restaurant.findOne({ email, ...tenantFilter }).select("_id email slug name tenantId onboardingStatus isActive").lean().exec();
-  }
+  const restaurant = account.restaurantId
+    ? await Restaurant.findById(account.restaurantId).select("_id email onboardingStatus isActive").lean().exec() as any
+    : await Restaurant.findOne({ email }).select("_id email onboardingStatus isActive").lean().exec() as any;
   if (!restaurant) { console.log(JSON.stringify({ event: "partner_access_repair", email, result: "restaurant_not_found", accountId: String(account._id) })); return; }
-
-  const isProtectedOwner = Boolean(account.ownerProtected && email === ownerEmail);
-  // This function only runs for REPAIR_PARTNER_EMAIL. Keep the demonstration
-  // menu available to that explicitly configured Partner even if an old
-  // owner flag has not yet been migrated in MongoDB.
-  if (restaurant.slug === "kfc-xativa-test" || restaurant.slug === "kfc-xativa-qa") {
-    const seeded = await Restaurant.findOneAndUpdate(
-      {
-        _id: restaurant._id,
-        $or: [
-          { demoMenuVersion: { $lt: PARTNER_DEMO_MENU_VERSION } },
-          { demoMenuVersion: { $exists: false } },
-        ],
-      },
-      {
-        $set: {
-          internalDemo: restaurant.slug !== "kfc-xativa-qa",
-          demoMenuVersion: PARTNER_DEMO_MENU_VERSION,
-          tagline: restaurant.slug === "kfc-xativa-qa" ? "Local QA de Xàtiva habilitado para pruebas operativas reales." : "Entorno de demostración interna de PIKI · sin afiliación comercial.",
-          address: "Calle Sor Isabel de Villena 82, bajo, Novelé, Valencia",
-          locality: "Novetlè",
-          location: { type: "Point", coordinates: [-0.5468067, 38.9817572] },
-          menu: partnerDemoMenu,
-        },
-      },
-      { new: true },
-    ).select("_id email slug name tenantId onboardingStatus isActive internalDemo demoMenuVersion").lean().exec();
-    if (seeded) {
-      restaurant = seeded;
-      console.log(JSON.stringify({ event: "partner_demo_menu_restored", restaurantId: String(restaurant._id), menuVersion: PARTNER_DEMO_MENU_VERSION, itemCount: partnerDemoMenu.length }));
-    }
+  if (restaurant.onboardingStatus !== "approved" || restaurant.isActive !== true) {
+    console.log(JSON.stringify({ event: "partner_access_repair", email, result: "restaurant_not_approved", restaurantId: String(restaurant._id), onboardingStatus: restaurant.onboardingStatus, isActive: restaurant.isActive })); return;
   }
-
-  // The repair itself is explicitly allow-listed by REPAIR_PARTNER_EMAIL in
-  // render.yaml. Restore the whole fixed demonstration portfolio for that
-  // account; relying on an old ownerProtected flag left it with only KFC.
-  const includeXativaTestPortfolio = true;
-  const testPortfolio = [
-    { slug: "kings-tacos-xativa", name: "Kings Tacos Xàtiva", cuisine: "Mexicana", category: "Mexicana" },
-    { slug: "eleven-burgers-xativa", name: "Eleven Burgers Xàtiva", cuisine: "Hamburguesas", category: "Hamburguesas" },
-    { slug: "nakama-sushi-xativa", name: "Nakama Sushi Xàtiva", cuisine: "Japonesa", category: "Japonesa" },
-    { slug: "rooster-kebab-xativa", name: "Rooster Kebab Xàtiva", cuisine: "Kebab", category: "Kebab" },
-    { slug: "alibaba-kebab-xativa", name: "Alibaba Kebab Xàtiva", cuisine: "Kebab", category: "Kebab" },
-  ] as const;
-  const assignedRestaurants = includeXativaTestPortfolio
-    ? await Promise.all(testPortfolio.map((location) => Restaurant.findOneAndUpdate(
-      { slug: location.slug },
-      {
-        $set: {
-          tenantId: account.tenantId || null,
-          name: location.name,
-          cuisine: location.cuisine,
-          category: location.category,
-          locality: "Xàtiva",
-          partnerGroupKey: "xativa",
-          availabilityStatus: "coming_soon",
-          upcomingMessage: "Disponible muy pronto",
-          onboardingStatus: "approved",
-          isActive: false,
-        },
-        $setOnInsert: { slug: location.slug, tagline: "Próximo partner PIKI en Xàtiva", phone: "", address: "Xàtiva" },
-      },
-      { upsert: true, new: true, setDefaultsOnInsert: true },
-    ).select("_id slug name").lean().exec()))
-    : [];
-  const portfolioIds = [restaurant._id, ...assignedRestaurants.map((location: any) => location._id)];
-  if (includeXativaTestPortfolio && new Set(assignedRestaurants.map((location: any) => location.slug)).size !== COMING_SOON_SLUGS.length) {
-    throw new Error("Configured Xàtiva test portfolio does not match the public catalog");
-  }
-
-  const roles = [...new Set([...(Array.isArray(account.roles) ? account.roles : []), "partner", ...(isProtectedOwner ? ["admin"] : [])])];
-  await EmployeeAccount.updateOne(
-    { _id: account._id },
-    {
-      $set: {
-        restaurantId: restaurant._id,
-        restaurantIds: portfolioIds,
-        apiRole: isProtectedOwner ? "admin" : "partner",
-        jobRole: isProtectedOwner ? "admin" : "partner",
-        roles,
-        primaryRole: isProtectedOwner ? "admin" : "partner",
-        active: true,
-        authorizationStatus: "approved",
-        authorizedAt: new Date(),
-        authorizationReason: includeXativaTestPortfolio ? "Asignación de cartera de pruebas Partner de Xàtiva." : "Asignación de KFC XATIVA TEST para pruebas Partner.",
-      },
-    },
-  ).exec();
-  console.log(JSON.stringify({ event: "partner_access_repair", email, result: "repaired", restaurantId: String(restaurant._id), restaurantName: restaurant.name, assignedRestaurantCount: portfolioIds.length, ownerPreserved: isProtectedOwner }));
+  await EmployeeAccount.updateOne({ _id: account._id }, { $set: { restaurantId: restaurant._id, apiRole: "partner", jobRole: "partner", active: true, authorizationStatus: "approved", authorizedAt: new Date(), authorizationReason: "Reparación de acceso Partner solicitada por PIKI para pruebas operativas." } }).exec();
+  console.log(JSON.stringify({ event: "partner_access_repair", email, result: "repaired", restaurantId: String(restaurant._id), previous: { active: account.active, authorizationStatus: account.authorizationStatus, apiRole: account.apiRole, jobRole: account.jobRole, restaurantId: account.restaurantId ? String(account.restaurantId) : null } }));
 }
+
 async function start() {
   const uri = process.env.MONGODB_URI;
-  if (uri) {
-    await mongoose.connect(uri, { dbName: databaseName, serverSelectionTimeoutMS: 10_000, socketTimeoutMS: 45_000, maxPoolSize: 20, minPoolSize: 2, retryWrites: true });
-    // Authorization records are never repaired or approved while serving traffic.
-    // Use `npm run migrate:authorizations -- --apply` in a controlled window instead.
-    await ensureExpiresAtTtlIndex("employee_sessions");
-    await ensureExpiresAtTtlIndex("employee_password_resets");
-    await ensureIndexes();
-    startRealtimeRelay();
-    startNotificationWorker();
-    await repairConfiguredPartnerAccess();
-    await purgeTestDataIfEnabled();
-    databaseReady = true;
-    if (process.env.RUN_TENANT_MIGRATION === "true") {
-      if (process.env.ALLOW_TENANT_MIGRATION !== "true") throw new Error("RUN_TENANT_MIGRATION requires ALLOW_TENANT_MIGRATION=true");
-      console.log(JSON.stringify({ event: "tenant_migration_started" }));
-      console.log(JSON.stringify({ event: "tenant_migration_completed", ...(await runTenantMigration()) }));
-    }
-  } else console.warn("MONGODB_URI is not configured; /ready will remain unavailable.");
+  if (uri) { await mongoose.connect(uri, { dbName: databaseName, serverSelectionTimeoutMS: 10_000 }); await EmployeeAccount.updateMany({ authorizationStatus: { $exists: false } }, { $set: { authorizationStatus: "approved", accessLevel: "subadmin" } }).exec(); await EmployeeAccount.updateOne({ email: ownerEmail }, { $set: { accessLevel: "superadmin", authorizationStatus: "approved", ownerProtected: true, active: true } }).exec(); const owner = await EmployeeAccount.findOne({ email: ownerEmail }).select("_id").lean().exec() as any; const legacyApproved = await EmployeeAccount.find({ email: { $ne: ownerEmail }, authorizationStatus: "approved", authorizedAt: null }).select("_id apiRole accessLevel createdAt").lean().exec() as any[]; for (const employee of legacyApproved) { const authorizedAt = employee.createdAt || new Date(); await EmployeeAccount.updateOne({ _id: employee._id, authorizedAt: null }, { $set: { authorizedAt, authorizedBy: owner?._id || null, authorizationReason: "Migración de autorización aprobada existente." } }).exec(); if (owner?._id && !(await AccessAuthorization.exists({ employeeId: employee._id }))) await AccessAuthorization.create({ employeeId: employee._id, action: "created", previousStatus: null, nextStatus: "approved", previousRole: null, nextRole: employee.apiRole, accessLevel: employee.accessLevel || "subadmin", actorEmployeeId: owner._id, reason: "Migración de autorización aprobada existente." }); } await ensureIndexes(); startRealtimeRelay(); startNotificationWorker(); if (process.env.NODE_ENV !== "production" && process.env.SEED_DEMO_DATA === "true") await seedCatalog(); if (process.env.REPAIR_PARTNER_EMAIL) await repairConfiguredPartnerAccess(); databaseReady = true; if (process.env.RUN_TENANT_MIGRATION === "true") { if (process.env.ALLOW_TENANT_MIGRATION !== "true") throw new Error("RUN_TENANT_MIGRATION requires ALLOW_TENANT_MIGRATION=true"); console.log(JSON.stringify({ event: "tenant_migration_started" })); console.log(JSON.stringify({ event: "tenant_migration_completed", ...(await runTenantMigration()) })); } } else console.warn("MONGODB_URI is not configured; /ready will remain unavailable.");
   await EmployeeSession.init();
-  await EmployeePasswordReset.init();
   const server = app.listen(port, "0.0.0.0", () => console.log(`PIKI API listening on port ${port}`));
-  void verifyCorporateEmailConnection().then(result => console.log(JSON.stringify({ event: "corporate_email_transport_probe", ...result }))).catch(() => console.warn("Corporate email probe failed without exposing credentials"));
-  // Dispatch is intentionally not scheduled in the web process. Run
-  // `npm run start:dispatch-worker` as a separate service to consume the
-  // persistent dispatch_outbox with atomic leases and retry/backoff.
+  const sweepTimer = setInterval(() => { void runAutomaticDispatchSweep().catch((error) => console.error("Automatic dispatch sweep crashed", error)); }, 5_000).unref();
+  void runAutomaticDispatchSweep().catch((error) => console.error("Initial automatic dispatch sweep failed", error));
   process.once("SIGTERM", () => {
-    stopNotificationWorker(); databaseReady = false;
+    clearInterval(sweepTimer); stopNotificationWorker(); databaseReady = false;
     server.close(() => { void mongoose.disconnect().finally(() => process.exit(0)); });
     setTimeout(() => process.exit(0), 25_000).unref();
   });
