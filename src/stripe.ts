@@ -2,6 +2,7 @@ import Stripe from "stripe";
 import mongoose from "mongoose";
 import { Order, StripeEvent } from "./models.js";
 import { publishOrderIntakeEvents } from "./realtime.js";
+import { dispatchCustomerOrderById } from "./customerCompat.js";
 import { dispatchInitialIdempotencyKey, enqueueDispatchOutbox } from "./dispatchOutbox.js";
 import {
   allowedPriorPaymentStates,

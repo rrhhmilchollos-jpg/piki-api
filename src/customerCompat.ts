@@ -18,6 +18,10 @@ let dispatchCustomerOrder: ((orderId: string) => Promise<unknown>) | null = null
 export function setCustomerOrderDispatcher(dispatcher: (orderId: string) => Promise<unknown>) {
   dispatchCustomerOrder = dispatcher;
 }
+export async function dispatchCustomerOrderById(orderId: string) {
+  if (!dispatchCustomerOrder) return { state: "dispatcher_unavailable" as const };
+  return dispatchCustomerOrder(orderId);
+}
 const hashToken = (value: string) => createHash("sha256").update(value).digest("hex");
 const hashPassword = (value: string, salt = randomBytes(16).toString("hex")) => `${salt}:${scryptSync(value, salt, 64).toString("hex")}`;
 const checkPassword = (value: string, encoded: string) => {
