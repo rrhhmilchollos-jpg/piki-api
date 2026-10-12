@@ -41,6 +41,43 @@ function inputOf(req: Request): any {
 }
 function reply(res: Response, value: unknown) { return res.json({ result: { data: { json: value } } }); }
 function fail(res: Response, message: string, code = "BAD_REQUEST") { const status = code === "UNAUTHORIZED" || code === "AUTH_REQUIRED" ? 401 : code === "FORBIDDEN" ? 403 : code === "CONFLICT" ? 409 : code === "NOT_FOUND" ? 404 : code === "STRIPE_UNAVAILABLE" ? 503 : 400; return res.status(status).json({ error: { json: { message, code: -32000, data: { code, httpStatus: status } } } }); }
+
+function validRestaurantPoint(value: unknown): value is [number, number] {
+  return Array.isArray(value) && value.length >= 2 && Number.isFinite(Number(value[0])) && Number.isFinite(Number(value[1])) && Number(value[0]) >= -180 && Number(value[0]) <= 180 && Number(value[1]) >= -90 && Number(value[1]) <= 90;
+}
+
+const restaurantGeocodeCache = new Map<string, { expiresAt: number; point: [number, number] | null }>();
+async function resolveRestaurantPoint(restaurant: any): Promise<[number, number] | null> {
+  const current = restaurant?.location?.coordinates;
+  if (validRestaurantPoint(current)) return [Number(current[0]), Number(current[1])];
+  const address = String(restaurant?.address || "").trim();
+  const locality = String(restaurant?.locality || "").trim();
+  // Never geocode a bare city/locality: it is not precise enough for dispatch.
+  if (address.length < 8 || !locality || address.toLocaleLowerCase() === locality.toLocaleLowerCase()) return null;
+  const cacheKey = `${address}|${locality}`.toLocaleLowerCase();
+  const cached = restaurantGeocodeCache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) return cached.point;
+  try {
+    const url = new URL("https://nominatim.openstreetmap.org/search");
+    url.searchParams.set("q", `${address}, ${locality}, Comunitat Valenciana, España`);
+    url.searchParams.set("format", "jsonv2");
+    url.searchParams.set("limit", "1");
+    const response = await fetch(url, { signal: AbortSignal.timeout(1_500), headers: { "User-Agent": "PIKI-Delivery/0.2 (+https://pikidelivery.com)" } });
+    const rows = response.ok ? await response.json() as Array<{ lat?: string; lon?: string }> : [];
+    const latitude = Number(rows[0]?.lat);
+    const longitude = Number(rows[0]?.lon);
+    const point: [number, number] | null = Number.isFinite(latitude) && Number.isFinite(longitude) ? [longitude, latitude] : null;
+    restaurantGeocodeCache.set(cacheKey, { expiresAt: Date.now() + 300_000, point });
+    if (point && restaurant?._id) {
+      await Restaurant.updateOne({ _id: restaurant._id }, { $set: { location: { type: "Point", coordinates: point } } }).exec();
+    }
+    return point;
+  } catch (error) {
+    console.warn("Restaurant geocoding unavailable", error instanceof Error ? error.message : error);
+    restaurantGeocodeCache.set(cacheKey, { expiresAt: Date.now() + 30_000, point: null });
+    return null;
+  }
+}
 function getSession(req: Request) {
   const header = req.header("x-piki-session");
   if (header) return header;
@@ -258,9 +295,9 @@ export async function handleCustomerTrpc(req: Request, res: Response) {
       const deliveryPoint: [number, number] = [longitude, latitude];
       const coverage = evaluateXativaCoverage(deliveryPoint);
       if (!coverage.covered || coverage.deliveryFeeCents === null || coverage.serviceFeeCents === null) return fail(res, "Todavía no repartimos en esa dirección.", "DELIVERY_OUTSIDE_COVERAGE");
-      const restaurantPoint = restaurant.location?.coordinates;
-      if (!Array.isArray(restaurantPoint) || restaurantPoint.length < 2) return fail(res, "El restaurante no tiene ubicación operativa configurada.", "RESTAURANT_LOCATION_UNAVAILABLE");
-      const route = await quoteDeliveryRoute([Number(restaurantPoint[0]), Number(restaurantPoint[1])], deliveryPoint);
+      const restaurantPoint = await resolveRestaurantPoint(restaurant);
+      if (!restaurantPoint) return fail(res, "El restaurante no tiene una dirección operativa verificable. Contacta con PIKI para completar su ubicación.", "RESTAURANT_LOCATION_UNAVAILABLE");
+      const route = await quoteDeliveryRoute(restaurantPoint, deliveryPoint);
       const subtotalCents = normalized.reduce((sum, item) => sum + item.unitPriceCents * item.quantity, 0);
       const deliveryCents = coverage.deliveryFeeCents; const serviceCents = coverage.serviceFeeCents; const totalCents = subtotalCents + deliveryCents + serviceCents;
       if (!isCashOrderWithinLimit(paymentMethod, totalCents)) return res.status(422).json(cashOrderLimitError(totalCents));
