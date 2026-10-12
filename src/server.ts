@@ -4077,6 +4077,7 @@ async function repairConfiguredPartnerAccess() {
   // owner as a safe bootstrap fallback so its idempotent portfolio repair
   // still runs after deployment.
   const email = String(process.env.REPAIR_PARTNER_EMAIL || "rrhh.milchollos@gmail.com").trim().toLowerCase();
+  const configuredPartnerSlug = String(process.env.REPAIR_PARTNER_SLUG || "kfc-xativa-qa").trim().toLowerCase();
   if (!email) return;
   const account = await EmployeeAccount.findOne({ email }).select("_id email tenantId restaurantId restaurantIds apiRole jobRole roles primaryRole active authorizationStatus ownerProtected").lean().exec() as any;
   if (!account) { console.log(JSON.stringify({ event: "partner_access_repair", email, result: "account_not_found" })); return; }
@@ -4087,10 +4088,10 @@ async function repairConfiguredPartnerAccess() {
     // The exact test slug is unique; adopting a legacy record also ensures it
     // lives in the same tenant as the account that will operate it.
     restaurant = await Restaurant.findOneAndUpdate(
-      { slug: "kfc-xativa-test" },
+      { slug: configuredPartnerSlug },
       {
         $set: { tenantId: account.tenantId || null, email, onboardingStatus: "approved", isActive: true, internalDemo: true },
-        $setOnInsert: { slug: "kfc-xativa-test", name: "KFC XATIVA TEST", cuisine: "Americana", category: "Americana", locality: "Xàtiva", partnerGroupKey: "xativa", tagline: "Entorno de demostración interna de PIKI · sin afiliación comercial.", phone: "", address: "Xàtiva" },
+        $setOnInsert: { slug: configuredPartnerSlug, name: "KFC XATIVA QA", cuisine: "Americana", category: "Americana", locality: "Xàtiva", partnerGroupKey: "xativa", tagline: "Entorno QA interno de PIKI · sin afiliación comercial.", phone: "", address: "Xàtiva" },
       },
       { upsert: true, new: true, setDefaultsOnInsert: true },
     ).select("_id email slug name tenantId onboardingStatus isActive internalDemo demoMenuVersion").lean().exec();
@@ -4107,7 +4108,7 @@ async function repairConfiguredPartnerAccess() {
   // This function only runs for REPAIR_PARTNER_EMAIL. Keep the demonstration
   // menu available to that explicitly configured Partner even if an old
   // owner flag has not yet been migrated in MongoDB.
-  if (restaurant.slug === "kfc-xativa-test") {
+  if (restaurant.slug === "kfc-xativa-test" || restaurant.slug === "kfc-xativa-qa") {
     const seeded = await Restaurant.findOneAndUpdate(
       {
         _id: restaurant._id,
