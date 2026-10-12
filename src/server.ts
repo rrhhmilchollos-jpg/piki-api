@@ -3286,13 +3286,21 @@ if (!slot) {
     return res.status(409).json({ error: "SHIFT_OUTSIDE_SCHEDULE", message: `Jornada bloqueada: solo puedes iniciar en la fecha y franja asignadas. Hora oficial: ${now.date} ${now.time} (${now.timeZone}).`, now, serverClock: now });
   }
   const currentSlot = slot as any;
+  const hasFreshLocation = Boolean(rider.lastLocationAt && new Date(rider.lastLocationAt).getTime() >= Date.now() - 90_000);
+  if (!hasFreshLocation) {
+    return res.status(409).json({
+      error: "FRESH_LOCATION_REQUIRED",
+      message: "Jornada bloqueada: activa y comparte una posición GPS real antes de continuar.",
+      locationRequired: true,
+      serverClock: now,
+    });
+  }
   const updatedSlot = await RiderSlot.findOneAndUpdate({ _id: currentSlot._id, status: { $in: ["planned", "active"] } }, { $set: { status: "active" } }, { new: true }).lean().exec();
   await trackRiderShiftStart(updatedSlot || currentSlot, rider).catch((error) => console.error("Rider incentive shift tracking start failed", error instanceof Error ? error.message : error));
   const hasOrders = await Order.exists({ riderId, status: { $nin: ["delivered", "cancelled"] }, assignmentState: { $in: ["offered", "assigned"] } });
-  const hasFreshLocation = Boolean(rider.lastLocationAt && new Date(rider.lastLocationAt).getTime() >= Date.now() - 90_000);
-  const status = hasOrders ? "busy" : hasFreshLocation ? "available" : "paused";
+  const status = hasOrders ? "busy" : "available";
   await Rider.findByIdAndUpdate(riderId, { $set: { status } }).exec();
-  return res.json({ message: hasFreshLocation ? "Jornada iniciada" : "Jornada iniciada: comparte tu ubicación para quedar disponible.", warningSound: "start_shift", locationRequired: !hasFreshLocation, serverClock: now, rider: { id: riderId, riderCode: rider.riderCode, status }, shift: updatedSlot });
+  return res.json({ message: "Jornada iniciada", warningSound: "start_shift", locationRequired: false, serverClock: now, rider: { id: riderId, riderCode: rider.riderCode, status }, shift: updatedSlot });
 });
 
 app.post("/api/v1/riders/:id/shift/stop", requireRole("admin", "rider", "fleet"), async (req, res) => {
