@@ -197,7 +197,7 @@ const pickupQrIsValid = (orderCode: string, raw: unknown) => {
   if (value.toUpperCase() === pickupQrPin(orderCode)) return true;
   try { const url = new URL(value); return url.searchParams.get("order_id") === orderCode && url.searchParams.get("pickup_token") === pickupQrSignature(orderCode); } catch { return false; }
 };
-const riderLocationSchema = locationSchema.extend({ riderId: z.string().min(1) });
+const riderLocationSchema = locationSchema.extend({ riderId: z.string().min(1), accuracy: z.number().finite().min(0).max(100000).optional() });
 const zoneSchema = z.object({ name: z.string().min(2).max(120), slug: z.string().regex(/^[a-z0-9-]+$/), serviceFeeCents: z.number().int().min(0).max(10000).default(0), maxEtaMinutes: z.number().int().min(1).max(240).default(60), polygon: z.object({ coordinates: z.array(z.array(z.array(z.number()))).min(1) }) });
 const dispatchSchema = z.object({ preparationMinutes: z.coerce.number().int().min(1).max(180).default(15), offerSeconds: z.coerce.number().int().min(15).max(180).default(60), maxCustomerEtaMinutes: z.coerce.number().int().min(10).max(240).optional() });
 const riderIncidentSchema = z.object({ reason: z.enum(["late_acceptance", "late_delivery", "no_show", "unsafe_driving", "fraud_signal", "customer_complaint", "document_expired", "other"]), evidence: z.array(z.string().url()).max(10).default([]), occurredAt: z.coerce.date().optional() });
@@ -2015,7 +2015,7 @@ app.get("/api/v1/riders/:id/slots", requireRole("admin", "rider", "fleet"), asyn
   if (req.auth?.role === "rider" && !(await riderAccessForRequest(riderId, req))) return res.status(403).json({ error: "RIDER_ACCESS_DENIED" });
   if (req.auth?.role === "fleet" && !(await fleetCanAccessRider(req, riderId))) return res.status(403).json({ error: "FLEET_RIDER_ACCESS_DENIED" });
   const slots = await RiderSlot.find({ riderId, ...tenantScope(req) }).sort({ date: 1, startTime: 1 }).limit(500).lean().exec();
-  return res.json({ riderId, slots });
+  return res.json({ riderId, slots: slots.map((slot: any) => ({ ...slot, day: new Intl.DateTimeFormat("es-ES", { timeZone: "Europe/Madrid", weekday: "long" }).format(new Date(`${slot.date}T12:00:00Z`)), start: slot.startTime, end: slot.endTime, zone: slot.zoneSlug })) });
 });
 
 function madridNow() {
@@ -2067,7 +2067,8 @@ app.get("/api/v1/riders/:id/shift", requireRole("admin", "rider", "fleet"), asyn
   if (!rider) return res.status(404).json({ error: "RIDER_NOT_FOUND" });
   if (!(await canAccessRiderShift(riderId, req))) return res.status(403).json({ error: "RIDER_ACCESS_DENIED" });
   const { now, slot, selfStartAllowed } = await findCurrentRiderSlot(riderId);
-  return res.json({ rider: { id: rider._id, riderCode: rider.riderCode, status: rider.status }, now, eligible: Boolean(slot) || selfStartAllowed, selfStartAllowed, shift: slot });
+  const shift = slot ? { ...(slot as any), day: new Intl.DateTimeFormat("es-ES", { timeZone: "Europe/Madrid", weekday: "long" }).format(new Date(`${(slot as any).date}T12:00:00Z`)), start: (slot as any).startTime, end: (slot as any).endTime, zone: (slot as any).zoneSlug } : null;
+  return res.json({ rider: { id: rider._id, riderCode: rider.riderCode, status: rider.status }, now, eligible: Boolean(slot) || selfStartAllowed, selfStartAllowed, shift });
 });
 
 app.post("/api/v1/riders/:id/shift/start", requireRole("admin", "rider", "fleet"), async (req, res) => {
