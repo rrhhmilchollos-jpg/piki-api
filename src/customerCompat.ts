@@ -50,6 +50,14 @@ const restaurantGeocodeCache = new Map<string, { expiresAt: number; point: [numb
 async function resolveRestaurantPoint(restaurant: any): Promise<[number, number] | null> {
   const current = restaurant?.location?.coordinates;
   if (validRestaurantPoint(current)) return [Number(current[0]), Number(current[1])];
+  // KFC QA is an explicitly allow-listed operational test partner. Keep its
+  // verified street geocode as a last-resort fallback while the idempotent
+  // Render repair writes the same point to MongoDB.
+  if (["kfc-xativa-qa", "kfc-xativa-test"].includes(String(restaurant?.slug || "").trim().toLowerCase())) {
+    const point: [number, number] = [-0.5468067, 38.9817572];
+    await Restaurant.updateOne({ _id: restaurant._id }, { $set: { address: "Calle Sor Isabel de Villena 82, bajo, Novelé, Valencia", locality: "Novetlè", location: { type: "Point", coordinates: point } } }).exec();
+    return point;
+  }
   const address = String(restaurant?.address || "").trim();
   const locality = String(restaurant?.locality || "").trim();
   // Never geocode a bare city/locality: it is not precise enough for dispatch.
