@@ -1746,7 +1746,21 @@ app.get("/api/v1/admin/:kind-leads/:id/documents", requireRole("admin", "commerc
   if (!Model || !id) return res.status(400).json({ error: "INVALID_LEAD_DOCUMENT_TARGET" });
   const lead = await Model.findOne({ _id: id, ...await onboardingScope(req) }).lean().exec() as any;
   if (!lead) return res.status(404).json({ error: "LEAD_NOT_FOUND" });
-  return res.json({ leadId: lead._id, name: lead.name, email: lead.email, documents: lead.documents || [] });
+  const subjectType = `${req.params.kind}_lead`;
+  const requests = await DocumentRequest.find({ subjectType, subjectId: id, ...await onboardingScope(req) }).select("_id documents").lean().exec() as any[];
+  const requestIdsByType = new Map<string, string[]>();
+  for (const request of requests) for (const document of request.documents || []) {
+    const key = String(document.type);
+    const ids = requestIdsByType.get(key) || [];
+    if (!ids.includes(String(request._id))) ids.push(String(request._id));
+    requestIdsByType.set(key, ids);
+  }
+  const documents = (lead.documents || []).map((document: any) => {
+    if (document.documentRequestId) return document;
+    const candidates = requestIdsByType.get(String(document.type)) || [];
+    return candidates.length === 1 ? { ...document, documentRequestId: candidates[0] } : document;
+  });
+  return res.json({ leadId: lead._id, name: lead.name, email: lead.email, documents });
 });
 app.get("/api/v1/admin/:kind-leads/:id/documents/:documentId/content", requireRole("admin", "commercial", "gerente_comercial_zona"), async (req, res) => {
   const Model = leadModel(Array.isArray(req.params.kind) ? req.params.kind[0] : req.params.kind) as any;
@@ -1954,7 +1968,7 @@ app.post("/api/v1/admin/:kind-leads/:id/route", requireRole("admin"), async (req
 });
 function documentRequestTokenHash(token: string) { return createHash("sha256").update(token).digest("hex"); }
 function documentRequestUploadUrl(token: string) { return `${String(process.env.ADMIN_APP_URL || "https://admin.pikidelivery.com").replace(/\/$/, "")}/#document-request=${encodeURIComponent(token)}`; }
-function documentRequestMetadata(document: { type: string; fileName: string; mimeType: string; sizeBytes: number; sha256: string }) { return { type: document.type, fileName: document.fileName, mimeType: document.mimeType, sizeBytes: document.sizeBytes, sha256: document.sha256.toLowerCase(), uploadedAt: new Date() }; }
+function documentRequestMetadata(document: { type: string; fileName: string; mimeType: string; sizeBytes: number; sha256: string; documentRequestId?: mongoose.Types.ObjectId | string | null }) { return { type: document.type, documentRequestId: document.documentRequestId || null, fileName: document.fileName, mimeType: document.mimeType, sizeBytes: document.sizeBytes, sha256: document.sha256.toLowerCase(), uploadedAt: new Date() }; }
 function normalizeDocumentBytes(contentBase64: string, sizeBytes: number, mimeType: string, sha256: string) {
   const rawBase64 = contentBase64.replace(/^data:[^;]+;base64,/, "");
   if (!/^[A-Za-z0-9+/]*={0,2}$/.test(rawBase64) || rawBase64.length % 4 === 1) throw new Error("DOCUMENT_BASE64_INVALID");
