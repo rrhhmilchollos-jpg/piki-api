@@ -1,6 +1,6 @@
 import "dotenv/config";
 import "express-async-errors";
-import { createHash, createHmac, randomBytes, randomInt } from "node:crypto";
+import { createHash, createHmac, randomBytes, randomInt, randomUUID } from "node:crypto";
 import { MalwareDetectedError, MalwareScannerUnavailableError, normalizeDocumentUpload, sanitizePdfFileName, scanUploadBuffer, scanUploadBuffers } from "./fileSecurity.js";
 import { fileURLToPath } from "node:url";
 import cors from "cors";
@@ -39,6 +39,7 @@ import { cashOrderLimitError, isCashOrderWithinLimit } from "./paymentPolicy.js"
 import { extractAndParseMenu, readAssetBytes } from "./menuImport.js";
 import { purgeTestDataIfEnabled } from "./purgeTestData.js";
 import { validateDocumentRequestSubmission } from "./onboardingDocumentPolicy.js";
+import { dispatchInitialIdempotencyKey, dispatchRequeueIdempotencyKey, enqueueDispatchOutbox } from "./dispatchOutbox.js";
 import { buildFleetEntityScope, buildTenantScope } from "./tenantScope.js";
 import { authenticationOptions, registrationOptions, verifyAuthentication, verifyRegistration } from "./passkeys.js";
 
@@ -2372,7 +2373,7 @@ app.post("/api/v1/orders", rateLimit(20, 60_000, "orders-create"), async (req, r
   const authenticatedCustomer = await currentCustomer(req) as any;
   const order = await Order.create({ tenantId: restaurant.tenantId || null, publicCode, ...dailyCode, restaurantId: restaurant._id, customerId: authenticatedCustomer?._id || null, customerName: String(authenticatedCustomer?.name || "").trim(), items: normalizedItems, deliveryAddress: parsed.data.deliveryAddress, deliveryNote: parsed.data.deliveryNote, deliveryLocation: { type: "Point", coordinates: deliveryPoint }, coveragePolicySlug: coverage.policySlug, coveragePolicyVersion: coverage.policyVersion, coverageDecision: coverage.reason, straightLineDistanceKm: coverage.straightLineDistanceKm, withinMunicipality: coverage.withinMunicipality, deliveryBaseFeeCents: coverage.deliveryBaseFeeCents, outsideMunicipalitySurchargeCents: coverage.outsideMunicipalitySurchargeCents, routeDistanceKm: route.routeDistanceKm, routeDurationMinutes: route.routeDurationMinutes, routeProvider: route.routeProvider, routingDegraded: route.routingDegraded, requiredVehicleClasses: route.requiredVehicleClasses, subtotalCents, deliveryFeeCents, serviceFeeCents, totalCents, paymentMethod: parsed.data.paymentMethod, paymentState: "pending", statusHistory: [{ status: "pending", actorRole: "customer", reason: parsed.data.paymentMethod === "cash" ? "Pedido a contrarreembolso; cobro pendiente hasta la entrega" : "Pedido creado con política de cobertura Xàtiva" }] });
   if (parsed.data.paymentMethod === "cash") {
-    const dispatch = queueAutomaticDispatch(order._id as mongoose.Types.ObjectId).catch((error) => console.warn("Immediate cash-order dispatch failed", error instanceof Error ? error.message : error));
+    const dispatch = enqueueOrderForDispatch(order._id as mongoose.Types.ObjectId).catch((error) => console.warn("Dispatch outbox enqueue failed", error instanceof Error ? error.message : error));
     await Promise.all([dispatch, publishOrderIntakeEvents(order, { settlement: "cash_due", message: "Contrarreembolso: el Rider cobrará en efectivo al entregar." })]);
   }
   res.status(201).json({ order: { id: order.id, publicCode, displayCode: order.displayCode, displayCodeDate: order.displayCodeDate, status: order.status, paymentState: parsed.data.paymentMethod === "cash" ? "pending_cash_collection" : order.paymentState, paymentMethod: parsed.data.paymentMethod, cashDueAtDelivery: parsed.data.paymentMethod === "cash", deliveryQrUrl: deliveryQrUrl(publicCode), subtotalCents, deliveryFeeCents, serviceFeeCents, totalCents, coverage, route, partnerPreparationLimitMinutes: PARTNER_PREPARATION_LIMIT_MINUTES, customerDeliveryTargetMinutes: CUSTOMER_DELIVERY_TARGET_MINUTES, etaMinutes: calculateEtaRange([PARTNER_PREPARATION_LIMIT_MINUTES, PARTNER_PREPARATION_LIMIT_MINUTES], [5, 15]) } });
@@ -2398,7 +2399,7 @@ app.post("/api/v1/internal/customer-orders/sync", async (req, res) => {
   const newlyPaid = ["authorized", "paid"].includes(input.paymentState) && !["authorized", "paid"].includes(existing?.paymentState || "");
   const newCashOrder = input.paymentMethod === "cash" && !existing;
   if (newlyPaid || newCashOrder) {
-    const dispatch = queueAutomaticDispatch(order._id as mongoose.Types.ObjectId).catch((error) => console.warn("Immediate order dispatch failed", error instanceof Error ? error.message : error));
+    const dispatch = enqueueOrderForDispatch(order._id as mongoose.Types.ObjectId).catch((error) => console.warn("Dispatch outbox enqueue failed", error instanceof Error ? error.message : error));
     const settlement = newCashOrder
       ? { settlement: "cash_due" as const, message: "Contrarreembolso recibido desde PIKI Customer: el Rider cobrará al entregar." }
       : { settlement: "paid" as const, message: "Pago confirmado desde PIKI Customer." };
@@ -2634,7 +2635,7 @@ app.post("/api/v1/admin/support/orders/:id/reassign", requireRole(...supportOper
   const released = await Order.findOneAndUpdate(
     { _id: orderId, ...supportTenantScope(req), riderId: previousRiderId, assignmentState: order.assignmentState, version: order.version },
     {
-      $set: { riderId: null, assignmentState: "expired", assignmentExpiresAt: null, pickupDeadlineAt: null },
+      $set: { riderId: null, assignmentState: "expired", offerId: null, assignmentExpiresAt: null, pickupDeadlineAt: null },
       $inc: { dispatchAttempts: 1, version: 1 },
       $push: { statusHistory: { status: order.status, actorRole: "support", reason: parsed.data.reason } },
     },
@@ -2649,7 +2650,7 @@ app.post("/api/v1/admin/support/orders/:id/reassign", requireRole(...supportOper
   // A QA order must never fall back to the live candidate pool. Reuse only its
   // dedicated test rider, preserving the non-commercial boundary of this scenario.
   const preferredQaRiderId = order.isTestOrder && order.qaRiderId ? objectId(String(order.qaRiderId)) || undefined : undefined;
-  const assignment = await queueAutomaticDispatch(orderId, preferredQaRiderId);
+  const assignment = await enqueueOrderForDispatch(orderId, preferredQaRiderId, "support_reassign");
   return res.json({ assignment, audit: { action: "order_reassigned", reason: parsed.data.reason, previousRiderId: String(previousRiderId), qaScenario: Boolean(order.isTestOrder) } });
 });
 
@@ -3422,9 +3423,22 @@ async function reassignLatePickupOrders() {
     await DispatchDecision.updateMany({ orderId: released._id, riderId: released.riderId, outcome: { $in: ["accepted", "offered"] } }, { $set: { outcome: "expired", actorRole: "system" } }).exec();
     reassigned += 1;
     await publishOrderStatusEvents(released, released.status).catch((error) => console.warn("Late pickup event failed", error instanceof Error ? error.message : error));
-    void queueAutomaticDispatch(released._id as mongoose.Types.ObjectId).catch((error) => console.error("Late pickup reassignment failed", error));
+    await enqueueDispatchOutbox({ orderId: released._id, tenantId: released.tenantId || null, idempotencyKey: dispatchRequeueIdempotencyKey(released._id, Number(released.version || 0) + 1), reason: "late_pickup" });
   }
   return reassigned;
+}
+/** Persist a dispatch intent; the dedicated worker owns actual offering. */
+async function enqueueOrderForDispatch(orderId: mongoose.Types.ObjectId, preferredRiderId?: mongoose.Types.ObjectId, reason = "initial") {
+  const order = await Order.findById(orderId).select("_id tenantId").lean().exec() as any;
+  if (!order) return { state: "not_found" as const };
+  const event = await enqueueDispatchOutbox({
+    orderId: order._id,
+    tenantId: order.tenantId || null,
+    idempotencyKey: reason === "initial" ? dispatchInitialIdempotencyKey(order._id) : dispatchRequeueIdempotencyKey(order._id, Number((await Order.findById(order._id).select("version").lean().exec() as any)?.version || 0)),
+    preferredRiderId,
+    reason,
+  });
+  return { state: "queued" as const, eventId: event?.eventId || null };
 }
 /**
  * Asignación automática idempotente. El algoritmo solo acepta riders con sesión
@@ -3467,7 +3481,7 @@ async function assignOrderAutomatically(orderId: mongoose.Types.ObjectId, prefer
       if (!assignmentReservation) continue;
       const rider = assignmentReservation.rider;
       const expiresAt = assignmentReservation.reservation.expiresAt;
-      const assigned = await Order.findOneAndUpdate({ _id: order._id, ...tenantFilter, riderId: null, assignmentState: { $in: ["unassigned", "expired", "rejected"] } }, { $set: { riderId: rider._id, assignmentState: "offered", assignmentExpiresAt: expiresAt, pickupDeadlineAt: null, dispatchScore: decision.score }, $inc: { dispatchAttempts: 1, version: 1 } }, { new: true }).lean().exec() as any;
+      const assigned = await Order.findOneAndUpdate({ _id: order._id, ...tenantFilter, riderId: null, assignmentState: { $in: ["unassigned", "expired", "rejected"] } }, { $set: { riderId: rider._id, assignmentState: "offered", offerId: randomUUID(), assignmentExpiresAt: expiresAt, pickupDeadlineAt: null, dispatchScore: decision.score }, $inc: { dispatchAttempts: 1, version: 1 } }, { new: true }).lean().exec() as any;
       if (!assigned) { await releaseRiderOrderSlot(order._id, rider._id); continue; }
       await DispatchDecision.create({ ...tenantFilter, orderId: assigned._id, ...decision, riderId: rider._id, outcome: "offered", actorRole: "system" });
       await publishRiderOfferEvent(assigned, String(rider._id));
@@ -3479,7 +3493,7 @@ async function assignOrderAutomatically(orderId: mongoose.Types.ObjectId, prefer
   }
 }
 
-async function queueAutomaticDispatch(orderId: mongoose.Types.ObjectId, preferredRiderId?: mongoose.Types.ObjectId) {
+export async function queueAutomaticDispatch(orderId: mongoose.Types.ObjectId, preferredRiderId?: mongoose.Types.ObjectId) {
   // Reintenta la selección del Rider; el flujo de alta espera este resultado para sincronizar las apps.
   for (let attempt = 0; attempt < 3; attempt += 1) {
     const result = await assignOrderAutomatically(orderId, preferredRiderId);
@@ -3491,7 +3505,7 @@ async function queueAutomaticDispatch(orderId: mongoose.Types.ObjectId, preferre
 
 setCustomerOrderDispatcher(async (orderId) => {
   if (!mongoose.Types.ObjectId.isValid(orderId)) return { state: "invalid_order_id" as const };
-  return queueAutomaticDispatch(new mongoose.Types.ObjectId(orderId));
+  return enqueueOrderForDispatch(new mongoose.Types.ObjectId(orderId));
 });
 
 /**
@@ -3561,7 +3575,7 @@ app.post("/api/v1/admin/qa/dispatch-orders", requireRole("admin"), async (req, r
     assignmentState: "unassigned",
     statusHistory: [{ status: "ready_for_pickup", actorRole: "system", reason: `Simulación QA solicitada por ${employee?.email || "admin"}. Sin cobro ni entrega real.` }],
   });
-  const dispatch = await queueAutomaticDispatch(order._id as mongoose.Types.ObjectId, qaRider._id as mongoose.Types.ObjectId);
+  const dispatch = await enqueueOrderForDispatch(order._id as mongoose.Types.ObjectId, qaRider._id as mongoose.Types.ObjectId);
   const supportTicket = await SupportTicket.create({
     tenantId: restaurant.tenantId || null,
     orderId: order._id,
@@ -3604,11 +3618,12 @@ async function expireStaleOffers() {
   let expiredCount = 0;
   const expired = await Order.find({ assignmentState: "offered", assignmentExpiresAt: { $lte: new Date() } }).select("_id riderId").limit(100).lean().exec() as any[];
   for (const offer of expired) {
-    const released = await Order.findOneAndUpdate({ _id: offer._id, assignmentState: "offered", assignmentExpiresAt: { $lte: new Date() } }, { $set: { assignmentState: "expired", riderId: null, assignmentExpiresAt: null, pickupDeadlineAt: null }, $inc: { version: 1 } }, { new: false }).lean().exec() as any;
+    const released = await Order.findOneAndUpdate({ _id: offer._id, assignmentState: "offered", assignmentExpiresAt: { $lte: new Date() } }, { $set: { assignmentState: "expired", riderId: null, offerId: null, assignmentExpiresAt: null, pickupDeadlineAt: null }, $inc: { version: 1 } }, { new: false }).lean().exec() as any;
     if (!released?.riderId) continue;
     await releaseRiderOrderSlot(released._id, released.riderId);
     expiredCount += 1;
     await DispatchDecision.updateMany({ orderId: released._id, riderId: released.riderId, outcome: "offered" }, { $set: { outcome: "expired" } }).exec();
+    await enqueueDispatchOutbox({ orderId: released._id, tenantId: released.tenantId || null, idempotencyKey: dispatchRequeueIdempotencyKey(released._id, Number(released.version || 0) + 1), reason: "offer_expired" });
   }
   return expiredCount;
 }
@@ -3621,7 +3636,7 @@ async function runAutomaticDispatchSweep() {
     const reassigned = await reassignLatePickupOrders();
     const expiredOffers = await expireStaleOffers();
     const candidates = await Order.find({ riderId: null, assignmentState: { $in: ["unassigned", "expired", "rejected"] }, ...dispatchablePaymentFilter, status: { $in: [...dispatchableOrderStatuses] } }).select("_id").sort({ createdAt: 1 }).limit(25).lean().exec();
-    for (const order of candidates) void queueAutomaticDispatch(order._id as mongoose.Types.ObjectId).catch((error) => console.error("Automatic dispatch sweep failed", error));
+    for (const order of candidates) void enqueueOrderForDispatch(order._id as mongoose.Types.ObjectId).catch((error) => console.error("Dispatch outbox enqueue failed", error));
     automaticDispatchSweepStats.runs += 1;
     automaticDispatchSweepStats.reassigned += reassigned;
     automaticDispatchSweepStats.expiredOffers += expiredOffers;
@@ -3637,6 +3652,12 @@ async function runAutomaticDispatchSweep() {
     console.error(JSON.stringify({ event: "automatic_dispatch_sweep_error", error: automaticDispatchSweepStats.lastError }));
     throw error;
   }
+}
+/** Called exclusively by the explicit dispatch worker process. */
+export async function runDispatchMaintenance() {
+  if (mongoose.connection.readyState !== 1) return { reassigned: 0, expiredOffers: 0 };
+  const [reassigned, expiredOffers] = await Promise.all([reassignLatePickupOrders(), expireStaleOffers()]);
+  return { reassigned, expiredOffers };
 }
 async function findDispatchOrder(orderId: mongoose.Types.ObjectId, req: express.Request) {
   const scoped = await Order.findOne({ _id: orderId, ...tenantScope(req) }).lean().exec() as any;
@@ -3749,16 +3770,18 @@ app.post("/api/v1/dispatch/orders/:id/offer-response", requireRole("rider", "adm
     return res.status(409).json({ error: "OFFER_EXPIRED", message: "La oferta ha vencido y se ha devuelto a la cola de reparto." });
   }
   if (parsed.data.accept) {
-    const updated = await Order.findOneAndUpdate({ _id: orderId, ...tenantScope(req), assignmentState: "offered", riderId: order.riderId }, { $set: { assignmentState: "assigned", pickupDeadlineAt: new Date(Date.now() + PICKUP_REASSIGN_AFTER_MS) }, $inc: { version: 1 } }, { new: true }).lean().exec() as any;
+    const updated = await Order.findOneAndUpdate({ _id: orderId, ...tenantScope(req), assignmentState: "offered", riderId: order.riderId, offerId: order.offerId || null, version: order.version, assignmentExpiresAt: { $gt: new Date() } }, { $set: { assignmentState: "assigned", pickupDeadlineAt: new Date(Date.now() + PICKUP_REASSIGN_AFTER_MS) }, $inc: { version: 1 } }, { new: true }).lean().exec() as any;
     if (!updated) return res.status(409).json({ error: "OFFER_CHANGED_RETRY" });
     await RiderAssignmentReservation.updateOne({ orderId: updated._id, riderId: updated.riderId, status: "reserved" }, { $set: { expiresAt: null } }).exec();
     await DispatchDecision.updateMany({ orderId: updated._id, riderId: updated.riderId, outcome: "offered" }, { $set: { outcome: "accepted", actorRole: "rider" } }).exec();
     await publishOrderStatusEvents(updated, updated.status);
     return res.json({ assignment: { state: "assigned", orderId: updated._id, riderId: updated.riderId } });
   }
-  await Order.findOneAndUpdate({ _id: orderId, ...tenantScope(req), assignmentState: "offered", riderId: order.riderId }, { $set: { assignmentState: "rejected", riderId: null, assignmentExpiresAt: null }, $inc: { version: 1 } }).exec();
+  const rejected = await Order.findOneAndUpdate({ _id: orderId, ...tenantScope(req), assignmentState: "offered", riderId: order.riderId, offerId: order.offerId || null, version: order.version, assignmentExpiresAt: { $gt: new Date() } }, { $set: { assignmentState: "rejected", riderId: null, offerId: null, assignmentExpiresAt: null }, $inc: { version: 1 } }, { new: true }).lean().exec() as any;
+  if (!rejected) return res.status(409).json({ error: "OFFER_CHANGED_RETRY" });
   await DispatchDecision.updateMany({ orderId, riderId: order.riderId, outcome: "offered" }, { $set: { outcome: "rejected", actorRole: "rider" } }).exec();
   await releaseRiderOrderSlot(orderId, order.riderId);
+  await enqueueDispatchOutbox({ orderId: rejected._id, tenantId: rejected.tenantId || null, idempotencyKey: dispatchRequeueIdempotencyKey(rejected._id, Number(rejected.version || 0)), reason: "offer_rejected" });
   return res.json({ assignment: { state: "rejected", orderId } });
 });
 
@@ -4190,10 +4213,11 @@ async function start() {
   await EmployeePasswordReset.init();
   const server = app.listen(port, "0.0.0.0", () => console.log(`PIKI API listening on port ${port}`));
   void verifyCorporateEmailConnection().then(result => console.log(JSON.stringify({ event: "corporate_email_transport_probe", ...result }))).catch(() => console.warn("Corporate email probe failed without exposing credentials"));
-  const sweepTimer = setInterval(() => { void runAutomaticDispatchSweep().catch((error) => console.error("Automatic dispatch sweep crashed", error)); }, 5_000).unref();
-  void runAutomaticDispatchSweep().catch((error) => console.error("Initial automatic dispatch sweep failed", error));
+  // Dispatch is intentionally not scheduled in the web process. Run
+  // `npm run start:dispatch-worker` as a separate service to consume the
+  // persistent dispatch_outbox with atomic leases and retry/backoff.
   process.once("SIGTERM", () => {
-    clearInterval(sweepTimer); stopNotificationWorker(); databaseReady = false;
+    stopNotificationWorker(); databaseReady = false;
     server.close(() => { void mongoose.disconnect().finally(() => process.exit(0)); });
     setTimeout(() => process.exit(0), 25_000).unref();
   });

@@ -1,4 +1,5 @@
 import { createHash, createHmac, randomBytes, scryptSync, timingSafeEqual } from "node:crypto";
+import mongoose from "mongoose";
 import type { Request, Response } from "express";
 import { Order, Restaurant, CustomerAccount, RiderOrderMessage } from "./models.js";
 import { publishOrderIntakeEvents } from "./realtime.js";
@@ -8,6 +9,7 @@ import { CUSTOMER_CATALOG_RESTAURANT_FILTER, CUSTOMER_ORDERABLE_RESTAURANT_FILTE
 import { modifierGroupsForItem, quoteMenuItem, usesReferenceAddOns } from "./menuModifiers.js";
 import { cashOrderLimitError, isCashOrderWithinLimit } from "./paymentPolicy.js";
 import { createCheckoutSession } from "./stripe.js";
+import { dispatchInitialIdempotencyKey, enqueueDispatchOutbox } from "./dispatchOutbox.js";
 import { SupportTicket } from "./models.js";
 import { customerSupportCreateSchema, customerSupportTicketNumber, customerSupportTicketView } from "./customerSupportPolicy.js";
 
@@ -263,7 +265,26 @@ export async function handleCustomerTrpc(req: Request, res: Response) {
       const deliveryCents = coverage.deliveryFeeCents; const serviceCents = coverage.serviceFeeCents; const totalCents = subtotalCents + deliveryCents + serviceCents;
       if (!isCashOrderWithinLimit(paymentMethod, totalCents)) return res.status(422).json(cashOrderLimitError(totalCents));
       const code = `PIKI-${Date.now().toString(36).toUpperCase()}`;
-      const order = await Order.create({ publicCode: code, tenantId: restaurant.tenantId || null, restaurantId: restaurant._id, customerId: String(user._id), items: normalized, deliveryAddress: String(input.address || "").trim(), deliveryLocation: { type: "Point", coordinates: deliveryPoint }, coveragePolicySlug: coverage.policySlug, coveragePolicyVersion: coverage.policyVersion, coverageDecision: coverage.reason, straightLineDistanceKm: coverage.straightLineDistanceKm, withinMunicipality: coverage.withinMunicipality, deliveryBaseFeeCents: coverage.deliveryBaseFeeCents, outsideMunicipalitySurchargeCents: coverage.outsideMunicipalitySurchargeCents, routeDistanceKm: route.routeDistanceKm, routeDurationMinutes: route.routeDurationMinutes, routeProvider: route.routeProvider, routingDegraded: route.routingDegraded, requiredVehicleClasses: route.requiredVehicleClasses, subtotalCents, deliveryFeeCents: deliveryCents, serviceFeeCents: serviceCents, totalCents, paymentMethod, paymentState: "pending", statusHistory: [{ status: "pending", actorRole: "customer", reason: paymentMethod === "cash" ? "Pedido a contrarreembolso; cobro pendiente hasta la entrega" : "Pedido pendiente de confirmación del pago online" }] });
+      let order: any;
+      const orderSession = await mongoose.startSession();
+      try {
+        await orderSession.withTransaction(async () => {
+      const orderPayload = { publicCode: code, tenantId: restaurant.tenantId || null, restaurantId: restaurant._id, customerId: String(user._id), items: normalized, deliveryAddress: String(input.address || "").trim(), deliveryLocation: { type: "Point", coordinates: deliveryPoint }, coveragePolicySlug: coverage.policySlug, coveragePolicyVersion: coverage.policyVersion, coverageDecision: coverage.reason, straightLineDistanceKm: coverage.straightLineDistanceKm, withinMunicipality: coverage.withinMunicipality, deliveryBaseFeeCents: coverage.deliveryBaseFeeCents, outsideMunicipalitySurchargeCents: coverage.outsideMunicipalitySurchargeCents, routeDistanceKm: route.routeDistanceKm, routeDurationMinutes: route.routeDurationMinutes, routeProvider: route.routeProvider, routingDegraded: route.routingDegraded, requiredVehicleClasses: route.requiredVehicleClasses, subtotalCents, deliveryFeeCents: deliveryCents, serviceFeeCents: serviceCents, totalCents, paymentMethod, paymentState: "pending", statusHistory: [{ status: "pending", actorRole: "customer", reason: paymentMethod === "cash" ? "Pedido a contrarreembolso; cobro pendiente hasta la entrega" : "Pedido pendiente de confirmación del pago online" }]  };
+          const created = await Order.create([orderPayload], { session: orderSession });
+          order = created[0];
+          if (paymentMethod === "cash") {
+            await enqueueDispatchOutbox({
+              orderId: order._id,
+              tenantId: restaurant.tenantId || null,
+              idempotencyKey: dispatchInitialIdempotencyKey(order._id),
+              reason: "cash_order_created",
+              session: orderSession,
+            });
+          }
+        });
+      } finally {
+        await orderSession.endSession();
+      }
       let checkoutUrl: string | null = null;
       if (procedure === "order.checkout" && paymentMethod === "stripe") {
         try {
@@ -275,10 +296,7 @@ export async function handleCustomerTrpc(req: Request, res: Response) {
           return fail(res, "El pago online no está disponible temporalmente.", "STRIPE_UNAVAILABLE");
         }
       }
-      const dispatch = paymentMethod === "cash" && dispatchCustomerOrder
-        ? dispatchCustomerOrder(String(order._id)).catch((error) => console.warn("Customer compatibility order dispatch failed", error instanceof Error ? error.message : error))
-        : Promise.resolve();
-      if (paymentMethod === "cash") await Promise.all([dispatch, publishOrderIntakeEvents(order, { settlement: "cash_due", message: "Pedido a contrarreembolso: el Rider cobrará en efectivo al entregar." })]);
+      if (paymentMethod === "cash") await publishOrderIntakeEvents(order, { settlement: "cash_due", message: "Pedido a contrarreembolso: el Rider cobrará en efectivo al entregar." });
       return reply(res, { orderId: code, checkoutUrl, totalCents, paymentMethod, paymentState: paymentMethod === "cash" ? "pending_cash_collection" : "pending", cashDueAtDelivery: paymentMethod === "cash", deliveryQrUrl: deliveryQrUrl(code), coverage, route });
     }
     return fail(res, `Procedimiento no soportado: ${procedure}`, "NOT_FOUND");

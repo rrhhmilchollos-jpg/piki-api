@@ -6,14 +6,16 @@
   "packageManager": "pnpm@10.4.1",
   "scripts": {
     "dev": "tsx watch src/server.ts",
-    "build": "./node_modules/esbuild/bin/esbuild src/server.ts --platform=node --packages=external --bundle --format=esm --outdir=dist",
+    "build": "./node_modules/esbuild/bin/esbuild src/server.ts src/dispatch-worker.ts --platform=node --packages=external --bundle --format=esm --outdir=dist",
     "start": "node dist/server.js",
     "check": "tsc --noEmit",
     "test": "tsx --test src/*.test.ts",
     "migrate:tenants": "tsx scripts/migrate-tenants.ts",
     "migrate:authorizations": "tsx scripts/migrate-legacy-authorizations.ts",
     "dispatch:postgis": "node scripts/run-postgis-batch.mjs",
-    "seed:staging:qa": "tsx scripts/seed-staging-qa.ts"
+    "seed:staging:qa": "tsx scripts/seed-staging-qa.ts",
+    "start:dispatch-worker": "node dist/dispatch-worker.js",
+    "dispatch:worker": "tsx src/dispatch-worker.ts"
   },
   "dependencies": {
     "@simplewebauthn/server": "^13.2.2",
