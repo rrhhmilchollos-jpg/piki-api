@@ -1,7 +1,7 @@
 import "dotenv/config";
 import "express-async-errors";
 import { createHash, createHmac, randomBytes, randomInt, randomUUID } from "node:crypto";
-import { MalwareDetectedError, MalwareScannerUnavailableError, normalizeDocumentUpload, sanitizePdfFileName, scanUploadBuffer, scanUploadBuffers } from "./fileSecurity.js";
+import { MalwareDetectedError, MalwareScannerUnavailableError, normalizeDocumentUpload, sanitizePdfFileName, sanitizeUploadFileName, scanUploadBuffer, scanUploadBuffers } from "./fileSecurity.js";
 import { fileURLToPath } from "node:url";
 import cors from "cors";
 import express from "express";
@@ -1681,12 +1681,11 @@ app.get("/api/v1/admin/restaurants/:id/documents/:documentId/content", requireRo
   const restaurant = await Restaurant.findOne({ _id: id, ...tenantScope(req), "partnerProfile.documents._id": req.params.documentId }).select("+partnerProfile.documents.contentBase64").lean().exec() as any;
   const document = restaurant?.partnerProfile?.documents?.find((item: any) => String(item._id) === req.params.documentId);
   if (!document) return res.status(404).json({ error: "DOCUMENT_NOT_FOUND" });
-  if (document.mimeType !== "application/pdf") return res.status(415).json({ error: "DOCUMENT_PDF_REQUIRED", message: "Este expediente contiene un archivo antiguo no PDF. Solicita que se vuelva a subir en PDF." });
   const viewedAt = new Date();
   const viewedBy = objectId(req.auth!.employeeId!);
   const result = await Restaurant.updateOne({ _id: id, ...tenantScope(req), "partnerProfile.documents._id": req.params.documentId }, { $set: { "partnerProfile.documents.$.viewedAt": viewedAt, "partnerProfile.documents.$.viewedBy": viewedBy } }).exec();
   if (!result.matchedCount) return res.status(404).json({ error: "DOCUMENT_NOT_FOUND" });
-  return res.json({ fileName: sanitizePdfFileName(document.fileName), mimeType: "application/pdf", sizeBytes: document.sizeBytes, sha256: document.sha256, contentBase64: document.contentBase64, viewedAt: viewedAt.toISOString() });
+  return res.json({ fileName: sanitizeUploadFileName(document.fileName), mimeType: document.mimeType, sizeBytes: document.sizeBytes, sha256: document.sha256, contentBase64: document.contentBase64, viewedAt: viewedAt.toISOString() });
 });
 
 app.patch("/api/v1/admin/restaurants/:id/documents/:documentId/status", requireRole("admin"), async (req, res) => {
@@ -1756,12 +1755,11 @@ app.get("/api/v1/admin/:kind-leads/:id/documents/:documentId/content", requireRo
   const lead = await Model.findOne({ _id: id, ...await onboardingScope(req), "documents._id": req.params.documentId }).select("+documents.contentBase64").lean().exec() as any;
   const document = lead?.documents?.find((item: any) => String(item._id) === req.params.documentId);
   if (!document) return res.status(404).json({ error: "DOCUMENT_NOT_FOUND" });
-  if (document.mimeType !== "application/pdf") return res.status(415).json({ error: "DOCUMENT_PDF_REQUIRED", message: "Este expediente contiene un archivo antiguo no PDF. Solicita que se vuelva a subir en PDF." });
   const viewedAt = new Date();
   const viewedBy = objectId(req.auth!.employeeId!);
   const result = await Model.updateOne({ _id: id, ...await onboardingScope(req), "documents._id": req.params.documentId }, { $set: { "documents.$.viewedAt": viewedAt, "documents.$.viewedBy": viewedBy } }).exec();
   if (!result.matchedCount) return res.status(404).json({ error: "DOCUMENT_NOT_FOUND" });
-  return res.json({ fileName: sanitizePdfFileName(document.fileName), mimeType: "application/pdf", sizeBytes: document.sizeBytes, sha256: document.sha256, contentBase64: document.contentBase64, viewedAt: viewedAt.toISOString() });
+  return res.json({ fileName: sanitizeUploadFileName(document.fileName), mimeType: document.mimeType, sizeBytes: document.sizeBytes, sha256: document.sha256, contentBase64: document.contentBase64, viewedAt: viewedAt.toISOString() });
 });
 app.patch("/api/v1/admin/:kind-leads/:id/documents/:documentId/status", requireRole("admin", "commercial", "gerente_comercial_zona"), async (req, res) => {
   const Model = leadModel(Array.isArray(req.params.kind) ? req.params.kind[0] : req.params.kind) as any;
@@ -1855,12 +1853,11 @@ app.get("/api/v1/rider-applications/:id/documents/:documentId/content", requireR
   const application = await RiderApplication.findOne({ _id: id, ...await adminOnboardingScope(req), "documents._id": req.params.documentId }).select("+documents.contentBase64").lean().exec() as any;
   const document = application?.documents?.find((item: any) => String(item._id) === req.params.documentId);
   if (!document) return res.status(404).json({ error: "DOCUMENT_NOT_FOUND" });
-  if (document.mimeType !== "application/pdf") return res.status(415).json({ error: "DOCUMENT_PDF_REQUIRED", message: "Este expediente contiene un archivo antiguo no PDF. Solicita que se vuelva a subir en PDF." });
   const viewedAt = new Date();
   const viewedBy = objectId(req.auth!.employeeId!);
   const result = await RiderApplication.updateOne({ _id: id, ...await adminOnboardingScope(req), "documents._id": req.params.documentId }, { $set: { "documents.$.viewedAt": viewedAt, "documents.$.viewedBy": viewedBy } }).exec();
   if (!result.matchedCount) return res.status(404).json({ error: "DOCUMENT_NOT_FOUND" });
-  return res.json({ fileName: sanitizePdfFileName(document.fileName), mimeType: "application/pdf", sizeBytes: document.sizeBytes, sha256: document.sha256, contentBase64: document.contentBase64, viewedAt: viewedAt.toISOString() });
+  return res.json({ fileName: sanitizeUploadFileName(document.fileName), mimeType: document.mimeType, sizeBytes: document.sizeBytes, sha256: document.sha256, contentBase64: document.contentBase64, viewedAt: viewedAt.toISOString() });
 });
 app.patch("/api/v1/rider-applications/:id/documents/:documentId/status", requireRole("admin"), async (req, res) => {
   const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
