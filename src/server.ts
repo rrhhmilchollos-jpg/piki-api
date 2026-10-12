@@ -7,7 +7,7 @@ import cors from "cors";
 import express from "express";
 import mongoose from "mongoose";
 import { z } from "zod";
-import { CashLedgerEntry, CustomerAccount, DispatchDecision, DocumentRequest, EmployeeAccount, AccessAuthorization, Fleet, Order, Restaurant, PartnerAsset, PartnerLocalityGroup, MenuImportDraft, Rider, RiderApplication, PartnerLead, RiderLead, RiderIncident, RiderOrderMessage, RiderSlot, SignatureRequest, Zone, PushSubscription, RealtimeEvent, Notification, Tenant, TenantMembership, RiderAssignmentReservation, SupportTicket, OnboardingRequest, TrackingSession, LocationSample, ensureIndexes } from "./models.js";
+import { CashLedgerEntry, CustomerAccount, DispatchDecision, DispatchOutbox, DocumentRequest, EmployeeAccount, AccessAuthorization, Fleet, Order, Restaurant, StripeEvent, PartnerAsset, PartnerLocalityGroup, MenuImportDraft, Rider, RiderApplication, PartnerLead, RiderLead, RiderIncident, RiderOrderMessage, RiderSlot, SignatureRequest, Zone, PushSubscription, RealtimeEvent, Notification, Tenant, TenantMembership, RiderAssignmentReservation, SupportTicket, OnboardingRequest, TrackingSession, LocationSample, TestOrderPurgeAudit, ensureIndexes } from "./models.js";
 import { normalizeLeadEmail, partnerLeadSubmissionSchema, riderLeadSubmissionSchema, webLeadReviewSchema, webLeadStatusSchema } from "./webLeads.js";
 import { assertTransition, calculateEtaRange, transitionSchema, validateCoordinates } from "./algorithms/index.js";
 import { configuredAuthRoles, requireOwner, requireRole, resolveRole } from "./auth.js";
@@ -15,7 +15,7 @@ import { EmployeeSession, issueEmployeeSession, revokeEmployeeSessions, sessionR
 import { isStripeSignatureError, processStripeWebhook, stripeConfigured, createSignaturitSignature, signaturitBaseUrl, signaturitConfigured, signaturitMode, signatureWebhookUrl, webhookDigest, handleCustomerTrpc, currentCustomer, issueCustomerSession, setCustomerOrderDispatcher } from "./integrations/index.js";
 import { getVersionPolicy, isPikiSurface, requiresUpdate, setVersionPolicy, syncVersionPolicy, versionPolicySchema, type PikiSurface } from "./appVersion.js";
 import { publicPushConfig, revokePushSubscription, savePushSubscription } from "./push.js";
-import { publishOrderStatusEvents, publishOrderIntakeEvents, publishRiderOfferEvent, publishRiderArrivalEvent, publishRiderLocationEvents, publishRiderScheduleEvent, publishRiderCustomerMessageEvent, publishRealtimeEvent, serveRealtimeEvents, startRealtimeRelay, tenantAudienceKey } from "./realtime.js";
+import { publishOrderStatusEvents, publishOrderIntakeEvents, publishRiderOfferEvent, publishRiderOfferExpiredEvent, publishRiderArrivalEvent, publishRiderLocationEvents, publishRiderScheduleEvent, publishRiderCustomerMessageEvent, publishRealtimeEvent, serveRealtimeEvents, startRealtimeRelay, tenantAudienceKey } from "./realtime.js";
 import { listNotifications, markAllNotificationsRead, markNotificationRead, sendDocumentRequestEmail, sendDocumentUploadEmail, startNotificationWorker, stopNotificationWorker, type NotificationPrincipal } from "./notifications.js";
 import { captureStripePaymentIntent, createCheckoutSession } from "./stripe.js";
 import { rankDispatchCandidates, computeMobilityAdvice, calculateSanctionDecision, defaultSanctionPolicy } from "./algorithms/index.js";
@@ -38,11 +38,14 @@ import { decideLatePickup, pointDistanceMeters } from "./pickupPolicy.js";
 import { buildLegacyRiderSupportTicketFilter, buildRiderSupportTicketFilter } from "./supportTicketScope.js";
 import { cashOrderLimitError, isCashOrderWithinLimit } from "./paymentPolicy.js";
 import { extractAndParseMenu, readAssetBytes } from "./menuImport.js";
-import { purgeTestDataIfEnabled } from "./purgeTestData.js";
 import { validateDocumentRequestSubmission } from "./onboardingDocumentPolicy.js";
 import { dispatchInitialIdempotencyKey, dispatchRequeueIdempotencyKey, enqueueDispatchOutbox, processDispatchOutboxBatch, type DispatchOutboxEvent } from "./dispatchOutbox.js";
 import { buildFleetEntityScope, buildTenantScope } from "./tenantScope.js";
 import { authenticationOptions, registrationOptions, verifyAuthentication, verifyRegistration } from "./passkeys.js";
+import { RiderIncentiveEntry } from "./riderIncentivesModels.js";
+import { registerAdminTestOrderPurgeRoutes } from "./adminTestOrderPurge.js";
+import { isExactQaRestaurantName, isPartnerTestOrderCandidate, SAFE_ISOLATED_QA_ORDER_STATUSES, SAFE_TEST_ORDER_PAYMENT_STATES, TEST_ORDER_PURGE_SCOPE_VERSION } from "./testOrderPurgePolicy.js";
+import { recentlyExpiredOfferRiderIds, RIDER_OFFER_RETRY_COOLDOWN_MS } from "./riderOfferRetryPolicy.js";
 
 export const app = express();
 app.set("trust proxy", 1);
@@ -1438,6 +1441,7 @@ app.get("/api/v1/partners/kitchen/orders", requireRole("partner"), async (req, r
       pickupPin: order.status === "ready_for_pickup" ? pickupQrPin(order.publicCode) : null,
       partnerPrepDeadlineAt: order.partnerPrepDeadlineAt || null,
       partnerPrepOverdue: Boolean(order.partnerPrepDeadlineAt && new Date(order.partnerPrepDeadlineAt).getTime() < Date.now()),
+      testCleanupEligible: isPartnerTestOrderCandidate(order, restaurant?.name),
     };
   }) });
 });
@@ -1505,6 +1509,123 @@ app.patch("/api/v1/partners/kitchen/orders/:id/status", requireRole("partner"), 
   await publishOrderStatusEvents(order, target).catch((error) => console.warn("Realtime partner status event failed", error instanceof Error ? error.message : error));
   scheduleCustomerOrderPush(order, target);
   return res.json({ order });
+});
+class PartnerTestOrderCleanupError extends Error {
+  constructor(readonly status: number, readonly code: string, readonly message: string) { super(code); }
+}
+const partnerTestOrderCleanupSchema = z.object({ confirmOrderId: z.string().regex(/^[a-f\d]{24}$/i) }).strict();
+app.post("/api/v1/partners/kitchen/orders/:id/test-cleanup", rateLimit(3, 60_000, "partner-test-order-cleanup"), requireRole("partner"), async (req, res) => {
+  if (!databaseReady || mongoose.connection.readyState !== 1) return res.status(503).json({ error: "DATABASE_UNAVAILABLE" });
+  const parsed = partnerTestOrderCleanupSchema.safeParse(req.body || {});
+  if (!parsed.success) return res.status(400).json({ error: "EXPLICIT_ORDER_CONFIRMATION_REQUIRED" });
+  const orderId = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
+  if (!orderId || parsed.data.confirmOrderId !== String(orderId)) return res.status(400).json({ error: "ORDER_CONFIRMATION_MISMATCH" });
+  const { access, allowed } = await partnerRequestAccess(req, "orders:cancel");
+  if (!allowed || !access) return res.status(403).json({ error: "PARTNER_PERMISSION_DENIED", permission: "orders:cancel" });
+  const restaurantIdValue = await employeeRestaurant(req, access);
+  const restaurantId = restaurantIdValue ? objectId(restaurantIdValue) : null;
+  if (!restaurantId) return res.status(403).json({ error: "PARTNER_RESTAURANT_ACCESS_DENIED" });
+  const actorEmployeeId = req.auth?.employeeId ? objectId(req.auth.employeeId) : null;
+  if (!actorEmployeeId) return res.status(403).json({ error: "PARTNER_EMPLOYEE_SESSION_REQUIRED" });
+
+  const session = await mongoose.startSession();
+  let deleted: { order: any; releasedRiderIds: string[]; removedQaSupportTickets: number; auditId: string } | null = null;
+  try {
+    await session.withTransaction(async () => {
+      const order = await Order.findOne({ _id: orderId, restaurantId, ...tenantScope(req) }).session(session).lean().exec() as any;
+      if (!order) throw new PartnerTestOrderCleanupError(404, "ORDER_NOT_FOUND", "El pedido ya no existe en este local.");
+      const restaurant = await Restaurant.findOne({ _id: restaurantId, ...tenantScope(req) }).select("name").session(session).lean().exec() as any;
+      const exactQaRestaurant = isExactQaRestaurantName(restaurant?.name);
+      if (!isPartnerTestOrderCandidate(order, restaurant?.name)) throw new PartnerTestOrderCleanupError(409, "ORDER_NOT_MARKED_AS_TEST", "Solo se pueden eliminar pedidos de prueba o del restaurante KFC XATIVA QA.");
+      if (!(SAFE_TEST_ORDER_PAYMENT_STATES as readonly string[]).includes(String(order.paymentState || "")) || order.stripeCheckoutSessionId || order.stripePaymentIntentId || order.cashCollectedAt || order.cashCollectedByRiderId || (order.partnerPaymentRequired === true && Number(order.partnerPaymentCents || 0) > 0)) {
+        throw new PartnerTestOrderCleanupError(409, "ORDER_HAS_FINANCIAL_ACTIVITY", "No se elimina: el pedido tiene un estado o una referencia de pago/cobro que requiere conciliación financiera.");
+      }
+      const activeQaTestState = (SAFE_ISOLATED_QA_ORDER_STATUSES as readonly string[]).includes(String(order.status || ""));
+      if (order.status !== "cancelled" && (!activeQaTestState || (!exactQaRestaurant && (order.isTestOrder !== true || !order.qaRiderId)))) {
+        throw new PartnerTestOrderCleanupError(409, "ORDER_STATE_NOT_SAFE_TO_DELETE", "Solo se eliminan pedidos QA todavía no recogidos; los pedidos en reparto o entregados se conservan.");
+      }
+
+      const publicCode = String(order.publicCode || "");
+      const linkedTickets = await SupportTicket.find({ $or: [{ orderId }, ...(publicCode ? [{ orderReference: publicCode }] : [])] }).select("_id sourceRole ticketNumber orderId orderReference").session(session).lean().exec() as any[];
+      const qaTickets = linkedTickets.filter((ticket) => String(ticket.sourceRole || "").toLowerCase() === "qa" && /^SUP-QA-[A-Z0-9-]+$/i.test(String(ticket.ticketNumber || "")));
+      if (qaTickets.length !== linkedTickets.length) throw new PartnerTestOrderCleanupError(409, "ORDER_HAS_SUPPORT_HISTORY", "No se elimina: existe un caso de soporte operativo asociado al pedido.");
+
+      const orderIdStrings = [String(order._id)];
+      const incentiveReference = await RiderIncentiveEntry.findOne({ $or: [
+        { "metadata.orderId": { $in: [order._id, ...orderIdStrings] } },
+        ...(publicCode ? [{ "metadata.orderCode": publicCode }, { "metadata.publicCode": publicCode }] : []),
+      ] }).select("_id").session(session).lean().exec();
+      const [cashReference, stripeReference] = await Promise.all([
+        CashLedgerEntry.findOne({ orderId }).select("_id").session(session).lean().exec(),
+        publicCode ? (StripeEvent.findOne({ orderCode: publicCode }).select("_id").session(session).lean().exec()) : Promise.resolve(null),
+      ]);
+      if (cashReference || stripeReference || incentiveReference) throw new PartnerTestOrderCleanupError(409, "ORDER_HAS_FINANCIAL_REFERENCE", "No se elimina: hay movimientos de caja, Stripe o incentivos asociados.");
+
+      const activeRiders = await Rider.find({ activeOrderId: orderId }).select("_id status isTestRider activeOrderId").session(session).lean().exec() as any[];
+      const allowedRiderIds = new Set([order.riderId, order.qaRiderId].filter(Boolean).map(String));
+      if (activeRiders.some((rider) => !allowedRiderIds.has(String(rider._id)))) throw new PartnerTestOrderCleanupError(409, "RIDER_REFERENCE_CONFLICT", "No se elimina: otro Rider tiene una referencia activa al pedido.");
+      if (!exactQaRestaurant && activeRiders.some((rider) => rider.isTestRider !== true)) throw new PartnerTestOrderCleanupError(409, "REAL_RIDER_TEST_MARKER_REQUIRED", "No se elimina: la asignación no pertenece a un Rider QA aislado.");
+
+      const qaTicketIds = qaTickets.map((ticket) => ticket._id);
+      await DispatchOutbox.deleteMany({ orderId }, { session });
+      await DispatchDecision.deleteMany({ orderId }, { session });
+      await RiderAssignmentReservation.deleteMany({ orderId }, { session });
+      await RiderOrderMessage.deleteMany({ orderId }, { session });
+      if (qaTicketIds.length) {
+        const ticketDelete = await SupportTicket.deleteMany({ _id: { $in: qaTicketIds }, sourceRole: "qa", ticketNumber: /^SUP-QA-[A-Z0-9-]+$/i }, { session });
+        if (Number(ticketDelete.deletedCount || 0) !== qaTicketIds.length) throw new PartnerTestOrderCleanupError(409, "SUPPORT_PRECONDITION_CHANGED", "El caso QA cambió durante la operación; no se completó la eliminación.");
+      }
+      await Notification.deleteMany({ entityType: "order", entityId: { $in: [...orderIdStrings, publicCode] } }, { session });
+
+      const orderDelete = await Order.deleteOne({ _id: orderId, restaurantId, ...tenantScope(req), version: Number(order.version || 0), status: order.status, paymentState: order.paymentState }, { session }).exec();
+      if (Number(orderDelete.deletedCount || 0) !== 1) throw new PartnerTestOrderCleanupError(409, "ORDER_CHANGED_RETRY", "El pedido cambió durante la operación; actualiza la lista y vuelve a intentarlo.");
+
+      const riderIdsToRelease = [...new Set([order.riderId, ...activeRiders.map((rider) => rider._id)].filter(Boolean).map(String))];
+      for (const riderIdString of riderIdsToRelease) {
+        const riderId = objectId(riderIdString);
+        if (!riderId) continue;
+        const rider = await Rider.findOne({ _id: riderId, activeOrderId: orderId }).select("_id status activeOrderId").session(session).lean().exec() as any;
+        if (!rider) continue;
+        const [nextAssigned, nextReservation] = await Promise.all([
+          Order.findOne({ riderId, assignmentState: "assigned", status: { $in: [...activeOperationalOrderStatuses] } }).select("_id").session(session).lean().exec() as Promise<any>,
+          RiderAssignmentReservation.findOne({ riderId, status: "reserved" }).select("_id").session(session).lean().exec() as Promise<any>,
+        ]);
+        const update: Record<string, unknown> = { activeOrderId: nextAssigned?._id || null };
+        if (nextAssigned) update.status = "busy";
+        else if (!nextReservation && rider.status === "busy") update.status = "available";
+        await Rider.updateOne({ _id: riderId, activeOrderId: orderId }, { $set: update }, { session }).exec();
+      }
+
+      const deletedAt = new Date();
+      const audit = await TestOrderPurgeAudit.create([{
+        actorEmployeeId,
+        actorRole: "partner",
+        source: "partner_manual",
+        restaurantId,
+        previewId: null,
+        scopeVersion: TEST_ORDER_PURGE_SCOPE_VERSION,
+        deletedOrderIds: [orderId],
+        deletedPublicCodes: [publicCode],
+        deletedCount: 1,
+        releasedRiderIds: riderIdsToRelease.map((id) => objectId(id)).filter(Boolean),
+        deletedAt,
+      }], { session });
+      deleted = { order, releasedRiderIds: riderIdsToRelease, removedQaSupportTickets: qaTicketIds.length, auditId: String(audit[0]._id) };
+    }, { readConcern: { level: "snapshot" }, writeConcern: { w: "majority" }, readPreference: "primary" });
+  } catch (error: any) {
+    if (error instanceof PartnerTestOrderCleanupError) return res.status(error.status).json({ error: error.code, message: error.message });
+    const message = String(error?.message || "");
+    if (error?.code === 20 || error?.codeName === "IllegalOperation" || /transactions are not supported|Transaction numbers are only allowed|replica set member or mongos/i.test(message)) {
+      return res.status(503).json({ error: "MONGODB_TRANSACTION_REQUIRED", message: "La operación requiere transacciones MongoDB; no se ejecutó ningún borrado." });
+    }
+    throw error;
+  } finally {
+    await session.endSession();
+  }
+  const completed = deleted as { order: any; releasedRiderIds: string[]; removedQaSupportTickets: number; auditId: string } | null;
+  if (!completed) return res.status(500).json({ error: "TEST_ORDER_CLEANUP_DID_NOT_COMPLETE" });
+  await publishOrderStatusEvents({ ...completed.order, assignmentState: "rejected", riderId: completed.order.riderId }, "cancelled").catch((error) => console.warn("Partner test-order removal event failed", error instanceof Error ? error.message : error));
+  return res.json({ deleted: true, publicCode: completed.order.publicCode, releasedRiderIds: completed.releasedRiderIds, removedQaSupportTickets: completed.removedQaSupportTickets, auditId: completed.auditId, preserved: { restaurant: true, partnerAccounts: true, riderAccounts: true, financialRecords: true } });
 });
 const partnerSupportTicketSchema = z.object({ orderId: z.string().optional(), priority: z.enum(["low", "normal", "high", "urgent"]).default("normal"), subject: z.string().trim().min(3).max(180), description: z.string().trim().min(3).max(4000) });
 app.post("/api/v1/partners/support/tickets", requireRole("partner"), async (req, res) => {
@@ -2741,21 +2862,7 @@ app.post("/api/v1/riders/:riderId/support/tickets/:ticketId/messages", requireRo
   return res.json({ ticket });
 });
 app.post("/api/v1/admin/orders/cleanup-test-data", requireOwner(), async (_req, res) => {
-  const testOrders = await Order.find({ isTestOrder: true }).select("_id publicCode displayCode").lean().exec() as any[];
-  const orderIds = testOrders.map((order) => order._id);
-  if (!orderIds.length) return res.json({ deleted: false, message: "No quedan pedidos de prueba en producción.", counts: { orders: 0, messages: 0, dispatchDecisions: 0, reservations: 0, supportTickets: 0, cashEntries: 0, realtimeEvents: 0, notifications: 0 } });
-  const orderIdFilter = { orderId: { $in: orderIds } };
-  const [messages, dispatchDecisions, reservations, supportTickets, cashEntries, realtimeEvents, notifications, orders] = await Promise.all([
-    RiderOrderMessage.deleteMany(orderIdFilter).exec(),
-    DispatchDecision.deleteMany(orderIdFilter).exec(),
-    RiderAssignmentReservation.deleteMany(orderIdFilter).exec(),
-    SupportTicket.deleteMany(orderIdFilter).exec(),
-    CashLedgerEntry.deleteMany(orderIdFilter).exec(),
-    RealtimeEvent.deleteMany({ "payload.orderId": { $in: orderIds.map(String) } }).exec(),
-    Notification.deleteMany({ entityType: "order", entityId: { $in: orderIds.map(String) } }).exec(),
-    Order.deleteMany({ _id: { $in: orderIds }, isTestOrder: true }).exec(),
-  ]);
-  return res.json({ deleted: true, orderCodes: testOrders.map((order) => order.displayCode || order.publicCode), counts: { orders: orders.deletedCount, messages: messages.deletedCount, dispatchDecisions: dispatchDecisions.deletedCount, reservations: reservations.deletedCount, supportTickets: supportTickets.deletedCount, cashEntries: cashEntries.deletedCount, realtimeEvents: realtimeEvents.deletedCount, notifications: notifications.deletedCount } });
+  return res.status(410).json({ error: "SAFE_TEST_ORDER_PURGE_REQUIRED", message: "La ruta de borrado directo está desactivada. Usa el preview y la confirmación de dos fases de /api/v1/admin/maintenance/test-orders." });
 });
 app.get("/api/v1/orders", requireRole("admin", "partner", "rider", "fleet"), async (req, res) => {
   const filter: Record<string, unknown> = { ...tenantScope(req) };
@@ -2959,7 +3066,10 @@ app.post("/api/v1/riders/:riderId/orders/:orderId/accept-offer", requireRole("ri
   if (!(await riderAccessForRequest(riderId, req))) return res.status(403).json({ error: "RIDER_ACCESS_DENIED" });
   const order = await Order.findOne({ _id: orderId, riderId, assignmentState: "offered" }).lean().exec() as any;
   if (!order) return res.status(404).json({ error: "RIDER_OFFER_NOT_FOUND" });
-  if (order.assignmentExpiresAt && new Date(order.assignmentExpiresAt).getTime() <= Date.now()) return res.status(409).json({ error: "RIDER_OFFER_EXPIRED", message: "La oferta ha caducado y PIKI ya busca otro rider." });
+  if (!order.assignmentExpiresAt || new Date(order.assignmentExpiresAt).getTime() <= Date.now()) {
+    await expireStaleOffers();
+    return res.status(409).json({ error: "RIDER_OFFER_EXPIRED", message: "La oferta ha caducado y PIKI está buscando otro Rider." });
+  }
   const pickupDeadlineAt = new Date(Date.now() + PICKUP_REASSIGN_AFTER_MS);
   const updated = await Order.findOneAndUpdate(
     { _id: orderId, riderId, assignmentState: "offered", version: order.version },
@@ -3492,8 +3602,11 @@ async function assignOrderAutomatically(orderId: mongoose.Types.ObjectId, prefer
     };
     if (preferredRiderId) riderFilter._id = { $in: currentRiderIds.filter((id) => String(id) === String(preferredRiderId)) };
     const riders = await Rider.find(riderFilter).limit(100).lean().exec() as any[];
-    const counts = await activeOrderCounts(riders.map((rider) => rider._id));
-    const ranked = rankDispatchCandidates(riders.map((rider) => ({ id: String(rider._id), status: rider.status, vehicle: rider.vehicle, location: rider.location, lastLocationAt: rider.lastLocationAt, reliabilityScore: rider.reliabilityScore, ratingScore: rider.ratingScore ?? rider.reliabilityScore, activeOrderCount: counts.get(String(rider._id)) || 0, zoneFit: 1, servicePriority: preferredRiderId && String(rider._id) === String(preferredRiderId) ? 1 : 0.5 })), { restaurantLocation: [restaurant.location.coordinates[0], restaurant.location.coordinates[1]], customerLocation: [order.deliveryLocation.coordinates[0], order.deliveryLocation.coordinates[1]], routeDistanceKm: typeof order.routeDistanceKm === "number" ? order.routeDistanceKm : null, routeDurationMinutes: typeof order.routeDurationMinutes === "number" ? order.routeDurationMinutes : null, requiredVehicleClasses: Array.isArray(order.requiredVehicleClasses) ? order.requiredVehicleClasses : [], preparationMinutes: PARTNER_PREPARATION_LIMIT_MINUTES, maxCustomerEtaMinutes: CUSTOMER_DELIVERY_TARGET_MINUTES, maxConcurrentOrders: policy.maxConcurrentOrders });
+    const recentAttempts = await DispatchDecision.find({ orderId: order._id, outcome: { $in: ["expired", "rejected"] }, createdAt: { $gte: new Date(Date.now() - RIDER_OFFER_RETRY_COOLDOWN_MS) } }).select("riderId outcome createdAt").lean().exec() as any[];
+    const recentlyExpiredRiders = recentlyExpiredOfferRiderIds(recentAttempts);
+    const retryEligibleRiders = riders.filter((rider) => !recentlyExpiredRiders.has(String(rider._id)));
+    const counts = await activeOrderCounts(retryEligibleRiders.map((rider) => rider._id));
+    const ranked = rankDispatchCandidates(retryEligibleRiders.map((rider) => ({ id: String(rider._id), status: rider.status, vehicle: rider.vehicle, location: rider.location, lastLocationAt: rider.lastLocationAt, reliabilityScore: rider.reliabilityScore, ratingScore: rider.ratingScore ?? rider.reliabilityScore, activeOrderCount: counts.get(String(rider._id)) || 0, zoneFit: 1, servicePriority: preferredRiderId && String(rider._id) === String(preferredRiderId) ? 1 : 0.5 })), { restaurantLocation: [restaurant.location.coordinates[0], restaurant.location.coordinates[1]], customerLocation: [order.deliveryLocation.coordinates[0], order.deliveryLocation.coordinates[1]], routeDistanceKm: typeof order.routeDistanceKm === "number" ? order.routeDistanceKm : null, routeDurationMinutes: typeof order.routeDurationMinutes === "number" ? order.routeDurationMinutes : null, requiredVehicleClasses: Array.isArray(order.requiredVehicleClasses) ? order.requiredVehicleClasses : [], preparationMinutes: PARTNER_PREPARATION_LIMIT_MINUTES, maxCustomerEtaMinutes: CUSTOMER_DELIVERY_TARGET_MINUTES, maxConcurrentOrders: policy.maxConcurrentOrders });
     if (!ranked.length) return { state: "no_eligible_rider" as const, candidatesConsidered: riders.length };
     for (const decision of ranked) {
       const riderId = objectId(decision.riderId); if (!riderId) continue;
@@ -3616,22 +3729,7 @@ app.post("/api/v1/admin/qa/dispatch-orders", requireRole("admin"), async (req, r
 });
 
 app.delete("/api/v1/admin/qa/dispatch-orders/:id", requireRole("admin"), async (req, res) => {
-  const orderId = objectId(String(req.params.id));
-  if (!orderId) return res.status(400).json({ error: "INVALID_ORDER_ID" });
-  const order = await Order.findOne({ _id: orderId, ...tenantScope(req), isTestOrder: true }).lean().exec() as any;
-  if (!order) return res.status(404).json({ error: "QA_ORDER_NOT_FOUND" });
-  if (order.riderId) await releaseRiderOrderSlot(order._id, order.riderId);
-  await Promise.all([
-    DispatchDecision.deleteMany({ orderId: order._id }),
-    RiderAssignmentReservation.deleteMany({ orderId: order._id }),
-    SupportTicket.deleteMany({ orderId: order._id }),
-    Order.deleteOne({ _id: order._id, isTestOrder: true }),
-  ]);
-  if (order.qaRiderId) {
-    await RiderSlot.deleteMany({ riderId: order.qaRiderId, notes: "PIKI QA dispatch automatico" });
-    await Rider.deleteOne({ _id: order.qaRiderId, isTestRider: true });
-  }
-  return res.status(204).end();
+  return res.status(410).json({ error: "SAFE_TEST_ORDER_PURGE_REQUIRED", message: "La eliminación directa del escenario QA está desactivada. Usa el flujo auditado de mantenimiento o el botón de Partner para un pedido individual." });
 });
 
 async function expireStaleOffers() {
@@ -3643,6 +3741,7 @@ async function expireStaleOffers() {
     await releaseRiderOrderSlot(released._id, released.riderId);
     expiredCount += 1;
     await DispatchDecision.updateMany({ orderId: released._id, riderId: released.riderId, outcome: "offered" }, { $set: { outcome: "expired" } }).exec();
+    await publishRiderOfferExpiredEvent(released, String(released.riderId)).catch((error) => console.warn("Rider offer-expired event failed", error instanceof Error ? error.message : error));
     await enqueueDispatchOutbox({ orderId: released._id, tenantId: released.tenantId || null, idempotencyKey: dispatchRequeueIdempotencyKey(released._id, Number(released.version || 0) + 1), reason: "offer_expired" });
   }
   return expiredCount;
@@ -3810,7 +3909,7 @@ app.get("/api/v1/riders/:id/offers", requireRole("rider"), async (req, res) => {
   if (!riderId) return res.status(400).json({ error: "INVALID_RIDER_SESSION" });
   const rider = await riderAccessForRequest(riderId, req);
   if (!rider) return res.status(403).json({ error: "RIDER_ACCESS_DENIED" });
-  const offers = await Order.find({ riderId, assignmentState: { $in: ["offered", "assigned"] }, status: { $nin: ["delivered", "cancelled"] } })
+  const offers = await Order.find({ riderId, status: { $nin: ["delivered", "cancelled"] }, $or: [{ assignmentState: "assigned" }, { assignmentState: "offered", assignmentExpiresAt: { $gt: new Date() } }] })
 .select("_id publicCode displayCode displayCodeDate restaurantId customerId riderId status paymentState paymentMethod partnerPaymentRequired partnerPaymentCents subtotalCents deliveryFeeCents serviceFeeCents totalCents assignmentState assignmentExpiresAt pickupDeadlineAt partnerPrepDeadlineAt deliveryAddress deliveryNote deliveryLocation items createdAt")
     .sort({ createdAt: -1 }).limit(10).lean().exec() as any[];
   const riderProfile = await Rider.findById(riderId).select("vehicle").lean().exec() as any;
@@ -4078,6 +4177,7 @@ app.get("/api/v1/fleets/overview", requireRole("admin", "fleet"), async (_req, r
   res.json({ service: "piki-api", overview: { active_fleets: fleets, assigned_riders: assignedRiders, active_zones: zones, live_orders: liveOrders } });
 });
 
+registerAdminTestOrderPurgeRoutes(app, rateLimit);
 app.use((_req, res) => res.status(404).json({ error: "NOT_FOUND" }));
 app.use((error: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
   if (res.headersSent) return next(error);
@@ -4225,7 +4325,8 @@ async function start() {
     startRealtimeRelay();
     startNotificationWorker();
     await repairConfiguredPartnerAccess();
-    await purgeTestDataIfEnabled();
+    // Test-order cleanup is explicit, tenant-scoped, transactional and audited;
+    // never run the legacy broad account/restaurant purge during API startup.
     databaseReady = true;
     if (process.env.RUN_TENANT_MIGRATION === "true") {
       if (process.env.ALLOW_TENANT_MIGRATION !== "true") throw new Error("RUN_TENANT_MIGRATION requires ALLOW_TENANT_MIGRATION=true");

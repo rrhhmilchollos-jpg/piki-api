@@ -180,6 +180,18 @@ export async function publishRiderOfferEvent(order: any, riderId: string) {
     dedupeKey: `offer:rider:${String(order._id)}:${riderId}:${order.dispatchAttempts || 0}`,
   });
 }
+
+export async function publishRiderOfferExpiredEvent(order: any, riderId: string) {
+  await publishRealtimeEvent({
+    channel: "rider",
+    audienceKey: `rider:${riderId}`,
+    tenantId: validTenantId(order.tenantId),
+    type: "order.offer_expired",
+    payload: { orderId: String(order._id), publicCode: order.publicCode, assignmentState: "expired", message: "La oferta ha caducado. PIKI está buscando otro Rider." },
+    dedupeKey: `offer-expired:rider:${String(order._id)}:${riderId}:${Number(order.version || 0) + 1}`,
+  });
+}
+
 export async function publishRiderCustomerMessageEvent(order: any, message: any) {
   if (!order.customerId || !mongoose.isValidObjectId(order.customerId)) return;
   const messageId = String(message._id || `${order._id}:${message.createdAt || Date.now()}`);
