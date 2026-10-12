@@ -4082,7 +4082,11 @@ async function repairConfiguredPartnerAccess() {
   const account = await EmployeeAccount.findOne({ email }).select("_id email tenantId restaurantId restaurantIds apiRole jobRole roles primaryRole active authorizationStatus ownerProtected").lean().exec() as any;
   if (!account) { console.log(JSON.stringify({ event: "partner_access_repair", email, result: "account_not_found" })); return; }
 
-  const createOrUseTestRestaurant = process.env.REPAIR_PARTNER_CREATE_TEST === "true";
+  // The production Render service may retain an older Blueprint environment.
+  // Keep the explicitly allow-listed QA portfolio self-healing for the owner
+  // account, while all other partner repair paths remain opt-in.
+  const createOrUseTestRestaurant = process.env.REPAIR_PARTNER_CREATE_TEST === "true"
+    || (email === ownerEmail && configuredPartnerSlug === "kfc-xativa-qa");
   let restaurant: any = null;
   if (createOrUseTestRestaurant) {
     // The exact test slug is unique; adopting a legacy record also ensures it
