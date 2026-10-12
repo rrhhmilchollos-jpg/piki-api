@@ -47,7 +47,7 @@ import { authenticationOptions, registrationOptions, verifyAuthentication, verif
 export const app = express();
 app.set("trust proxy", 1);
 const port = Number(process.env.PORT || 3000);
-const PARTNER_PREPARATION_LIMIT_MINUTES = 10;
+const PARTNER_PREPARATION_LIMIT_MINUTES = 15;
 const CUSTOMER_DELIVERY_TARGET_MINUTES = 30;
 const defaultOrigins = ["http://localhost:3000", "http://localhost:5173", "https://localhost", "https://pikidelivery.com", "https://www.pikidelivery.com", "https://app.pikidelivery.com", "https://partners.pikidelivery.com", "https://admin.pikidelivery.com", "https://support.pikidelivery.com", "https://piki-admin-live.vercel.app", "https://piki-support.vercel.app", "https://riders.pikidelivery.com", "https://fleet.pikidelivery.com", "https://piki-customer.onrender.com", "https://piki-riders.onrender.com", "https://piki-admin.onrender.com", "https://edpexgfa.manus.space"];
 const configuredOrigins = (process.env.CORS_ORIGINS || "").split(",").map((origin) => origin.trim()).filter(Boolean);
@@ -2970,7 +2970,7 @@ app.post("/api/v1/riders/:riderId/orders/:orderId/accept-offer", requireRole("ri
   await RiderAssignmentReservation.updateOne({ orderId, riderId, status: "reserved" }, { $set: { expiresAt: null } }).exec();
   await DispatchDecision.updateMany({ orderId, riderId, outcome: "offered" }, { $set: { outcome: "accepted", actorRole: "rider" } }).exec();
   await publishOrderStatusEvents(updated, updated.status);
-  return res.json({ message: "Pedido aceptado. Llegar al Partner en un máximo de 10 minutos.", pickupDeadlineAt, order: updated });
+  return res.json({ message: "Pedido aceptado. Llegar al Partner en un máximo de 15 minutos.", pickupDeadlineAt, order: updated });
 });
 
 app.post("/api/v1/riders/:riderId/orders/:orderId/confirm-arrival", requireRole("rider"), async (req, res) => {
@@ -3405,8 +3405,8 @@ const automaticDispatchSweepStats = {
   lastDurationMs: null as number | null,
   lastError: null as string | null,
 };
-const PICKUP_REASSIGN_AFTER_MS = Math.max(60_000, Number(process.env.PIKI_PICKUP_REASSIGN_AFTER_MINUTES || 10) * 60_000);
-const PICKUP_ARRIVAL_RADIUS_METERS = Math.max(50, Number(process.env.PIKI_PICKUP_ARRIVAL_RADIUS_METERS || 250));
+const PICKUP_REASSIGN_AFTER_MS = Math.max(60_000, Number(process.env.PIKI_PICKUP_REASSIGN_AFTER_MINUTES || 15) * 60_000);
+const PICKUP_ARRIVAL_RADIUS_METERS = Math.max(1, Number(process.env.PIKI_PICKUP_ARRIVAL_RADIUS_METERS || 10));
 async function reassignLatePickupOrders() {
   const now = new Date();
   let reassigned = 0;
@@ -4017,7 +4017,7 @@ app.get("/api/v1/admin/operations/health", requireRole("admin", "fleet"), async 
     else if (!hasGps || !last) acc.missingGps += 1;
     return acc;
   }, { total: 0, online: 0, offline: 0, freshGps: 0, staleGps: 0, missingGps: 0 });
-  return res.json({ service: "piki-api", generatedAt: new Date().toISOString(), riders: summary, dispatch: { queue: dispatchQueue, activeOffers, activeOrders }, automaticDispatchSweep: { ...automaticDispatchSweepStats, intervalSeconds: 5, healthy: automaticDispatchSweepStats.runs > 0 && automaticDispatchSweepStats.errors === 0 && Boolean(automaticDispatchSweepStats.lastCompletedAt) }, thresholds: { freshGpsSeconds: 90, staleGpsMinutes: 10, pickupReassignMinutes: 10, pickupArrivalRadiusMeters: PICKUP_ARRIVAL_RADIUS_METERS, partnerPreparationMinutes: PARTNER_PREPARATION_LIMIT_MINUTES, customerDeliveryTargetMinutes: CUSTOMER_DELIVERY_TARGET_MINUTES } });
+  return res.json({ service: "piki-api", generatedAt: new Date().toISOString(), riders: summary, dispatch: { queue: dispatchQueue, activeOffers, activeOrders }, automaticDispatchSweep: { ...automaticDispatchSweepStats, intervalSeconds: 5, healthy: automaticDispatchSweepStats.runs > 0 && automaticDispatchSweepStats.errors === 0 && Boolean(automaticDispatchSweepStats.lastCompletedAt) }, thresholds: { freshGpsSeconds: 90, staleGpsMinutes: 10, pickupReassignMinutes: Math.round(PICKUP_REASSIGN_AFTER_MS / 60_000), pickupArrivalRadiusMeters: PICKUP_ARRIVAL_RADIUS_METERS, partnerPreparationMinutes: PARTNER_PREPARATION_LIMIT_MINUTES, customerDeliveryTargetMinutes: CUSTOMER_DELIVERY_TARGET_MINUTES } });
 });
 
 app.get("/api/v1/admin/operations/live", requireRole("admin"), async (req, res) => {
