@@ -4102,8 +4102,17 @@ async function repairConfiguredPartnerAccess() {
     restaurant = await Restaurant.findOneAndUpdate(
       { slug: configuredPartnerSlug },
       {
-        $set: { tenantId: account.tenantId || null, email, onboardingStatus: "approved", isActive: true, internalDemo: configuredPartnerSlug !== "kfc-xativa-qa" },
-        $setOnInsert: { slug: configuredPartnerSlug, name: "KFC XATIVA QA", cuisine: "Americana", category: "Americana", locality: "Xàtiva", partnerGroupKey: "xativa", tagline: "Entorno QA interno de PIKI · sin afiliación comercial.", phone: "", address: "Xàtiva" },
+        $set: {
+          tenantId: account.tenantId || null,
+          email,
+          onboardingStatus: "approved",
+          isActive: true,
+          internalDemo: configuredPartnerSlug !== "kfc-xativa-qa",
+          address: "Calle Sor Isabel de Villena 82, bajo, Novelé, Valencia",
+          locality: "Novetlè",
+          location: { type: "Point", coordinates: [-0.5468067, 38.9817572] },
+        },
+        $setOnInsert: { slug: configuredPartnerSlug, name: "KFC XATIVA QA", cuisine: "Americana", category: "Americana", locality: "Novetlè", partnerGroupKey: "xativa", tagline: "Entorno QA interno de PIKI · sin afiliación comercial.", phone: "", address: "Calle Sor Isabel de Villena 82, bajo, Novelé, Valencia", location: { type: "Point", coordinates: [-0.5468067, 38.9817572] } },
       },
       { upsert: true, new: true, setDefaultsOnInsert: true },
     ).select("_id email slug name tenantId onboardingStatus isActive internalDemo demoMenuVersion").lean().exec();
@@ -4134,6 +4143,9 @@ async function repairConfiguredPartnerAccess() {
           internalDemo: restaurant.slug !== "kfc-xativa-qa",
           demoMenuVersion: PARTNER_DEMO_MENU_VERSION,
           tagline: restaurant.slug === "kfc-xativa-qa" ? "Local QA de Xàtiva habilitado para pruebas operativas reales." : "Entorno de demostración interna de PIKI · sin afiliación comercial.",
+          address: "Calle Sor Isabel de Villena 82, bajo, Novelé, Valencia",
+          locality: "Novetlè",
+          location: { type: "Point", coordinates: [-0.5468067, 38.9817572] },
           menu: partnerDemoMenu,
         },
       },
