@@ -32,6 +32,7 @@ import { awardRiderRecruitmentMilestones, claimRiderReferralCode, completeRiderS
 import { buildApprovedRiderOperationalProfile } from "./riderApproval.js";
 import { COMING_SOON_SLUGS, CUSTOMER_CATALOG_RESTAURANT_FILTER, CUSTOMER_ORDERABLE_RESTAURANT_FILTER, presentCustomerCatalogRestaurant } from "./customerCatalogPolicy.js";
 import { PARTNER_DEMO_MENU_VERSION, partnerDemoMenu } from "./partnerDemoMenu.js";
+import { configuredPartnerRestaurantUpsert } from "./partnerRepairPolicy.js";
 import { quoteMenuItem, usesReferenceAddOns } from "./menuModifiers.js";
 import { decideLatePickup, pointDistanceMeters } from "./pickupPolicy.js";
 import { buildLegacyRiderSupportTicketFilter, buildRiderSupportTicketFilter } from "./supportTicketScope.js";
@@ -4101,19 +4102,7 @@ async function repairConfiguredPartnerAccess() {
     // lives in the same tenant as the account that will operate it.
     restaurant = await Restaurant.findOneAndUpdate(
       { slug: configuredPartnerSlug },
-      {
-        $set: {
-          tenantId: account.tenantId || null,
-          email,
-          onboardingStatus: "approved",
-          isActive: true,
-          internalDemo: configuredPartnerSlug !== "kfc-xativa-qa",
-          address: "Calle Sor Isabel de Villena 82, bajo, Novelé, Valencia",
-          locality: "Novetlè",
-          location: { type: "Point", coordinates: [-0.5468067, 38.9817572] },
-        },
-        $setOnInsert: { slug: configuredPartnerSlug, name: "KFC XATIVA QA", cuisine: "Americana", category: "Americana", locality: "Novetlè", partnerGroupKey: "xativa", tagline: "Entorno QA interno de PIKI · sin afiliación comercial.", phone: "", address: "Calle Sor Isabel de Villena 82, bajo, Novelé, Valencia", location: { type: "Point", coordinates: [-0.5468067, 38.9817572] } },
-      },
+      configuredPartnerRestaurantUpsert(account.tenantId, email, configuredPartnerSlug),
       { upsert: true, new: true, setDefaultsOnInsert: true },
     ).select("_id email slug name tenantId onboardingStatus isActive internalDemo demoMenuVersion").lean().exec();
     console.log(JSON.stringify({ event: "partner_access_repair", email, result: "test_restaurant_created_or_reused", restaurantId: String(restaurant._id), restaurantName: restaurant.name, tenantId: restaurant.tenantId ? String(restaurant.tenantId) : null }));
