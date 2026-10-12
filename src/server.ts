@@ -1,7 +1,7 @@
 import "dotenv/config";
 import "express-async-errors";
 import { createHash, createHmac, randomBytes, randomInt, randomUUID } from "node:crypto";
-import { MalwareDetectedError, MalwareScannerUnavailableError, normalizeDocumentUpload, sanitizePdfFileName, sanitizeUploadFileName, scanUploadBuffer, scanUploadBuffers } from "./fileSecurity.js";
+import { MalwareDetectedError, MalwareScannerUnavailableError, DOCUMENT_UPLOAD_MIME_TYPES, normalizeDocumentUpload, sanitizePdfFileName, sanitizeUploadFileName, scanUploadBuffer, scanUploadBuffers } from "./fileSecurity.js";
 import { fileURLToPath } from "node:url";
 import cors from "cors";
 import express from "express";
@@ -287,20 +287,20 @@ const riderIncidentSchema = z.object({ reason: z.enum(["late_acceptance", "late_
 const riderSlotSchema = z.object({ zoneSlug: z.string().regex(/^[a-z0-9-]+$/), date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/), startTime: z.string().regex(/^(?:[01]\d|2[0-3]):[0-5]\d$/), endTime: z.string().regex(/^(?:[01]\d|2[0-3]):[0-5]\d$/), status: z.enum(["planned", "active", "completed", "cancelled"]).default("planned"), notes: z.string().max(500).default("") });
 const riderSlotCreateSchema = riderSlotSchema.extend({ riderId: z.string().regex(/^[a-f\d]{24}$/) });
 const riderSlotWeekSchema = riderSlotCreateSchema.extend({ weekdays: z.array(z.number().int().min(0).max(6)).min(1).max(7).default([0, 1, 2, 3, 4, 5, 6]) });
-const riderDocumentInputSchema = z.object({ type: z.enum(["identity", "residence_permit", "social_security_number", "bank_certificate", "profile_photo", "driving_license", "insurance", "vehicle_registration", "vehicle_technical_sheet", "scooter_responsible_declaration", "dgt_mvp_homologation", "work_authorization_confirmation", "ppe_and_safety", "other"]), fileName: z.string().min(1).max(180), mimeType: z.literal("application/pdf"), sizeBytes: z.number().int().min(1).max(2_500_000), sha256: z.string().regex(/^[a-f0-9]{64}$/i), contentBase64: z.string().min(1).max(3_500_000) });
+const riderDocumentInputSchema = z.object({ type: z.enum(["identity", "residence_permit", "social_security_number", "bank_certificate", "profile_photo", "driving_license", "insurance", "vehicle_registration", "vehicle_technical_sheet", "scooter_responsible_declaration", "dgt_mvp_homologation", "work_authorization_confirmation", "ppe_and_safety", "other"]), fileName: z.string().min(1).max(180), mimeType: z.enum(DOCUMENT_UPLOAD_MIME_TYPES), sizeBytes: z.number().int().min(1).max(2_500_000), sha256: z.string().regex(/^[a-f0-9]{64}$/i), contentBase64: z.string().min(1).max(3_500_000) });
 const riderApplicationSchema = z.object({ name: z.string().min(2).max(160), email: z.string().email(), phone: z.string().min(6).max(40), city: z.string().min(2).max(120), vehicle: z.enum(["bike", "electric_bike", "electric_scooter", "motorcycle", "scooter", "car"]), availability: z.string().min(2).max(160), socialSecurityNumber: z.string().min(4).max(40), identityVerificationMethod: z.literal("online_scan"), safetyDeclarationAccepted: z.literal(true), documents: z.array(riderDocumentInputSchema).min(3).max(12), website: z.string().max(0).optional() });
 const documentRequestSubjectSchema = z.enum(["rider_application", "restaurant", "rider_lead", "partner_lead"]);
 const documentRequestRequirementInputSchema = z.object({ type: z.string().regex(/^[a-z0-9_]{2,80}$/), inputMode: z.enum(["file", "form"]).default("file"), label: z.string().trim().min(2).max(160), description: z.string().trim().max(500).default("") });
 const documentRequestCreateSchema = z.object({ subjectType: documentRequestSubjectSchema, subjectId: z.string().regex(/^[a-f\d]{24}$/), message: z.string().trim().min(10).max(2000), dueAt: z.coerce.date().nullable().optional(), requirements: z.array(documentRequestRequirementInputSchema).min(1).max(12), sendEmail: z.boolean().default(true) });
 const publicDocumentUploadSchema = z.object({
   responses: z.array(z.object({ type: z.string().regex(/^[a-z0-9_]{2,80}$/), value: z.string().trim().min(1).max(500) })).max(12).default([]),
-  documents: z.array(z.object({ type: z.string().regex(/^[a-z0-9_]{2,80}$/), fileName: z.string().trim().min(1).max(180), mimeType: z.literal("application/pdf"), sizeBytes: z.number().int().min(1).max(2_500_000), sha256: z.string().regex(/^[a-f0-9]{64}$/i), contentBase64: z.string().min(1).max(3_500_000) })).max(5).default([]),
+  documents: z.array(z.object({ type: z.string().regex(/^[a-z0-9_]{2,80}$/), fileName: z.string().trim().min(1).max(180), mimeType: z.enum(DOCUMENT_UPLOAD_MIME_TYPES), sizeBytes: z.number().int().min(1).max(2_500_000), sha256: z.string().regex(/^[a-f0-9]{64}$/i), contentBase64: z.string().min(1).max(3_500_000) })).max(5).default([]),
 }).superRefine((value, ctx) => {
   if (!value.documents.length && !value.responses.length) ctx.addIssue({ code: "custom", path: ["documents"], message: "documents_or_responses_required" });
 });
 const riderDocumentRequestTypes = new Set(["identity", "residence_permit", "social_security_number", "bank_certificate", "profile_photo", "driving_license", "insurance", "vehicle_registration", "vehicle_technical_sheet", "scooter_responsible_declaration", "dgt_mvp_homologation", "work_authorization_confirmation", "ppe_and_safety", "other"]);
 const partnerDocumentRequestTypes = new Set(["tax_id", "bank_certificate", "insurance", "activity_license", "food_sanitary_authorization", "identity", "other"]);
-const leadDocumentInputSchema = z.object({ type: z.string().trim().min(2).max(80), fileName: z.string().trim().min(1).max(180), mimeType: z.literal("application/pdf"), sizeBytes: z.number().int().min(1).max(2_500_000), sha256: z.string().regex(/^[a-f0-9]{64}$/i), contentBase64: z.string().min(20).max(3_500_000) });
+const leadDocumentInputSchema = z.object({ type: z.string().trim().min(2).max(80), fileName: z.string().trim().min(1).max(180), mimeType: z.enum(DOCUMENT_UPLOAD_MIME_TYPES), sizeBytes: z.number().int().min(1).max(2_500_000), sha256: z.string().regex(/^[a-f0-9]{64}$/i), contentBase64: z.string().min(20).max(3_500_000) });
 const riderApplicationAttempts = new Map<string, { count: number; resetAt: number }>();
 const ownerEmail = "rrhh.milchollos@gmail.com";
 const MAX_MENU_IMAGE_BYTES = 200 * 1024;
@@ -1103,7 +1103,7 @@ app.patch("/api/v1/admin/partner-leads/:id", requireRole("admin", "commercial", 
   return res.json({ lead });
 });
 
-const partnerDocumentSchema = z.object({ type: z.enum(["tax_id", "bank_certificate", "insurance", "activity_license", "food_sanitary_authorization", "identity", "other"]), fileName: z.string().min(1).max(180), mimeType: z.literal("application/pdf"), sizeBytes: z.number().int().positive().max(2_500_000), sha256: z.string().regex(/^[a-f0-9]{64}$/), contentBase64: z.string().min(20).max(3_500_000) });
+const partnerDocumentSchema = z.object({ type: z.enum(["tax_id", "bank_certificate", "insurance", "activity_license", "food_sanitary_authorization", "identity", "other"]), fileName: z.string().min(1).max(180), mimeType: z.enum(DOCUMENT_UPLOAD_MIME_TYPES), sizeBytes: z.number().int().positive().max(2_500_000), sha256: z.string().regex(/^[a-f0-9]{64}$/), contentBase64: z.string().min(20).max(3_500_000) });
 const openingHoursSchema = z.record(z.string().min(2).max(15), z.object({ open: z.string().regex(/^\d{2}:\d{2}$/), close: z.string().regex(/^\d{2}:\d{2}$/), closed: z.boolean() }));
 const partnerSchema = z.object({ name: z.string().min(2).max(160), email: z.string().email(), password: z.string().min(12).max(200).regex(/[A-Z]/).regex(/[a-z]/).regex(/[0-9]/), phone: z.string().min(6).max(40), address: z.string().min(5).max(280), legalName: z.string().min(2).max(180), taxId: z.string().regex(/^[A-Za-z0-9-]{5,20}$/), legalForm: z.enum(["autonomo", "sl", "sa", "cooperativa", "otra"]), representativeName: z.string().min(2).max(160), representativeRole: z.string().min(2).max(100), representativeDocument: z.string().min(5).max(30), fiscalAddress: z.string().min(5).max(280), operatingAddress: z.string().min(5).max(280), postalCode: z.string().regex(/^\d{5}$/), city: z.string().min(2).max(100), province: z.string().min(2).max(100), iban: z.string().regex(/^[A-Z]{2}\d{2}[A-Z0-9]{10,30}$/), bankAccountHolder: z.string().min(2).max(180), cuisine: z.string().min(2).max(100), vatRate: z.union([z.literal(4), z.literal(10), z.literal(21)]), commissionAccepted: z.literal(true), termsAcceptedAt: z.coerce.date(), contractAccepted: z.literal(true), privacyAccepted: z.literal(true), dataProcessingAccepted: z.literal(true), pdaUnits: z.number().int().min(1).max(50), pdaUnitCostCents: z.literal(30000), pdaCostAccepted: z.literal(true), pdaCostAcceptedAt: z.coerce.date(), privacyAcceptedAt: z.coerce.date(), dataProcessingAcceptedAt: z.coerce.date(), openingHours: openingHoursSchema, documents: z.array(partnerDocumentSchema).length(5) });
 app.post("/api/v1/partners/onboarding", async (req, res) => {
@@ -1977,7 +1977,7 @@ async function normalizeAndScanOnboardingDocuments<T extends IncomingOnboardingD
   const normalized = documents.map((document) => {
     const upload = normalizeDocumentUpload(document);
     return {
-      document: { ...document, fileName: sanitizePdfFileName(document.fileName), mimeType: "application/pdf", sha256: document.sha256.toLowerCase(), contentBase64: upload.contentBase64 } as T,
+      document: { ...document, fileName: sanitizeUploadFileName(document.fileName), mimeType: document.mimeType, sha256: document.sha256.toLowerCase(), contentBase64: upload.contentBase64 } as T,
       bytes: upload.bytes,
     };
   });
@@ -2116,9 +2116,9 @@ app.post("/api/v1/public/document-requests/:token/documents", async (req, res) =
   const uploaded = [] as Array<{ type: string; fileName: string; mimeType: string; sizeBytes: number; sha256: string; contentBase64: string }>;
   try {
     const normalizedDocuments = parsed.data.documents.map((document) => ({ document, normalized: normalizeDocumentUpload(document) }));
-    if (normalizedDocuments.length) await scanUploadBuffers(normalizedDocuments.map(({ document, normalized }) => ({ buffer: normalized.bytes, originalName: sanitizePdfFileName(document.fileName) })));
+    if (normalizedDocuments.length) await scanUploadBuffers(normalizedDocuments.map(({ document, normalized }) => ({ buffer: normalized.bytes, originalName: sanitizeUploadFileName(document.fileName) })));
     for (const { document, normalized } of normalizedDocuments) {
-      uploaded.push({ ...document, fileName: sanitizePdfFileName(document.fileName), mimeType: "application/pdf", sha256: document.sha256.toLowerCase(), contentBase64: normalized.contentBase64 });
+      uploaded.push({ ...document, fileName: sanitizeUploadFileName(document.fileName), mimeType: document.mimeType, sha256: document.sha256.toLowerCase(), contentBase64: normalized.contentBase64 });
     }
   } catch (error) {
     if (error instanceof MalwareDetectedError) return res.status(422).json({ error: "MALWARE_DETECTED", message: "Uno de los archivos ha sido rechazado por seguridad." });
