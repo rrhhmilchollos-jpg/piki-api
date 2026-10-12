@@ -57,3 +57,52 @@ export function calculateSettlement(orders: SettlementOrder[], options?: { partn
   }, { grossCents: 0, partnerCommissionCents: 0, partnerNetCents: 0, riderBaseCents: 0, riderDistanceCents: 0, riderIncentiveCents: 0, riderTipCents: 0, riderTotalCents: 0, platformNetCents: 0 });
   return { lines, totals, commissionRate: partnerCommissionRate, formulaVersion: "piki-partner-23-customer-fee-299-2026-10" } satisfies SettlementSummary;
 }
+
+
+export const RIDER_INCENTIVE_POLICY = {
+  hourlyRateCents: 700,
+  requiredShiftHours: 4,
+  minimumAcceptanceRate: 0.95,
+  centralZoneSlug: "xativa-centro",
+  acquisitionDeliveries: 5,
+  acquisitionBonusCents: 2000,
+  referralDeliveries: 20,
+  referralBonusCents: 1500,
+} as const;
+
+function nonNegativeCents(value: number) {
+  return Number.isFinite(value) ? Math.max(0, Math.round(value)) : 0;
+}
+
+/** Returns only the incremental top-up; base delivery earnings remain in calculateSettlement. */
+export function calculateHourlyGuaranteeTopUp(input: {
+  eligible: boolean;
+  scheduledHours: number;
+  completedHours: number;
+  deliveryEarningsCents: number;
+  hourlyRateCents?: number;
+}) {
+  if (!input.eligible || !Number.isFinite(input.scheduledHours) || input.scheduledHours <= 0) return 0;
+  if (!Number.isFinite(input.completedHours) || input.completedHours < input.scheduledHours) return 0;
+  const hourlyRateCents = nonNegativeCents(input.hourlyRateCents ?? RIDER_INCENTIVE_POLICY.hourlyRateCents);
+  const floorCents = Math.round(hourlyRateCents * input.scheduledHours);
+  return Math.max(0, floorCents - nonNegativeCents(input.deliveryEarningsCents));
+}
+
+/** Zero offers is treated as eligible: the 95% rule applies only when an offer actually arrives. */
+export function isAcceptanceRateEligible(acceptedOffers: number, totalOffers: number, minimumRate = RIDER_INCENTIVE_POLICY.minimumAcceptanceRate) {
+  if (!Number.isInteger(acceptedOffers) || !Number.isInteger(totalOffers) || acceptedOffers < 0 || totalOffers < 0 || acceptedOffers > totalOffers) return false;
+  if (totalOffers === 0) return true;
+  return acceptedOffers / totalOffers >= minimumRate;
+}
+
+export function getRecruitmentAwards(completedDeliveries: number, isReferred: boolean) {
+  const completed = Number.isFinite(completedDeliveries) ? Math.max(0, Math.floor(completedDeliveries)) : 0;
+  const acquisitionBonusCents = completed >= RIDER_INCENTIVE_POLICY.acquisitionDeliveries ? RIDER_INCENTIVE_POLICY.acquisitionBonusCents : 0;
+  const referralActive = isReferred && completed >= RIDER_INCENTIVE_POLICY.referralDeliveries;
+  return {
+    acquisitionBonusCents,
+    referredRiderBonusCents: referralActive ? RIDER_INCENTIVE_POLICY.referralBonusCents : 0,
+    inviterBonusCents: referralActive ? RIDER_INCENTIVE_POLICY.referralBonusCents : 0,
+  };
+}

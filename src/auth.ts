@@ -1,7 +1,7 @@
 import type { NextFunction, Request, Response } from "express";
 import { EmployeeAccount, Rider } from "./models.js";
-import { hashSessionToken } from "./employeeAuth.js";
-import { resolveEmployeeSession } from "./employeeSessions.js";
+import { adoptLegacyRootOwnerSession, resolveEmployeeSession } from "./employeeSessions.js";
+import { buildTenantEntityScope, buildTenantScope } from "./tenantScope.js";
 
 export const apiRoles = ["admin", "partner", "rider", "fleet", "commercial", "gerente_comercial_zona", "finance", "support"] as const;
 export type ApiRole = (typeof apiRoles)[number];
@@ -10,7 +10,7 @@ export const PIKI_OWNER_EMAIL = "rrhh.milchollos@gmail.com";
 declare global {
   namespace Express {
     interface Request {
-      auth?: { role: ApiRole; employeeId?: string; tenantId?: string; mustChangePassword?: boolean; accessLevel?: "superadmin" | "subadmin" };
+      auth?: { role: ApiRole; employeeId?: string; tenantId?: string; mustChangePassword?: boolean; accessLevel?: "superadmin" | "subadmin"; isRootOwner?: boolean };
     }
   }
 }
@@ -25,7 +25,7 @@ const tokenEntries: Array<[ApiRole, string | undefined]> = [
   ["support", process.env.SUPPORT_API_TOKEN],
 ];
 
-export async function resolveRole(request: Request): Promise<{ role: ApiRole; employeeId?: string; tenantId?: string; mustChangePassword?: boolean; accessLevel?: "superadmin" | "subadmin" } | null> {
+export async function resolveRole(request: Request): Promise<{ role: ApiRole; employeeId?: string; tenantId?: string; mustChangePassword?: boolean; accessLevel?: "superadmin" | "subadmin"; isRootOwner?: boolean } | null> {
   const header = request.header("authorization") || "";
   const [scheme, token] = header.split(" ");
   if (scheme?.toLowerCase() !== "bearer" || !token) return null;
@@ -33,8 +33,10 @@ export async function resolveRole(request: Request): Promise<{ role: ApiRole; em
   if (match?.[0]) return { role: match[0] };
   const scoped = await resolveEmployeeSession(token);
   if (scoped) return { ...scoped, role: scoped.role as ApiRole };
-  const employee = await EmployeeAccount.findOne({ sessionHash: hashSessionToken(token), active: true }).lean().exec() as any;
-  return employee ? { role: employee.apiRole as ApiRole, employeeId: String(employee._id), tenantId: employee.tenantId ? String(employee.tenantId) : undefined, mustChangePassword: employee.mustChangePassword, accessLevel: employee.accessLevel } : null;
+  // Only the protected platform owner may upgrade a pre-session credential;
+  // ordinary legacy hashes cannot be allowed to inherit a mutable tenant.
+  const legacyRoot = await adoptLegacyRootOwnerSession(token);
+  return legacyRoot ? { ...legacyRoot, role: legacyRoot.role as ApiRole } : null;
 }
 
 export function isTemporaryPasswordAllowedPath(path: string): boolean {
@@ -49,6 +51,7 @@ export function requireRole(...allowedRoles: ApiRole[]) {
       return response.status(401).json({ error: "AUTHENTICATION_REQUIRED" });
     }
     if (!allowedRoles.includes(auth.role)) return response.status(403).json({ error: "FORBIDDEN", role: auth.role });
+    if (auth.employeeId && !auth.tenantId && !auth.isRootOwner) return response.status(403).json({ error: "TENANT_CONTEXT_REQUIRED" });
     // A temporary credential only grants access to the password-change endpoint.
     // The profile endpoint is deliberately blocked too, preventing API clients
     // from treating the UI-only gate as an optional warning.
@@ -56,8 +59,14 @@ export function requireRole(...allowedRoles: ApiRole[]) {
     request.auth = auth;
     const riderResource = request.path.match(/^\/api\/v1\/riders\/([a-f\d]{24})(?:\/|$)/i);
     if (auth.role === "rider" && riderResource) {
-      const employee = auth.employeeId ? await EmployeeAccount.findById(auth.employeeId).select("email").lean().exec() as any : null;
-      const allowed = employee ? await Rider.exists({ _id: riderResource[1], email: employee.email }) : process.env.RIDER_API_RIDER_ID === riderResource[1];
+      const employeeScope = buildTenantScope(auth.tenantId);
+      const riderScope = buildTenantEntityScope(auth.tenantId, riderResource[1]);
+      const employee = auth.employeeId && auth.tenantId
+        ? await EmployeeAccount.findOne({ _id: auth.employeeId, ...employeeScope }).select("email").lean().exec() as any
+        : null;
+      const allowed = employee
+        ? await Rider.exists({ ...riderScope, email: employee.email })
+        : process.env.RIDER_API_RIDER_ID === riderResource[1];
       if (!allowed) return response.status(403).json({ error: "RIDER_ACCESS_DENIED" });
     }
     return next();

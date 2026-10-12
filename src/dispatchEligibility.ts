@@ -1,3 +1,5 @@
+import { cashOrderWithinLimitFilter, isDispatchableCashOrder } from "./paymentPolicy.js";
+
 export const dispatchableOrderStatuses = [
   "pending",
   "accepted",
@@ -18,11 +20,12 @@ export function isDispatchableOrderStatus(status: string): boolean {
 
 export const dispatchablePaymentFilter = {
   $or: [
-    { paymentState: "paid" },
-    { paymentMethod: "cash", paymentState: "pending" },
+    { paymentState: { $in: ["authorized", "paid"] } },
+    cashOrderWithinLimitFilter,
   ],
 };
 
-export function isDispatchablePayment(paymentState: string, paymentMethod?: string): boolean {
-  return paymentState === "paid" || (paymentState === "pending" && paymentMethod === "cash");
+export function isDispatchablePayment(paymentState: string, paymentMethod?: string, totalCents?: number): boolean {
+  return ["authorized", "paid"].includes(paymentState)
+    || isDispatchableCashOrder(paymentMethod, paymentState, Number(totalCents));
 }

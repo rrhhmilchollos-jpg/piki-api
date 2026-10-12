@@ -28,10 +28,14 @@ export function partnerRolesForEmployee(employee: PartnerEmployee | null | undef
   const configured = Array.isArray(roleSource)
     ? roleSource.filter((role): role is string => typeof role === "string" && Boolean(role.trim())).map((role) => role.trim())
     : [];
-  if (configured.length) return [...new Set(configured)];
-
   const fallback = typeof employee?.jobRole === "string" ? employee.jobRole : employee?.apiRole;
-  return fallback === "partner" ? ["partner_admin"] : typeof fallback === "string" && fallback ? [fallback] : [];
+  // Older multirol records can authenticate as Partner without a materialized
+  // partnerRoles value. The assigned restaurant remains the security boundary.
+  if (fallback === "partner" && !configured.some((role) => fullAccessRoles.has(role.toLowerCase()) || managerRoles.has(role.toLowerCase()))) {
+    return [...new Set([...configured, "partner_admin"] )];
+  }
+  if (configured.length) return [...new Set(configured)];
+  return typeof fallback === "string" && fallback ? [fallback] : [];
 }
 
 /** The protected owner may be assigned a narrowly scoped Partner location for live support. */

@@ -4,6 +4,7 @@
  */
 export {
   createCheckoutSession,
+  isStripeSignatureError,
   processStripeWebhook,
   stripeConfigured,
 } from "../stripe.js";
@@ -15,4 +16,4 @@ export {
   signatureWebhookUrl,
   webhookDigest,
 } from "../signaturit.js";
-export { handleCustomerTrpc, currentCustomer, setCustomerOrderDispatcher } from "../customerCompat.js";
+export { handleCustomerTrpc, currentCustomer, issueCustomerSession, setCustomerOrderDispatcher } from "../customerCompat.js";

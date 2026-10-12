@@ -56,7 +56,7 @@ npm run seed
 | `GET` | `/api/v1/fleets/overview` | Resume flotas y pedidos operativos. |
 | `POST` | `/api/v1/orders` | Valida catálogo, recalcula importes y crea un pedido pendiente de pago. |
 | `POST` | `/api/v1/payments/checkout` | Crea una Checkout Session de Stripe usando los importes guardados en MongoDB. |
-| `POST` | `/api/webhooks/stripe` | Endpoint canónico Stripe: verifica `Stripe-Signature`, deduplica y activa el pedido pagado. |
+| `POST` | `/api/webhooks/stripe` | Endpoint canónico Stripe: verifica `Stripe-Signature`, deduplica, autoriza el pago y solo lo captura al validar la entrega. |
 | `POST` | `/api/v1/payments/webhook` | Alias compatible del endpoint canónico Stripe. |
 | `GET` | `/api/v1/realtime/events` | Stream SSE autenticado y reanudable de eventos operativos por superficie. |
 | `GET` | `/api/v1/fleets/pending-partner-orders` | Cola Fleet de pedidos pagados que esperan aceptación del Partner. |
@@ -70,13 +70,13 @@ STRIPE_SECRET_KEY=sk_test_...
 STRIPE_WEBHOOK_SECRET=whsec_...
 ```
 
-Configura en Stripe el endpoint público **`https://api.pikidelivery.com/api/webhooks/stripe`** y suscríbelo, como mínimo, a `checkout.session.completed`, `checkout.session.async_payment_succeeded` y `payment_intent.succeeded`. La ruta histórica `/api/v1/payments/webhook` sigue disponible para no romper configuraciones anteriores.
+En la cuenta **Stripe test**, configura el endpoint de staging exacto **`https://piki-api-staging.onrender.com/api/webhooks/stripe`**. Suscríbelo, como mínimo, a `payment_intent.amount_capturable_updated`, `payment_intent.succeeded`, `payment_intent.payment_failed`, `checkout.session.async_payment_failed`, `checkout.session.expired` y `charge.refunded`. La ruta histórica `/api/v1/payments/webhook` sigue disponible como alias compatible, pero el endpoint canónico es `/api/webhooks/stripe`.
 
-Stripe requiere el cuerpo crudo para verificar la firma; por eso la ruta se registra antes de `express.json()`. Los eventos se deduplican en la colección `stripe_events` usando `event.id`. El cliente no debe marcar un pedido como pagado a partir de `success_url`: la confirmación válida es el webhook firmado.
+Stripe requiere el cuerpo crudo para verificar la firma; por eso la ruta se registra antes de `express.json()`. Los eventos se deduplican en la colección `stripe_events` usando `event.id`, con estados `processing`/`processed`/`failed`: sólo quedan `processed` después de actualizar el pedido y persistir el outbox de tiempo real. El cliente no debe marcar un pedido como pagado a partir de `success_url`: la confirmación válida es el webhook firmado.
 
 ## Flujo de pedido pagado en tiempo real
 
-1. El webhook válido mueve de forma idempotente el pedido a `paymentState=paid`, `status=pending` y `assignmentState=unassigned`.
+1. El webhook válido actualiza exclusivamente el estado de pago de forma idempotente; no modifica `status`, `assignmentState`, rider ni otros datos operacionales. Un pedido intacto en `pending/unassigned` recibe el outbox de intake una sola vez.
 2. La API escribe eventos persistentes en `realtime_events` (retención de 24 h) y los entrega por SSE; MongoDB Change Streams los replica cuando Render usa más de una instancia.
 3. Partner recibe `order.awaiting_partner_acceptance` y mantiene la alarma hasta pulsar **Aceptar pedido**. Fleet lo muestra en **Pedidos por asignar** y no reserva rider todavía. Admin recalcula GMV y pedidos abiertos.
 4. Customer recibe el texto de estado en directo. Rider solo recibe una oferta después de la aceptación del Partner y de la reserva segura de asignación.
@@ -90,3 +90,17 @@ El archivo `.env` no se versiona. Las credenciales se configuran en Render y los
 ## Próxima integración
 
 La siguiente iteración introduce autenticación por rol, una máquina de estados transaccional de pedido, pagos y el motor de asignación de riders. El modelo ya contiene índices por categoría, actividad, estado de pedido, identificador público y geoíndices para las posiciones que se habilitarán al activar el servicio de localización.
+
+
+### Rutas y pagos retenidos
+
+El API intenta calcular cada ruta restaurante → cliente con Google Maps Directions usando `GOOGLE_MAPS_API_KEY`. Si Google no responde, utiliza OSRM; si ambos fallan, marca `routingDegraded=true` y aplica la restricción conservadora de vehículos. La duración persistida se usa en el ranking de Riders.
+
+Stripe usa `capture_method=manual`: `payment_intent.amount_capturable_updated` deja el pedido en `authorized`, lo que permite el despacho sin considerar el dinero liquidado. La captura se ejecuta idempotentemente después de QR/PIN válido en `confirm-delivery`; solo entonces el pedido pasa a `paymentState=paid`. Para el rollout manual se recomienda validar primero tarjeta compatible; **Bizum no se anuncia como habilitado por esta API**. No se ha cambiado la configuración de métodos de pago en producción. Los pedidos `cash` no pasan por Stripe.
+
+### Límites de seguridad de Stripe
+
+- Esta documentación describe **test/staging**; no configura ni afirma una prueba E2E, cobro, webhook o KYC/payout real en producción.
+- Los nombres indicadores permitidos son `STRIPE_SECRET_KEY` y `STRIPE_WEBHOOK_SECRET`; sus valores sólo deben existir en el gestor de secretos del entorno. Nunca se incluyen claves en código, documentación, logs o respuestas HTTP.
+- Antes de habilitar pagos online a clientes, validar mediante un ensayo aislado el webhook firmado, autorizaciones, captura manual, reintentos, replays y eventos fuera de orden. La configuración de métodos de pago y cualquier cambio de producción requieren aprobación separada.
+- La entrega tolera que `payment_intent.succeeded` incremente la versión justo después de `capture()`: el webhook no toca el estado operacional y el cierre condiciona `on_the_way`/rider/asignación, no una versión antigua. **Sigue pendiente** una saga o conciliación para el caso de caída del proceso después de que Stripe capture y antes de persistir `delivered`, y para hacer atómico el ledger de efectivo con la entrega.
