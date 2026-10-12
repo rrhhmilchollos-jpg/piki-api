@@ -11,6 +11,7 @@
     "check": "tsc --noEmit",
     "test": "tsx --test src/*.test.ts",
     "migrate:tenants": "tsx scripts/migrate-tenants.ts",
+    "migrate:authorizations": "tsx scripts/migrate-legacy-authorizations.ts",
     "dispatch:postgis": "node scripts/run-postgis-batch.mjs",
     "seed:staging:qa": "tsx scripts/seed-staging-qa.ts"
   },

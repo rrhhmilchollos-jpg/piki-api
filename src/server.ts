@@ -4168,7 +4168,24 @@ async function repairConfiguredPartnerAccess() {
 }
 async function start() {
   const uri = process.env.MONGODB_URI;
-  if (uri) { await mongoose.connect(uri, { dbName: databaseName, serverSelectionTimeoutMS: 10_000, socketTimeoutMS: 45_000, maxPoolSize: 20, minPoolSize: 2, retryWrites: true }); await EmployeeAccount.updateMany({ authorizationStatus: { $exists: false } }, { $set: { authorizationStatus: "approved", accessLevel: "subadmin" } }).exec(); await EmployeeAccount.updateOne({ email: ownerEmail }, { $set: { accessLevel: "superadmin", authorizationStatus: "approved", ownerProtected: true, active: true } }).exec(); const owner = await EmployeeAccount.findOne({ email: ownerEmail }).select("_id").lean().exec() as any; const legacyApproved = await EmployeeAccount.find({ email: { $ne: ownerEmail }, authorizationStatus: "approved", authorizedAt: null }).select("_id apiRole accessLevel createdAt").lean().exec() as any[]; for (const employee of legacyApproved) { const authorizedAt = employee.createdAt || new Date(); await EmployeeAccount.updateOne({ _id: employee._id, authorizedAt: null }, { $set: { authorizedAt, authorizedBy: owner?._id || null, authorizationReason: "Migración de autorización aprobada existente." } }).exec(); if (owner?._id && !(await AccessAuthorization.exists({ employeeId: employee._id }))) await AccessAuthorization.create({ employeeId: employee._id, action: "created", previousStatus: null, nextStatus: "approved", previousRole: null, nextRole: employee.apiRole, accessLevel: employee.accessLevel || "subadmin", actorEmployeeId: owner._id, reason: "Migración de autorización aprobada existente." }); } await ensureExpiresAtTtlIndex("employee_sessions"); await ensureExpiresAtTtlIndex("employee_password_resets"); await ensureIndexes(); startRealtimeRelay(); startNotificationWorker(); await repairConfiguredPartnerAccess(); await purgeTestDataIfEnabled(); databaseReady = true; if (process.env.RUN_TENANT_MIGRATION === "true") { if (process.env.ALLOW_TENANT_MIGRATION !== "true") throw new Error("RUN_TENANT_MIGRATION requires ALLOW_TENANT_MIGRATION=true"); console.log(JSON.stringify({ event: "tenant_migration_started" })); console.log(JSON.stringify({ event: "tenant_migration_completed", ...(await runTenantMigration()) })); } } else console.warn("MONGODB_URI is not configured; /ready will remain unavailable.");
+  if (uri) {
+    await mongoose.connect(uri, { dbName: databaseName, serverSelectionTimeoutMS: 10_000, socketTimeoutMS: 45_000, maxPoolSize: 20, minPoolSize: 2, retryWrites: true });
+    // Authorization records are never repaired or approved while serving traffic.
+    // Use `npm run migrate:authorizations -- --apply` in a controlled window instead.
+    await ensureExpiresAtTtlIndex("employee_sessions");
+    await ensureExpiresAtTtlIndex("employee_password_resets");
+    await ensureIndexes();
+    startRealtimeRelay();
+    startNotificationWorker();
+    await repairConfiguredPartnerAccess();
+    await purgeTestDataIfEnabled();
+    databaseReady = true;
+    if (process.env.RUN_TENANT_MIGRATION === "true") {
+      if (process.env.ALLOW_TENANT_MIGRATION !== "true") throw new Error("RUN_TENANT_MIGRATION requires ALLOW_TENANT_MIGRATION=true");
+      console.log(JSON.stringify({ event: "tenant_migration_started" }));
+      console.log(JSON.stringify({ event: "tenant_migration_completed", ...(await runTenantMigration()) }));
+    }
+  } else console.warn("MONGODB_URI is not configured; /ready will remain unavailable.");
   await EmployeeSession.init();
   await EmployeePasswordReset.init();
   const server = app.listen(port, "0.0.0.0", () => console.log(`PIKI API listening on port ${port}`));
