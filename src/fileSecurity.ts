@@ -50,6 +50,13 @@ export function sanitizeUploadFileName(originalName: string, fallback = "documen
   return cleaned || fallback;
 }
 
+/** Keeps the stored filename consistent with the validated PDF-only document policy. */
+export function sanitizePdfFileName(originalName: string, fallback = "document.pdf"): string {
+  const cleaned = sanitizeUploadFileName(originalName, fallback);
+  const stem = cleaned.replace(/\.[^.]*$/, "").trim() || "document";
+  return `${stem.slice(0, 176)}.pdf`;
+}
+
 /**
  * Canonicalizes a base64 document only after checking its exact decoded size,
  * magic bytes, and checksum. Malware scanning remains a separate fail-closed

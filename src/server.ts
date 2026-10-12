@@ -1,7 +1,7 @@
 import "dotenv/config";
 import "express-async-errors";
 import { createHash, createHmac, randomBytes, randomInt } from "node:crypto";
-import { MalwareDetectedError, MalwareScannerUnavailableError, normalizeDocumentUpload, sanitizeUploadFileName, scanUploadBuffer, scanUploadBuffers } from "./fileSecurity.js";
+import { MalwareDetectedError, MalwareScannerUnavailableError, normalizeDocumentUpload, sanitizePdfFileName, scanUploadBuffer, scanUploadBuffers } from "./fileSecurity.js";
 import { fileURLToPath } from "node:url";
 import cors from "cors";
 import express from "express";
@@ -284,7 +284,7 @@ const riderIncidentSchema = z.object({ reason: z.enum(["late_acceptance", "late_
 const riderSlotSchema = z.object({ zoneSlug: z.string().regex(/^[a-z0-9-]+$/), date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/), startTime: z.string().regex(/^(?:[01]\d|2[0-3]):[0-5]\d$/), endTime: z.string().regex(/^(?:[01]\d|2[0-3]):[0-5]\d$/), status: z.enum(["planned", "active", "completed", "cancelled"]).default("planned"), notes: z.string().max(500).default("") });
 const riderSlotCreateSchema = riderSlotSchema.extend({ riderId: z.string().regex(/^[a-f\d]{24}$/) });
 const riderSlotWeekSchema = riderSlotCreateSchema.extend({ weekdays: z.array(z.number().int().min(0).max(6)).min(1).max(7).default([0, 1, 2, 3, 4, 5, 6]) });
-const riderDocumentInputSchema = z.object({ type: z.enum(["identity", "residence_permit", "social_security_number", "bank_certificate", "profile_photo", "driving_license", "insurance", "vehicle_registration", "vehicle_technical_sheet", "scooter_responsible_declaration", "dgt_mvp_homologation", "work_authorization_confirmation", "ppe_and_safety", "other"]), fileName: z.string().min(1).max(180), mimeType: z.string().min(1).max(120), sizeBytes: z.number().int().min(1).max(2_500_000), sha256: z.string().regex(/^[a-f0-9]{64}$/i), contentBase64: z.string().min(1).max(3_500_000) });
+const riderDocumentInputSchema = z.object({ type: z.enum(["identity", "residence_permit", "social_security_number", "bank_certificate", "profile_photo", "driving_license", "insurance", "vehicle_registration", "vehicle_technical_sheet", "scooter_responsible_declaration", "dgt_mvp_homologation", "work_authorization_confirmation", "ppe_and_safety", "other"]), fileName: z.string().min(1).max(180), mimeType: z.literal("application/pdf"), sizeBytes: z.number().int().min(1).max(2_500_000), sha256: z.string().regex(/^[a-f0-9]{64}$/i), contentBase64: z.string().min(1).max(3_500_000) });
 const riderApplicationSchema = z.object({ name: z.string().min(2).max(160), email: z.string().email(), phone: z.string().min(6).max(40), city: z.string().min(2).max(120), vehicle: z.enum(["bike", "electric_bike", "electric_scooter", "motorcycle", "scooter", "car"]), availability: z.string().min(2).max(160), socialSecurityNumber: z.string().min(4).max(40), identityVerificationMethod: z.literal("online_scan"), safetyDeclarationAccepted: z.literal(true), documents: z.array(riderDocumentInputSchema).min(3).max(12), website: z.string().max(0).optional() });
 const documentRequestSubjectSchema = z.enum(["rider_application", "restaurant", "rider_lead", "partner_lead"]);
 const documentRequestRequirementInputSchema = z.object({ type: z.string().regex(/^[a-z0-9_]{2,80}$/), inputMode: z.enum(["file", "form"]).default("file"), label: z.string().trim().min(2).max(160), description: z.string().trim().max(500).default("") });
@@ -1650,7 +1650,11 @@ app.get("/api/v1/admin/restaurants/:id/documents/:documentId/content", requireRo
   const document = restaurant?.partnerProfile?.documents?.find((item: any) => String(item._id) === req.params.documentId);
   if (!document) return res.status(404).json({ error: "DOCUMENT_NOT_FOUND" });
   if (document.mimeType !== "application/pdf") return res.status(415).json({ error: "DOCUMENT_PDF_REQUIRED", message: "Este expediente contiene un archivo antiguo no PDF. Solicita que se vuelva a subir en PDF." });
-  return res.json({ fileName: document.fileName, mimeType: document.mimeType, sizeBytes: document.sizeBytes, sha256: document.sha256, contentBase64: document.contentBase64, viewedAt: new Date().toISOString() });
+  const viewedAt = new Date();
+  const viewedBy = objectId(req.auth!.employeeId!);
+  const result = await Restaurant.updateOne({ _id: id, ...tenantScope(req), "partnerProfile.documents._id": req.params.documentId }, { $set: { "partnerProfile.documents.$.viewedAt": viewedAt, "partnerProfile.documents.$.viewedBy": viewedBy } }).exec();
+  if (!result.matchedCount) return res.status(404).json({ error: "DOCUMENT_NOT_FOUND" });
+  return res.json({ fileName: sanitizePdfFileName(document.fileName), mimeType: "application/pdf", sizeBytes: document.sizeBytes, sha256: document.sha256, contentBase64: document.contentBase64, viewedAt: viewedAt.toISOString() });
 });
 
 app.patch("/api/v1/admin/restaurants/:id/documents/:documentId/status", requireRole("admin"), async (req, res) => {
@@ -1695,13 +1699,13 @@ app.post("/api/v1/admin/:kind-leads/:id/documents", requireRole("admin", "commer
   let normalized: ReturnType<typeof normalizeDocumentUpload>;
   try {
     normalized = normalizeDocumentUpload(parsed.data);
-    await scanUploadBuffers([{ buffer: normalized.bytes, originalName: sanitizeUploadFileName(parsed.data.fileName) }]);
+    await scanUploadBuffers([{ buffer: normalized.bytes, originalName: sanitizePdfFileName(parsed.data.fileName) }]);
   } catch (error) {
     if (error instanceof MalwareDetectedError) return res.status(422).json({ error: "MALWARE_DETECTED" });
     if (error instanceof MalwareScannerUnavailableError) return res.status(503).json({ error: "MALWARE_SCANNER_UNAVAILABLE" });
     return res.status(400).json({ error: error instanceof Error ? error.message : "DOCUMENT_VALIDATION_FAILED" });
   }
-  const lead = await Model.findOneAndUpdate({ _id: id, ...await adminOnboardingScope(req) }, { $push: { documents: { ...parsed.data, fileName: sanitizeUploadFileName(parsed.data.fileName), sha256: parsed.data.sha256.toLowerCase(), contentBase64: normalized.contentBase64, status: "received" } } }, { new: true }).select("name email documents").lean().exec() as any;
+  const lead = await Model.findOneAndUpdate({ _id: id, ...await adminOnboardingScope(req) }, { $push: { documents: { ...parsed.data, fileName: sanitizePdfFileName(parsed.data.fileName), sha256: parsed.data.sha256.toLowerCase(), contentBase64: normalized.contentBase64, status: "received" } } }, { new: true }).select("name email documents").lean().exec() as any;
   if (!lead) return res.status(404).json({ error: "LEAD_NOT_FOUND" });
   return res.status(201).json({ leadId: lead._id, documents: (lead.documents || []).map(({ contentBase64, ...metadata }: any) => metadata) });
 });
@@ -1721,7 +1725,11 @@ app.get("/api/v1/admin/:kind-leads/:id/documents/:documentId/content", requireRo
   const document = lead?.documents?.find((item: any) => String(item._id) === req.params.documentId);
   if (!document) return res.status(404).json({ error: "DOCUMENT_NOT_FOUND" });
   if (document.mimeType !== "application/pdf") return res.status(415).json({ error: "DOCUMENT_PDF_REQUIRED", message: "Este expediente contiene un archivo antiguo no PDF. Solicita que se vuelva a subir en PDF." });
-  return res.json({ fileName: document.fileName, mimeType: document.mimeType, sizeBytes: document.sizeBytes, sha256: document.sha256, contentBase64: document.contentBase64, viewedAt: new Date().toISOString() });
+  const viewedAt = new Date();
+  const viewedBy = objectId(req.auth!.employeeId!);
+  const result = await Model.updateOne({ _id: id, ...await onboardingScope(req), "documents._id": req.params.documentId }, { $set: { "documents.$.viewedAt": viewedAt, "documents.$.viewedBy": viewedBy } }).exec();
+  if (!result.matchedCount) return res.status(404).json({ error: "DOCUMENT_NOT_FOUND" });
+  return res.json({ fileName: sanitizePdfFileName(document.fileName), mimeType: "application/pdf", sizeBytes: document.sizeBytes, sha256: document.sha256, contentBase64: document.contentBase64, viewedAt: viewedAt.toISOString() });
 });
 app.patch("/api/v1/admin/:kind-leads/:id/documents/:documentId/status", requireRole("admin", "commercial", "gerente_comercial_zona"), async (req, res) => {
   const Model = leadModel(Array.isArray(req.params.kind) ? req.params.kind[0] : req.params.kind) as any;
@@ -1816,7 +1824,11 @@ app.get("/api/v1/rider-applications/:id/documents/:documentId/content", requireR
   const document = application?.documents?.find((item: any) => String(item._id) === req.params.documentId);
   if (!document) return res.status(404).json({ error: "DOCUMENT_NOT_FOUND" });
   if (document.mimeType !== "application/pdf") return res.status(415).json({ error: "DOCUMENT_PDF_REQUIRED", message: "Este expediente contiene un archivo antiguo no PDF. Solicita que se vuelva a subir en PDF." });
-  return res.json({ fileName: document.fileName, mimeType: document.mimeType, sizeBytes: document.sizeBytes, sha256: document.sha256, contentBase64: document.contentBase64, viewedAt: new Date().toISOString() });
+  const viewedAt = new Date();
+  const viewedBy = objectId(req.auth!.employeeId!);
+  const result = await RiderApplication.updateOne({ _id: id, ...await adminOnboardingScope(req), "documents._id": req.params.documentId }, { $set: { "documents.$.viewedAt": viewedAt, "documents.$.viewedBy": viewedBy } }).exec();
+  if (!result.matchedCount) return res.status(404).json({ error: "DOCUMENT_NOT_FOUND" });
+  return res.json({ fileName: sanitizePdfFileName(document.fileName), mimeType: "application/pdf", sizeBytes: document.sizeBytes, sha256: document.sha256, contentBase64: document.contentBase64, viewedAt: viewedAt.toISOString() });
 });
 app.patch("/api/v1/rider-applications/:id/documents/:documentId/status", requireRole("admin"), async (req, res) => {
   const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
@@ -1936,7 +1948,7 @@ async function normalizeAndScanOnboardingDocuments<T extends IncomingOnboardingD
   const normalized = documents.map((document) => {
     const upload = normalizeDocumentUpload(document);
     return {
-      document: { ...document, fileName: sanitizeUploadFileName(document.fileName), sha256: document.sha256.toLowerCase(), contentBase64: upload.contentBase64 } as T,
+      document: { ...document, fileName: sanitizePdfFileName(document.fileName), mimeType: "application/pdf", sha256: document.sha256.toLowerCase(), contentBase64: upload.contentBase64 } as T,
       bytes: upload.bytes,
     };
   });
@@ -2075,9 +2087,9 @@ app.post("/api/v1/public/document-requests/:token/documents", async (req, res) =
   const uploaded = [] as Array<{ type: string; fileName: string; mimeType: string; sizeBytes: number; sha256: string; contentBase64: string }>;
   try {
     const normalizedDocuments = parsed.data.documents.map((document) => ({ document, normalized: normalizeDocumentUpload(document) }));
-    if (normalizedDocuments.length) await scanUploadBuffers(normalizedDocuments.map(({ document, normalized }) => ({ buffer: normalized.bytes, originalName: sanitizeUploadFileName(document.fileName) })));
+    if (normalizedDocuments.length) await scanUploadBuffers(normalizedDocuments.map(({ document, normalized }) => ({ buffer: normalized.bytes, originalName: sanitizePdfFileName(document.fileName) })));
     for (const { document, normalized } of normalizedDocuments) {
-      uploaded.push({ ...document, fileName: sanitizeUploadFileName(document.fileName), sha256: document.sha256.toLowerCase(), contentBase64: normalized.contentBase64 });
+      uploaded.push({ ...document, fileName: sanitizePdfFileName(document.fileName), mimeType: "application/pdf", sha256: document.sha256.toLowerCase(), contentBase64: normalized.contentBase64 });
     }
   } catch (error) {
     if (error instanceof MalwareDetectedError) return res.status(422).json({ error: "MALWARE_DETECTED", message: "Uno de los archivos ha sido rechazado por seguridad." });
