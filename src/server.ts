@@ -4090,7 +4090,7 @@ async function repairConfiguredPartnerAccess() {
     restaurant = await Restaurant.findOneAndUpdate(
       { slug: configuredPartnerSlug },
       {
-        $set: { tenantId: account.tenantId || null, email, onboardingStatus: "approved", isActive: true, internalDemo: true },
+        $set: { tenantId: account.tenantId || null, email, onboardingStatus: "approved", isActive: true, internalDemo: configuredPartnerSlug !== "kfc-xativa-qa" },
         $setOnInsert: { slug: configuredPartnerSlug, name: "KFC XATIVA QA", cuisine: "Americana", category: "Americana", locality: "Xàtiva", partnerGroupKey: "xativa", tagline: "Entorno QA interno de PIKI · sin afiliación comercial.", phone: "", address: "Xàtiva" },
       },
       { upsert: true, new: true, setDefaultsOnInsert: true },
@@ -4119,9 +4119,9 @@ async function repairConfiguredPartnerAccess() {
       },
       {
         $set: {
-          internalDemo: true,
+          internalDemo: restaurant.slug !== "kfc-xativa-qa",
           demoMenuVersion: PARTNER_DEMO_MENU_VERSION,
-          tagline: "Entorno de demostración interna de PIKI · sin afiliación comercial.",
+          tagline: restaurant.slug === "kfc-xativa-qa" ? "Local QA de Xàtiva habilitado para pruebas operativas reales." : "Entorno de demostración interna de PIKI · sin afiliación comercial.",
           menu: partnerDemoMenu,
         },
       },
