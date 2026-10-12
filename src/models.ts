@@ -325,6 +325,35 @@ orderSchema.index({ tenantId: 1, restaurantId: 1, archivedAt: -1 });
 orderSchema.index({ displayCodeDate: 1, displayCode: 1 }, { unique: true, partialFilterExpression: { displayCodeDate: { $type: "string" }, displayCode: { $type: "string" } } });
 orderSchema.index({ deliveryLocation: "2dsphere" }, { sparse: true });
 
+const testOrderPurgePreviewSchema = new Schema({
+  actorEmployeeId: { type: Schema.Types.ObjectId, ref: "EmployeeAccount", required: true, index: true },
+  tokenHash: { type: String, required: true, select: false },
+  snapshotHash: { type: String, required: true },
+  candidateOrderIds: { type: [Schema.Types.ObjectId], default: [] },
+  eligibleOrderIds: { type: [Schema.Types.ObjectId], default: [] },
+  expectedDeleteCount: { type: Number, required: true, min: 0 },
+  scopeVersion: { type: Number, required: true },
+  expiresAt: { type: Date, required: true },
+  consumedAt: { type: Date, default: null },
+}, { timestamps: true, collection: "test_order_purge_previews" });
+testOrderPurgePreviewSchema.index({ expiresAt: 1 }, { expireAfterSeconds: 0 });
+testOrderPurgePreviewSchema.index({ actorEmployeeId: 1, createdAt: -1 });
+
+const testOrderPurgeAuditSchema = new Schema({
+  actorEmployeeId: { type: Schema.Types.ObjectId, ref: "EmployeeAccount", required: true, index: true },
+  actorRole: { type: String, enum: ["admin", "partner"], default: "admin", index: true },
+  source: { type: String, enum: ["admin_two_phase", "partner_manual"], default: "admin_two_phase", index: true },
+  restaurantId: { type: Schema.Types.ObjectId, ref: "Restaurant", default: null, index: true },
+  previewId: { type: Schema.Types.ObjectId, default: null, index: true },
+  scopeVersion: { type: Number, required: true },
+  deletedOrderIds: { type: [Schema.Types.ObjectId], required: true },
+  deletedPublicCodes: { type: [String], required: true },
+  deletedCount: { type: Number, required: true, min: 1 },
+  releasedRiderIds: { type: [Schema.Types.ObjectId], default: [] },
+  deletedAt: { type: Date, required: true },
+}, { timestamps: true, collection: "test_order_purge_audits" });
+testOrderPurgeAuditSchema.index({ actorEmployeeId: 1, createdAt: -1 });
+
 const zoneSchema = new Schema({
   tenantId: { type: Schema.Types.ObjectId, ref: "Tenant", default: null, index: true }, name: { type: String, required: true }, slug: { type: String, required: true }, isActive: { type: Boolean, default: true, index: true }, polygon: { type: { type: String, enum: ["Polygon"], default: "Polygon" }, coordinates: { type: [[[Number]]], required: true } }, serviceFeeCents: { type: Number, default: 0, min: 0 }, maxEtaMinutes: { type: Number, default: 60, min: 1 } }, { timestamps: true, collection: "zones" });
 zoneSchema.index({ tenantId: 1, slug: 1 }, { unique: true });
@@ -367,6 +396,8 @@ export const RealtimeEvent = mongoose.models.RealtimeEvent || mongoose.model("Re
 export const RiderAssignmentReservation = mongoose.models.RiderAssignmentReservation || mongoose.model("RiderAssignmentReservation", riderAssignmentReservationSchema);
 export const TrackingSession = mongoose.models.TrackingSession || mongoose.model("TrackingSession", trackingSessionSchema);
 export const LocationSample = mongoose.models.LocationSample || mongoose.model("LocationSample", locationSampleSchema);
+export const TestOrderPurgePreview = mongoose.models.TestOrderPurgePreview || mongoose.model("TestOrderPurgePreview", testOrderPurgePreviewSchema);
+export const TestOrderPurgeAudit = mongoose.models.TestOrderPurgeAudit || mongoose.model("TestOrderPurgeAudit", testOrderPurgeAuditSchema);
 
 export async function ensureIndexes() {
   // Remove unique indexes from older schema versions before initialization.
@@ -377,6 +408,7 @@ export async function ensureIndexes() {
   }
   await Promise.all([PartnerLocalityGroup.syncIndexes(), Fleet.syncIndexes(), Zone.syncIndexes(), RiderSlot.syncIndexes(), RiderReferralProfile.syncIndexes(), RiderShiftIncentiveMetric.syncIndexes(), RiderIncentiveEntry.syncIndexes(), RiderIncentiveBudget.syncIndexes()]);
   await Promise.all([Tenant.init(), TenantMembership.init(), Restaurant.init(), PartnerAsset.init(), PartnerLocalityGroup.init(), MenuImportDraft.init(), Fleet.init(), Order.init(), Zone.init(), StripeEvent.init(), CashLedgerEntry.init(), DispatchDecision.init(), DispatchOutbox.init(), RiderIncident.init(), RiderOrderMessage.init(), RiderApplication.init(), PartnerLead.init(), RiderLead.init(), DocumentRequest.init(), CustomerAccount.init(), RiderSlot.init(), SignatureRequest.init(), PasskeyCredential.init(), PasskeyChallenge.init(), PushSubscription.init(), Notification.init(), RealtimeEvent.init(), RiderAssignmentReservation.init(), TrackingSession.init(), LocationSample.init(), EmployeeAccount.init(), AccessAuthorization.init(), OnboardingRequest.init(), RiderReferralProfile.init(), RiderShiftIncentiveMetric.init(), RiderIncentiveEntry.init(), RiderIncentiveBudget.init()]);
+  await Promise.all([TestOrderPurgePreview.init(), TestOrderPurgeAudit.init()]);
   const ridersWithoutCode = await Rider.find({ $or: [{ riderCode: { $exists: false } }, { riderCode: null }, { riderCode: "" }] }).select("_id").lean().exec();
   for (const rider of ridersWithoutCode) {
     const base = `PIKI-R-${String(rider._id).slice(-6).toUpperCase()}`;
