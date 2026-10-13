@@ -38,6 +38,7 @@ import { decideLatePickup, pointDistanceMeters } from "./pickupPolicy.js";
 import { buildLegacyRiderSupportTicketFilter, buildRiderSupportTicketFilter } from "./supportTicketScope.js";
 import { cashOrderLimitError, isCashOrderWithinLimit } from "./paymentPolicy.js";
 import { calculateMarketplaceBreakdown, DEFAULT_PARTNER_COMMISSION_BPS } from "./marketplaceAccounting.js";
+import { postMarketplaceOrderLedger, preparePartnerPayoutBatch } from "./marketplaceLedger.js";
 import { extractAndParseMenu, readAssetBytes } from "./menuImport.js";
 import { purgeTestDataIfEnabled } from "./purgeTestData.js";
 import { validateDocumentRequestSubmission } from "./onboardingDocumentPolicy.js";
@@ -3070,9 +3071,10 @@ app.post("/api/v1/riders/:riderId/orders/:orderId/confirm-delivery", requireRole
   // a successfully captured delivery merely because that benign event won the
   // version race. Status/rider/assignment predicates remain the concurrency
   // guard, and Stripe orders must be authorized or already marked paid.
-  const updated = await Order.findOneAndUpdate({ _id: orderId, riderId, assignmentState: "assigned", status: "on_the_way", ...(order.paymentMethod === "stripe" ? { paymentState: { $in: ["authorized", "paid"] } } : {}) }, { $set: { status: "delivered", deliveredAt: new Date(), archivedAt: new Date(), ...(order.paymentMethod === "stripe" ? { paymentState: "paid" } : {}) }, $inc: { version: 1 }, $push: { statusHistory: { status: "delivered", actorRole: "rider", reason: order.paymentMethod === "cash" ? "Entrega confirmada y cobro en efectivo registrado" : "Entrega confirmada por el Rider" } } }, { new: true }).lean().exec();
+  const updated = await Order.findOneAndUpdate({ _id: orderId, riderId, assignmentState: "assigned", status: "on_the_way", ...(order.paymentMethod === "stripe" ? { paymentState: { $in: ["authorized", "paid"] } } : {}) }, { $set: { status: "delivered", deliveredAt: new Date(), archivedAt: new Date(), paymentState: "paid" }, $inc: { version: 1 }, $push: { statusHistory: { status: "delivered", actorRole: "rider", reason: order.paymentMethod === "cash" ? "Entrega confirmada y cobro en efectivo registrado" : "Entrega confirmada por el Rider" } } }, { new: true }).lean().exec();
   if (!updated) return res.status(409).json({ error: "ORDER_CHANGED_RETRY" });
   const deliveredOrder = updated as any;
+  await postMarketplaceOrderLedger(deliveredOrder).catch((error) => console.error("Marketplace ledger posting failed", error instanceof Error ? error.message : error));
   await RiderOrderMessage.deleteMany({ orderId, riderId }).exec();
   await releaseRiderOrderSlot(orderId, riderId);
   if (!order.isTestOrder) await awardRiderRecruitmentMilestones(riderId).catch((error) => console.error("Rider referral milestone evaluation failed", error instanceof Error ? error.message : error));
@@ -3980,6 +3982,28 @@ app.get("/api/v1/fleets/pending-partner-orders", requireRole("admin", "fleet", "
   const restaurants = await Restaurant.find({ ...tenant, _id: { $in: orders.map((order) => order.restaurantId) } }).select("name").lean().exec() as any[];
   const names = new Map(restaurants.map((restaurant) => [String(restaurant._id), restaurant.name]));
   return res.json({ orders: orders.map((order) => ({ id: String(order._id), publicCode: order.publicCode, restaurant: names.get(String(order.restaurantId)) || "Restaurante", totalCents: order.totalCents, createdAt: order.createdAt, status: order.status, paymentState: order.paymentState, paymentMethod: order.paymentMethod || "stripe", cashDueAtDelivery: order.paymentMethod === "cash", assignmentState: order.assignmentState })) });
+});
+const payoutPeriodSchema = z.object({ restaurantId: z.string().regex(/^[a-f\d]{24}$/i), startsAt: z.coerce.date(), endsAt: z.coerce.date() }).refine((value) => value.endsAt > value.startsAt, "INVALID_PAYOUT_PERIOD");
+app.get("/api/v1/finance/partner-balances", requireRole("admin", "finance"), async (req, res) => {
+  const tenant = tenantScope(req);
+  const balances = await Order.aggregate([
+    { $match: { ...tenant, status: "delivered", paymentState: "paid", payoutStatus: { $in: ["eligible", "pending"] } } },
+    { $group: { _id: "$restaurantId", orders: { $sum: 1 }, partnerPayoutCents: { $sum: "$partnerPayoutCents" }, marketplaceCommissionCents: { $sum: "$marketplaceCommissionCents" }, riderEarningsCents: { $sum: "$riderEarningsCents" } } },
+    { $sort: { partnerPayoutCents: -1 } },
+  ]);
+  const restaurants = await Restaurant.find({ ...tenant, _id: { $in: balances.map((row: any) => row._id) } }).select("name slug").lean().exec() as any[];
+  const names = new Map(restaurants.map((restaurant) => [String(restaurant._id), restaurant]));
+  return res.json({ balances: balances.map((row: any) => ({ restaurant: names.get(String(row._id)) || null, orders: Number(row.orders), partnerPayoutCents: Number(row.partnerPayoutCents || 0), marketplaceCommissionCents: Number(row.marketplaceCommissionCents || 0), riderEarningsCents: Number(row.riderEarningsCents || 0) })) });
+});
+app.post("/api/v1/finance/payout-batches/prepare", requireRole("admin", "finance"), async (req, res) => {
+  const parsed = payoutPeriodSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "INVALID_PAYOUT_PERIOD", details: parsed.error.flatten() });
+  const restaurantId = objectId(parsed.data.restaurantId);
+  if (!restaurantId) return res.status(400).json({ error: "INVALID_RESTAURANT_ID" });
+  const restaurant = await Restaurant.findOne({ _id: restaurantId, ...tenantScope(req) }).select("_id").lean().exec();
+  if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
+  const result = await preparePartnerPayoutBatch({ restaurantId, startsAt: parsed.data.startsAt, endsAt: parsed.data.endsAt, tenantId: (req.auth as any)?.tenantId || null });
+  return res.status(201).json({ ...result, execution: "blocked_until_stripe_connect_and_kyb_approval" });
 });
 app.get("/api/v1/finance/overview", requireRole("admin", "finance"), async (req, res) => {
   const startOfDay = new Date(); startOfDay.setHours(0, 0, 0, 0);

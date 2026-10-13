@@ -82,6 +82,32 @@ const cashLedgerEntrySchema = new Schema({
 }, { timestamps: true, collection: "cash_ledger_entries" });
 cashLedgerEntrySchema.index({ riderId: 1, createdAt: -1 });
 
+const marketplaceLedgerEntrySchema = new Schema({
+  tenantId: { type: Schema.Types.ObjectId, ref: "Tenant", default: null, index: true },
+  orderId: { type: Schema.Types.ObjectId, ref: "Order", required: true, index: true },
+  restaurantId: { type: Schema.Types.ObjectId, ref: "Restaurant", required: true, index: true },
+  currency: { type: String, enum: ["eur"], default: "eur" },
+  accountType: { type: String, enum: ["customer_cash", "partner_payable", "rider_payable", "platform_revenue"], required: true, index: true },
+  direction: { type: String, enum: ["debit", "credit"], required: true },
+  amountCents: { type: Number, required: true, min: 0 },
+  reason: { type: String, required: true },
+  source: { type: String, required: true },
+  idempotencyKey: { type: String, required: true, unique: true, index: true },
+}, { timestamps: true, collection: "marketplace_ledger_entries" });
+marketplaceLedgerEntrySchema.index({ restaurantId: 1, createdAt: -1 });
+const partnerPayoutBatchSchema = new Schema({
+  tenantId: { type: Schema.Types.ObjectId, ref: "Tenant", default: null, index: true },
+  restaurantId: { type: Schema.Types.ObjectId, ref: "Restaurant", required: true, index: true },
+  orderIds: { type: [Schema.Types.ObjectId], ref: "Order", default: [] },
+  startsAt: { type: Date, required: true, index: true },
+  endsAt: { type: Date, required: true, index: true },
+  amountCents: { type: Number, required: true, min: 0 },
+  currency: { type: String, enum: ["eur"], default: "eur" },
+  status: { type: String, enum: ["prepared", "approved", "paid", "failed", "cancelled"], default: "prepared", index: true },
+  idempotencyKey: { type: String, required: true, unique: true, index: true },
+  externalTransferId: { type: String, default: null, index: true },
+}, { timestamps: true, collection: "partner_payout_batches" });
+partnerPayoutBatchSchema.index({ restaurantId: 1, startsAt: 1, endsAt: 1 }, { unique: true });
 const stripeEventSchema = new Schema({ stripeEventId: { type: String, required: true, unique: true, index: true }, type: { type: String, required: true }, orderCode: { type: String, default: null }, receivedAt: { type: Date, default: Date.now }, processingStatus: { type: String, enum: ["processing", "processed", "failed"], default: "processed", index: true }, processingStartedAt: { type: Date, default: null, index: true }, processedAt: { type: Date, default: null }, failedAt: { type: Date, default: null }, lastError: { type: String, default: null, maxlength: 120 } }, { timestamps: true, collection: "stripe_events" });
 const passkeyCredentialSchema = new Schema({
   ownerType: { type: String, enum: ["customer", "employee"], required: true, index: true },
@@ -342,6 +368,8 @@ export const Rider = mongoose.models.Rider || mongoose.model("Rider", riderSchem
 export const Fleet = mongoose.models.Fleet || mongoose.model("Fleet", fleetSchema);
 export const Order = mongoose.models.Order || mongoose.model("Order", orderSchema);
 export const Zone = mongoose.models.Zone || mongoose.model("Zone", zoneSchema);
+export const MarketplaceLedgerEntry = mongoose.models.MarketplaceLedgerEntry || mongoose.model("MarketplaceLedgerEntry", marketplaceLedgerEntrySchema);
+export const PartnerPayoutBatch = mongoose.models.PartnerPayoutBatch || mongoose.model("PartnerPayoutBatch", partnerPayoutBatchSchema);
 export const StripeEvent = mongoose.models.StripeEvent || mongoose.model("StripeEvent", stripeEventSchema);
 export const CashLedgerEntry = mongoose.models.CashLedgerEntry || mongoose.model("CashLedgerEntry", cashLedgerEntrySchema);
 export const DispatchDecision = mongoose.models.DispatchDecision || mongoose.model("DispatchDecision", dispatchDecisionSchema);
@@ -376,7 +404,7 @@ export async function ensureIndexes() {
     }
   }
   await Promise.all([PartnerLocalityGroup.syncIndexes(), Fleet.syncIndexes(), Zone.syncIndexes(), RiderSlot.syncIndexes(), RiderReferralProfile.syncIndexes(), RiderShiftIncentiveMetric.syncIndexes(), RiderIncentiveEntry.syncIndexes(), RiderIncentiveBudget.syncIndexes()]);
-  await Promise.all([Tenant.init(), TenantMembership.init(), Restaurant.init(), PartnerAsset.init(), PartnerLocalityGroup.init(), MenuImportDraft.init(), Fleet.init(), Order.init(), Zone.init(), StripeEvent.init(), CashLedgerEntry.init(), DispatchDecision.init(), DispatchOutbox.init(), RiderIncident.init(), RiderOrderMessage.init(), RiderApplication.init(), PartnerLead.init(), RiderLead.init(), DocumentRequest.init(), CustomerAccount.init(), RiderSlot.init(), SignatureRequest.init(), PasskeyCredential.init(), PasskeyChallenge.init(), PushSubscription.init(), Notification.init(), RealtimeEvent.init(), RiderAssignmentReservation.init(), TrackingSession.init(), LocationSample.init(), EmployeeAccount.init(), AccessAuthorization.init(), OnboardingRequest.init(), RiderReferralProfile.init(), RiderShiftIncentiveMetric.init(), RiderIncentiveEntry.init(), RiderIncentiveBudget.init()]);
+  await Promise.all([Tenant.init(), TenantMembership.init(), Restaurant.init(), PartnerAsset.init(), PartnerLocalityGroup.init(), MenuImportDraft.init(), Fleet.init(), Order.init(), Zone.init(), MarketplaceLedgerEntry.init(), PartnerPayoutBatch.init(), StripeEvent.init(), CashLedgerEntry.init(), DispatchDecision.init(), DispatchOutbox.init(), RiderIncident.init(), RiderOrderMessage.init(), RiderApplication.init(), PartnerLead.init(), RiderLead.init(), DocumentRequest.init(), CustomerAccount.init(), RiderSlot.init(), SignatureRequest.init(), PasskeyCredential.init(), PasskeyChallenge.init(), PushSubscription.init(), Notification.init(), RealtimeEvent.init(), RiderAssignmentReservation.init(), TrackingSession.init(), LocationSample.init(), EmployeeAccount.init(), AccessAuthorization.init(), OnboardingRequest.init(), RiderReferralProfile.init(), RiderShiftIncentiveMetric.init(), RiderIncentiveEntry.init(), RiderIncentiveBudget.init()]);
   const ridersWithoutCode = await Rider.find({ $or: [{ riderCode: { $exists: false } }, { riderCode: null }, { riderCode: "" }] }).select("_id").lean().exec();
   for (const rider of ridersWithoutCode) {
     const base = `PIKI-R-${String(rider._id).slice(-6).toUpperCase()}`;
