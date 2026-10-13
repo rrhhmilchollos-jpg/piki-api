@@ -368,7 +368,7 @@ async function reserveRiderOrderSlot(riderId: mongoose.Types.ObjectId, orderId: 
   if (reserved >= Math.min(MAX_RIDER_ACTIVE_ORDERS, maxOrders)) return null;
   const slot = reserved + 1;
   try {
-    const reservation = await RiderAssignmentReservation.create({ ...tenantFilter, riderId, orderId, slot, mode: reserved ? "saturated" : "normal", status: "reserved", expiresAt: new Date(Date.now() + 180_000) });
+    const reservation = await RiderAssignmentReservation.create({ ...tenantFilter, riderId, orderId, slot, mode: reserved ? "saturated" : "normal", status: "reserved", expiresAt: null });
     const rider = await Rider.findOneAndUpdate({ ...tenantFilter, _id: riderId, status: { $in: ["available", "busy"] }, ...(reserved === 0 ? { activeOrderId: null } : {}) }, { $set: { status: "busy", ...(reserved === 0 ? { activeOrderId: orderId } : {}) } }, { new: true }).lean().exec() as any;
     if (!rider) { await RiderAssignmentReservation.updateOne({ _id: reservation._id }, { $set: { status: "released" } }).exec(); return null; }
     return { rider, reservation };
@@ -2959,7 +2959,6 @@ app.post("/api/v1/riders/:riderId/orders/:orderId/accept-offer", requireRole("ri
   if (!(await riderAccessForRequest(riderId, req))) return res.status(403).json({ error: "RIDER_ACCESS_DENIED" });
   const order = await Order.findOne({ _id: orderId, riderId, assignmentState: "offered" }).lean().exec() as any;
   if (!order) return res.status(404).json({ error: "RIDER_OFFER_NOT_FOUND" });
-  if (order.assignmentExpiresAt && new Date(order.assignmentExpiresAt).getTime() <= Date.now()) return res.status(409).json({ error: "RIDER_OFFER_EXPIRED", message: "La oferta ha caducado y PIKI ya busca otro rider." });
   const pickupDeadlineAt = new Date(Date.now() + PICKUP_REASSIGN_AFTER_MS);
   const updated = await Order.findOneAndUpdate(
     { _id: orderId, riderId, assignmentState: "offered", version: order.version },
@@ -3500,7 +3499,8 @@ async function assignOrderAutomatically(orderId: mongoose.Types.ObjectId, prefer
       const assignmentReservation = await reserveRiderOrderSlot(riderId, order._id, tenantFilter, policy.maxConcurrentOrders);
       if (!assignmentReservation) continue;
       const rider = assignmentReservation.rider;
-      const expiresAt = assignmentReservation.reservation.expiresAt;
+      // El identificador permite auditar la oferta; no se fija una caducidad temporal.
+      const expiresAt = null;
       const assigned = await Order.findOneAndUpdate({ _id: order._id, ...tenantFilter, riderId: null, assignmentState: { $in: ["unassigned", "expired", "rejected"] } }, { $set: { riderId: rider._id, assignmentState: "offered", offerId: randomUUID(), assignmentExpiresAt: expiresAt, pickupDeadlineAt: null, dispatchScore: decision.score }, $inc: { dispatchAttempts: 1, version: 1 } }, { new: true }).lean().exec() as any;
       if (!assigned) { await releaseRiderOrderSlot(order._id, rider._id); continue; }
       await DispatchDecision.create({ ...tenantFilter, orderId: assigned._id, ...decision, riderId: rider._id, outcome: "offered", actorRole: "system" });
@@ -3635,17 +3635,11 @@ app.delete("/api/v1/admin/qa/dispatch-orders/:id", requireRole("admin"), async (
 });
 
 async function expireStaleOffers() {
-  let expiredCount = 0;
-  const expired = await Order.find({ assignmentState: "offered", assignmentExpiresAt: { $lte: new Date() } }).select("_id riderId").limit(100).lean().exec() as any[];
-  for (const offer of expired) {
-    const released = await Order.findOneAndUpdate({ _id: offer._id, assignmentState: "offered", assignmentExpiresAt: { $lte: new Date() } }, { $set: { assignmentState: "expired", riderId: null, offerId: null, assignmentExpiresAt: null, pickupDeadlineAt: null }, $inc: { version: 1 } }, { new: false }).lean().exec() as any;
-    if (!released?.riderId) continue;
-    await releaseRiderOrderSlot(released._id, released.riderId);
-    expiredCount += 1;
-    await DispatchDecision.updateMany({ orderId: released._id, riderId: released.riderId, outcome: "offered" }, { $set: { outcome: "expired" } }).exec();
-    await enqueueDispatchOutbox({ orderId: released._id, tenantId: released.tenantId || null, idempotencyKey: dispatchRequeueIdempotencyKey(released._id, Number(released.version || 0) + 1), reason: "offer_expired" });
-  }
-  return expiredCount;
+  // Las ofertas no caducan por tiempo. El rider asignado puede aceptarlas
+  // siempre; solo una aceptación atómica, una reasignación de Soporte o el
+  // cierre del pedido libera la reserva. Se conserva la función para que los
+  // contadores históricos del sweep sigan siendo compatibles.
+  return 0;
 }
 
 async function runAutomaticDispatchSweep() {
@@ -3783,10 +3777,6 @@ app.post("/api/v1/dispatch/orders/:id/offer-response", requireRole("rider", "adm
   if (req.auth?.role === "rider") {
     const rider = await riderAccessForRequest(order.riderId, req);
     if (!rider) return res.status(403).json({ error: "RIDER_ACCESS_DENIED" });
-  }
-  if (new Date(order.assignmentExpiresAt || 0).getTime() < Date.now()) {
-    await expireStaleOffers();
-    return res.status(409).json({ error: "OFFER_EXPIRED", message: "La oferta ha vencido y se ha devuelto a la cola de reparto." });
   }
   if (parsed.data.accept) {
     const updated = await Order.findOneAndUpdate({ _id: orderId, ...tenantScope(req), assignmentState: "offered", riderId: order.riderId, offerId: order.offerId || null, version: order.version, assignmentExpiresAt: { $gt: new Date() } }, { $set: { assignmentState: "assigned", pickupDeadlineAt: new Date(Date.now() + PICKUP_REASSIGN_AFTER_MS) }, $inc: { version: 1 } }, { new: true }).lean().exec() as any;
