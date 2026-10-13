@@ -1108,6 +1108,20 @@ app.patch("/api/v1/admin/partner-leads/:id", requireRole("admin", "commercial", 
 const partnerDocumentSchema = z.object({ type: z.enum(["tax_id", "bank_certificate", "insurance", "activity_license", "food_sanitary_authorization", "identity", "other"]), fileName: z.string().min(1).max(180), mimeType: z.enum(DOCUMENT_UPLOAD_MIME_TYPES), sizeBytes: z.number().int().positive().max(2_500_000), sha256: z.string().regex(/^[a-f0-9]{64}$/), contentBase64: z.string().min(20).max(3_500_000) });
 const openingHoursSchema = z.record(z.string().min(2).max(15), z.object({ open: z.string().regex(/^\d{2}:\d{2}$/), close: z.string().regex(/^\d{2}:\d{2}$/), closed: z.boolean() }));
 const partnerSchema = z.object({ name: z.string().min(2).max(160), email: z.string().email(), password: z.string().min(12).max(200).regex(/[A-Z]/).regex(/[a-z]/).regex(/[0-9]/), phone: z.string().min(6).max(40), address: z.string().min(5).max(280), legalName: z.string().min(2).max(180), taxId: z.string().regex(/^[A-Za-z0-9-]{5,20}$/), legalForm: z.enum(["autonomo", "sl", "sa", "cooperativa", "otra"]), representativeName: z.string().min(2).max(160), representativeRole: z.string().min(2).max(100), representativeDocument: z.string().min(5).max(30), fiscalAddress: z.string().min(5).max(280), operatingAddress: z.string().min(5).max(280), postalCode: z.string().regex(/^\d{5}$/), city: z.string().min(2).max(100), province: z.string().min(2).max(100), iban: z.string().regex(/^[A-Z]{2}\d{2}[A-Z0-9]{10,30}$/), bankAccountHolder: z.string().min(2).max(180), cuisine: z.string().min(2).max(100), vatRate: z.union([z.literal(4), z.literal(10), z.literal(21)]), commissionAccepted: z.literal(true), termsAcceptedAt: z.coerce.date(), contractAccepted: z.literal(true), privacyAccepted: z.literal(true), dataProcessingAccepted: z.literal(true), pdaUnits: z.number().int().min(1).max(50), pdaUnitCostCents: z.literal(30000), pdaCostAccepted: z.literal(true), pdaCostAcceptedAt: z.coerce.date(), privacyAcceptedAt: z.coerce.date(), dataProcessingAcceptedAt: z.coerce.date(), openingHours: openingHoursSchema, documents: z.array(partnerDocumentSchema).length(5) });
+app.get("/api/v1/public/partners/:id/stripe/onboarding-link", async (req, res) => {
+  const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
+  if (!id || !process.env.STRIPE_SECRET_KEY) return res.status(404).json({ error: "STRIPE_ONBOARDING_NOT_AVAILABLE" });
+  const restaurant = await Restaurant.findOne({ _id: id, ...await publicOnboardingTenantScope() }).select("name email partnerProfile marketplaceCompliance").lean().exec() as any;
+  if (!restaurant?.marketplaceCompliance?.stripeAccountId) return res.status(404).json({ error: "STRIPE_ACCOUNT_NOT_FOUND" });
+  try {
+    const partnerApp = String(process.env.PARTNER_APP_URL || "https://partners.pikidelivery.com").replace(/\/$/, "");
+    const connected = await createPartnerStripeOnboardingLink({ restaurantId: String(id), email: String(restaurant.email || ""), legalName: String(restaurant.partnerProfile?.legalName || restaurant.name), legalForm: restaurant.partnerProfile?.legalForm || "otra", existingAccountId: restaurant.marketplaceCompliance.stripeAccountId, refreshUrl: `${process.env.API_PUBLIC_URL || "https://api.pikidelivery.com"}/api/v1/public/partners/${String(id)}/stripe/onboarding-link`, returnUrl: `${partnerApp}/?onboarding=stripe-complete&restaurant_id=${encodeURIComponent(String(id))}` });
+    await Restaurant.updateOne({ _id: id }, { $set: { "marketplaceCompliance.stripeStatus": "onboarding", "marketplaceCompliance.lastSyncedAt": new Date() } }).exec();
+    return res.redirect(connected.link.url);
+  } catch (error) {
+    return res.status(502).json({ error: "STRIPE_ONBOARDING_LINK_FAILED", message: error instanceof Error ? error.message : "No se pudo crear el enlace Stripe." });
+  }
+});
 app.post("/api/v1/partners/onboarding", async (req, res) => {
   const parsed = partnerSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_PARTNER", details: parsed.error.flatten() });
