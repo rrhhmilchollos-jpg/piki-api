@@ -1,5 +1,7 @@
 export const COMING_SOON_SLUGS = ["kings-tacos-xativa", "eleven-burgers-xativa", "nakama-sushi-xativa", "rooster-kebab-xativa", "alibaba-kebab-xativa"] as const;
+export const CUSTOMER_HIDDEN_TEST_SLUGS = ["kfc-xativa-qa", "kfc-xativa-test", "partner-test"] as const;
 export const CUSTOMER_ORDERABLE_RESTAURANT_FILTER = {
+  slug: { $nin: [...CUSTOMER_HIDDEN_TEST_SLUGS] },
   internalDemo: { $ne: true },
   isActive: true,
   onboardingStatus: "approved",
