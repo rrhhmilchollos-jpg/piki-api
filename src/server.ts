@@ -1690,6 +1690,37 @@ app.get("/api/v1/admin/restaurants/:id/documents/:documentId/content", requireRo
   return res.json({ fileName: sanitizeUploadFileName(document.fileName), mimeType: document.mimeType, sizeBytes: document.sizeBytes, sha256: document.sha256, contentBase64: document.contentBase64, viewedAt: viewedAt.toISOString() });
 });
 
+app.get("/api/v1/admin/restaurants/:id/compliance", requireRole("admin"), async (req, res) => {
+  const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
+  if (!id) return res.status(400).json({ error: "INVALID_RESTAURANT_ID" });
+  const restaurant = await Restaurant.findOne({ _id: id, ...tenantScope(req) }).lean().exec() as any;
+  if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
+  const profile = restaurant.partnerProfile || {};
+  const compliance = restaurant.marketplaceCompliance || {};
+  const documents = (profile.documents || []).map(({ contentBase64, ...metadata }: any) => metadata);
+  return res.json({ restaurantId: String(restaurant._id), restaurantName: restaurant.name, legalName: profile.legalName || null, taxId: profile.taxId || null, compliance: { pikiStatus: compliance.pikiStatus || "pending", stripeAccountId: compliance.stripeAccountId || null, stripeStatus: compliance.stripeStatus || "not_created", chargesEnabled: Boolean(compliance.chargesEnabled), payoutsEnabled: Boolean(compliance.payoutsEnabled), currentlyDue: compliance.currentlyDue || [], pastDue: compliance.pastDue || [], pendingVerification: compliance.pendingVerification || [], rejectionReason: compliance.rejectionReason || null, reviewedAt: compliance.reviewedAt || null }, documents });
+});
+
+app.patch("/api/v1/admin/restaurants/:id/compliance/status", requireRole("admin"), async (req, res) => {
+  const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
+  if (!id) return res.status(400).json({ error: "INVALID_RESTAURANT_ID" });
+  const parsed = z.object({ status: z.enum(["in_review", "verified", "rejected", "suspended"]), rejectionReason: z.string().trim().max(1000).default("") }).safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "INVALID_COMPLIANCE_STATUS", details: parsed.error.flatten() });
+  const existing = await Restaurant.findOne({ _id: id, ...tenantScope(req) }).select("partnerProfile marketplaceCompliance name").lean().exec() as any;
+  if (!existing) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
+  const documents = existing.partnerProfile?.documents || [];
+  const requiredDocuments = documents.length > 0;
+  const allDocumentsApproved = requiredDocuments && documents.every((document: any) => document.status === "approved");
+  if (parsed.data.status === "verified" && !allDocumentsApproved) return res.status(409).json({ error: "KYB_DOCUMENT_REVIEW_REQUIRED", message: "Aprueba todos los documentos obligatorios antes de verificar el expediente KYB." });
+  if (parsed.data.status === "rejected" && !parsed.data.rejectionReason) return res.status(400).json({ error: "KYB_REJECTION_REASON_REQUIRED", message: "Indica el motivo del rechazo para dejar trazabilidad." });
+  const now = new Date();
+  const update = { $set: { "marketplaceCompliance.pikiStatus": parsed.data.status, "marketplaceCompliance.rejectionReason": parsed.data.status === "rejected" ? parsed.data.rejectionReason : null, "marketplaceCompliance.reviewedAt": now, "marketplaceCompliance.reviewedBy": objectId(req.auth!.employeeId!) } };
+  const restaurant = await Restaurant.findOneAndUpdate({ _id: id, ...tenantScope(req) }, update, { new: true }).lean().exec() as any;
+  if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
+  await notifyOnboarding({ channel: "admin", type: "onboarding.partner_kyb.updated", entityId: String(id), tenantId: (restaurant as any).tenantId, payload: { restaurantId: String(id), status: parsed.data.status } });
+  return res.json({ restaurantId: String(id), compliance: restaurant.marketplaceCompliance });
+});
+
 app.patch("/api/v1/admin/restaurants/:id/documents/:documentId/status", requireRole("admin"), async (req, res) => {
   const restaurantId = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
   if (!restaurantId) return res.status(400).json({ error: "INVALID_RESTAURANT_ID" });
