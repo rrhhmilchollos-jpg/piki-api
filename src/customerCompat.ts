@@ -1,4 +1,5 @@
 import { createHash, createHmac, randomBytes, scryptSync, timingSafeEqual } from "node:crypto";
+import mongoose from "mongoose";
 import type { Request, Response } from "express";
 import { Order, Restaurant, CustomerAccount, RiderOrderMessage } from "./models.js";
 import { publishOrderIntakeEvents } from "./realtime.js";
@@ -8,6 +9,7 @@ import { CUSTOMER_CATALOG_RESTAURANT_FILTER, CUSTOMER_ORDERABLE_RESTAURANT_FILTE
 import { modifierGroupsForItem, quoteMenuItem, usesReferenceAddOns } from "./menuModifiers.js";
 import { cashOrderLimitError, isCashOrderWithinLimit } from "./paymentPolicy.js";
 import { createCheckoutSession } from "./stripe.js";
+import { dispatchInitialIdempotencyKey, enqueueDispatchOutbox } from "./dispatchOutbox.js";
 import { SupportTicket } from "./models.js";
 import { customerSupportCreateSchema, customerSupportTicketNumber, customerSupportTicketView } from "./customerSupportPolicy.js";
 
@@ -15,6 +17,10 @@ const COOKIE = "piki_customer_session";
 let dispatchCustomerOrder: ((orderId: string) => Promise<unknown>) | null = null;
 export function setCustomerOrderDispatcher(dispatcher: (orderId: string) => Promise<unknown>) {
   dispatchCustomerOrder = dispatcher;
+}
+export async function dispatchCustomerOrderById(orderId: string) {
+  if (!dispatchCustomerOrder) return { state: "dispatcher_unavailable" as const };
+  return dispatchCustomerOrder(orderId);
 }
 const hashToken = (value: string) => createHash("sha256").update(value).digest("hex");
 const hashPassword = (value: string, salt = randomBytes(16).toString("hex")) => `${salt}:${scryptSync(value, salt, 64).toString("hex")}`;
@@ -39,6 +45,51 @@ function inputOf(req: Request): any {
 }
 function reply(res: Response, value: unknown) { return res.json({ result: { data: { json: value } } }); }
 function fail(res: Response, message: string, code = "BAD_REQUEST") { const status = code === "UNAUTHORIZED" || code === "AUTH_REQUIRED" ? 401 : code === "FORBIDDEN" ? 403 : code === "CONFLICT" ? 409 : code === "NOT_FOUND" ? 404 : code === "STRIPE_UNAVAILABLE" ? 503 : 400; return res.status(status).json({ error: { json: { message, code: -32000, data: { code, httpStatus: status } } } }); }
+
+function validRestaurantPoint(value: unknown): value is [number, number] {
+  return Array.isArray(value) && value.length >= 2 && Number.isFinite(Number(value[0])) && Number.isFinite(Number(value[1])) && Number(value[0]) >= -180 && Number(value[0]) <= 180 && Number(value[1]) >= -90 && Number(value[1]) <= 90;
+}
+
+const restaurantGeocodeCache = new Map<string, { expiresAt: number; point: [number, number] | null }>();
+async function resolveRestaurantPoint(restaurant: any): Promise<[number, number] | null> {
+  const current = restaurant?.location?.coordinates;
+  if (validRestaurantPoint(current)) return [Number(current[0]), Number(current[1])];
+  // KFC QA is an explicitly allow-listed operational test partner. Keep its
+  // verified street geocode as a last-resort fallback while the idempotent
+  // Render repair writes the same point to MongoDB.
+  if (["kfc-xativa-qa", "kfc-xativa-test"].includes(String(restaurant?.slug || "").trim().toLowerCase())) {
+    const point: [number, number] = [-0.5468067, 38.9817572];
+    await Restaurant.updateOne({ _id: restaurant._id }, { $set: { address: "Calle Sor Isabel de Villena 82, bajo, Novelé, Valencia", locality: "Novetlè", location: { type: "Point", coordinates: point } } }).exec();
+    return point;
+  }
+  const address = String(restaurant?.address || "").trim();
+  const locality = String(restaurant?.locality || "").trim();
+  // Never geocode a bare city/locality: it is not precise enough for dispatch.
+  if (address.length < 8 || !locality || address.toLocaleLowerCase() === locality.toLocaleLowerCase()) return null;
+  const cacheKey = `${address}|${locality}`.toLocaleLowerCase();
+  const cached = restaurantGeocodeCache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) return cached.point;
+  try {
+    const url = new URL("https://nominatim.openstreetmap.org/search");
+    url.searchParams.set("q", `${address}, ${locality}, Comunitat Valenciana, España`);
+    url.searchParams.set("format", "jsonv2");
+    url.searchParams.set("limit", "1");
+    const response = await fetch(url, { signal: AbortSignal.timeout(1_500), headers: { "User-Agent": "PIKI-Delivery/0.2 (+https://pikidelivery.com)" } });
+    const rows = response.ok ? await response.json() as Array<{ lat?: string; lon?: string }> : [];
+    const latitude = Number(rows[0]?.lat);
+    const longitude = Number(rows[0]?.lon);
+    const point: [number, number] | null = Number.isFinite(latitude) && Number.isFinite(longitude) ? [longitude, latitude] : null;
+    restaurantGeocodeCache.set(cacheKey, { expiresAt: Date.now() + 300_000, point });
+    if (point && restaurant?._id) {
+      await Restaurant.updateOne({ _id: restaurant._id }, { $set: { location: { type: "Point", coordinates: point } } }).exec();
+    }
+    return point;
+  } catch (error) {
+    console.warn("Restaurant geocoding unavailable", error instanceof Error ? error.message : error);
+    restaurantGeocodeCache.set(cacheKey, { expiresAt: Date.now() + 30_000, point: null });
+    return null;
+  }
+}
 function getSession(req: Request) {
   const header = req.header("x-piki-session");
   if (header) return header;
@@ -46,7 +97,8 @@ function getSession(req: Request) {
   return cookie ? cookie.slice(COOKIE.length + 1) : null;
 }
 export async function currentCustomer(req: Request) { const raw = getSession(req); return raw ? CustomerAccount.findOne({ sessionHash: hashToken(raw) }).lean().exec() : null; }
-async function setSession(res: Response, userId: string) { const raw = randomBytes(32).toString("base64url"); await CustomerAccount.updateOne({ _id: userId }, { $set: { sessionHash: hashToken(raw), lastSignedIn: new Date() } }).exec(); res.setHeader("Set-Cookie", `${COOKIE}=${raw}; Max-Age=31536000; Path=/; HttpOnly; Secure; SameSite=None`); }
+export async function issueCustomerSession(res: Response, userId: string) { const raw = randomBytes(32).toString("base64url"); await CustomerAccount.updateOne({ _id: userId }, { $set: { sessionHash: hashToken(raw), lastSignedIn: new Date() } }).exec(); res.setHeader("Set-Cookie", `${COOKIE}=${raw}; Max-Age=31536000; Path=/; HttpOnly; Secure; SameSite=None`); }
+async function setSession(res: Response, userId: string) { return issueCustomerSession(res, userId); }
 const customerPaymentMethod = (value: unknown) => {
   const method = String(value || "cash");
   return method === "cash" || method === "stripe" ? method : null;
@@ -255,14 +307,33 @@ export async function handleCustomerTrpc(req: Request, res: Response) {
       const deliveryPoint: [number, number] = [longitude, latitude];
       const coverage = evaluateXativaCoverage(deliveryPoint);
       if (!coverage.covered || coverage.deliveryFeeCents === null || coverage.serviceFeeCents === null) return fail(res, "Todavía no repartimos en esa dirección.", "DELIVERY_OUTSIDE_COVERAGE");
-      const restaurantPoint = restaurant.location?.coordinates;
-      if (!Array.isArray(restaurantPoint) || restaurantPoint.length < 2) return fail(res, "El restaurante no tiene ubicación operativa configurada.", "RESTAURANT_LOCATION_UNAVAILABLE");
-      const route = await quoteDeliveryRoute([Number(restaurantPoint[0]), Number(restaurantPoint[1])], deliveryPoint);
+      const restaurantPoint = await resolveRestaurantPoint(restaurant);
+      if (!restaurantPoint) return fail(res, "El restaurante no tiene una dirección operativa verificable. Contacta con PIKI para completar su ubicación.", "RESTAURANT_LOCATION_UNAVAILABLE");
+      const route = await quoteDeliveryRoute(restaurantPoint, deliveryPoint);
       const subtotalCents = normalized.reduce((sum, item) => sum + item.unitPriceCents * item.quantity, 0);
       const deliveryCents = coverage.deliveryFeeCents; const serviceCents = coverage.serviceFeeCents; const totalCents = subtotalCents + deliveryCents + serviceCents;
       if (!isCashOrderWithinLimit(paymentMethod, totalCents)) return res.status(422).json(cashOrderLimitError(totalCents));
       const code = `PIKI-${Date.now().toString(36).toUpperCase()}`;
-      const order = await Order.create({ publicCode: code, tenantId: restaurant.tenantId || null, restaurantId: restaurant._id, customerId: String(user._id), items: normalized, deliveryAddress: String(input.address || "").trim(), deliveryLocation: { type: "Point", coordinates: deliveryPoint }, coveragePolicySlug: coverage.policySlug, coveragePolicyVersion: coverage.policyVersion, coverageDecision: coverage.reason, straightLineDistanceKm: coverage.straightLineDistanceKm, withinMunicipality: coverage.withinMunicipality, deliveryBaseFeeCents: coverage.deliveryBaseFeeCents, outsideMunicipalitySurchargeCents: coverage.outsideMunicipalitySurchargeCents, routeDistanceKm: route.routeDistanceKm, routeDurationMinutes: route.routeDurationMinutes, routeProvider: route.routeProvider, routingDegraded: route.routingDegraded, requiredVehicleClasses: route.requiredVehicleClasses, subtotalCents, deliveryFeeCents: deliveryCents, serviceFeeCents: serviceCents, totalCents, paymentMethod, paymentState: "pending", statusHistory: [{ status: "pending", actorRole: "customer", reason: paymentMethod === "cash" ? "Pedido a contrarreembolso; cobro pendiente hasta la entrega" : "Pedido pendiente de confirmación del pago online" }] });
+      let order: any;
+      const orderSession = await mongoose.startSession();
+      try {
+        await orderSession.withTransaction(async () => {
+      const orderPayload = { publicCode: code, tenantId: restaurant.tenantId || null, restaurantId: restaurant._id, customerId: String(user._id), items: normalized, deliveryAddress: String(input.address || "").trim(), deliveryLocation: { type: "Point", coordinates: deliveryPoint }, coveragePolicySlug: coverage.policySlug, coveragePolicyVersion: coverage.policyVersion, coverageDecision: coverage.reason, straightLineDistanceKm: coverage.straightLineDistanceKm, withinMunicipality: coverage.withinMunicipality, deliveryBaseFeeCents: coverage.deliveryBaseFeeCents, outsideMunicipalitySurchargeCents: coverage.outsideMunicipalitySurchargeCents, routeDistanceKm: route.routeDistanceKm, routeDurationMinutes: route.routeDurationMinutes, routeProvider: route.routeProvider, routingDegraded: route.routingDegraded, requiredVehicleClasses: route.requiredVehicleClasses, subtotalCents, deliveryFeeCents: deliveryCents, serviceFeeCents: serviceCents, totalCents, paymentMethod, paymentState: "pending", statusHistory: [{ status: "pending", actorRole: "customer", reason: paymentMethod === "cash" ? "Pedido a contrarreembolso; cobro pendiente hasta la entrega" : "Pedido pendiente de confirmación del pago online" }]  };
+          const created = await Order.create([orderPayload], { session: orderSession });
+          order = created[0];
+          if (paymentMethod === "cash") {
+            await enqueueDispatchOutbox({
+              orderId: order._id,
+              tenantId: restaurant.tenantId || null,
+              idempotencyKey: dispatchInitialIdempotencyKey(order._id),
+              reason: "cash_order_created",
+              session: orderSession,
+            });
+          }
+        });
+      } finally {
+        await orderSession.endSession();
+      }
       let checkoutUrl: string | null = null;
       if (procedure === "order.checkout" && paymentMethod === "stripe") {
         try {
@@ -274,10 +345,7 @@ export async function handleCustomerTrpc(req: Request, res: Response) {
           return fail(res, "El pago online no está disponible temporalmente.", "STRIPE_UNAVAILABLE");
         }
       }
-      const dispatch = paymentMethod === "cash" && dispatchCustomerOrder
-        ? dispatchCustomerOrder(String(order._id)).catch((error) => console.warn("Customer compatibility order dispatch failed", error instanceof Error ? error.message : error))
-        : Promise.resolve();
-      if (paymentMethod === "cash") await Promise.all([dispatch, publishOrderIntakeEvents(order, { settlement: "cash_due", message: "Pedido a contrarreembolso: el Rider cobrará en efectivo al entregar." })]);
+      if (paymentMethod === "cash") await publishOrderIntakeEvents(order, { settlement: "cash_due", message: "Pedido a contrarreembolso: el Rider cobrará en efectivo al entregar." });
       return reply(res, { orderId: code, checkoutUrl, totalCents, paymentMethod, paymentState: paymentMethod === "cash" ? "pending_cash_collection" : "pending", cashDueAtDelivery: paymentMethod === "cash", deliveryQrUrl: deliveryQrUrl(code), coverage, route });
     }
     return fail(res, `Procedimiento no soportado: ${procedure}`, "NOT_FOUND");

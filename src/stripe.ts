@@ -1,6 +1,9 @@
 import Stripe from "stripe";
+import mongoose from "mongoose";
 import { Order, StripeEvent } from "./models.js";
 import { publishOrderIntakeEvents } from "./realtime.js";
+import { dispatchCustomerOrderById } from "./customerCompat.js";
+import { dispatchInitialIdempotencyKey, enqueueDispatchOutbox } from "./dispatchOutbox.js";
 import {
   allowedPriorPaymentStates,
   shouldPublishOperationalIntake,
@@ -135,24 +138,38 @@ async function applyPaymentTransition(input: { orderCode: string; paymentState: 
     },
     $inc: { version: 1 },
   };
-  // Deliberately do not set status, assignmentState, riderId or lifecycle data
-  // here. Payment webhooks can arrive after dispatch/delivery and must never
-  // reopen or unassign an operational order.
-  const transitioned = await Order.findOneAndUpdate(
-    {
-      publicCode: input.orderCode,
-      paymentMethod: "stripe",
-      paymentState: { $in: allowedPriorPaymentStates(input.paymentState) },
-    },
-    update,
-    { new: true },
-  ).lean().exec() as any;
-  if (transitioned) return { order: transitioned, transitioned: true };
-
-  // On retry, the order may already have transitioned while the durable outbox
-  // write failed. Reload it so this invocation can complete that outbox work.
-  const order = await Order.findOne({ publicCode: input.orderCode }).lean().exec() as any;
-  return { order, transitioned: false };
+  // Payment and dispatch intent share one Mongo transaction. A redelivery uses
+  // the same idempotency key, so it repairs a missing intent without a second
+  // rider offer.
+  let result: PaymentApplyResult = { order: null, transitioned: false };
+  const session = await mongoose.startSession();
+  try {
+    await session.withTransaction(async () => {
+      const transitioned = await Order.findOneAndUpdate(
+        {
+          publicCode: input.orderCode,
+          paymentMethod: "stripe",
+          paymentState: { $in: allowedPriorPaymentStates(input.paymentState) },
+        },
+        update,
+        { new: true, session },
+      ).lean().exec() as any;
+      const order = transitioned || await Order.findOne({ publicCode: input.orderCode }).session(session).lean().exec() as any;
+      if (shouldPublishOperationalIntake(order, { paymentState: input.paymentState, activatesOperationalIntake: ["authorized", "paid"].includes(input.paymentState) })) {
+        await enqueueDispatchOutbox({
+          orderId: order._id,
+          tenantId: order.tenantId || null,
+          idempotencyKey: dispatchInitialIdempotencyKey(order._id),
+          reason: "stripe_payment_confirmed",
+          session,
+        });
+      }
+      result = { order, transitioned: Boolean(transitioned) };
+    });
+  } finally {
+    await session.endSession();
+  }
+  return result;
 }
 
 const defaultStripeWebhookDependencies: StripeWebhookDependencies = {
