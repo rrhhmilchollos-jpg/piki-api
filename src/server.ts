@@ -17,7 +17,7 @@ import { getVersionPolicy, isPikiSurface, requiresUpdate, setVersionPolicy, sync
 import { publicPushConfig, revokePushSubscription, savePushSubscription } from "./push.js";
 import { publishOrderStatusEvents, publishOrderIntakeEvents, publishRiderOfferEvent, publishRiderArrivalEvent, publishRiderLocationEvents, publishRiderScheduleEvent, publishRiderCustomerMessageEvent, publishRealtimeEvent, serveRealtimeEvents, startRealtimeRelay, tenantAudienceKey } from "./realtime.js";
 import { listNotifications, markAllNotificationsRead, markNotificationRead, sendDocumentRequestEmail, sendDocumentUploadEmail, startNotificationWorker, stopNotificationWorker, type NotificationPrincipal } from "./notifications.js";
-import { captureStripePaymentIntent, createCheckoutSession } from "./stripe.js";
+import { captureStripePaymentIntent, createCheckoutSession, createPartnerStripeOnboardingLink } from "./stripe.js";
 import { rankDispatchCandidates, computeMobilityAdvice, calculateSanctionDecision, defaultSanctionPolicy } from "./algorithms/index.js";
 import { createSessionToken, generateTemporaryPassword, hashPassword, hashSessionToken, verifyPassword } from "./employeeAuth.js";
 import { EmployeePasswordReset } from "./passwordReset.js";
@@ -1131,6 +1131,20 @@ app.post("/api/v1/partners/onboarding", async (req, res) => {
   const locality = city.trim();
   const groupKey = localityKey(locality);
   const partner = await Restaurant.create({ ...publicTenant, slug, name: contact.name, cuisine, category: cuisine, locality, partnerGroupKey: groupKey, address: operatingAddress, tagline: "Solicitud recibida por PIKI", onboardingStatus: "pending_review", isActive: false, email: contact.email, phone: contact.phone, partnerProfile: { legalName, taxId: taxId.toUpperCase(), legalForm, representativeName, representativeRole, representativeDocument, fiscalAddress, operatingAddress, postalCode, city, province, iban: iban.toUpperCase(), bankAccountHolder, cuisine, vatRate, commissionAccepted, termsAcceptedAt, contractAcceptedAt: contractAccepted ? termsAcceptedAt : null, privacyAcceptedAt, dataProcessingAcceptedAt, pdaUnits, pdaUnitCostCents, pdaCostAcceptedAt: pdaCostAccepted ? pdaCostAcceptedAt : null, openingHours, documents: documents.map(({ contentBase64, ...metadata }) => ({ ...metadata, contentBase64, status: "received" })) } });
+  let stripeOnboarding: { accountId: string; url: string } | null = null;
+  if (process.env.STRIPE_SECRET_KEY) {
+    try {
+      const partnerApp = String(process.env.PARTNER_APP_URL || "https://partners.pikidelivery.com").replace(/\/$/, "");
+      const connected = await createPartnerStripeOnboardingLink({ restaurantId: String(partner._id), email: normalizedEmail, legalName, legalForm, refreshUrl: `${partnerApp}/?onboarding=stripe-refresh&restaurant_id=${encodeURIComponent(String(partner._id))}`, returnUrl: `${partnerApp}/?onboarding=stripe-complete&restaurant_id=${encodeURIComponent(String(partner._id))}` });
+      stripeOnboarding = { accountId: connected.account.id, url: connected.link.url };
+      await Restaurant.updateOne({ _id: partner._id }, { $set: { onboardingStage: "stripe", "onboardingChecklist.profile": true, "onboardingChecklist.documents": true, "onboardingChecklist.stripe": false, "marketplaceCompliance.stripeAccountId": connected.account.id, "marketplaceCompliance.stripeStatus": "onboarding", "marketplaceCompliance.pikiStatus": "in_review" } }).exec();
+    } catch (error) {
+      console.warn("Partner Stripe onboarding link creation failed", error instanceof Error ? error.message : error);
+      await Restaurant.updateOne({ _id: partner._id }, { $set: { onboardingStage: "review", "onboardingChecklist.profile": true, "onboardingChecklist.documents": true, "onboardingChecklist.stripe": false, "marketplaceCompliance.pikiStatus": "in_review" } }).exec();
+    }
+  } else {
+    await Restaurant.updateOne({ _id: partner._id }, { $set: { onboardingStage: "review", "onboardingChecklist.profile": true, "onboardingChecklist.documents": true, "marketplaceCompliance.pikiStatus": "in_review" } }).exec();
+  }
   try {
     await EmployeeAccount.create({ ...publicTenant, name: contact.name, email: normalizedEmail, jobRole: "partner", apiRole: "partner", roles: ["partner"], partnerRoles: ["partner_admin"], accessLevel: "subadmin", authorizationStatus: "pending", restaurantId: partner._id, restaurantIds: [partner._id], passwordHash: hashPassword(parsed.data.password), mustChangePassword: false, active: false });
   } catch (error) {
@@ -1140,7 +1154,7 @@ app.post("/api/v1/partners/onboarding", async (req, res) => {
   }
   await PartnerLocalityGroup.findOneAndUpdate({ ...publicTenant, localityKey: groupKey }, { $set: { localityName: locality, province, isActive: true }, $setOnInsert: publicTenant, $addToSet: { restaurantIds: partner._id } }, { upsert: true, new: true });
   await notifyOnboarding({ channel: "admin", type: "onboarding.partner_application.created", entityId: String(partner._id), tenantId: (partner as any).tenantId });
-  res.status(201).json({ message: "Solicitud recibida para revisión.", partner: { id: partner.id, partnerCode: onboardingCode("P", partner._id), name: partner.name, email: partner.email, phone: partner.phone, locality, partnerGroupKey: groupKey, onboarding_status: partner.onboardingStatus } });
+  res.status(201).json({ message: "Solicitud recibida. Completa la verificación de Stripe para que PIKI pueda liquidar tus ventas.", partner: { id: partner.id, partnerCode: onboardingCode("P", partner._id), name: partner.name, email: partner.email, phone: partner.phone, locality, partnerGroupKey: groupKey, onboarding_status: partner.onboardingStatus, onboarding_stage: stripeOnboarding ? "stripe" : "review", checklist: { profile: true, documents: true, stripe: Boolean(stripeOnboarding), adminReview: false }, stripe_onboarding_url: stripeOnboarding?.url || null } });
 });
 
 function assignedRestaurantIds(employee: any): string[] {
@@ -1690,6 +1704,21 @@ app.get("/api/v1/admin/restaurants/:id/documents/:documentId/content", requireRo
   return res.json({ fileName: sanitizeUploadFileName(document.fileName), mimeType: document.mimeType, sizeBytes: document.sizeBytes, sha256: document.sha256, contentBase64: document.contentBase64, viewedAt: viewedAt.toISOString() });
 });
 
+app.post("/api/v1/admin/restaurants/:id/stripe/onboarding-link", requireRole("admin"), async (req, res) => {
+  const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
+  if (!id) return res.status(400).json({ error: "INVALID_RESTAURANT_ID" });
+  const restaurant = await Restaurant.findOne({ _id: id, ...tenantScope(req) }).select("name email partnerProfile marketplaceCompliance").lean().exec() as any;
+  if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
+  if (!process.env.STRIPE_SECRET_KEY) return res.status(503).json({ error: "STRIPE_NOT_CONFIGURED", message: "Configura Stripe antes de generar el enlace de onboarding." });
+  try {
+    const partnerApp = String(process.env.PARTNER_APP_URL || "https://partners.pikidelivery.com").replace(/\/$/, "");
+    const connected = await createPartnerStripeOnboardingLink({ restaurantId: String(id), email: String(restaurant.email || ""), legalName: String(restaurant.partnerProfile?.legalName || restaurant.name), legalForm: restaurant.partnerProfile?.legalForm || "otra", existingAccountId: restaurant.marketplaceCompliance?.stripeAccountId, refreshUrl: `${partnerApp}/?onboarding=stripe-refresh&restaurant_id=${encodeURIComponent(String(id))}`, returnUrl: `${partnerApp}/?onboarding=stripe-complete&restaurant_id=${encodeURIComponent(String(id))}` });
+    await Restaurant.updateOne({ _id: id, ...tenantScope(req) }, { $set: { onboardingStage: "stripe", "marketplaceCompliance.stripeAccountId": connected.account.id, "marketplaceCompliance.stripeStatus": "onboarding", "marketplaceCompliance.lastSyncedAt": new Date() } }).exec();
+    return res.json({ restaurantId: String(id), stripeAccountId: connected.account.id, url: connected.link.url });
+  } catch (error) {
+    return res.status(502).json({ error: "STRIPE_ONBOARDING_LINK_FAILED", message: error instanceof Error ? error.message : "No se pudo crear el enlace Stripe." });
+  }
+});
 app.get("/api/v1/admin/restaurants/:id/compliance", requireRole("admin"), async (req, res) => {
   const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
   if (!id) return res.status(400).json({ error: "INVALID_RESTAURANT_ID" });
