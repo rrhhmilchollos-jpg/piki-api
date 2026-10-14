@@ -5,7 +5,7 @@ import { Order, Restaurant, CustomerAccount, RiderOrderMessage } from "./models.
 import { publishOrderIntakeEvents } from "./realtime.js";
 import { evaluateXativaCoverage } from "./coverage/xativaPolicy.js";
 import { quoteDeliveryRoute } from "./coverage/routing.js";
-import { CUSTOMER_CATALOG_RESTAURANT_FILTER, CUSTOMER_ORDERABLE_RESTAURANT_FILTER, customerCatalogRestaurantName } from "./customerCatalogPolicy.js";
+import { CUSTOMER_CATALOG_RESTAURANT_FILTER, CUSTOMER_ORDERABLE_RESTAURANT_FILTER, customerCatalogRestaurantName, restaurantIsWithinOpeningHours } from "./customerCatalogPolicy.js";
 import { modifierGroupsForItem, quoteMenuItem, usesReferenceAddOns } from "./menuModifiers.js";
 import { cashOrderLimitError, isCashOrderWithinLimit } from "./paymentPolicy.js";
 import { createCheckoutSession } from "./stripe.js";
@@ -155,6 +155,14 @@ export async function handleCustomerTrpc(req: Request, res: Response) {
       return reply(res, row ? restaurantView(row) : null);
     }
     if (procedure === "auth.me") return reply(res, await currentCustomer(req).then((user) => publicUser(user)));
+    if (procedure === "customer.orders.list") {
+      const user = await currentCustomer(req) as any;
+      if (!user) return fail(res, "Inicia sesión para consultar tus pedidos.", "AUTH_REQUIRED");
+      const orders = await Order.find({ customerId: String(user._id) }).sort({ createdAt: -1 }).limit(100).select("publicCode status restaurantId totalCents createdAt updatedAt paymentState assignmentState routeDurationMinutes items").lean().exec() as any[];
+      const restaurants = await Restaurant.find({ _id: { $in: orders.map((order) => order.restaurantId) } }).select("name").lean().exec() as any[];
+      const names = new Map(restaurants.map((restaurant) => [String(restaurant._id), restaurant.name]));
+      return reply(res, orders.map((order) => ({ id: order.publicCode, restaurant: names.get(String(order.restaurantId)) || "Restaurante PIKI", status: order.status, total: Number(order.totalCents || 0) / 100, createdAt: order.createdAt, updatedAt: order.updatedAt, active: !["delivered", "cancelled"].includes(order.status), paymentState: order.paymentState, assignmentState: order.assignmentState, eta: order.routeDurationMinutes ? `${order.routeDurationMinutes} min` : "actualizando…", items: order.items || [] })));
+    }
     if (procedure === "customer.support.list") {
       const user = await currentCustomer(req) as any;
       if (!user) return fail(res, "Inicia sesión para consultar tus solicitudes de soporte.", "AUTH_REQUIRED");
@@ -286,6 +294,7 @@ export async function handleCustomerTrpc(req: Request, res: Response) {
       if (!user) return fail(res, "Debes iniciar sesión para realizar pedidos", "AUTH_REQUIRED");
       const restaurant = await Restaurant.findOne({ _id: input?.restaurantId, ...CUSTOMER_ORDERABLE_RESTAURANT_FILTER }).lean().exec() as any;
       if (!restaurant) return fail(res, "Restaurante no encontrado", "NOT_FOUND");
+      if (!restaurantIsWithinOpeningHours(restaurant.partnerProfile?.openingHours)) return fail(res, "Este establecimiento está cerrado ahora. Elige otro horario para realizar el pedido.", "PARTNER_CLOSED");
       const requested = Array.isArray(input?.items) ? input.items : [];
       const useReferenceFallback = usesReferenceAddOns(restaurant);
       const items = requested.map((line: any) => {

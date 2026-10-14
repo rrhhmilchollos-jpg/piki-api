@@ -7,7 +7,7 @@ import cors from "cors";
 import express from "express";
 import mongoose from "mongoose";
 import { z } from "zod";
-import { CashLedgerEntry, CustomerAccount, DispatchDecision, DocumentRequest, EmployeeAccount, AccessAuthorization, Fleet, Order, Restaurant, PartnerAsset, PartnerLocalityGroup, MenuImportDraft, Rider, RiderApplication, PartnerLead, RiderLead, RiderIncident, RiderOrderMessage, RiderSlot, SignatureRequest, Zone, PushSubscription, RealtimeEvent, Notification, Tenant, TenantMembership, RiderAssignmentReservation, SupportTicket, OnboardingRequest, TrackingSession, LocationSample, ensureIndexes } from "./models.js";
+import { CashLedgerEntry, CustomerAccount, DispatchDecision, DocumentRequest, EmployeeAccount, AccessAuthorization, Fleet, Order, Restaurant, PartnerAsset, PartnerLocalityGroup, MenuImportDraft, Rider, RiderApplication, PartnerLead, RiderLead, RiderIncident, RiderOrderMessage, RiderSlot, SignatureRequest, Zone, PushSubscription, RealtimeEvent, Notification, Tenant, TenantMembership, RiderAssignmentReservation, SupportTicket, OnboardingRequest, TrackingSession, RiderPayoutBatch, PartnerPayoutBatch, GovernanceAuditEvent, LocationSample, ensureIndexes } from "./models.js";
 import { normalizeLeadEmail, partnerLeadSubmissionSchema, riderLeadSubmissionSchema, webLeadReviewSchema, webLeadStatusSchema } from "./webLeads.js";
 import { assertTransition, calculateEtaRange, transitionSchema, validateCoordinates } from "./algorithms/index.js";
 import { configuredAuthRoles, requireOwner, requireRole, resolveRole } from "./auth.js";
@@ -46,6 +46,7 @@ import { validateDocumentRequestSubmission } from "./onboardingDocumentPolicy.js
 import { dispatchInitialIdempotencyKey, dispatchRequeueIdempotencyKey, enqueueDispatchOutbox, processDispatchOutboxBatch, type DispatchOutboxEvent } from "./dispatchOutbox.js";
 import { buildFleetEntityScope, buildTenantScope } from "./tenantScope.js";
 import { authenticationOptions, registrationOptions, verifyAuthentication, verifyRegistration } from "./passkeys.js";
+import { markPartnerBatchPaid, markRiderBatchPaid, publicPartnerCode, publicRiderCode, recordGovernanceEvent, syncPublicIds } from "./pikiGovernance.js";
 
 export const app = express();
 app.set("trust proxy", 1);
@@ -65,7 +66,7 @@ const geocodeCache = new Map<string, { expiresAt: number; body: any }>();
 const CATALOG_CACHE_MS = 30_000;
 const GEOCODE_CACHE_MS = 300_000;
 const boundedFetch = (input: string | URL, init: RequestInit = {}) => fetch(input, { ...init, signal: AbortSignal.timeout(1_200) });
-mongoose.connection.on("connected", () => { databaseReady = true; startRealtimeRelay(); });
+mongoose.connection.on("connected", () => { databaseReady = true; startRealtimeRelay(); void syncPublicIds().catch((error) => console.error("Public ID sync failed", error)); });
 mongoose.connection.on("disconnected", () => { databaseReady = false; console.warn("MongoDB disconnected; API entering not-ready state"); });
 mongoose.connection.on("error", (error) => { databaseReady = false; console.error("MongoDB connection error", error instanceof Error ? error.message : error); });
 
@@ -671,8 +672,15 @@ app.post("/api/v1/auth/employee/password-reset/confirm", rateLimit(8, 15 * 60_00
 });
 app.post("/api/v1/auth/employee/login", async (req, res) => {
   const parsed = employeeLoginSchema.safeParse(req.body); if (!parsed.success) return res.status(400).json({ error: "INVALID_LOGIN" });
-  if (String(req.headers["x-piki-surface"] || "").toLowerCase() === "admin" && parsed.data.email.toLowerCase() !== ownerEmail) { /* subadmins are allowed; destructive operations remain superadmin-only */ }
-  const employee = await EmployeeAccount.findOne({ email: parsed.data.email.toLowerCase() }).select("+passwordHash").exec() as any;
+  const identifier = parsed.data.email.trim().toLowerCase();
+  if (String(req.headers["x-piki-surface"] || "").toLowerCase() === "admin" && identifier !== ownerEmail) { /* subadmins are allowed; destructive operations remain superadmin-only */ }
+  let employee = await EmployeeAccount.findOne({ email: identifier }).select("+passwordHash").exec() as any;
+  if (!employee && /^piki-p-[a-z0-9-]+$/i.test(identifier)) {
+    const restaurants = await Restaurant.find({ onboardingStatus: "approved" }).select("_id").lean().exec() as any[];
+    const restaurant = restaurants.find((item) => onboardingCode("P", item._id)?.toLowerCase() === identifier);
+    if (restaurant) employee = await EmployeeAccount.findOne({ restaurantIds: restaurant._id }).select("+passwordHash").exec() as any;
+    if (!employee && restaurant) employee = await EmployeeAccount.findOne({ restaurantId: restaurant._id }).select("+passwordHash").exec() as any;
+  }
   if (!employee || !verifyPassword(parsed.data.password, employee.passwordHash)) return res.status(401).json({ error: "INVALID_CREDENTIALS" });
   if (!employee.active || (employee.authorizationStatus && employee.authorizationStatus !== "approved")) {
     const isPartner = employee.apiRole === "partner";
@@ -969,7 +977,7 @@ app.get("/api/v1/catalog/restaurants", async (req, res) => {
   const restaurants = await Restaurant.find(filter)
     // Explicit inclusion avoids MongoDB path-collision errors caused by
     // partnerProfile.documents having select:false nested fields.
-    .select("slug name cuisine category locality partnerGroupKey tagline etaMinutes deliveryFeeCents rating reviews promoted image accent phone address location menu isActive onboardingStatus availabilityStatus upcomingAt upcomingMessage")
+    .select("slug name cuisine category locality partnerGroupKey tagline etaMinutes deliveryFeeCents rating reviews promoted image accent phone address location menu isActive onboardingStatus availabilityStatus upcomingAt upcomingMessage partnerProfile.openingHours")
     .sort({ promoted: -1, rating: -1, reviews: -1 }).lean().exec();
   const catalogPriority: Record<string, number> = {
     "alibaba-kebab-xativa": 0,
@@ -1417,6 +1425,33 @@ app.get("/api/v1/partners/locations", requireRole("partner"), async (req, res) =
   const access = await partnerAccessForRequest(req);
   return res.json({ locations: access ? await partnerLocationsFor(access.employee, access.roles, access.permissions) : [] });
 });
+app.get("/api/v1/partners/profile", requireRole("partner"), async (req, res) => {
+  const access = await partnerAccessForRequest(req);
+  if (!access || !partnerCan(access.roles, "store:write")) return res.status(403).json({ error: "PARTNER_PERMISSION_DENIED", permission: "store:write" });
+  const restaurantId = await employeeRestaurant(req, access);
+  if (!restaurantId) return res.status(403).json({ error: "PARTNER_RESTAURANT_NOT_ASSIGNED" });
+  const restaurant = await Restaurant.findOne({ _id: objectId(restaurantId), ...tenantScope(req) }).select("_id partnerCode name email phone address locality partnerProfile.commissionRateBps").lean().exec() as any;
+  if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
+  return res.json({ profile: { id: String(restaurant._id), partnerCode: restaurant.partnerCode || publicPartnerCode(restaurant._id), name: restaurant.name, email: restaurant.email, phone: restaurant.phone, address: restaurant.address, locality: restaurant.locality, commissionRateBps: Number(restaurant.partnerProfile?.commissionRateBps ?? DEFAULT_PARTNER_COMMISSION_BPS), commissionPercent: Number(restaurant.partnerProfile?.commissionRateBps ?? DEFAULT_PARTNER_COMMISSION_BPS) / 100 } });
+});
+const partnerBasicProfileSchema = z.object({ email: z.string().email().max(254).optional(), phone: z.string().trim().max(40).optional() }).strict();
+app.patch("/api/v1/partners/profile", requireRole("partner"), async (req, res) => {
+  const access = await partnerAccessForRequest(req);
+  if (!access || !partnerCan(access.roles, "store:write")) return res.status(403).json({ error: "PARTNER_PERMISSION_DENIED", permission: "store:write" });
+  const restaurantId = await employeeRestaurant(req, access);
+  const parsed = partnerBasicProfileSchema.safeParse(req.body);
+  if (!restaurantId || !parsed.success || !Object.keys(parsed.data).length) return res.status(400).json({ error: "INVALID_PARTNER_PROFILE", details: parsed.success ? undefined : parsed.error.flatten() });
+  const scope = { _id: objectId(restaurantId), ...tenantScope(req) };
+  const restaurant = await Restaurant.findOne(scope).select("_id partnerCode name email phone address locality partnerProfile.commissionRateBps").lean().exec() as any;
+  if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
+  const email = parsed.data.email?.trim().toLowerCase();
+  if (email && email !== String(restaurant.email || "").toLowerCase() && await EmployeeAccount.exists({ email, _id: { $ne: access.employee._id } })) return res.status(409).json({ error: "EMAIL_ALREADY_IN_USE" });
+  if (email) await EmployeeAccount.updateOne({ _id: access.employee._id, ...tenantScope(req) }, { $set: { email } }).exec();
+  const updated = await Restaurant.findOneAndUpdate(scope, { $set: { ...(email ? { email } : {}), ...(parsed.data.phone !== undefined ? { phone: parsed.data.phone } : {}) } }, { new: true }).select("_id name email phone address locality").lean().exec() as any;
+  await AccessAuthorization.create({ employeeId: access.employee._id, action: "profile_updated", previousStatus: "approved", nextStatus: "approved", previousRole: "partner", nextRole: "partner", accessLevel: "subadmin", actorEmployeeId: access.employee._id, reason: "El Partner actualizó sus datos básicos de contacto." });
+  await recordGovernanceEvent({ actor: { employeeId: access.employee._id, role: "partner", tenantId: (req.auth as any)?.tenantId }, action: "partner_basic_profile_updated", targetType: "restaurant", targetId: restaurant._id, before: { email: restaurant.email, phone: restaurant.phone }, after: { email: updated.email, phone: updated.phone }, reason: "Cambio básico permitido al partner; sin acceso a comisión, KYB ni configuración crítica." });
+  return res.json({ updated: true, profile: { id: String(updated._id), partnerCode: updated.partnerCode || publicPartnerCode(updated._id), name: updated.name, email: updated.email, phone: updated.phone, address: updated.address, locality: updated.locality, commissionRateBps: Number(updated.partnerProfile?.commissionRateBps ?? DEFAULT_PARTNER_COMMISSION_BPS), commissionPercent: Number(updated.partnerProfile?.commissionRateBps ?? DEFAULT_PARTNER_COMMISSION_BPS) / 100 } });
+});
 app.patch("/api/v1/partners/store/status", requireRole("partner"), async (req, res) => {
   const { access, allowed } = await partnerRequestAccess(req, "store:write");
   if (!allowed) return res.status(403).json({ error: "PARTNER_PERMISSION_DENIED", permission: "store:write" });
@@ -1690,6 +1725,43 @@ app.get("/api/v1/admin/restaurants", requireRole("admin"), async (req, res) => {
   return res.json({ restaurants: restaurants.map((restaurant: any) => ({ ...restaurant, partnerCode: onboardingCode("P", restaurant._id) })) });
 });
 
+const partnerSettingsSchema = z.object({
+  name: z.string().trim().min(2).max(160).optional(),
+  cuisine: z.string().trim().min(2).max(120).optional(),
+  category: z.string().trim().min(2).max(120).optional(),
+  phone: z.string().trim().max(40).optional(),
+  // El email puede quedar vacío mientras el expediente del partner sigue en onboarding.
+  email: z.union([z.string().email().max(254), z.literal("")]).optional(),
+  address: z.string().trim().max(280).optional(),
+  locality: z.string().trim().max(120).optional(),
+  deliveryFeeCents: z.number().int().min(0).max(10000).optional(),
+  isActive: z.boolean().optional(),
+  availabilityStatus: z.enum(["available", "coming_soon"]).optional(),
+  promoted: z.boolean().optional(),
+  commissionRateBps: z.number().int().min(0).max(10000).optional(),
+}).strict();
+
+app.get("/api/v1/admin/restaurants/:id/settings", requireOwner(), async (req, res) => {
+  const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
+  if (!id) return res.status(400).json({ error: "INVALID_RESTAURANT_ID" });
+  const restaurant = await Restaurant.findOne({ _id: id, ...tenantScope(req) }).select("_id slug name cuisine category phone email address locality deliveryFeeCents isActive availabilityStatus promoted image location onboardingStatus partnerProfile.commissionRateBps").lean().exec() as any;
+  if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
+  return res.json({ restaurant: { ...restaurant, id: String(restaurant._id), partnerCode: restaurant.partnerCode || publicPartnerCode(restaurant._id), commissionRateBps: Number(restaurant.partnerProfile?.commissionRateBps ?? DEFAULT_PARTNER_COMMISSION_BPS), commissionPercent: Number(restaurant.partnerProfile?.commissionRateBps ?? DEFAULT_PARTNER_COMMISSION_BPS) / 100 } });
+});
+
+app.patch("/api/v1/admin/restaurants/:id/settings", requireOwner(), async (req, res) => {
+  const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
+  if (!id) return res.status(400).json({ error: "INVALID_RESTAURANT_ID" });
+  const parsed = partnerSettingsSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "INVALID_PARTNER_SETTINGS", details: parsed.error.flatten() });
+  const { commissionRateBps, ...settings } = parsed.data;
+  const update = { ...settings, ...(commissionRateBps === undefined ? {} : { "partnerProfile.commissionRateBps": commissionRateBps }) };
+  const restaurant = await Restaurant.findOneAndUpdate({ _id: id, ...tenantScope(req) }, { $set: update }, { new: true }).select("_id slug name cuisine category phone email address locality deliveryFeeCents isActive availabilityStatus promoted image location onboardingStatus partnerProfile.commissionRateBps").lean().exec() as any;
+  if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
+  await AccessAuthorization.create({ employeeId: objectId(String(req.auth!.employeeId!)), action: "settings_updated", previousStatus: "approved", nextStatus: "approved", previousRole: "partner", nextRole: "partner", accessLevel: "superadmin", actorEmployeeId: objectId(String(req.auth!.employeeId!)), reason: `Configuración protegida actualizada para ${restaurant.name}; comisión definida por PIKI superadmin.` });
+  return res.json({ updated: true, restaurant: { ...restaurant, id: String(restaurant._id), partnerCode: restaurant.partnerCode || publicPartnerCode(restaurant._id), commissionRateBps: Number(restaurant.partnerProfile?.commissionRateBps ?? DEFAULT_PARTNER_COMMISSION_BPS), commissionPercent: Number(restaurant.partnerProfile?.commissionRateBps ?? DEFAULT_PARTNER_COMMISSION_BPS) / 100 } });
+});
+
 app.patch("/api/v1/admin/restaurants/:id/customer-name", requireOwner(), async (req, res) => {
   const idParam = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
   const id = objectId(idParam);
@@ -1765,9 +1837,9 @@ app.patch("/api/v1/admin/restaurants/:id/commission", requireOwner(), async (req
   if (!id) return res.status(400).json({ error: "INVALID_RESTAURANT_ID" });
   const parsed = partnerCommissionSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_PARTNER_COMMISSION", details: parsed.error.flatten() });
-  const restaurant = await Restaurant.findOneAndUpdate({ _id: id, ...tenantScope(req) }, { $set: { "partnerProfile.commissionRateBps": parsed.data.commissionRateBps } }, { new: true }).select("_id name slug partnerProfile.commissionRateBps").lean().exec() as any;
+  const restaurant = await Restaurant.findOneAndUpdate({ _id: id, ...tenantScope(req) }, { $set: { "partnerProfile.commissionRateBps": 1800 } }, { new: true }).select("_id name slug partnerProfile.commissionRateBps").lean().exec() as any;
   if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
-  return res.json({ restaurant: { id: String(restaurant._id), name: restaurant.name, slug: restaurant.slug, commissionRateBps: Number(restaurant.partnerProfile?.commissionRateBps || 0), commissionPercent: Number(restaurant.partnerProfile?.commissionRateBps || 0) / 100 } });
+  return res.json({ restaurant: { id: String(restaurant._id), name: restaurant.name, slug: restaurant.slug, commissionRateBps: 1800, commissionPercent: 18 } });
 });
 
 app.patch("/api/v1/admin/restaurants/:id/configuration", requireOwner(), async (req, res) => {
@@ -3376,6 +3448,40 @@ app.post("/api/v1/riders/:id/location", requireRole("admin", "rider", "fleet"), 
   await Promise.all(trackedOrders.map((order) => publishRiderLocationEvents(order, rider))).catch((error) => console.warn("Realtime rider location event failed", error instanceof Error ? error.message : error));
   return res.json({ rider: { id: rider._id, riderCode: rider.riderCode, status: rider.status, location: rider.location, lastLocationAt: rider.lastLocationAt } });
 });
+const riderBasicProfileSchema = z.object({ phone: z.string().trim().max(40).optional(), city: z.string().trim().max(120).optional(), availability: z.string().trim().max(160).optional() }).strict();
+app.get("/api/v1/riders/:id/profile", requireRole("admin", "rider", "fleet"), async (req, res) => {
+  const riderId = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
+  if (!riderId) return res.status(400).json({ error: "INVALID_RIDER_ID" });
+  if (req.auth?.role === "rider" && !(await riderAccessForRequest(riderId, req))) return res.status(403).json({ error: "RIDER_ACCESS_DENIED" });
+  if (req.auth?.role === "fleet" && !(await fleetCanAccessRider(req, riderId))) return res.status(403).json({ error: "FLEET_RIDER_ACCESS_DENIED" });
+  const rider = await Rider.findOne({ _id: riderId, ...tenantScope(req) }).select("_id riderCode name email phone city availability vehicle status lifecycleStatus fleetId zoneSlug lastLocationAt").lean().exec() as any;
+  if (!rider) return res.status(404).json({ error: "RIDER_NOT_FOUND" });
+  return res.json({ profile: { ...rider, id: String(rider._id), riderCode: rider.riderCode || publicRiderCode(rider._id) } });
+});
+app.patch("/api/v1/riders/:id/profile", requireRole("rider"), async (req, res) => {
+  const riderId = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
+  if (!riderId || !(await riderAccessForRequest(riderId, req))) return res.status(403).json({ error: "RIDER_ACCESS_DENIED" });
+  const parsed = riderBasicProfileSchema.safeParse(req.body);
+  if (!parsed.success || !Object.keys(parsed.data).length) return res.status(400).json({ error: "INVALID_RIDER_PROFILE", details: parsed.success ? undefined : parsed.error.flatten() });
+  const updated = await Rider.findOneAndUpdate({ _id: riderId, ...tenantScope(req) }, { $set: parsed.data }, { new: true }).select("_id riderCode name email phone city availability vehicle status lifecycleStatus fleetId zoneSlug").lean().exec() as any;
+  if (!updated) return res.status(404).json({ error: "RIDER_NOT_FOUND" });
+  const employeeId = objectId(String(req.auth!.employeeId!));
+  if (employeeId) await AccessAuthorization.create({ employeeId, action: "profile_updated", previousStatus: "approved", nextStatus: "approved", previousRole: "rider", nextRole: "rider", accessLevel: "subadmin", actorEmployeeId: employeeId, reason: "El Rider actualizó sus datos básicos de contacto y disponibilidad." });
+  await recordGovernanceEvent({ actor: { employeeId, role: "rider", tenantId: (req.auth as any)?.tenantId }, action: "rider_basic_profile_updated", targetType: "rider", targetId: riderId, before: null, after: { fields: Object.keys(parsed.data) }, reason: "Cambio básico permitido al rider; sin acceso a pagos, asignaciones críticas ni configuración de PIKI." });
+  return res.json({ updated: true, profile: { ...updated, id: String(updated._id), riderCode: updated.riderCode || publicRiderCode(updated._id) } });
+});
+app.patch("/api/v1/admin/riders/:id/profile", requireOwner(), async (req, res) => {
+  const riderId = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
+  if (!riderId) return res.status(400).json({ error: "INVALID_RIDER_ID" });
+  const parsed = riderBasicProfileSchema.extend({ name: z.string().trim().min(2).max(160).optional(), vehicle: z.enum(["bike", "electric_bike", "electric_scooter", "motorcycle", "scooter", "car"]).optional(), fleetId: z.string().regex(/^[a-f\d]{24}$/).nullable().optional(), zoneSlug: z.string().trim().max(80).nullable().optional() }).safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "INVALID_RIDER_ADMIN_PROFILE", details: parsed.error.flatten() });
+  const { fleetId, ...fields } = parsed.data;
+  const updated = await Rider.findOneAndUpdate({ _id: riderId, ...tenantScope(req) }, { $set: { ...fields, ...(fleetId !== undefined ? { fleetId: fleetId ? objectId(fleetId) : null } : {}) } }, { new: true }).select("_id riderCode name email phone city availability vehicle status lifecycleStatus fleetId zoneSlug").lean().exec() as any;
+  if (!updated) return res.status(404).json({ error: "RIDER_NOT_FOUND" });
+  const ownerId = objectId(String(req.auth!.employeeId!));
+  if (ownerId) await AccessAuthorization.create({ employeeId: riderId, action: "settings_updated", previousStatus: "approved", nextStatus: "approved", previousRole: "rider", nextRole: "rider", accessLevel: "superadmin", actorEmployeeId: ownerId, reason: "Superadmin actualizó el perfil operativo del Rider." });
+  return res.json({ updated: true, profile: { ...updated, id: String(updated._id), riderCode: updated.riderCode || publicRiderCode(updated._id) } });
+});
 app.patch("/api/v1/riders/:id/status", requireRole("admin", "rider", "fleet"), async (req, res) => {
   const idParam = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
   const id = objectId(idParam); if (!id) return res.status(400).json({ error: "INVALID_RIDER_ID" });
@@ -4007,8 +4113,8 @@ app.get("/api/v1/riders/:id/offers", requireRole("rider"), async (req, res) => {
   const restaurantIds = offers.map((offer) => offer.restaurantId).filter(Boolean);
   const customerIds = offers.map((offer) => offer.customerId).filter((value): value is mongoose.Types.ObjectId => Boolean(value) && mongoose.isValidObjectId(value));
   const [restaurants, customers] = await Promise.all([
-    Restaurant.find({ _id: { $in: restaurantIds } }).select("name address phone cuisine etaMinutes deliveryFeeCents").lean().exec(),
-    CustomerAccount.find({ _id: { $in: customerIds } }).select("name").lean().exec(),
+    Restaurant.find({ _id: { $in: restaurantIds } }).select("name address phone cuisine etaMinutes deliveryFeeCents image location").lean().exec(),
+    CustomerAccount.find({ _id: { $in: customerIds } }).select("name phone").lean().exec(),
   ]);
   const restaurantById = new Map(restaurants.map((restaurant: any) => [String(restaurant._id), restaurant]));
   const customerById = new Map(customers.map((customer: any) => [String(customer._id), customer]));
@@ -4049,8 +4155,9 @@ partnerPrepDeadlineAt: offer.partnerPrepDeadlineAt || null,
       vehicle: riderProfile?.vehicle || "unknown",
       phase: phase[offer.status] || "assigned",
       etaMinutes: offer.assignmentExpiresAt ? Math.max(0, Math.ceil((new Date(offer.assignmentExpiresAt).getTime() - now) / 60000)) : null,
-      restaurant: restaurant ? { name: restaurant.name, address: restaurant.address || "", phone: restaurant.phone || "", cuisine: restaurant.cuisine || "", etaMinutes: restaurant.etaMinutes || [] } : null,
+      restaurant: restaurant ? { name: restaurant.name, address: restaurant.address || "", phone: restaurant.phone || "", cuisine: restaurant.cuisine || "", etaMinutes: restaurant.etaMinutes || [], imageUrl: restaurant.image || "", location: restaurant.location || null } : null,
       customerName: customerPhase ? customer?.name || offer.customerName || "Cliente" : null,
+      customerPhone: customerPhase ? customer?.phone || offer.customerPhone || null : null,
       deliveryAddress: customerPhase ? offer.deliveryAddress || "" : null,
       deliveryNote: customerPhase ? offer.deliveryNote || null : null,
       deliveryLocation: customerPhase ? offer.deliveryLocation || null : null,
@@ -4157,6 +4264,73 @@ app.get("/api/v1/fleets/pending-partner-orders", requireRole("admin", "fleet", "
   return res.json({ orders: orders.map((order) => ({ id: String(order._id), publicCode: order.publicCode, restaurant: names.get(String(order.restaurantId)) || "Restaurante", totalCents: order.totalCents, createdAt: order.createdAt, status: order.status, paymentState: order.paymentState, paymentMethod: order.paymentMethod || "stripe", cashDueAtDelivery: order.paymentMethod === "cash", assignmentState: order.assignmentState })) });
 });
 const payoutPeriodSchema = z.object({ restaurantId: z.string().regex(/^[a-f\d]{24}$/i), startsAt: z.coerce.date(), endsAt: z.coerce.date() }).refine((value) => value.endsAt > value.startsAt, "INVALID_PAYOUT_PERIOD");
+app.get("/api/v1/admin/governance/directory", requireRole("admin"), async (req, res) => {
+  const tenant = tenantScope(req);
+  const [partners, riders] = await Promise.all([
+    Restaurant.find(tenant).select("_id partnerCode slug name email phone onboardingStatus marketplaceCompliance.pikiStatus marketplaceCompliance.stripeStatus partnerProfile.commissionRateBps isActive").sort({ name: 1 }).lean().exec(),
+    Rider.find(tenant).select("_id riderCode name email phone lifecycleStatus status fleetId zoneSlug isTestRider").sort({ name: 1 }).lean().exec(),
+  ]);
+  return res.json({ owner: { email: ownerEmail, role: "superadmin" }, partners: partners.map((p: any) => ({ ...p, id: String(p._id), partnerCode: p.partnerCode || publicPartnerCode(p._id), commissionRateBps: Number(p.partnerProfile?.commissionRateBps ?? DEFAULT_PARTNER_COMMISSION_BPS) })), riders: riders.map((r: any) => ({ ...r, id: String(r._id), riderCode: r.riderCode || publicRiderCode(r._id) })) });
+});
+app.patch("/api/v1/admin/partners/:id/settings", requireOwner(), async (req, res) => {
+  const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id); if (!id) return res.status(400).json({ error: "INVALID_PARTNER_ID" });
+  const parsed = z.object({ commissionRateBps: z.number().int().min(0).max(10000).optional(), onboardingStatus: z.enum(["pending_review", "approved", "rejected", "suspended"]).optional(), isActive: z.boolean().optional(), marketplaceStatus: z.enum(["pending", "in_review", "verified", "rejected", "expired", "suspended"]).optional() }).strict().safeParse(req.body);
+  if (!parsed.success || !Object.keys(parsed.data).length) return res.status(400).json({ error: "INVALID_PARTNER_SETTINGS", details: parsed.success ? undefined : parsed.error.flatten() });
+  const current = await Restaurant.findOne({ _id: id, ...tenantScope(req) }).select("_id partnerCode onboardingStatus isActive marketplaceCompliance.pikiStatus partnerProfile.commissionRateBps").lean().exec() as any;
+  if (!current) return res.status(404).json({ error: "PARTNER_NOT_FOUND" });
+  const { commissionRateBps, onboardingStatus, isActive, marketplaceStatus } = parsed.data;
+  const update: Record<string, unknown> = {};
+  if (commissionRateBps !== undefined) update["partnerProfile.commissionRateBps"] = commissionRateBps;
+  if (onboardingStatus !== undefined) update.onboardingStatus = onboardingStatus;
+  if (isActive !== undefined) update.isActive = isActive;
+  if (marketplaceStatus !== undefined) update["marketplaceCompliance.pikiStatus"] = marketplaceStatus;
+  const updated = await Restaurant.findOneAndUpdate({ _id: id, ...tenantScope(req) }, { $set: update }, { new: true }).select("_id partnerCode name onboardingStatus isActive marketplaceCompliance.pikiStatus partnerProfile.commissionRateBps").lean().exec() as any;
+  await recordGovernanceEvent({ actor: { employeeId: req.auth?.employeeId, role: "superadmin", tenantId: (req.auth as any)?.tenantId }, action: "partner_settings_updated", targetType: "restaurant", targetId: id, before: current, after: updated, reason: "Cambio realizado exclusivamente por PIKI superadmin." });
+  return res.json({ updated: true, partner: { ...updated, id: String(updated._id), partnerCode: updated.partnerCode || publicPartnerCode(updated._id), commissionRateBps: Number(updated.partnerProfile?.commissionRateBps ?? DEFAULT_PARTNER_COMMISSION_BPS) } });
+});
+app.get("/api/v1/admin/governance/audit", requireRole("admin"), async (req, res) => {
+  const limit = Math.min(Math.max(Number(req.query.limit || 100), 1), 500);
+  return res.json({ events: await GovernanceAuditEvent.find(tenantScope(req)).sort({ createdAt: -1 }).limit(limit).lean().exec() });
+});
+app.post("/api/v1/finance/payout-batches/:id/approve", requireRole("admin", "finance"), async (req, res) => {
+  const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id); if (!id) return res.status(400).json({ error: "INVALID_PAYOUT_BATCH_ID" });
+  const batch = await PartnerPayoutBatch.findOneAndUpdate({ _id: id, ...tenantScope(req), status: "prepared" }, { $set: { status: "approved" } }, { new: true }).lean().exec();
+  if (!batch) return res.status(409).json({ error: "PAYOUT_BATCH_NOT_PREPARED" });
+  await recordGovernanceEvent({ actor: { employeeId: req.auth?.employeeId, role: req.auth?.role, tenantId: (req.auth as any)?.tenantId }, action: "partner_payout_approved", targetType: "payout_batch", targetId: id, after: batch, reason: "Aprobación financiera separada del pago." });
+  return res.json({ approved: true, batch });
+});
+app.post("/api/v1/finance/payout-batches/:id/pay", requireRole("admin", "finance"), async (req, res) => {
+  const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id); const parsed = z.object({ externalTransferId: z.string().trim().min(3).max(180), note: z.string().trim().max(1000).optional() }).safeParse(req.body);
+  if (!id || !parsed.success) return res.status(400).json({ error: "INVALID_PAYOUT_EXECUTION", details: parsed.success ? undefined : parsed.error.flatten() });
+  try { const batch = await markPartnerBatchPaid({ batchId: id, externalTransferId: parsed.data.externalTransferId, actor: { employeeId: req.auth?.employeeId, role: req.auth?.role, tenantId: (req.auth as any)?.tenantId }, note: parsed.data.note }); return res.json({ paid: true, batch }); } catch (error) { return res.status(409).json({ error: error instanceof Error ? error.message : "PAYOUT_EXECUTION_FAILED" }); }
+});
+app.post("/api/v1/finance/rider-payouts/prepare", requireRole("admin", "finance"), async (req, res) => {
+  const parsed = z.object({ riderId: z.string().regex(/^[a-f\d]{24}$/i), startsAt: z.coerce.date(), endsAt: z.coerce.date() }).refine((value) => value.endsAt > value.startsAt, "INVALID_PAYOUT_PERIOD").safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "INVALID_RIDER_PAYOUT_PERIOD", details: parsed.error.flatten() });
+  const riderId = objectId(parsed.data.riderId); if (!riderId) return res.status(400).json({ error: "INVALID_RIDER_ID" });
+  const rider = await Rider.findOne({ _id: riderId, ...tenantScope(req) }).select("_id riderCode name").lean().exec() as any; if (!rider) return res.status(404).json({ error: "RIDER_NOT_FOUND" });
+  const orders = await Order.find({ ...tenantScope(req), riderId, status: "delivered", paymentState: "paid", deliveredAt: { $gte: parsed.data.startsAt, $lt: parsed.data.endsAt }, riderPayoutStatus: { $in: ["pending", "eligible"] }, riderPayoutBatchId: null }).select("_id riderEarningsCents").lean().exec() as any[];
+  if (!orders.length) return res.status(409).json({ error: "NO_RIDER_PAYOUTS_ELIGIBLE" });
+  const amountCents = orders.reduce((sum, order) => sum + Number(order.riderEarningsCents || 0), 0);
+  const idempotencyKey = `rider:${riderId}:${parsed.data.startsAt.toISOString()}:${parsed.data.endsAt.toISOString()}`;
+  const batch = await RiderPayoutBatch.findOneAndUpdate({ idempotencyKey }, { $setOnInsert: { tenantId: (req.auth as any)?.tenantId || null, riderId, orderIds: orders.map((order) => order._id), startsAt: parsed.data.startsAt, endsAt: parsed.data.endsAt, amountCents, idempotencyKey, status: "prepared", externalTransferId: null } }, { upsert: true, new: true, setDefaultsOnInsert: true }).lean().exec() as any;
+  await Order.updateMany({ _id: { $in: orders.map((order) => order._id) }, riderPayoutBatchId: null }, { $set: { riderPayoutBatchId: String(batch._id), riderPayoutStatus: "eligible" } }).exec();
+  await recordGovernanceEvent({ actor: { employeeId: req.auth?.employeeId, role: req.auth?.role, tenantId: (req.auth as any)?.tenantId }, action: "rider_payout_prepared", targetType: "rider_payout_batch", targetId: batch._id, after: { riderId, amountCents, orderCount: orders.length, status: batch.status }, reason: "Lote preparado desde pedidos entregados y pagados; requiere aprobación financiera." });
+  return res.status(201).json({ prepared: true, batch, rider: { id: String(rider._id), riderCode: (rider as any).riderCode || publicRiderCode(rider._id), name: (rider as any).name } });
+});
+app.get("/api/v1/finance/rider-payouts", requireRole("admin", "finance"), async (req, res) => { return res.json({ batches: await RiderPayoutBatch.find(tenantScope(req)).sort({ createdAt: -1 }).limit(200).lean().exec() }); });
+app.post("/api/v1/finance/rider-payouts/:id/approve", requireRole("admin", "finance"), async (req, res) => {
+  const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id); if (!id) return res.status(400).json({ error: "INVALID_RIDER_PAYOUT_BATCH_ID" });
+  const batch = await RiderPayoutBatch.findOneAndUpdate({ _id: id, ...tenantScope(req), status: "prepared" }, { $set: { status: "approved" } }, { new: true }).lean().exec();
+  if (!batch) return res.status(409).json({ error: "RIDER_PAYOUT_BATCH_NOT_PREPARED" });
+  await recordGovernanceEvent({ actor: { employeeId: req.auth?.employeeId, role: req.auth?.role, tenantId: (req.auth as any)?.tenantId }, action: "rider_payout_approved", targetType: "rider_payout_batch", targetId: id, after: batch, reason: "Aprobación financiera separada del pago." });
+  return res.json({ approved: true, batch });
+});
+app.post("/api/v1/finance/rider-payouts/:id/pay", requireRole("admin", "finance"), async (req, res) => {
+  const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id); const parsed = z.object({ externalTransferId: z.string().trim().min(3).max(180), note: z.string().trim().max(1000).optional() }).safeParse(req.body);
+  if (!id || !parsed.success) return res.status(400).json({ error: "INVALID_RIDER_PAYOUT_EXECUTION" });
+  try { const batch = await markRiderBatchPaid({ batchId: id, externalTransferId: parsed.data.externalTransferId, actor: { employeeId: req.auth?.employeeId, role: req.auth?.role, tenantId: (req.auth as any)?.tenantId }, note: parsed.data.note }); return res.json({ paid: true, batch }); } catch (error) { return res.status(409).json({ error: error instanceof Error ? error.message : "RIDER_PAYOUT_EXECUTION_FAILED" }); }
+});
 app.get("/api/v1/finance/partner-balances", requireRole("admin", "finance"), async (req, res) => {
   const tenant = tenantScope(req);
   const balances = await Order.aggregate([

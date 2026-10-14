@@ -95,6 +95,19 @@ const marketplaceLedgerEntrySchema = new Schema({
   idempotencyKey: { type: String, required: true, unique: true, index: true },
 }, { timestamps: true, collection: "marketplace_ledger_entries" });
 marketplaceLedgerEntrySchema.index({ restaurantId: 1, createdAt: -1 });
+const riderPayoutBatchSchema = new Schema({
+  tenantId: { type: Schema.Types.ObjectId, ref: "Tenant", default: null, index: true },
+  riderId: { type: Schema.Types.ObjectId, ref: "Rider", required: true, index: true },
+  orderIds: { type: [Schema.Types.ObjectId], ref: "Order", default: [] },
+  startsAt: { type: Date, required: true, index: true },
+  endsAt: { type: Date, required: true, index: true },
+  amountCents: { type: Number, required: true, min: 0 },
+  currency: { type: String, enum: ["eur"], default: "eur" },
+  status: { type: String, enum: ["prepared", "approved", "paid", "failed", "cancelled"], default: "prepared", index: true },
+  idempotencyKey: { type: String, required: true, unique: true, index: true },
+  externalTransferId: { type: String, default: null, index: true },
+}, { timestamps: true, collection: "rider_payout_batches" });
+riderPayoutBatchSchema.index({ riderId: 1, startsAt: 1, endsAt: 1 }, { unique: true });
 const partnerPayoutBatchSchema = new Schema({
   tenantId: { type: Schema.Types.ObjectId, ref: "Tenant", default: null, index: true },
   restaurantId: { type: Schema.Types.ObjectId, ref: "Restaurant", required: true, index: true },
@@ -297,7 +310,7 @@ const customerAccountSchema = new Schema({
 
 const restaurantSchema = new Schema({
   tenantId: { type: Schema.Types.ObjectId, ref: "Tenant", default: null, index: true },
-  slug: { type: String, required: true, unique: true, index: true }, name: { type: String, required: true, trim: true }, cuisine: { type: String, required: true }, category: { type: String, required: true, index: true }, locality: { type: String, default: "", index: true }, partnerGroupKey: { type: String, default: "", index: true }, tagline: { type: String, default: "" }, internalDemo: { type: Boolean, default: false, index: true }, demoMenuVersion: { type: Number, default: 0, min: 0 }, etaMinutes: { type: [Number], default: [20, 35] }, deliveryFeeCents: { type: Number, default: 0, min: 0 }, rating: { type: Number, default: 0, min: 0, max: 5 }, reviews: { type: Number, default: 0, min: 0 }, promoted: { type: Boolean, default: false }, image: { type: String, default: "" }, accent: { type: String, default: "#171715" }, availabilityStatus: { type: String, enum: ["available", "coming_soon"], default: "available", index: true }, upcomingAt: { type: Date, default: null }, upcomingMessage: { type: String, default: "", trim: true, maxlength: 240 }, onboardingStage: { type: String, enum: ["lead", "profile", "documents", "stripe", "review", "active", "rejected"], default: "lead", index: true }, onboardingChecklist: { type: Schema.Types.Mixed, default: { profile: false, documents: false, stripe: false, adminReview: false } }, marketplaceCompliance: { pikiStatus: { type: String, enum: ["pending", "in_review", "verified", "rejected", "expired", "suspended"], default: "pending", index: true }, stripeAccountId: { type: String, default: null, index: true }, stripeStatus: { type: String, enum: ["not_created", "onboarding", "pending_verification", "verified", "restricted", "disabled"], default: "not_created" }, chargesEnabled: { type: Boolean, default: false }, payoutsEnabled: { type: Boolean, default: false }, currentlyDue: { type: [String], default: [] }, pastDue: { type: [String], default: [] }, pendingVerification: { type: [String], default: [] }, rejectionReason: { type: String, default: null, maxlength: 1000 }, reviewedAt: { type: Date, default: null }, reviewedBy: { type: Schema.Types.ObjectId, ref: "EmployeeAccount", default: null }, lastSyncedAt: { type: Date, default: null } }, onboardingStatus: { type: String, enum: ["pending_review", "approved", "rejected", "suspended"], default: "approved", index: true }, onboardingReviewedBy: { type: Schema.Types.ObjectId, ref: "EmployeeAccount", default: null }, onboardingReviewedAt: { type: Date, default: null }, isActive: { type: Boolean, default: true, index: true }, email: { type: String, default: "" }, commercialEmployeeId: { type: Schema.Types.ObjectId, ref: "EmployeeAccount", default: null, index: true }, phone: { type: String, default: "" }, address: { type: String, default: "" }, partnerProfile: { type: partnerProfile, default: undefined }, location: { type: geoPoint, default: undefined }, menu: { type: [menuItem], default: [] },
+  slug: { type: String, required: true, unique: true, index: true }, partnerCode: { type: String, unique: true, sparse: true, index: true, immutable: true }, name: { type: String, required: true, trim: true }, cuisine: { type: String, required: true }, category: { type: String, required: true, index: true }, locality: { type: String, default: "", index: true }, partnerGroupKey: { type: String, default: "", index: true }, tagline: { type: String, default: "" }, internalDemo: { type: Boolean, default: false, index: true }, demoMenuVersion: { type: Number, default: 0, min: 0 }, etaMinutes: { type: [Number], default: [20, 35] }, deliveryFeeCents: { type: Number, default: 0, min: 0 }, rating: { type: Number, default: 0, min: 0, max: 5 }, reviews: { type: Number, default: 0, min: 0 }, promoted: { type: Boolean, default: false }, image: { type: String, default: "" }, accent: { type: String, default: "#171715" }, availabilityStatus: { type: String, enum: ["available", "coming_soon"], default: "available", index: true }, upcomingAt: { type: Date, default: null }, upcomingMessage: { type: String, default: "", trim: true, maxlength: 240 }, onboardingStage: { type: String, enum: ["lead", "profile", "documents", "stripe", "review", "active", "rejected"], default: "lead", index: true }, onboardingChecklist: { type: Schema.Types.Mixed, default: { profile: false, documents: false, stripe: false, adminReview: false } }, marketplaceCompliance: { pikiStatus: { type: String, enum: ["pending", "in_review", "verified", "rejected", "expired", "suspended"], default: "pending", index: true }, stripeAccountId: { type: String, default: null, index: true }, stripeStatus: { type: String, enum: ["not_created", "onboarding", "pending_verification", "verified", "restricted", "disabled"], default: "not_created" }, chargesEnabled: { type: Boolean, default: false }, payoutsEnabled: { type: Boolean, default: false }, currentlyDue: { type: [String], default: [] }, pastDue: { type: [String], default: [] }, pendingVerification: { type: [String], default: [] }, rejectionReason: { type: String, default: null, maxlength: 1000 }, reviewedAt: { type: Date, default: null }, reviewedBy: { type: Schema.Types.ObjectId, ref: "EmployeeAccount", default: null }, lastSyncedAt: { type: Date, default: null } }, onboardingStatus: { type: String, enum: ["pending_review", "approved", "rejected", "suspended"], default: "approved", index: true }, onboardingReviewedBy: { type: Schema.Types.ObjectId, ref: "EmployeeAccount", default: null }, onboardingReviewedAt: { type: Date, default: null }, isActive: { type: Boolean, default: true, index: true }, email: { type: String, default: "" }, commercialEmployeeId: { type: Schema.Types.ObjectId, ref: "EmployeeAccount", default: null, index: true }, phone: { type: String, default: "" }, address: { type: String, default: "" }, partnerProfile: { type: partnerProfile, default: undefined }, location: { type: geoPoint, default: undefined }, menu: { type: [menuItem], default: [] },
 }, { timestamps: true, collection: "restaurants" });
 restaurantSchema.index({ location: "2dsphere" }, { sparse: true });
 restaurantSchema.index({ isActive: 1, category: 1, rating: -1 });
@@ -323,7 +336,7 @@ onboardingRequestSchema.index({ requestedBy: 1, createdAt: -1 });
 const accessAuthorizationSchema = new Schema({
   tenantId: { type: Schema.Types.ObjectId, ref: "Tenant", default: null, index: true },
   employeeId: { type: Schema.Types.ObjectId, ref: "EmployeeAccount", required: true, index: true },
-  action: { type: String, enum: ["approved", "suspended", "revoked", "role_changed", "created", "credentials_sent"], required: true },
+  action: { type: String, enum: ["approved", "suspended", "revoked", "role_changed", "created", "credentials_sent", "profile_updated", "settings_updated"], required: true },
   previousStatus: { type: String, default: null },
   nextStatus: { type: String, required: true },
   previousRole: { type: String, default: null },
@@ -333,6 +346,18 @@ const accessAuthorizationSchema = new Schema({
   reason: { type: String, default: "" },
 }, { timestamps: true, collection: "access_authorizations" });
 accessAuthorizationSchema.index({ employeeId: 1, createdAt: -1 });
+const governanceAuditEventSchema = new Schema({
+  tenantId: { type: Schema.Types.ObjectId, ref: "Tenant", default: null, index: true },
+  actorEmployeeId: { type: Schema.Types.ObjectId, ref: "EmployeeAccount", default: null, index: true },
+  actorRole: { type: String, required: true },
+  action: { type: String, required: true, index: true },
+  targetType: { type: String, enum: ["restaurant", "rider", "employee", "payout_batch", "rider_payout_batch", "system"], required: true, index: true },
+  targetId: { type: Schema.Types.ObjectId, default: null, index: true },
+  before: { type: Schema.Types.Mixed, default: null },
+  after: { type: Schema.Types.Mixed, default: null },
+  reason: { type: String, default: "", maxlength: 2000 },
+}, { timestamps: true, collection: "governance_audit_events" });
+governanceAuditEventSchema.index({ targetType: 1, targetId: 1, createdAt: -1 });
 const riderSlotSchema = new Schema({
   tenantId: { type: Schema.Types.ObjectId, ref: "Tenant", default: null, index: true }, riderId: { type: Schema.Types.ObjectId, ref: "Rider", required: true, index: true }, zoneSlug: { type: String, required: true }, date: { type: String, required: true }, startTime: { type: String, required: true }, endTime: { type: String, required: true }, status: { type: String, enum: ["planned", "active", "completed", "cancelled"], default: "planned" }, notes: { type: String, default: "" } }, { timestamps: true, collection: "rider_slots" });
 riderSlotSchema.index({ tenantId: 1, riderId: 1, date: 1, startTime: 1 }, { unique: true });
@@ -370,6 +395,7 @@ export const Order = mongoose.models.Order || mongoose.model("Order", orderSchem
 export const Zone = mongoose.models.Zone || mongoose.model("Zone", zoneSchema);
 export const MarketplaceLedgerEntry = mongoose.models.MarketplaceLedgerEntry || mongoose.model("MarketplaceLedgerEntry", marketplaceLedgerEntrySchema);
 export const PartnerPayoutBatch = mongoose.models.PartnerPayoutBatch || mongoose.model("PartnerPayoutBatch", partnerPayoutBatchSchema);
+export const RiderPayoutBatch = mongoose.models.RiderPayoutBatch || mongoose.model("RiderPayoutBatch", riderPayoutBatchSchema);
 export const StripeEvent = mongoose.models.StripeEvent || mongoose.model("StripeEvent", stripeEventSchema);
 export const CashLedgerEntry = mongoose.models.CashLedgerEntry || mongoose.model("CashLedgerEntry", cashLedgerEntrySchema);
 export const DispatchDecision = mongoose.models.DispatchDecision || mongoose.model("DispatchDecision", dispatchDecisionSchema);
@@ -384,6 +410,7 @@ export const DocumentRequest = mongoose.models.DocumentRequest || mongoose.model
 export const CustomerAccount = mongoose.models.CustomerAccount || mongoose.model("CustomerAccount", customerAccountSchema);
 export const EmployeeAccount = mongoose.models.EmployeeAccount || mongoose.model("EmployeeAccount", employeeAccountSchema);
 export const AccessAuthorization = mongoose.models.AccessAuthorization || mongoose.model("AccessAuthorization", accessAuthorizationSchema);
+export const GovernanceAuditEvent = mongoose.models.GovernanceAuditEvent || mongoose.model("GovernanceAuditEvent", governanceAuditEventSchema);
 export const OnboardingRequest = mongoose.models.OnboardingRequest || mongoose.model("OnboardingRequest", onboardingRequestSchema);
 export const RiderSlot = mongoose.models.RiderSlot || mongoose.model("RiderSlot", riderSlotSchema);
 export const SignatureRequest = mongoose.models.SignatureRequest || mongoose.model("SignatureRequest", signatureRequestSchema);
