@@ -3918,10 +3918,10 @@ app.post("/api/v1/dispatch/orders/:id/assign", requireRole("admin", "fleet"), as
     const assignmentReservation = await reserveRiderOrderSlot(riderId, order._id, scope, maxConcurrentOrders);
     if (!assignmentReservation) continue;
     const rider = assignmentReservation.rider;
-    const assigned = await Order.findOneAndUpdate({ _id: order._id, ...scope, riderId: null, assignmentState: { $in: ["unassigned", "expired", "rejected"] } }, { $set: { riderId: rider._id, assignmentState: "assigned", assignmentExpiresAt: null, pickupDeadlineAt: new Date(Date.now() + PICKUP_REASSIGN_AFTER_MS), dispatchScore: decision.score }, $inc: { dispatchAttempts: 1, version: 1 } }, { new: true }).lean().exec() as any;
+    const assigned = await Order.findOneAndUpdate({ _id: order._id, ...scope, riderId: null, assignmentState: { $in: ["unassigned", "expired", "rejected"] } }, { $set: { riderId: rider._id, assignmentState: "offered", offerId: randomUUID(), assignmentExpiresAt: null, pickupDeadlineAt: null, dispatchScore: decision.score }, $inc: { dispatchAttempts: 1, version: 1 } }, { new: true }).lean().exec() as any;
     if (!assigned) { await releaseRiderOrderSlot(order._id, rider._id); continue; }
     await RiderAssignmentReservation.updateOne({ orderId: assigned._id, riderId: rider._id, status: "reserved" }, { $set: { expiresAt: null } }).exec();
-    await DispatchDecision.create({ ...scope, orderId: assigned._id, ...decision, riderId: rider._id, outcome: "accepted", actorRole: req.auth?.role || "system" });
+    await DispatchDecision.create({ ...scope, orderId: assigned._id, ...decision, riderId: rider._id, outcome: "offered", actorRole: req.auth?.role || "system" });
     await publishRiderOfferEvent(assigned, String(rider._id));
     return res.status(201).json({ assignment: { orderId: assigned._id, riderId: rider._id, slot: assignmentReservation.reservation.slot, state: assigned.assignmentState, expiresAt: null, score: decision.score, pickupDistanceKm: decision.pickupDistanceKm, pickupEtaMinutes: decision.pickupEtaMinutes, customerEtaMinutes: decision.customerEtaMinutes, totalEtaMinutes: decision.totalEtaMinutes, algorithmVersion: decision.algorithmVersion, maxConcurrentOrders, saturated: policy.saturated, reasons: decision.reasons } });
   }
