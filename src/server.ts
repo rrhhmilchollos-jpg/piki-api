@@ -672,8 +672,15 @@ app.post("/api/v1/auth/employee/password-reset/confirm", rateLimit(8, 15 * 60_00
 });
 app.post("/api/v1/auth/employee/login", async (req, res) => {
   const parsed = employeeLoginSchema.safeParse(req.body); if (!parsed.success) return res.status(400).json({ error: "INVALID_LOGIN" });
-  if (String(req.headers["x-piki-surface"] || "").toLowerCase() === "admin" && parsed.data.email.toLowerCase() !== ownerEmail) { /* subadmins are allowed; destructive operations remain superadmin-only */ }
-  const employee = await EmployeeAccount.findOne({ email: parsed.data.email.toLowerCase() }).select("+passwordHash").exec() as any;
+  const identifier = parsed.data.email.trim().toLowerCase();
+  if (String(req.headers["x-piki-surface"] || "").toLowerCase() === "admin" && identifier !== ownerEmail) { /* subadmins are allowed; destructive operations remain superadmin-only */ }
+  let employee = await EmployeeAccount.findOne({ email: identifier }).select("+passwordHash").exec() as any;
+  if (!employee && /^piki-p-[a-z0-9-]+$/i.test(identifier)) {
+    const restaurants = await Restaurant.find({ onboardingStatus: "approved" }).select("_id").lean().exec() as any[];
+    const restaurant = restaurants.find((item) => onboardingCode("P", item._id)?.toLowerCase() === identifier);
+    if (restaurant) employee = await EmployeeAccount.findOne({ restaurantIds: restaurant._id }).select("+passwordHash").exec() as any;
+    if (!employee && restaurant) employee = await EmployeeAccount.findOne({ restaurantId: restaurant._id }).select("+passwordHash").exec() as any;
+  }
   if (!employee || !verifyPassword(parsed.data.password, employee.passwordHash)) return res.status(401).json({ error: "INVALID_CREDENTIALS" });
   if (!employee.active || (employee.authorizationStatus && employee.authorizationStatus !== "approved")) {
     const isPartner = employee.apiRole === "partner";
@@ -970,7 +977,7 @@ app.get("/api/v1/catalog/restaurants", async (req, res) => {
   const restaurants = await Restaurant.find(filter)
     // Explicit inclusion avoids MongoDB path-collision errors caused by
     // partnerProfile.documents having select:false nested fields.
-    .select("slug name cuisine category locality partnerGroupKey tagline etaMinutes deliveryFeeCents rating reviews promoted image accent phone address location menu isActive onboardingStatus availabilityStatus upcomingAt upcomingMessage")
+    .select("slug name cuisine category locality partnerGroupKey tagline etaMinutes deliveryFeeCents rating reviews promoted image accent phone address location menu isActive onboardingStatus availabilityStatus upcomingAt upcomingMessage partnerProfile.openingHours")
     .sort({ promoted: -1, rating: -1, reviews: -1 }).lean().exec();
   const catalogPriority: Record<string, number> = {
     "alibaba-kebab-xativa": 0,
