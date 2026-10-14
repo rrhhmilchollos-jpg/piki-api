@@ -1712,7 +1712,8 @@ const partnerSettingsSchema = z.object({
   cuisine: z.string().trim().min(2).max(120).optional(),
   category: z.string().trim().min(2).max(120).optional(),
   phone: z.string().trim().max(40).optional(),
-  email: z.string().email().max(254).optional(),
+  // El email puede quedar vacío mientras el expediente del partner sigue en onboarding.
+  email: z.union([z.string().email().max(254), z.literal("")]).optional(),
   address: z.string().trim().max(280).optional(),
   locality: z.string().trim().max(120).optional(),
   deliveryFeeCents: z.number().int().min(0).max(10000).optional(),
