@@ -323,7 +323,7 @@ onboardingRequestSchema.index({ requestedBy: 1, createdAt: -1 });
 const accessAuthorizationSchema = new Schema({
   tenantId: { type: Schema.Types.ObjectId, ref: "Tenant", default: null, index: true },
   employeeId: { type: Schema.Types.ObjectId, ref: "EmployeeAccount", required: true, index: true },
-  action: { type: String, enum: ["approved", "suspended", "revoked", "role_changed", "created", "credentials_sent"], required: true },
+  action: { type: String, enum: ["approved", "suspended", "revoked", "role_changed", "created", "credentials_sent", "profile_updated", "settings_updated"], required: true },
   previousStatus: { type: String, default: null },
   nextStatus: { type: String, required: true },
   previousRole: { type: String, default: null },

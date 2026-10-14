@@ -1408,6 +1408,32 @@ app.get("/api/v1/partners/locations", requireRole("partner"), async (req, res) =
   const access = await partnerAccessForRequest(req);
   return res.json({ locations: access ? await partnerLocationsFor(access.employee, access.roles, access.permissions) : [] });
 });
+app.get("/api/v1/partners/profile", requireRole("partner"), async (req, res) => {
+  const access = await partnerAccessForRequest(req);
+  if (!access || !partnerCan(access.roles, "store:write")) return res.status(403).json({ error: "PARTNER_PERMISSION_DENIED", permission: "store:write" });
+  const restaurantId = await employeeRestaurant(req, access);
+  if (!restaurantId) return res.status(403).json({ error: "PARTNER_RESTAURANT_NOT_ASSIGNED" });
+  const restaurant = await Restaurant.findOne({ _id: objectId(restaurantId), ...tenantScope(req) }).select("_id name email phone address locality").lean().exec() as any;
+  if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
+  return res.json({ profile: { id: String(restaurant._id), partnerCode: onboardingCode("P", restaurant._id), name: restaurant.name, email: restaurant.email, phone: restaurant.phone, address: restaurant.address, locality: restaurant.locality, commissionRateBps: 1800, commissionPercent: 18 } });
+});
+const partnerBasicProfileSchema = z.object({ email: z.string().email().max(254).optional(), phone: z.string().trim().max(40).optional() }).strict();
+app.patch("/api/v1/partners/profile", requireRole("partner"), async (req, res) => {
+  const access = await partnerAccessForRequest(req);
+  if (!access || !partnerCan(access.roles, "store:write")) return res.status(403).json({ error: "PARTNER_PERMISSION_DENIED", permission: "store:write" });
+  const restaurantId = await employeeRestaurant(req, access);
+  const parsed = partnerBasicProfileSchema.safeParse(req.body);
+  if (!restaurantId || !parsed.success || !Object.keys(parsed.data).length) return res.status(400).json({ error: "INVALID_PARTNER_PROFILE", details: parsed.success ? undefined : parsed.error.flatten() });
+  const scope = { _id: objectId(restaurantId), ...tenantScope(req) };
+  const restaurant = await Restaurant.findOne(scope).select("_id name email phone address locality").lean().exec() as any;
+  if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
+  const email = parsed.data.email?.trim().toLowerCase();
+  if (email && email !== String(restaurant.email || "").toLowerCase() && await EmployeeAccount.exists({ email, _id: { $ne: access.employee._id } })) return res.status(409).json({ error: "EMAIL_ALREADY_IN_USE" });
+  if (email) await EmployeeAccount.updateOne({ _id: access.employee._id, ...tenantScope(req) }, { $set: { email } }).exec();
+  const updated = await Restaurant.findOneAndUpdate(scope, { $set: { ...(email ? { email } : {}), ...(parsed.data.phone !== undefined ? { phone: parsed.data.phone } : {}) } }, { new: true }).select("_id name email phone address locality").lean().exec() as any;
+  await AccessAuthorization.create({ employeeId: access.employee._id, action: "profile_updated", previousStatus: "approved", nextStatus: "approved", previousRole: "partner", nextRole: "partner", accessLevel: "subadmin", actorEmployeeId: access.employee._id, reason: "El Partner actualizó sus datos básicos de contacto." });
+  return res.json({ updated: true, profile: { id: String(updated._id), partnerCode: onboardingCode("P", updated._id), name: updated.name, email: updated.email, phone: updated.phone, address: updated.address, locality: updated.locality, commissionRateBps: 1800, commissionPercent: 18 } });
+});
 app.patch("/api/v1/partners/store/status", requireRole("partner"), async (req, res) => {
   const { access, allowed } = await partnerRequestAccess(req, "store:write");
   if (!allowed) return res.status(403).json({ error: "PARTNER_PERMISSION_DENIED", permission: "store:write" });
@@ -1672,6 +1698,42 @@ app.get("/api/v1/admin/restaurants", requireRole("admin"), async (req, res) => {
   return res.json({ restaurants: restaurants.map((restaurant: any) => ({ ...restaurant, partnerCode: onboardingCode("P", restaurant._id) })) });
 });
 
+const partnerSettingsSchema = z.object({
+  name: z.string().trim().min(2).max(160).optional(),
+  cuisine: z.string().trim().min(2).max(120).optional(),
+  category: z.string().trim().min(2).max(120).optional(),
+  phone: z.string().trim().max(40).optional(),
+  email: z.string().email().max(254).optional(),
+  address: z.string().trim().max(280).optional(),
+  locality: z.string().trim().max(120).optional(),
+  deliveryFeeCents: z.number().int().min(0).max(10000).optional(),
+  isActive: z.boolean().optional(),
+  availabilityStatus: z.enum(["available", "coming_soon"]).optional(),
+  promoted: z.boolean().optional(),
+  commissionRateBps: z.literal(1800).optional(),
+}).strict();
+
+app.get("/api/v1/admin/restaurants/:id/settings", requireOwner(), async (req, res) => {
+  const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
+  if (!id) return res.status(400).json({ error: "INVALID_RESTAURANT_ID" });
+  const restaurant = await Restaurant.findOne({ _id: id, ...tenantScope(req) }).select("_id slug name cuisine category phone email address locality deliveryFeeCents isActive availabilityStatus promoted image location onboardingStatus partnerProfile.commissionRateBps").lean().exec() as any;
+  if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
+  return res.json({ restaurant: { ...restaurant, id: String(restaurant._id), partnerCode: onboardingCode("P", restaurant._id), commissionRateBps: 1800, commissionPercent: 18 } });
+});
+
+app.patch("/api/v1/admin/restaurants/:id/settings", requireOwner(), async (req, res) => {
+  const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
+  if (!id) return res.status(400).json({ error: "INVALID_RESTAURANT_ID" });
+  const parsed = partnerSettingsSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "INVALID_PARTNER_SETTINGS", details: parsed.error.flatten() });
+  const { commissionRateBps: _ignored, ...settings } = parsed.data;
+  const update = { ...settings, "partnerProfile.commissionRateBps": 1800 };
+  const restaurant = await Restaurant.findOneAndUpdate({ _id: id, ...tenantScope(req) }, { $set: update }, { new: true }).select("_id slug name cuisine category phone email address locality deliveryFeeCents isActive availabilityStatus promoted image location onboardingStatus partnerProfile.commissionRateBps").lean().exec() as any;
+  if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
+  await AccessAuthorization.create({ employeeId: objectId(String(req.auth!.employeeId!)), action: "settings_updated", previousStatus: "approved", nextStatus: "approved", previousRole: "partner", nextRole: "partner", accessLevel: "superadmin", actorEmployeeId: objectId(String(req.auth!.employeeId!)), reason: `Configuración protegida actualizada para ${restaurant.name}; comisión fijada al 18%.` });
+  return res.json({ updated: true, restaurant: { ...restaurant, id: String(restaurant._id), partnerCode: onboardingCode("P", restaurant._id), commissionRateBps: 1800, commissionPercent: 18 } });
+});
+
 app.patch("/api/v1/admin/restaurants/:id/customer-name", requireOwner(), async (req, res) => {
   const idParam = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
   const id = objectId(idParam);
@@ -1735,15 +1797,15 @@ app.patch("/api/v1/admin/restaurants/:id/demo-visibility", requireOwner(), async
   return res.json({ updated: true, restaurant });
 });
 
-const partnerCommissionSchema = z.object({ commissionRateBps: z.number().int().min(0).max(5000) });
+const partnerCommissionSchema = z.object({ commissionRateBps: z.literal(1800) });
 app.patch("/api/v1/admin/restaurants/:id/commission", requireOwner(), async (req, res) => {
   const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
   if (!id) return res.status(400).json({ error: "INVALID_RESTAURANT_ID" });
   const parsed = partnerCommissionSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_PARTNER_COMMISSION", details: parsed.error.flatten() });
-  const restaurant = await Restaurant.findOneAndUpdate({ _id: id, ...tenantScope(req) }, { $set: { "partnerProfile.commissionRateBps": parsed.data.commissionRateBps } }, { new: true }).select("_id name slug partnerProfile.commissionRateBps").lean().exec() as any;
+  const restaurant = await Restaurant.findOneAndUpdate({ _id: id, ...tenantScope(req) }, { $set: { "partnerProfile.commissionRateBps": 1800 } }, { new: true }).select("_id name slug partnerProfile.commissionRateBps").lean().exec() as any;
   if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
-  return res.json({ restaurant: { id: String(restaurant._id), name: restaurant.name, slug: restaurant.slug, commissionRateBps: Number(restaurant.partnerProfile?.commissionRateBps || 0), commissionPercent: Number(restaurant.partnerProfile?.commissionRateBps || 0) / 100 } });
+  return res.json({ restaurant: { id: String(restaurant._id), name: restaurant.name, slug: restaurant.slug, commissionRateBps: 1800, commissionPercent: 18 } });
 });
 
 app.get("/api/v1/admin/restaurants/:id/documents", requireRole("admin"), async (req, res) => {
@@ -3338,6 +3400,39 @@ app.post("/api/v1/riders/:id/location", requireRole("admin", "rider", "fleet"), 
   const trackedOrders = await Order.find({ riderId: id, assignmentState: "assigned", status: { $in: ["picked_up", "on_the_way"] } }).select("_id publicCode restaurantId customerId tenantId status assignmentState").lean().exec() as any[];
   await Promise.all(trackedOrders.map((order) => publishRiderLocationEvents(order, rider))).catch((error) => console.warn("Realtime rider location event failed", error instanceof Error ? error.message : error));
   return res.json({ rider: { id: rider._id, riderCode: rider.riderCode, status: rider.status, location: rider.location, lastLocationAt: rider.lastLocationAt } });
+});
+const riderBasicProfileSchema = z.object({ phone: z.string().trim().max(40).optional(), city: z.string().trim().max(120).optional(), availability: z.string().trim().max(160).optional() }).strict();
+app.get("/api/v1/riders/:id/profile", requireRole("admin", "rider", "fleet"), async (req, res) => {
+  const riderId = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
+  if (!riderId) return res.status(400).json({ error: "INVALID_RIDER_ID" });
+  if (req.auth?.role === "rider" && !(await riderAccessForRequest(riderId, req))) return res.status(403).json({ error: "RIDER_ACCESS_DENIED" });
+  if (req.auth?.role === "fleet" && !(await fleetCanAccessRider(req, riderId))) return res.status(403).json({ error: "FLEET_RIDER_ACCESS_DENIED" });
+  const rider = await Rider.findOne({ _id: riderId, ...tenantScope(req) }).select("_id riderCode name email phone city availability vehicle status lifecycleStatus fleetId zoneSlug lastLocationAt").lean().exec() as any;
+  if (!rider) return res.status(404).json({ error: "RIDER_NOT_FOUND" });
+  return res.json({ profile: { ...rider, id: String(rider._id), riderCode: rider.riderCode || `PIKI-R-${String(rider._id).slice(-6).toUpperCase()}` } });
+});
+app.patch("/api/v1/riders/:id/profile", requireRole("rider"), async (req, res) => {
+  const riderId = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
+  if (!riderId || !(await riderAccessForRequest(riderId, req))) return res.status(403).json({ error: "RIDER_ACCESS_DENIED" });
+  const parsed = riderBasicProfileSchema.safeParse(req.body);
+  if (!parsed.success || !Object.keys(parsed.data).length) return res.status(400).json({ error: "INVALID_RIDER_PROFILE", details: parsed.success ? undefined : parsed.error.flatten() });
+  const updated = await Rider.findOneAndUpdate({ _id: riderId, ...tenantScope(req) }, { $set: parsed.data }, { new: true }).select("_id riderCode name email phone city availability vehicle status lifecycleStatus fleetId zoneSlug").lean().exec() as any;
+  if (!updated) return res.status(404).json({ error: "RIDER_NOT_FOUND" });
+  const employeeId = objectId(String(req.auth!.employeeId!));
+  if (employeeId) await AccessAuthorization.create({ employeeId, action: "profile_updated", previousStatus: "approved", nextStatus: "approved", previousRole: "rider", nextRole: "rider", accessLevel: "subadmin", actorEmployeeId: employeeId, reason: "El Rider actualizó sus datos básicos de contacto y disponibilidad." });
+  return res.json({ updated: true, profile: { ...updated, id: String(updated._id), riderCode: updated.riderCode || `PIKI-R-${String(updated._id).slice(-6).toUpperCase()}` } });
+});
+app.patch("/api/v1/admin/riders/:id/profile", requireOwner(), async (req, res) => {
+  const riderId = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
+  if (!riderId) return res.status(400).json({ error: "INVALID_RIDER_ID" });
+  const parsed = riderBasicProfileSchema.extend({ name: z.string().trim().min(2).max(160).optional(), vehicle: z.enum(["bike", "electric_bike", "electric_scooter", "motorcycle", "scooter", "car"]).optional(), fleetId: z.string().regex(/^[a-f\d]{24}$/).nullable().optional(), zoneSlug: z.string().trim().max(80).nullable().optional() }).safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "INVALID_RIDER_ADMIN_PROFILE", details: parsed.error.flatten() });
+  const { fleetId, ...fields } = parsed.data;
+  const updated = await Rider.findOneAndUpdate({ _id: riderId, ...tenantScope(req) }, { $set: { ...fields, ...(fleetId !== undefined ? { fleetId: fleetId ? objectId(fleetId) : null } : {}) } }, { new: true }).select("_id riderCode name email phone city availability vehicle status lifecycleStatus fleetId zoneSlug").lean().exec() as any;
+  if (!updated) return res.status(404).json({ error: "RIDER_NOT_FOUND" });
+  const ownerId = objectId(String(req.auth!.employeeId!));
+  if (ownerId) await AccessAuthorization.create({ employeeId: riderId, action: "settings_updated", previousStatus: "approved", nextStatus: "approved", previousRole: "rider", nextRole: "rider", accessLevel: "superadmin", actorEmployeeId: ownerId, reason: "Superadmin actualizó el perfil operativo del Rider." });
+  return res.json({ updated: true, profile: { ...updated, id: String(updated._id), riderCode: updated.riderCode || `PIKI-R-${String(updated._id).slice(-6).toUpperCase()}` } });
 });
 app.patch("/api/v1/riders/:id/status", requireRole("admin", "rider", "fleet"), async (req, res) => {
   const idParam = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
