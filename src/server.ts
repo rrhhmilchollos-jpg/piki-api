@@ -4258,6 +4258,20 @@ app.post("/api/v1/finance/payout-batches/:id/pay", requireRole("admin", "finance
   if (!id || !parsed.success) return res.status(400).json({ error: "INVALID_PAYOUT_EXECUTION", details: parsed.success ? undefined : parsed.error.flatten() });
   try { const batch = await markPartnerBatchPaid({ batchId: id, externalTransferId: parsed.data.externalTransferId, actor: { employeeId: req.auth?.employeeId, role: req.auth?.role, tenantId: (req.auth as any)?.tenantId }, note: parsed.data.note }); return res.json({ paid: true, batch }); } catch (error) { return res.status(409).json({ error: error instanceof Error ? error.message : "PAYOUT_EXECUTION_FAILED" }); }
 });
+app.post("/api/v1/finance/rider-payouts/prepare", requireRole("admin", "finance"), async (req, res) => {
+  const parsed = z.object({ riderId: z.string().regex(/^[a-f\d]{24}$/i), startsAt: z.coerce.date(), endsAt: z.coerce.date() }).refine((value) => value.endsAt > value.startsAt, "INVALID_PAYOUT_PERIOD").safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "INVALID_RIDER_PAYOUT_PERIOD", details: parsed.error.flatten() });
+  const riderId = objectId(parsed.data.riderId); if (!riderId) return res.status(400).json({ error: "INVALID_RIDER_ID" });
+  const rider = await Rider.findOne({ _id: riderId, ...tenantScope(req) }).select("_id riderCode name").lean().exec(); if (!rider) return res.status(404).json({ error: "RIDER_NOT_FOUND" });
+  const orders = await Order.find({ ...tenantScope(req), riderId, status: "delivered", paymentState: "paid", deliveredAt: { $gte: parsed.data.startsAt, $lt: parsed.data.endsAt }, riderPayoutStatus: { $in: ["pending", "eligible"] }, riderPayoutBatchId: null }).select("_id riderEarningsCents").lean().exec() as any[];
+  if (!orders.length) return res.status(409).json({ error: "NO_RIDER_PAYOUTS_ELIGIBLE" });
+  const amountCents = orders.reduce((sum, order) => sum + Number(order.riderEarningsCents || 0), 0);
+  const idempotencyKey = `rider:${riderId}:${parsed.data.startsAt.toISOString()}:${parsed.data.endsAt.toISOString()}`;
+  const batch = await RiderPayoutBatch.findOneAndUpdate({ idempotencyKey }, { $setOnInsert: { tenantId: (req.auth as any)?.tenantId || null, riderId, orderIds: orders.map((order) => order._id), startsAt: parsed.data.startsAt, endsAt: parsed.data.endsAt, amountCents, idempotencyKey, status: "prepared", externalTransferId: null } }, { upsert: true, new: true, setDefaultsOnInsert: true }).lean().exec() as any;
+  await Order.updateMany({ _id: { $in: orders.map((order) => order._id) }, riderPayoutBatchId: null }, { $set: { riderPayoutBatchId: String(batch._id), riderPayoutStatus: "eligible" } }).exec();
+  await recordGovernanceEvent({ actor: { employeeId: req.auth?.employeeId, role: req.auth?.role, tenantId: (req.auth as any)?.tenantId }, action: "rider_payout_prepared", targetType: "rider_payout_batch", targetId: batch._id, after: { riderId, amountCents, orderCount: orders.length, status: batch.status }, reason: "Lote preparado desde pedidos entregados y pagados; requiere aprobación financiera." });
+  return res.status(201).json({ prepared: true, batch, rider: { id: String(rider._id), riderCode: (rider as any).riderCode || publicRiderCode(rider._id), name: (rider as any).name } });
+});
 app.get("/api/v1/finance/rider-payouts", requireRole("admin", "finance"), async (req, res) => { return res.json({ batches: await RiderPayoutBatch.find(tenantScope(req)).sort({ createdAt: -1 }).limit(200).lean().exec() }); });
 app.post("/api/v1/finance/rider-payouts/:id/approve", requireRole("admin", "finance"), async (req, res) => {
   const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id); if (!id) return res.status(400).json({ error: "INVALID_RIDER_PAYOUT_BATCH_ID" });
