@@ -30,7 +30,7 @@ import { activeOperationalOrderStatuses, dispatchableOrderStatuses, dispatchable
 import { canReceivePartnerLocations, partnerCan, partnerPermissions, partnerRolesForEmployee, permissionsForPartnerRoles, type PartnerPermission } from "./partnerAccess.js";
 import { awardRiderRecruitmentMilestones, claimRiderReferralCode, completeRiderShiftIncentiveTracking, incentiveProgramStatus, loadRiderIncentiveSnapshot, trackRiderLocationForIncentive, trackRiderShiftStart } from "./riderIncentives.js";
 import { buildApprovedRiderOperationalProfile } from "./riderApproval.js";
-import { COMING_SOON_SLUGS, CUSTOMER_CATALOG_RESTAURANT_FILTER, CUSTOMER_ORDERABLE_RESTAURANT_FILTER, presentCustomerCatalogRestaurant } from "./customerCatalogPolicy.js";
+import { COMING_SOON_SLUGS, CUSTOMER_CATALOG_RESTAURANT_FILTER, CUSTOMER_ORDERABLE_RESTAURANT_FILTER, customerMenuForRestaurant, presentCustomerCatalogRestaurant } from "./customerCatalogPolicy.js";
 import { PARTNER_DEMO_MENU_VERSION, partnerDemoMenu } from "./partnerDemoMenu.js";
 import { configuredPartnerRestaurantUpsert } from "./partnerRepairPolicy.js";
 import { quoteMenuItem, usesReferenceAddOns } from "./menuModifiers.js";
@@ -2354,9 +2354,13 @@ app.post("/api/v1/orders", rateLimit(20, 60_000, "orders-create"), async (req, r
   if (!restaurantObjectId) return res.status(400).json({ error: "INVALID_RESTAURANT_ID" });
   const restaurant = await Restaurant.findOne({ _id: restaurantObjectId, isActive: true, onboardingStatus: "approved" }).lean().exec() as any;
   if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_AVAILABLE" });
-  const useReferenceFallback = usesReferenceAddOns(restaurant);
+  // El catálogo público y el checkout deben compartir exactamente la misma política de precio.
+  // Alibaba aplica el 18% por producto; Kings Tacos y el resto no se alteran.
+  const pricedMenu = customerMenuForRestaurant(restaurant);
+  const pricedRestaurant = { ...restaurant, menu: pricedMenu };
+  const useReferenceFallback = usesReferenceAddOns(pricedRestaurant);
   const items = parsed.data.items.map((requested) => {
-    const item = restaurant.menu.find((candidate: any) => candidate.id === requested.itemId);
+    const item = pricedMenu.find((candidate: any) => candidate.id === requested.itemId);
     if (!item) return null;
     try {
       const quote = quoteMenuItem(item, requested.selections, useReferenceFallback);
@@ -2406,8 +2410,17 @@ app.post("/api/v1/internal/customer-orders/sync", async (req, res) => {
   if (!isCashOrderWithinLimit(input.paymentMethod, input.totalCents)) return res.status(422).json(cashOrderLimitError(input.totalCents));
   // Customer is the source of truth: never rebuild lines from a second menu copy.
   // This prevents price/name drift between Customer, Partner and Rider screens.
-  const canonicalItems = input.items.map(({ itemId, name, quantity, unitPriceCents, totalCents }) => ({ itemId, name, quantity, unitPriceCents, ...(totalCents == null ? {} : { totalCents }) }));
-  const order = await Order.findOneAndUpdate({ publicCode: input.publicCode }, { $set: { tenantId: restaurant.tenantId || null, restaurantId: restaurant._id, customerId: input.customerId || null, ...(input.customerName !== undefined ? { customerName: input.customerName || "" } : {}), items: canonicalItems, deliveryAddress: input.deliveryAddress, deliveryNote: input.deliveryNote, deliveryLocation: location, subtotalCents: input.subtotalCents, deliveryFeeCents: input.deliveryFeeCents, serviceFeeCents: input.serviceFeeCents, totalCents: input.totalCents, paymentMethod: input.paymentMethod, paymentState: input.paymentState, ...(input.stripeCheckoutSessionId !== undefined ? { stripeCheckoutSessionId: input.stripeCheckoutSessionId } : {}), ...(input.stripePaymentIntentId !== undefined ? { stripePaymentIntentId: input.stripePaymentIntentId } : {}), ...(["authorized", "paid"].includes(input.paymentState) && !["authorized", "paid"].includes(existing?.paymentState || "") ? { status: "pending", assignmentState: "unassigned" } : {}) }, $setOnInsert: { publicCode: input.publicCode, status: "pending", assignmentState: "unassigned", statusHistory: [{ status: "pending", actorRole: "system", reason: "Pedido sincronizado desde PIKI Customer" }] } }, { upsert: true, new: true, setDefaultsOnInsert: true }).lean().exec() as any;
+  const pricedMenu = customerMenuForRestaurant(restaurant);
+  const menuById = new Map(pricedMenu.map((item: any) => [String(item.id), item]));
+  const canonicalItems = input.items.map(({ itemId, name, quantity, unitPriceCents, totalCents }) => {
+    const catalogItem = menuById.get(String(itemId));
+    const effectiveUnitPriceCents = catalogItem ? Math.round(Number(catalogItem.price || 0) * 100) : unitPriceCents;
+    return { itemId, name: catalogItem?.name || name, quantity, unitPriceCents: effectiveUnitPriceCents, ...(totalCents == null ? {} : { totalCents: effectiveUnitPriceCents * quantity }) };
+  });
+  const canonicalSubtotalCents = canonicalItems.reduce((sum, item) => sum + item.unitPriceCents * item.quantity, 0);
+  const canonicalTotalCents = canonicalSubtotalCents + input.deliveryFeeCents + input.serviceFeeCents;
+  if (!isCashOrderWithinLimit(input.paymentMethod, canonicalTotalCents)) return res.status(422).json(cashOrderLimitError(canonicalTotalCents));
+  const order = await Order.findOneAndUpdate({ publicCode: input.publicCode }, { $set: { tenantId: restaurant.tenantId || null, restaurantId: restaurant._id, customerId: input.customerId || null, ...(input.customerName !== undefined ? { customerName: input.customerName || "" } : {}), items: canonicalItems, deliveryAddress: input.deliveryAddress, deliveryNote: input.deliveryNote, deliveryLocation: location, subtotalCents: canonicalSubtotalCents, deliveryFeeCents: input.deliveryFeeCents, serviceFeeCents: input.serviceFeeCents, totalCents: canonicalTotalCents, paymentMethod: input.paymentMethod, paymentState: input.paymentState, ...(input.stripeCheckoutSessionId !== undefined ? { stripeCheckoutSessionId: input.stripeCheckoutSessionId } : {}), ...(input.stripePaymentIntentId !== undefined ? { stripePaymentIntentId: input.stripePaymentIntentId } : {}), ...(["authorized", "paid"].includes(input.paymentState) && !["authorized", "paid"].includes(existing?.paymentState || "") ? { status: "pending", assignmentState: "unassigned" } : {}) }, $setOnInsert: { publicCode: input.publicCode, status: "pending", assignmentState: "unassigned", statusHistory: [{ status: "pending", actorRole: "system", reason: "Pedido sincronizado desde PIKI Customer" }] } }, { upsert: true, new: true, setDefaultsOnInsert: true }).lean().exec() as any;
   const newlyPaid = ["authorized", "paid"].includes(input.paymentState) && !["authorized", "paid"].includes(existing?.paymentState || "");
   const newCashOrder = input.paymentMethod === "cash" && !existing;
   if (newlyPaid || newCashOrder) {
@@ -3780,14 +3793,14 @@ app.post("/api/v1/dispatch/orders/:id/offer-response", requireRole("rider", "adm
     if (!rider) return res.status(403).json({ error: "RIDER_ACCESS_DENIED" });
   }
   if (parsed.data.accept) {
-    const updated = await Order.findOneAndUpdate({ _id: orderId, ...tenantScope(req), assignmentState: "offered", riderId: order.riderId, offerId: order.offerId || null, version: order.version, assignmentExpiresAt: { $gt: new Date() } }, { $set: { assignmentState: "assigned", pickupDeadlineAt: new Date(Date.now() + PICKUP_REASSIGN_AFTER_MS) }, $inc: { version: 1 } }, { new: true }).lean().exec() as any;
+    const updated = await Order.findOneAndUpdate({ _id: orderId, ...tenantScope(req), assignmentState: "offered", riderId: order.riderId, offerId: order.offerId || null, version: order.version }, { $set: { assignmentState: "assigned", pickupDeadlineAt: new Date(Date.now() + PICKUP_REASSIGN_AFTER_MS) }, $inc: { version: 1 } }, { new: true }).lean().exec() as any;
     if (!updated) return res.status(409).json({ error: "OFFER_CHANGED_RETRY" });
     await RiderAssignmentReservation.updateOne({ orderId: updated._id, riderId: updated.riderId, status: "reserved" }, { $set: { expiresAt: null } }).exec();
     await DispatchDecision.updateMany({ orderId: updated._id, riderId: updated.riderId, outcome: "offered" }, { $set: { outcome: "accepted", actorRole: "rider" } }).exec();
     await publishOrderStatusEvents(updated, updated.status);
     return res.json({ assignment: { state: "assigned", orderId: updated._id, riderId: updated.riderId } });
   }
-  const rejected = await Order.findOneAndUpdate({ _id: orderId, ...tenantScope(req), assignmentState: "offered", riderId: order.riderId, offerId: order.offerId || null, version: order.version, assignmentExpiresAt: { $gt: new Date() } }, { $set: { assignmentState: "rejected", riderId: null, offerId: null, assignmentExpiresAt: null }, $inc: { version: 1 } }, { new: true }).lean().exec() as any;
+  const rejected = await Order.findOneAndUpdate({ _id: orderId, ...tenantScope(req), assignmentState: "offered", riderId: order.riderId, offerId: order.offerId || null, version: order.version }, { $set: { assignmentState: "rejected", riderId: null, offerId: null, assignmentExpiresAt: null }, $inc: { version: 1 } }, { new: true }).lean().exec() as any;
   if (!rejected) return res.status(409).json({ error: "OFFER_CHANGED_RETRY" });
   await DispatchDecision.updateMany({ orderId, riderId: order.riderId, outcome: "offered" }, { $set: { outcome: "rejected", actorRole: "rider" } }).exec();
   await releaseRiderOrderSlot(orderId, order.riderId);
