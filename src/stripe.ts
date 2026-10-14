@@ -21,6 +21,38 @@ export function stripeConfigured() {
   return Boolean(stripe && process.env.STRIPE_WEBHOOK_SECRET);
 }
 
+/** Crea o reutiliza la cuenta Express del partner y devuelve el enlace hosted de Stripe. */
+export async function createPartnerStripeOnboardingLink(input: {
+  restaurantId: string;
+  email: string;
+  legalName: string;
+  legalForm: "autonomo" | "sl" | "sa" | "cooperativa" | "otra";
+  refreshUrl: string;
+  returnUrl: string;
+  existingAccountId?: string | null;
+}) {
+  if (!stripe) throw new Error("STRIPE_SECRET_KEY no configurada");
+  const account = input.existingAccountId
+    ? await stripe.accounts.retrieve(input.existingAccountId)
+    : await stripe.accounts.create({
+        type: "express",
+        country: "ES",
+        email: input.email,
+        business_type: input.legalForm === "autonomo" ? "individual" : "company",
+        capabilities: { card_payments: { requested: true }, transfers: { requested: true } },
+        business_profile: { name: input.legalName, product_description: "Restaurante partner de PIKI Delivery" },
+        metadata: { piki_restaurant_id: input.restaurantId, piki_role: "marketplace_partner" },
+      });
+  const link = await stripe.accountLinks.create({
+    account: account.id,
+    type: "account_onboarding",
+    refresh_url: input.refreshUrl,
+    return_url: input.returnUrl,
+    collection_options: { fields: "eventually_due" },
+  });
+  return { account, link };
+}
+
 export function isStripeSignatureError(error: unknown): boolean {
   return error instanceof Error && error.name === "StripeSignatureVerificationError";
 }

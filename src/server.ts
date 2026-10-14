@@ -17,7 +17,7 @@ import { getVersionPolicy, isPikiSurface, requiresUpdate, setVersionPolicy, sync
 import { publicPushConfig, revokePushSubscription, savePushSubscription } from "./push.js";
 import { publishOrderStatusEvents, publishOrderIntakeEvents, publishRiderOfferEvent, publishRiderArrivalEvent, publishRiderLocationEvents, publishRiderScheduleEvent, publishRiderCustomerMessageEvent, publishRealtimeEvent, serveRealtimeEvents, startRealtimeRelay, tenantAudienceKey } from "./realtime.js";
 import { listNotifications, markAllNotificationsRead, markNotificationRead, sendDocumentRequestEmail, sendDocumentUploadEmail, startNotificationWorker, stopNotificationWorker, type NotificationPrincipal } from "./notifications.js";
-import { captureStripePaymentIntent, createCheckoutSession } from "./stripe.js";
+import { captureStripePaymentIntent, createCheckoutSession, createPartnerStripeOnboardingLink } from "./stripe.js";
 import { rankDispatchCandidates, computeMobilityAdvice, calculateSanctionDecision, defaultSanctionPolicy } from "./algorithms/index.js";
 import { createSessionToken, generateTemporaryPassword, hashPassword, hashSessionToken, verifyPassword } from "./employeeAuth.js";
 import { EmployeePasswordReset } from "./passwordReset.js";
@@ -32,11 +32,14 @@ import { awardRiderRecruitmentMilestones, claimRiderReferralCode, completeRiderS
 import { buildApprovedRiderOperationalProfile } from "./riderApproval.js";
 import { COMING_SOON_SLUGS, CUSTOMER_CATALOG_RESTAURANT_FILTER, CUSTOMER_ORDERABLE_RESTAURANT_FILTER, customerMenuForRestaurant, presentCustomerCatalogRestaurant } from "./customerCatalogPolicy.js";
 import { PARTNER_DEMO_MENU_VERSION, partnerDemoMenu } from "./partnerDemoMenu.js";
+import { KINGS_TACOS_COVER_IMAGE, kingsTacosMenu } from "./kingsTacosMenu.js";
 import { configuredPartnerRestaurantUpsert } from "./partnerRepairPolicy.js";
 import { quoteMenuItem, usesReferenceAddOns } from "./menuModifiers.js";
 import { decideLatePickup, pointDistanceMeters } from "./pickupPolicy.js";
 import { buildLegacyRiderSupportTicketFilter, buildRiderSupportTicketFilter } from "./supportTicketScope.js";
 import { cashOrderLimitError, isCashOrderWithinLimit } from "./paymentPolicy.js";
+import { calculateMarketplaceBreakdown, DEFAULT_PARTNER_COMMISSION_BPS } from "./marketplaceAccounting.js";
+import { postMarketplaceOrderLedger, preparePartnerPayoutBatch } from "./marketplaceLedger.js";
 import { extractAndParseMenu, readAssetBytes } from "./menuImport.js";
 import { purgeTestDataIfEnabled } from "./purgeTestData.js";
 import { validateDocumentRequestSubmission } from "./onboardingDocumentPolicy.js";
@@ -968,6 +971,11 @@ app.get("/api/v1/catalog/restaurants", async (req, res) => {
     // partnerProfile.documents having select:false nested fields.
     .select("slug name cuisine category locality partnerGroupKey tagline etaMinutes deliveryFeeCents rating reviews promoted image accent phone address location menu isActive onboardingStatus availabilityStatus upcomingAt upcomingMessage")
     .sort({ promoted: -1, rating: -1, reviews: -1 }).lean().exec();
+  const catalogPriority: Record<string, number> = {
+    "alibaba-kebab-xativa": 0,
+    "kings-tacos-xativa": 1,
+  };
+  restaurants.sort((left: any, right: any) => (catalogPriority[left.slug] ?? 10) - (catalogPriority[right.slug] ?? 10));
   const body = { restaurants: restaurants.map((restaurant: any) => presentCustomerCatalogRestaurant(restaurant)) };
   catalogCache.set(cacheKey, { expiresAt: Date.now() + CATALOG_CACHE_MS, body });
   void sharedCacheSet(`piki:catalog:${cacheKey}`, body, 30);
@@ -1106,6 +1114,20 @@ app.patch("/api/v1/admin/partner-leads/:id", requireRole("admin", "commercial", 
 const partnerDocumentSchema = z.object({ type: z.enum(["tax_id", "bank_certificate", "insurance", "activity_license", "food_sanitary_authorization", "identity", "other"]), fileName: z.string().min(1).max(180), mimeType: z.enum(DOCUMENT_UPLOAD_MIME_TYPES), sizeBytes: z.number().int().positive().max(2_500_000), sha256: z.string().regex(/^[a-f0-9]{64}$/), contentBase64: z.string().min(20).max(3_500_000) });
 const openingHoursSchema = z.record(z.string().min(2).max(15), z.object({ open: z.string().regex(/^\d{2}:\d{2}$/), close: z.string().regex(/^\d{2}:\d{2}$/), closed: z.boolean() }));
 const partnerSchema = z.object({ name: z.string().min(2).max(160), email: z.string().email(), password: z.string().min(12).max(200).regex(/[A-Z]/).regex(/[a-z]/).regex(/[0-9]/), phone: z.string().min(6).max(40), address: z.string().min(5).max(280), legalName: z.string().min(2).max(180), taxId: z.string().regex(/^[A-Za-z0-9-]{5,20}$/), legalForm: z.enum(["autonomo", "sl", "sa", "cooperativa", "otra"]), representativeName: z.string().min(2).max(160), representativeRole: z.string().min(2).max(100), representativeDocument: z.string().min(5).max(30), fiscalAddress: z.string().min(5).max(280), operatingAddress: z.string().min(5).max(280), postalCode: z.string().regex(/^\d{5}$/), city: z.string().min(2).max(100), province: z.string().min(2).max(100), iban: z.string().regex(/^[A-Z]{2}\d{2}[A-Z0-9]{10,30}$/), bankAccountHolder: z.string().min(2).max(180), cuisine: z.string().min(2).max(100), vatRate: z.union([z.literal(4), z.literal(10), z.literal(21)]), commissionAccepted: z.literal(true), termsAcceptedAt: z.coerce.date(), contractAccepted: z.literal(true), privacyAccepted: z.literal(true), dataProcessingAccepted: z.literal(true), pdaUnits: z.number().int().min(1).max(50), pdaUnitCostCents: z.literal(30000), pdaCostAccepted: z.literal(true), pdaCostAcceptedAt: z.coerce.date(), privacyAcceptedAt: z.coerce.date(), dataProcessingAcceptedAt: z.coerce.date(), openingHours: openingHoursSchema, documents: z.array(partnerDocumentSchema).length(5) });
+app.get("/api/v1/public/partners/:id/stripe/onboarding-link", async (req, res) => {
+  const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
+  if (!id || !process.env.STRIPE_SECRET_KEY) return res.status(404).json({ error: "STRIPE_ONBOARDING_NOT_AVAILABLE" });
+  const restaurant = await Restaurant.findOne({ _id: id, ...await publicOnboardingTenantScope() }).select("name email partnerProfile marketplaceCompliance").lean().exec() as any;
+  if (!restaurant?.marketplaceCompliance?.stripeAccountId) return res.status(404).json({ error: "STRIPE_ACCOUNT_NOT_FOUND" });
+  try {
+    const partnerApp = String(process.env.PARTNER_APP_URL || "https://partners.pikidelivery.com").replace(/\/$/, "");
+    const connected = await createPartnerStripeOnboardingLink({ restaurantId: String(id), email: String(restaurant.email || ""), legalName: String(restaurant.partnerProfile?.legalName || restaurant.name), legalForm: restaurant.partnerProfile?.legalForm || "otra", existingAccountId: restaurant.marketplaceCompliance.stripeAccountId, refreshUrl: `${process.env.API_PUBLIC_URL || "https://api.pikidelivery.com"}/api/v1/public/partners/${String(id)}/stripe/onboarding-link`, returnUrl: `${partnerApp}/?onboarding=stripe-complete&restaurant_id=${encodeURIComponent(String(id))}` });
+    await Restaurant.updateOne({ _id: id }, { $set: { "marketplaceCompliance.stripeStatus": "onboarding", "marketplaceCompliance.lastSyncedAt": new Date() } }).exec();
+    return res.redirect(connected.link.url);
+  } catch (error) {
+    return res.status(502).json({ error: "STRIPE_ONBOARDING_LINK_FAILED", message: error instanceof Error ? error.message : "No se pudo crear el enlace Stripe." });
+  }
+});
 app.post("/api/v1/partners/onboarding", async (req, res) => {
   const parsed = partnerSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_PARTNER", details: parsed.error.flatten() });
@@ -1129,6 +1151,20 @@ app.post("/api/v1/partners/onboarding", async (req, res) => {
   const locality = city.trim();
   const groupKey = localityKey(locality);
   const partner = await Restaurant.create({ ...publicTenant, slug, name: contact.name, cuisine, category: cuisine, locality, partnerGroupKey: groupKey, address: operatingAddress, tagline: "Solicitud recibida por PIKI", onboardingStatus: "pending_review", isActive: false, email: contact.email, phone: contact.phone, partnerProfile: { legalName, taxId: taxId.toUpperCase(), legalForm, representativeName, representativeRole, representativeDocument, fiscalAddress, operatingAddress, postalCode, city, province, iban: iban.toUpperCase(), bankAccountHolder, cuisine, vatRate, commissionAccepted, termsAcceptedAt, contractAcceptedAt: contractAccepted ? termsAcceptedAt : null, privacyAcceptedAt, dataProcessingAcceptedAt, pdaUnits, pdaUnitCostCents, pdaCostAcceptedAt: pdaCostAccepted ? pdaCostAcceptedAt : null, openingHours, documents: documents.map(({ contentBase64, ...metadata }) => ({ ...metadata, contentBase64, status: "received" })) } });
+  let stripeOnboarding: { accountId: string; url: string } | null = null;
+  if (process.env.STRIPE_SECRET_KEY) {
+    try {
+      const partnerApp = String(process.env.PARTNER_APP_URL || "https://partners.pikidelivery.com").replace(/\/$/, "");
+      const connected = await createPartnerStripeOnboardingLink({ restaurantId: String(partner._id), email: normalizedEmail, legalName, legalForm, refreshUrl: `${partnerApp}/?onboarding=stripe-refresh&restaurant_id=${encodeURIComponent(String(partner._id))}`, returnUrl: `${partnerApp}/?onboarding=stripe-complete&restaurant_id=${encodeURIComponent(String(partner._id))}` });
+      stripeOnboarding = { accountId: connected.account.id, url: connected.link.url };
+      await Restaurant.updateOne({ _id: partner._id }, { $set: { onboardingStage: "stripe", "onboardingChecklist.profile": true, "onboardingChecklist.documents": true, "onboardingChecklist.stripe": false, "marketplaceCompliance.stripeAccountId": connected.account.id, "marketplaceCompliance.stripeStatus": "onboarding", "marketplaceCompliance.pikiStatus": "in_review" } }).exec();
+    } catch (error) {
+      console.warn("Partner Stripe onboarding link creation failed", error instanceof Error ? error.message : error);
+      await Restaurant.updateOne({ _id: partner._id }, { $set: { onboardingStage: "review", "onboardingChecklist.profile": true, "onboardingChecklist.documents": true, "onboardingChecklist.stripe": false, "marketplaceCompliance.pikiStatus": "in_review" } }).exec();
+    }
+  } else {
+    await Restaurant.updateOne({ _id: partner._id }, { $set: { onboardingStage: "review", "onboardingChecklist.profile": true, "onboardingChecklist.documents": true, "marketplaceCompliance.pikiStatus": "in_review" } }).exec();
+  }
   try {
     await EmployeeAccount.create({ ...publicTenant, name: contact.name, email: normalizedEmail, jobRole: "partner", apiRole: "partner", roles: ["partner"], partnerRoles: ["partner_admin"], accessLevel: "subadmin", authorizationStatus: "pending", restaurantId: partner._id, restaurantIds: [partner._id], passwordHash: hashPassword(parsed.data.password), mustChangePassword: false, active: false });
   } catch (error) {
@@ -1138,7 +1174,7 @@ app.post("/api/v1/partners/onboarding", async (req, res) => {
   }
   await PartnerLocalityGroup.findOneAndUpdate({ ...publicTenant, localityKey: groupKey }, { $set: { localityName: locality, province, isActive: true }, $setOnInsert: publicTenant, $addToSet: { restaurantIds: partner._id } }, { upsert: true, new: true });
   await notifyOnboarding({ channel: "admin", type: "onboarding.partner_application.created", entityId: String(partner._id), tenantId: (partner as any).tenantId });
-  res.status(201).json({ message: "Solicitud recibida para revisión.", partner: { id: partner.id, partnerCode: onboardingCode("P", partner._id), name: partner.name, email: partner.email, phone: partner.phone, locality, partnerGroupKey: groupKey, onboarding_status: partner.onboardingStatus } });
+  res.status(201).json({ message: "Solicitud recibida. Completa la verificación de Stripe para que PIKI pueda liquidar tus ventas.", partner: { id: partner.id, partnerCode: onboardingCode("P", partner._id), name: partner.name, email: partner.email, phone: partner.phone, locality, partnerGroupKey: groupKey, onboarding_status: partner.onboardingStatus, onboarding_stage: stripeOnboarding ? "stripe" : "review", checklist: { profile: true, documents: true, stripe: Boolean(stripeOnboarding), adminReview: false }, stripe_onboarding_url: stripeOnboarding?.url || null } });
 });
 
 function assignedRestaurantIds(employee: any): string[] {
@@ -1382,6 +1418,26 @@ app.patch("/api/v1/partners/store/status", requireRole("partner"), async (req, r
   const restaurant = await Restaurant.findOneAndUpdate({ _id: restaurantId, onboardingStatus: "approved" }, { $set: { isActive: parsed.data.status === "open" } }, { new: true }).select("_id name isActive").lean().exec() as any;
   if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
   return res.json({ restaurant: { id: String(restaurant._id), name: restaurant.name }, status: restaurant.isActive ? "open" : "paused", isOpen: Boolean(restaurant.isActive) });
+});
+app.get("/api/v1/partners/store/hours", requireRole("partner"), async (req, res) => {
+  const { access, allowed } = await partnerRequestAccess(req, "store:write");
+  if (!allowed) return res.status(403).json({ error: "PARTNER_PERMISSION_DENIED", permission: "store:write" });
+  const restaurantId = await employeeRestaurant(req, access);
+  if (!restaurantId) return res.status(403).json({ error: "PARTNER_RESTAURANT_NOT_ASSIGNED" });
+  const restaurant = await Restaurant.findOne({ _id: restaurantId, onboardingStatus: "approved", ...tenantScope(req) }).select("_id name isActive partnerProfile.openingHours").lean().exec() as any;
+  if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
+  return res.json({ restaurantId: String(restaurant._id), name: restaurant.name, isOpen: Boolean(restaurant.isActive), openingHours: restaurant.partnerProfile?.openingHours || {} });
+});
+app.patch("/api/v1/partners/store/hours", requireRole("partner"), async (req, res) => {
+  const { access, allowed } = await partnerRequestAccess(req, "store:write");
+  if (!allowed) return res.status(403).json({ error: "PARTNER_PERMISSION_DENIED", permission: "store:write" });
+  const restaurantId = await employeeRestaurant(req, access);
+  const parsed = openingHoursSchema.safeParse(req.body?.openingHours ?? req.body);
+  if (!restaurantId) return res.status(403).json({ error: "PARTNER_RESTAURANT_NOT_ASSIGNED" });
+  if (!parsed.success) return res.status(400).json({ error: "INVALID_OPENING_HOURS", details: parsed.error.flatten() });
+  const restaurant = await Restaurant.findOneAndUpdate({ _id: restaurantId, onboardingStatus: "approved", ...tenantScope(req) }, { $set: { "partnerProfile.openingHours": parsed.data } }, { new: true }).select("_id name isActive partnerProfile.openingHours").lean().exec() as any;
+  if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
+  return res.json({ restaurantId: String(restaurant._id), name: restaurant.name, isOpen: Boolean(restaurant.isActive), openingHours: restaurant.partnerProfile?.openingHours || parsed.data });
 });
 app.get("/api/v1/partners/menu", requireRole("partner"), async (req, res) => {
   const { access, allowed } = await partnerRequestAccess(req, "menu:read");
@@ -1686,6 +1742,52 @@ app.get("/api/v1/admin/restaurants/:id/documents/:documentId/content", requireRo
   const result = await Restaurant.updateOne({ _id: id, ...tenantScope(req), "partnerProfile.documents._id": req.params.documentId }, { $set: { "partnerProfile.documents.$.viewedAt": viewedAt, "partnerProfile.documents.$.viewedBy": viewedBy } }).exec();
   if (!result.matchedCount) return res.status(404).json({ error: "DOCUMENT_NOT_FOUND" });
   return res.json({ fileName: sanitizeUploadFileName(document.fileName), mimeType: document.mimeType, sizeBytes: document.sizeBytes, sha256: document.sha256, contentBase64: document.contentBase64, viewedAt: viewedAt.toISOString() });
+});
+
+app.post("/api/v1/admin/restaurants/:id/stripe/onboarding-link", requireRole("admin"), async (req, res) => {
+  const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
+  if (!id) return res.status(400).json({ error: "INVALID_RESTAURANT_ID" });
+  const restaurant = await Restaurant.findOne({ _id: id, ...tenantScope(req) }).select("name email partnerProfile marketplaceCompliance").lean().exec() as any;
+  if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
+  if (!process.env.STRIPE_SECRET_KEY) return res.status(503).json({ error: "STRIPE_NOT_CONFIGURED", message: "Configura Stripe antes de generar el enlace de onboarding." });
+  try {
+    const partnerApp = String(process.env.PARTNER_APP_URL || "https://partners.pikidelivery.com").replace(/\/$/, "");
+    const connected = await createPartnerStripeOnboardingLink({ restaurantId: String(id), email: String(restaurant.email || ""), legalName: String(restaurant.partnerProfile?.legalName || restaurant.name), legalForm: restaurant.partnerProfile?.legalForm || "otra", existingAccountId: restaurant.marketplaceCompliance?.stripeAccountId, refreshUrl: `${partnerApp}/?onboarding=stripe-refresh&restaurant_id=${encodeURIComponent(String(id))}`, returnUrl: `${partnerApp}/?onboarding=stripe-complete&restaurant_id=${encodeURIComponent(String(id))}` });
+    await Restaurant.updateOne({ _id: id, ...tenantScope(req) }, { $set: { onboardingStage: "stripe", "marketplaceCompliance.stripeAccountId": connected.account.id, "marketplaceCompliance.stripeStatus": "onboarding", "marketplaceCompliance.lastSyncedAt": new Date() } }).exec();
+    return res.json({ restaurantId: String(id), stripeAccountId: connected.account.id, url: connected.link.url });
+  } catch (error) {
+    return res.status(502).json({ error: "STRIPE_ONBOARDING_LINK_FAILED", message: error instanceof Error ? error.message : "No se pudo crear el enlace Stripe." });
+  }
+});
+app.get("/api/v1/admin/restaurants/:id/compliance", requireRole("admin"), async (req, res) => {
+  const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
+  if (!id) return res.status(400).json({ error: "INVALID_RESTAURANT_ID" });
+  const restaurant = await Restaurant.findOne({ _id: id, ...tenantScope(req) }).lean().exec() as any;
+  if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
+  const profile = restaurant.partnerProfile || {};
+  const compliance = restaurant.marketplaceCompliance || {};
+  const documents = (profile.documents || []).map(({ contentBase64, ...metadata }: any) => metadata);
+  return res.json({ restaurantId: String(restaurant._id), restaurantName: restaurant.name, legalName: profile.legalName || null, taxId: profile.taxId || null, compliance: { pikiStatus: compliance.pikiStatus || "pending", stripeAccountId: compliance.stripeAccountId || null, stripeStatus: compliance.stripeStatus || "not_created", chargesEnabled: Boolean(compliance.chargesEnabled), payoutsEnabled: Boolean(compliance.payoutsEnabled), currentlyDue: compliance.currentlyDue || [], pastDue: compliance.pastDue || [], pendingVerification: compliance.pendingVerification || [], rejectionReason: compliance.rejectionReason || null, reviewedAt: compliance.reviewedAt || null }, documents });
+});
+
+app.patch("/api/v1/admin/restaurants/:id/compliance/status", requireRole("admin"), async (req, res) => {
+  const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
+  if (!id) return res.status(400).json({ error: "INVALID_RESTAURANT_ID" });
+  const parsed = z.object({ status: z.enum(["in_review", "verified", "rejected", "suspended"]), rejectionReason: z.string().trim().max(1000).default("") }).safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "INVALID_COMPLIANCE_STATUS", details: parsed.error.flatten() });
+  const existing = await Restaurant.findOne({ _id: id, ...tenantScope(req) }).select("partnerProfile marketplaceCompliance name").lean().exec() as any;
+  if (!existing) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
+  const documents = existing.partnerProfile?.documents || [];
+  const requiredDocuments = documents.length > 0;
+  const allDocumentsApproved = requiredDocuments && documents.every((document: any) => document.status === "approved");
+  if (parsed.data.status === "verified" && !allDocumentsApproved) return res.status(409).json({ error: "KYB_DOCUMENT_REVIEW_REQUIRED", message: "Aprueba todos los documentos obligatorios antes de verificar el expediente KYB." });
+  if (parsed.data.status === "rejected" && !parsed.data.rejectionReason) return res.status(400).json({ error: "KYB_REJECTION_REASON_REQUIRED", message: "Indica el motivo del rechazo para dejar trazabilidad." });
+  const now = new Date();
+  const update = { $set: { "marketplaceCompliance.pikiStatus": parsed.data.status, "marketplaceCompliance.rejectionReason": parsed.data.status === "rejected" ? parsed.data.rejectionReason : null, "marketplaceCompliance.reviewedAt": now, "marketplaceCompliance.reviewedBy": objectId(req.auth!.employeeId!) } };
+  const restaurant = await Restaurant.findOneAndUpdate({ _id: id, ...tenantScope(req) }, update, { new: true }).lean().exec() as any;
+  if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
+  await notifyOnboarding({ channel: "admin", type: "onboarding.partner_kyb.updated", entityId: String(id), tenantId: (restaurant as any).tenantId, payload: { restaurantId: String(id), status: parsed.data.status } });
+  return res.json({ restaurantId: String(id), compliance: restaurant.marketplaceCompliance });
 });
 
 app.patch("/api/v1/admin/restaurants/:id/documents/:documentId/status", requireRole("admin"), async (req, res) => {
@@ -2383,16 +2485,31 @@ app.post("/api/v1/orders", rateLimit(20, 60_000, "orders-create"), async (req, r
   const deliveryFeeCents = coverage.deliveryFeeCents;
   const serviceFeeCents = coverage.serviceFeeCents;
   const totalCents = subtotalCents + deliveryFeeCents + serviceFeeCents;
+  const marketplace = calculateMarketplaceBreakdown({
+    subtotalCents,
+    deliveryFeeCents,
+    serviceFeeCents,
+    commissionRateBps: Number(restaurant.partnerProfile?.commissionRateBps ?? DEFAULT_PARTNER_COMMISSION_BPS),
+    riderEarningsCents: Math.max(0, Number(process.env.PIKI_RIDER_PAYOUT_CENTS || 350)),
+  });
+  if (marketplace.customerTotalCents !== totalCents) return res.status(500).json({ error: "MARKETPLACE_TOTAL_MISMATCH" });
   if (!isCashOrderWithinLimit(parsed.data.paymentMethod, totalCents)) return res.status(422).json(cashOrderLimitError(totalCents));
   const publicCode = await createRandomOrderCode();
   const dailyCode = await createDailyDisplayCode();
   const authenticatedCustomer = await currentCustomer(req) as any;
-  const order = await Order.create({ tenantId: restaurant.tenantId || null, publicCode, ...dailyCode, restaurantId: restaurant._id, customerId: authenticatedCustomer?._id || null, customerName: String(authenticatedCustomer?.name || "").trim(), items: normalizedItems, deliveryAddress: parsed.data.deliveryAddress, deliveryNote: parsed.data.deliveryNote, deliveryLocation: { type: "Point", coordinates: deliveryPoint }, coveragePolicySlug: coverage.policySlug, coveragePolicyVersion: coverage.policyVersion, coverageDecision: coverage.reason, straightLineDistanceKm: coverage.straightLineDistanceKm, withinMunicipality: coverage.withinMunicipality, deliveryBaseFeeCents: coverage.deliveryBaseFeeCents, outsideMunicipalitySurchargeCents: coverage.outsideMunicipalitySurchargeCents, routeDistanceKm: route.routeDistanceKm, routeDurationMinutes: route.routeDurationMinutes, routeProvider: route.routeProvider, routingDegraded: route.routingDegraded, requiredVehicleClasses: route.requiredVehicleClasses, subtotalCents, deliveryFeeCents, serviceFeeCents, totalCents, paymentMethod: parsed.data.paymentMethod, paymentState: "pending", statusHistory: [{ status: "pending", actorRole: "customer", reason: parsed.data.paymentMethod === "cash" ? "Pedido a contrarreembolso; cobro pendiente hasta la entrega" : "Pedido creado con política de cobertura Xàtiva" }] });
+  const order = await Order.create({ tenantId: restaurant.tenantId || null, publicCode, ...dailyCode, restaurantId: restaurant._id, customerId: authenticatedCustomer?._id || null, customerName: String(authenticatedCustomer?.name || "").trim(), items: normalizedItems, deliveryAddress: parsed.data.deliveryAddress, deliveryNote: parsed.data.deliveryNote, deliveryLocation: { type: "Point", coordinates: deliveryPoint }, coveragePolicySlug: coverage.policySlug, coveragePolicyVersion: coverage.policyVersion, coverageDecision: coverage.reason, straightLineDistanceKm: coverage.straightLineDistanceKm, withinMunicipality: coverage.withinMunicipality, deliveryBaseFeeCents: coverage.deliveryBaseFeeCents, outsideMunicipalitySurchargeCents: coverage.outsideMunicipalitySurchargeCents, routeDistanceKm: route.routeDistanceKm, routeDurationMinutes: route.routeDurationMinutes, routeProvider: route.routeProvider, routingDegraded: route.routingDegraded, requiredVehicleClasses: route.requiredVehicleClasses, subtotalCents, deliveryFeeCents, serviceFeeCents, totalCents,
+    marketplaceCommissionRateBps: marketplace.commissionRateBps,
+    marketplaceCommissionCents: marketplace.platformCommissionCents,
+    partnerPayoutCents: marketplace.partnerPayoutCents,
+    riderEarningsCents: marketplace.riderEarningsCents,
+    platformNetBeforeProcessingCents: marketplace.platformNetBeforeProcessingCents,
+    payoutStatus: "pending", paymentMethod: parsed.data.paymentMethod, paymentState: "pending", statusHistory: [{ status: "pending", actorRole: "customer", reason: parsed.data.paymentMethod === "cash" ? "Pedido a contrarreembolso; cobro pendiente hasta la entrega" : "Pedido creado con política de cobertura Xàtiva" }] });
   if (parsed.data.paymentMethod === "cash") {
     const dispatch = enqueueOrderForDispatch(order._id as mongoose.Types.ObjectId).catch((error) => console.warn("Dispatch outbox enqueue failed", error instanceof Error ? error.message : error));
     await Promise.all([dispatch, publishOrderIntakeEvents(order, { settlement: "cash_due", message: "Contrarreembolso: el Rider cobrará en efectivo al entregar." })]);
   }
-  res.status(201).json({ order: { id: order.id, publicCode, displayCode: order.displayCode, displayCodeDate: order.displayCodeDate, status: order.status, paymentState: parsed.data.paymentMethod === "cash" ? "pending_cash_collection" : order.paymentState, paymentMethod: parsed.data.paymentMethod, cashDueAtDelivery: parsed.data.paymentMethod === "cash", deliveryQrUrl: deliveryQrUrl(publicCode), subtotalCents, deliveryFeeCents, serviceFeeCents, totalCents, coverage, route, partnerPreparationLimitMinutes: PARTNER_PREPARATION_LIMIT_MINUTES, customerDeliveryTargetMinutes: CUSTOMER_DELIVERY_TARGET_MINUTES, etaMinutes: calculateEtaRange([PARTNER_PREPARATION_LIMIT_MINUTES, PARTNER_PREPARATION_LIMIT_MINUTES], [5, 15]) } });
+  res.status(201).json({ order: { id: order.id, publicCode, displayCode: order.displayCode, displayCodeDate: order.displayCodeDate, status: order.status, paymentState: parsed.data.paymentMethod === "cash" ? "pending_cash_collection" : order.paymentState, paymentMethod: parsed.data.paymentMethod, cashDueAtDelivery: parsed.data.paymentMethod === "cash", deliveryQrUrl: deliveryQrUrl(publicCode), subtotalCents, deliveryFeeCents, serviceFeeCents, totalCents,
+    marketplace: { commissionRateBps: marketplace.commissionRateBps, commissionCents: marketplace.platformCommissionCents, partnerPayoutCents: marketplace.partnerPayoutCents, riderEarningsCents: marketplace.riderEarningsCents, platformNetBeforeProcessingCents: marketplace.platformNetBeforeProcessingCents }, coverage, route, partnerPreparationLimitMinutes: PARTNER_PREPARATION_LIMIT_MINUTES, customerDeliveryTargetMinutes: CUSTOMER_DELIVERY_TARGET_MINUTES, etaMinutes: calculateEtaRange([PARTNER_PREPARATION_LIMIT_MINUTES, PARTNER_PREPARATION_LIMIT_MINUTES], [5, 15]) } });
 });
 
 const customerOrderSyncSchema = z.object({ publicCode: z.string().trim().min(6).max(64), restaurantSlug: z.string().trim().min(1).max(120), customerId: z.string().nullable().optional(), customerName: z.string().trim().max(160).nullable().optional(), deliveryAddress: z.string().trim().min(5).max(1000), deliveryNote: z.string().trim().max(500).default(""), deliveryLocation: z.object({ latitude: z.number().finite(), longitude: z.number().finite() }).nullable().optional(), items: z.array(z.object({ itemId: z.string().min(1), name: z.string().min(1), quantity: z.number().int().min(1).max(20), unitPriceCents: z.number().int().min(0), totalCents: z.number().int().min(0).optional() })).min(1), subtotalCents: z.number().int().min(0), deliveryFeeCents: z.number().int().min(0), serviceFeeCents: z.number().int().min(0), totalCents: z.number().int().min(0), paymentMethod: z.enum(["stripe", "cash"]).default("stripe"), paymentState: z.enum(["pending", "authorized", "paid", "failed", "refunded"]).default("pending"), stripeCheckoutSessionId: z.string().nullable().optional(), stripePaymentIntentId: z.string().nullable().optional() });
@@ -2408,6 +2525,14 @@ app.post("/api/v1/internal/customer-orders/sync", async (req, res) => {
   const location = input.deliveryLocation ? { type: "Point", coordinates: [input.deliveryLocation.longitude, input.deliveryLocation.latitude] } : restaurant.location;
   if (!location?.coordinates?.length) return res.status(409).json({ error: "DELIVERY_LOCATION_REQUIRED" });
   if (!isCashOrderWithinLimit(input.paymentMethod, input.totalCents)) return res.status(422).json(cashOrderLimitError(input.totalCents));
+  const marketplace = calculateMarketplaceBreakdown({
+    subtotalCents: input.subtotalCents,
+    deliveryFeeCents: input.deliveryFeeCents,
+    serviceFeeCents: input.serviceFeeCents,
+    commissionRateBps: Number(restaurant.partnerProfile?.commissionRateBps ?? DEFAULT_PARTNER_COMMISSION_BPS),
+    riderEarningsCents: Math.max(0, Number(process.env.PIKI_RIDER_PAYOUT_CENTS || 350)),
+  });
+  if (marketplace.customerTotalCents !== input.totalCents) return res.status(409).json({ error: "MARKETPLACE_TOTAL_MISMATCH" });
   // Customer is the source of truth: never rebuild lines from a second menu copy.
   // This prevents price/name drift between Customer, Partner and Rider screens.
   const pricedMenu = customerMenuForRestaurant(restaurant);
@@ -2420,7 +2545,7 @@ app.post("/api/v1/internal/customer-orders/sync", async (req, res) => {
   const canonicalSubtotalCents = canonicalItems.reduce((sum, item) => sum + item.unitPriceCents * item.quantity, 0);
   const canonicalTotalCents = canonicalSubtotalCents + input.deliveryFeeCents + input.serviceFeeCents;
   if (!isCashOrderWithinLimit(input.paymentMethod, canonicalTotalCents)) return res.status(422).json(cashOrderLimitError(canonicalTotalCents));
-  const order = await Order.findOneAndUpdate({ publicCode: input.publicCode }, { $set: { tenantId: restaurant.tenantId || null, restaurantId: restaurant._id, customerId: input.customerId || null, ...(input.customerName !== undefined ? { customerName: input.customerName || "" } : {}), items: canonicalItems, deliveryAddress: input.deliveryAddress, deliveryNote: input.deliveryNote, deliveryLocation: location, subtotalCents: canonicalSubtotalCents, deliveryFeeCents: input.deliveryFeeCents, serviceFeeCents: input.serviceFeeCents, totalCents: canonicalTotalCents, paymentMethod: input.paymentMethod, paymentState: input.paymentState, ...(input.stripeCheckoutSessionId !== undefined ? { stripeCheckoutSessionId: input.stripeCheckoutSessionId } : {}), ...(input.stripePaymentIntentId !== undefined ? { stripePaymentIntentId: input.stripePaymentIntentId } : {}), ...(["authorized", "paid"].includes(input.paymentState) && !["authorized", "paid"].includes(existing?.paymentState || "") ? { status: "pending", assignmentState: "unassigned" } : {}) }, $setOnInsert: { publicCode: input.publicCode, status: "pending", assignmentState: "unassigned", statusHistory: [{ status: "pending", actorRole: "system", reason: "Pedido sincronizado desde PIKI Customer" }] } }, { upsert: true, new: true, setDefaultsOnInsert: true }).lean().exec() as any;
+  const order = await Order.findOneAndUpdate({ publicCode: input.publicCode }, { $set: { tenantId: restaurant.tenantId || null, restaurantId: restaurant._id, customerId: input.customerId || null, ...(input.customerName !== undefined ? { customerName: input.customerName || "" } : {}), items: canonicalItems, deliveryAddress: input.deliveryAddress, deliveryNote: input.deliveryNote, deliveryLocation: location, subtotalCents: canonicalSubtotalCents, deliveryFeeCents: input.deliveryFeeCents, serviceFeeCents: input.serviceFeeCents, totalCents: canonicalTotalCents, marketplaceCommissionRateBps: marketplace.commissionRateBps, marketplaceCommissionCents: marketplace.platformCommissionCents, partnerPayoutCents: marketplace.partnerPayoutCents, riderEarningsCents: marketplace.riderEarningsCents, platformNetBeforeProcessingCents: marketplace.platformNetBeforeProcessingCents, payoutStatus: "pending", paymentMethod: input.paymentMethod, paymentState: input.paymentState, ...(input.stripeCheckoutSessionId !== undefined ? { stripeCheckoutSessionId: input.stripeCheckoutSessionId } : {}), ...(input.stripePaymentIntentId !== undefined ? { stripePaymentIntentId: input.stripePaymentIntentId } : {}), ...(["authorized", "paid"].includes(input.paymentState) && !["authorized", "paid"].includes(existing?.paymentState || "") ? { status: "pending", assignmentState: "unassigned" } : {}) }, $setOnInsert: { publicCode: input.publicCode, status: "pending", assignmentState: "unassigned", statusHistory: [{ status: "pending", actorRole: "system", reason: "Pedido sincronizado desde PIKI Customer" }] } }, { upsert: true, new: true, setDefaultsOnInsert: true }).lean().exec() as any;
   const newlyPaid = ["authorized", "paid"].includes(input.paymentState) && !["authorized", "paid"].includes(existing?.paymentState || "");
   const newCashOrder = input.paymentMethod === "cash" && !existing;
   if (newlyPaid || newCashOrder) {
@@ -3059,9 +3184,10 @@ app.post("/api/v1/riders/:riderId/orders/:orderId/confirm-delivery", requireRole
   // a successfully captured delivery merely because that benign event won the
   // version race. Status/rider/assignment predicates remain the concurrency
   // guard, and Stripe orders must be authorized or already marked paid.
-  const updated = await Order.findOneAndUpdate({ _id: orderId, riderId, assignmentState: "assigned", status: "on_the_way", ...(order.paymentMethod === "stripe" ? { paymentState: { $in: ["authorized", "paid"] } } : {}) }, { $set: { status: "delivered", deliveredAt: new Date(), archivedAt: new Date(), ...(order.paymentMethod === "stripe" ? { paymentState: "paid" } : {}) }, $inc: { version: 1 }, $push: { statusHistory: { status: "delivered", actorRole: "rider", reason: order.paymentMethod === "cash" ? "Entrega confirmada y cobro en efectivo registrado" : "Entrega confirmada por el Rider" } } }, { new: true }).lean().exec();
+  const updated = await Order.findOneAndUpdate({ _id: orderId, riderId, assignmentState: "assigned", status: "on_the_way", ...(order.paymentMethod === "stripe" ? { paymentState: { $in: ["authorized", "paid"] } } : {}) }, { $set: { status: "delivered", deliveredAt: new Date(), archivedAt: new Date(), paymentState: "paid" }, $inc: { version: 1 }, $push: { statusHistory: { status: "delivered", actorRole: "rider", reason: order.paymentMethod === "cash" ? "Entrega confirmada y cobro en efectivo registrado" : "Entrega confirmada por el Rider" } } }, { new: true }).lean().exec();
   if (!updated) return res.status(409).json({ error: "ORDER_CHANGED_RETRY" });
   const deliveredOrder = updated as any;
+  await postMarketplaceOrderLedger(deliveredOrder).catch((error) => console.error("Marketplace ledger posting failed", error instanceof Error ? error.message : error));
   await RiderOrderMessage.deleteMany({ orderId, riderId }).exec();
   await releaseRiderOrderSlot(orderId, riderId);
   if (!order.isTestOrder) await awardRiderRecruitmentMilestones(riderId).catch((error) => console.error("Rider referral milestone evaluation failed", error instanceof Error ? error.message : error));
@@ -3970,6 +4096,28 @@ app.get("/api/v1/fleets/pending-partner-orders", requireRole("admin", "fleet", "
   const names = new Map(restaurants.map((restaurant) => [String(restaurant._id), restaurant.name]));
   return res.json({ orders: orders.map((order) => ({ id: String(order._id), publicCode: order.publicCode, restaurant: names.get(String(order.restaurantId)) || "Restaurante", totalCents: order.totalCents, createdAt: order.createdAt, status: order.status, paymentState: order.paymentState, paymentMethod: order.paymentMethod || "stripe", cashDueAtDelivery: order.paymentMethod === "cash", assignmentState: order.assignmentState })) });
 });
+const payoutPeriodSchema = z.object({ restaurantId: z.string().regex(/^[a-f\d]{24}$/i), startsAt: z.coerce.date(), endsAt: z.coerce.date() }).refine((value) => value.endsAt > value.startsAt, "INVALID_PAYOUT_PERIOD");
+app.get("/api/v1/finance/partner-balances", requireRole("admin", "finance"), async (req, res) => {
+  const tenant = tenantScope(req);
+  const balances = await Order.aggregate([
+    { $match: { ...tenant, status: "delivered", paymentState: "paid", payoutStatus: { $in: ["eligible", "pending"] } } },
+    { $group: { _id: "$restaurantId", orders: { $sum: 1 }, partnerPayoutCents: { $sum: "$partnerPayoutCents" }, marketplaceCommissionCents: { $sum: "$marketplaceCommissionCents" }, riderEarningsCents: { $sum: "$riderEarningsCents" } } },
+    { $sort: { partnerPayoutCents: -1 } },
+  ]);
+  const restaurants = await Restaurant.find({ ...tenant, _id: { $in: balances.map((row: any) => row._id) } }).select("name slug").lean().exec() as any[];
+  const names = new Map(restaurants.map((restaurant) => [String(restaurant._id), restaurant]));
+  return res.json({ balances: balances.map((row: any) => ({ restaurant: names.get(String(row._id)) || null, orders: Number(row.orders), partnerPayoutCents: Number(row.partnerPayoutCents || 0), marketplaceCommissionCents: Number(row.marketplaceCommissionCents || 0), riderEarningsCents: Number(row.riderEarningsCents || 0) })) });
+});
+app.post("/api/v1/finance/payout-batches/prepare", requireRole("admin", "finance"), async (req, res) => {
+  const parsed = payoutPeriodSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "INVALID_PAYOUT_PERIOD", details: parsed.error.flatten() });
+  const restaurantId = objectId(parsed.data.restaurantId);
+  if (!restaurantId) return res.status(400).json({ error: "INVALID_RESTAURANT_ID" });
+  const restaurant = await Restaurant.findOne({ _id: restaurantId, ...tenantScope(req) }).select("_id").lean().exec();
+  if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
+  const result = await preparePartnerPayoutBatch({ restaurantId, startsAt: parsed.data.startsAt, endsAt: parsed.data.endsAt, tenantId: (req.auth as any)?.tenantId || null });
+  return res.status(201).json({ ...result, execution: "blocked_until_stripe_connect_and_kyb_approval" });
+});
 app.get("/api/v1/finance/overview", requireRole("admin", "finance"), async (req, res) => {
   const startOfDay = new Date(); startOfDay.setHours(0, 0, 0, 0);
   const tenant = tenantScope(req);
@@ -4186,12 +4334,30 @@ async function repairConfiguredPartnerAccess() {
           upcomingMessage: "Disponible muy pronto",
           onboardingStatus: "approved",
           isActive: false,
+          ...(location.slug === "alibaba-kebab-xativa" ? {
+            image: "https://glovo.dhmedia.io/image/stores-glovo/stores/ec0c56634066c61c377459150e646d1c604d45d816253eb90aba007057bf2269?t=W3sicmVzaXplIjp7Im1vZGUiOiJmaWxsIiwid2lkdGgiOjEyODAsImhlaWdodCI6MTIwfX0seyJ3ZWJwIjp7InEiOiJsb3cifX1d",
+            promoted: true,
+          } : {}),
         },
         $setOnInsert: { slug: location.slug, tagline: "Próximo partner PIKI en Xàtiva", phone: "", address: "Xàtiva" },
       },
       { upsert: true, new: true, setDefaultsOnInsert: true },
     ).select("_id slug name").lean().exec()))
     : [];
+  const alibabaGoLive = process.env.REPAIR_PARTNER_ALIBABA_GO_LIVE === "true" || email === "rrhh.milchollos@gmail.com";
+  if (alibabaGoLive) {
+    await Restaurant.updateOne(
+      { slug: "alibaba-kebab-xativa", tenantId: account.tenantId || null, onboardingStatus: "approved" },
+      { $set: { availabilityStatus: "available", upcomingMessage: "", isActive: true } },
+    ).exec();
+  }
+  const kingsGoLive = process.env.REPAIR_PARTNER_KINGS_GO_LIVE === "true" || email === "rrhh.milchollos@gmail.com";
+  if (kingsGoLive) {
+    await Restaurant.updateOne(
+      { slug: "kings-tacos-xativa", tenantId: account.tenantId || null, onboardingStatus: "approved" },
+      { $set: { availabilityStatus: "available", upcomingMessage: "", isActive: true, image: KINGS_TACOS_COVER_IMAGE, promoted: false, menu: kingsTacosMenu } },
+    ).exec();
+  }
   const portfolioIds = [restaurant._id, ...assignedRestaurants.map((location: any) => location._id)];
   if (includeXativaTestPortfolio && new Set(assignedRestaurants.map((location: any) => location.slug)).size !== COMING_SOON_SLUGS.length) {
     throw new Error("Configured Xàtiva test portfolio does not match the public catalog");
