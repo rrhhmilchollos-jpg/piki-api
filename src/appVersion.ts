@@ -104,16 +104,19 @@ export function setAllVersionPolicies(next: VersionPolicyMap): void {
 }
 
 /**
- * Mandatory updates are a compatibility decision, so they must be based on
- * ordered semantic versions. A build ID is diagnostic metadata only: hashes
- * cannot establish whether a different client is older or newer and therefore
- * must never lock a valid client out of login or operational API routes.
+ * A semantic minimum protects compatibility. Once a release is published with
+ * forceUpdate, a different build hash also means the tab is stale and must
+ * receive the recovery/update UI; the frontend still defers the reload while
+ * a payment, delivery, or form is active.
  */
 export function requiresUpdate(
   policy: VersionPolicy,
   clientVersion?: string,
-  _clientBuildId?: string,
+  clientBuildId?: string,
   _surface?: PikiSurface,
 ): boolean {
-  return Boolean(policy.forceUpdate && clientVersion && compareSemver(clientVersion, policy.minimumVersion) < 0);
+  if (!policy.forceUpdate) return false;
+  const olderSemanticVersion = Boolean(clientVersion && compareSemver(clientVersion, policy.minimumVersion) < 0);
+  const staleBuild = Boolean(clientBuildId && clientBuildId !== policy.buildId);
+  return olderSemanticVersion || staleBuild;
 }
