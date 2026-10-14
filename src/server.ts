@@ -1479,10 +1479,15 @@ app.get("/api/v1/partners/kitchen/orders", requireRole("partner"), async (req, r
   if (!allowed) return res.status(403).json({ error: "PARTNER_PERMISSION_DENIED", permission: "orders:read" });
   const restaurantId = await employeeRestaurant(req, access);
   if (!restaurantId) return res.status(403).json({ error: access?.restaurantIds.length ? "PARTNER_RESTAURANT_ACCESS_DENIED" : "PARTNER_RESTAURANT_NOT_ASSIGNED" });
-  const orders = await Order.find({ restaurantId, ...tenantScope(req), ...dispatchablePaymentFilter, status: { $in: ["pending", "accepted", "preparing", "ready_for_pickup"] } }).sort({ createdAt: 1 }).lean().exec() as any[];
-  const [restaurantRecord, customers] = await Promise.all([Restaurant.findOne({ _id: restaurantId, ...tenantScope(req) }).select("name address phone cuisine").lean().exec(), CustomerAccount.find({ _id: { $in: orders.map((order) => order.customerId).filter(Boolean) }, ...tenantScope(req) }).select("name email").lean().exec()]);
+  const orders = await Order.find({ restaurantId, ...tenantScope(req), ...dispatchablePaymentFilter, status: { $in: ["pending", "accepted", "preparing", "ready_for_pickup", "picked_up", "on_the_way"] } }).sort({ createdAt: 1 }).lean().exec() as any[];
+  const [restaurantRecord, customers, riders] = await Promise.all([
+    Restaurant.findOne({ _id: restaurantId, ...tenantScope(req) }).select("name address phone cuisine location").lean().exec(),
+    CustomerAccount.find({ _id: { $in: orders.map((order) => order.customerId).filter(Boolean) }, ...tenantScope(req) }).select("name email").lean().exec(),
+    Rider.find({ _id: { $in: orders.map((order) => order.riderId).filter(Boolean) } }).select("name vehicle location lastLocationAt status").lean().exec(),
+  ]);
   const restaurant = restaurantRecord as any;
   const customerMap = new Map(customers.map((customer: any) => [String(customer._id), customer]));
+  const riderMap = new Map(riders.map((rider: any) => [String(rider._id), rider]));
   return res.json({ orders: orders.map((order: any) => {
     const linkedCustomer = order.customerId ? customerMap.get(String(order.customerId)) : null;
     const customerName = String(linkedCustomer?.name || order.customerName || "").trim();
@@ -1494,6 +1499,13 @@ app.get("/api/v1/partners/kitchen/orders", requireRole("partner"), async (req, r
       pickupPin: order.status === "ready_for_pickup" ? pickupQrPin(order.publicCode) : null,
       partnerPrepDeadlineAt: order.partnerPrepDeadlineAt || null,
       partnerPrepOverdue: Boolean(order.partnerPrepDeadlineAt && new Date(order.partnerPrepDeadlineAt).getTime() < Date.now()),
+      riderTracking: (() => {
+        const rider = order.riderId ? riderMap.get(String(order.riderId)) : null;
+        const coordinates = rider?.location?.coordinates;
+        const lastLocationAt = rider?.lastLocationAt ? new Date(rider.lastLocationAt).getTime() : 0;
+        const fresh = Array.isArray(coordinates) && coordinates.length >= 2 && lastLocationAt >= Date.now() - 120_000;
+        return rider ? { riderId: String(rider._id), name: rider.name || "Rider PIKI", vehicle: rider.vehicle || "unknown", status: rider.status || "offline", latitude: fresh ? Number(coordinates[1]) : null, longitude: fresh ? Number(coordinates[0]) : null, lastLocationAt: fresh ? rider.lastLocationAt : null, fresh } : null;
+      })(),
     };
   }) });
 });
@@ -1721,6 +1733,17 @@ app.patch("/api/v1/admin/restaurants/:id/demo-visibility", requireOwner(), async
   ).select("_id slug name isActive onboardingStatus category cuisine locality menu").lean().exec() as any;
   if (!restaurant) return res.status(404).json({ error: "PIKI_PRUEBA_NOT_FOUND_OR_NOT_APPROVED" });
   return res.json({ updated: true, restaurant });
+});
+
+const partnerCommissionSchema = z.object({ commissionRateBps: z.number().int().min(0).max(5000) });
+app.patch("/api/v1/admin/restaurants/:id/commission", requireOwner(), async (req, res) => {
+  const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
+  if (!id) return res.status(400).json({ error: "INVALID_RESTAURANT_ID" });
+  const parsed = partnerCommissionSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "INVALID_PARTNER_COMMISSION", details: parsed.error.flatten() });
+  const restaurant = await Restaurant.findOneAndUpdate({ _id: id, ...tenantScope(req) }, { $set: { "partnerProfile.commissionRateBps": parsed.data.commissionRateBps } }, { new: true }).select("_id name slug partnerProfile.commissionRateBps").lean().exec() as any;
+  if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
+  return res.json({ restaurant: { id: String(restaurant._id), name: restaurant.name, slug: restaurant.slug, commissionRateBps: Number(restaurant.partnerProfile?.commissionRateBps || 0), commissionPercent: Number(restaurant.partnerProfile?.commissionRateBps || 0) / 100 } });
 });
 
 app.get("/api/v1/admin/restaurants/:id/documents", requireRole("admin"), async (req, res) => {
