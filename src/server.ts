@@ -1198,13 +1198,13 @@ async function partnerLocationsFor(employee: any, roles = partnerRolesForEmploye
   if (!employee?.tenantId) return [];
   const tenantFilter = { tenantId: employee.tenantId };
   let restaurants = ids.length
-    ? await Restaurant.find({ _id: { $in: ids }, ...tenantFilter }).select("_id name address email isActive onboardingStatus").lean().exec() as any[]
+    ? await Restaurant.find({ _id: { $in: ids }, ...tenantFilter }).select("_id name cuisine category locality address email phone deliveryFeeCents promoted availabilityStatus isActive onboardingStatus partnerProfile.commissionRateBps").lean().exec() as any[]
     : [];
   // Compatibilidad con cuentas de prueba/legacy creadas antes de guardar restaurantIds.
   // Solo se acepta una coincidencia exacta de correo entre la cuenta y el comercio.
   if (!restaurants.length && employee?.email) {
     const email = String(employee.email).trim().toLowerCase();
-    if (email) restaurants = await Restaurant.find({ email, ...tenantFilter }).select("_id name address email isActive onboardingStatus").limit(10).lean().exec() as any[];
+    if (email) restaurants = await Restaurant.find({ email, ...tenantFilter }).select("_id name cuisine category locality address email phone deliveryFeeCents promoted availabilityStatus isActive onboardingStatus partnerProfile.commissionRateBps").limit(10).lean().exec() as any[];
   }
   if (!restaurants.length) return [];
   const byId = new Map(restaurants.map((restaurant) => [String(restaurant._id), restaurant]));
@@ -1213,7 +1213,16 @@ async function partnerLocationsFor(employee: any, roles = partnerRolesForEmploye
     id: String(restaurant._id),
     partnerCode: onboardingCode("P", restaurant._id),
     name: restaurant.name,
+    cuisine: restaurant.cuisine || "",
+    category: restaurant.category || "",
+    locality: restaurant.locality || "",
     address: restaurant.address || "",
+    email: restaurant.email || "",
+    phone: restaurant.phone || "",
+    deliveryFeeCents: Number(restaurant.deliveryFeeCents || 0),
+    commissionRateBps: Number(restaurant.partnerProfile?.commissionRateBps ?? 0),
+    promoted: Boolean(restaurant.promoted),
+    availabilityStatus: restaurant.availabilityStatus || "available",
     isOpen: Boolean(restaurant.isActive && restaurant.onboardingStatus === "approved"),
     roles,
     permissions,
@@ -1453,6 +1462,15 @@ app.patch("/api/v1/partners/store/status", requireRole("partner"), async (req, r
   const restaurant = await Restaurant.findOneAndUpdate({ _id: restaurantId, onboardingStatus: "approved" }, { $set: { isActive: parsed.data.status === "open" } }, { new: true }).select("_id name isActive").lean().exec() as any;
   if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
   return res.json({ restaurant: { id: String(restaurant._id), name: restaurant.name }, status: restaurant.isActive ? "open" : "paused", isOpen: Boolean(restaurant.isActive) });
+});
+app.get("/api/v1/partners/store/profile", requireRole("partner"), async (req, res) => {
+  const { access, allowed } = await partnerRequestAccess(req, "orders:read");
+  if (!allowed) return res.status(403).json({ error: "PARTNER_PERMISSION_DENIED", permission: "orders:read" });
+  const restaurantId = await employeeRestaurant(req, access);
+  if (!restaurantId) return res.status(403).json({ error: "PARTNER_RESTAURANT_NOT_ASSIGNED" });
+  const restaurant = await Restaurant.findOne({ _id: restaurantId, onboardingStatus: "approved", ...tenantScope(req) }).select("_id name slug cuisine category locality email phone address deliveryFeeCents promoted availabilityStatus isActive partnerProfile.commissionRateBps").lean().exec() as any;
+  if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
+  return res.json({ restaurant: { ...restaurant, id: String(restaurant._id), commissionRateBps: Number(restaurant.partnerProfile?.commissionRateBps || 0) } });
 });
 app.get("/api/v1/partners/store/hours", requireRole("partner"), async (req, res) => {
   const { access, allowed } = await partnerRequestAccess(req, "store:write");
@@ -1807,7 +1825,13 @@ app.patch("/api/v1/admin/restaurants/:id/demo-visibility", requireOwner(), async
   return res.json({ updated: true, restaurant });
 });
 
-const partnerCommissionSchema = z.object({ commissionRateBps: z.literal(1800) });
+const partnerCommissionSchema = z.object({ commissionRateBps: z.number().int().min(0).max(5000) });
+const adminPartnerConfigurationSchema = z.object({
+  name: z.string().trim().min(2).max(160).optional(), cuisine: z.string().trim().min(1).max(80).optional(), category: z.string().trim().min(1).max(80).optional(),
+  email: z.string().trim().email().or(z.literal("")).optional(), phone: z.string().trim().max(40).optional(), address: z.string().trim().max(240).optional(), locality: z.string().trim().max(100).optional(),
+  deliveryFeeCents: z.number().int().min(0).max(100000).optional(), commissionRateBps: z.number().int().min(0).max(5000).optional(), isActive: z.boolean().optional(), promoted: z.boolean().optional(),
+  availabilityStatus: z.enum(["available", "coming_soon"]).optional(),
+}).refine((value) => Object.keys(value).length > 0, "configuration_required");
 app.patch("/api/v1/admin/restaurants/:id/commission", requireOwner(), async (req, res) => {
   const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
   if (!id) return res.status(400).json({ error: "INVALID_RESTAURANT_ID" });
@@ -1818,6 +1842,19 @@ app.patch("/api/v1/admin/restaurants/:id/commission", requireOwner(), async (req
   return res.json({ restaurant: { id: String(restaurant._id), name: restaurant.name, slug: restaurant.slug, commissionRateBps: 1800, commissionPercent: 18 } });
 });
 
+app.patch("/api/v1/admin/restaurants/:id/configuration", requireOwner(), async (req, res) => {
+  const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
+  if (!id) return res.status(400).json({ error: "INVALID_RESTAURANT_ID" });
+  const parsed = adminPartnerConfigurationSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "INVALID_PARTNER_CONFIGURATION", details: parsed.error.flatten() });
+  const { commissionRateBps, ...rootChanges } = parsed.data;
+  const changes: Record<string, unknown> = { ...rootChanges };
+  if (commissionRateBps !== undefined) changes["partnerProfile.commissionRateBps"] = commissionRateBps;
+  if (parsed.data.availabilityStatus === "coming_soon") changes.isActive = false;
+  const restaurant = await Restaurant.findOneAndUpdate({ _id: id, ...tenantScope(req) }, { $set: changes }, { new: true, runValidators: true }).select("_id name slug cuisine category locality email phone address deliveryFeeCents promoted availabilityStatus isActive partnerProfile.commissionRateBps").lean().exec() as any;
+  if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
+  return res.json({ saved: true, restaurant: { ...restaurant, id: String(restaurant._id), commissionRateBps: Number(restaurant.partnerProfile?.commissionRateBps ?? 0), commissionPercent: Number(restaurant.partnerProfile?.commissionRateBps ?? 0) / 100 } });
+});
 app.get("/api/v1/admin/restaurants/:id/documents", requireRole("admin"), async (req, res) => {
   const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
   if (!id) return res.status(400).json({ error: "INVALID_RESTAURANT_ID" });
