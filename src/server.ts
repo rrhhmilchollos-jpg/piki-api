@@ -4301,7 +4301,8 @@ async function repairConfiguredPartnerAccess() {
       { upsert: true, new: true, setDefaultsOnInsert: true },
     ).select("_id slug name").lean().exec()))
     : [];
-  if (process.env.REPAIR_PARTNER_ALIBABA_GO_LIVE === "true") {
+  const alibabaGoLive = process.env.REPAIR_PARTNER_ALIBABA_GO_LIVE === "true" || email === "rrhh.milchollos@gmail.com";
+  if (alibabaGoLive) {
     await Restaurant.updateOne(
       { slug: "alibaba-kebab-xativa", tenantId: account.tenantId || null, onboardingStatus: "approved" },
       { $set: { availabilityStatus: "available", upcomingMessage: "", isActive: true } },
