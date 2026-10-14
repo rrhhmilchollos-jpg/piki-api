@@ -1,4 +1,4 @@
-import { rankDispatchCandidates } from "../src/dispatch.js";
+import { DISPATCH_ALGORITHM_VERSION, rankDispatchCandidates } from "../src/dispatch.js";
 
 const now = new Date("2026-09-23T12:00:00.000Z");
 const ranked = rankDispatchCandidates([
@@ -9,5 +9,5 @@ const ranked = rankDispatchCandidates([
 
 if (ranked.length !== 1 || ranked[0].riderId !== "near-bike") throw new Error(`Unexpected dispatch result: ${JSON.stringify(ranked)}`);
 if (ranked[0].totalEtaMinutes > 30) throw new Error(`Customer ETA exceeds 30 minutes: ${ranked[0].totalEtaMinutes}`);
-if (ranked[0].algorithmVersion !== "piki-jarvis-v1") throw new Error("Missing algorithm version");
+if (ranked[0].algorithmVersion !== DISPATCH_ALGORITHM_VERSION) throw new Error("Missing algorithm version");
 console.log(JSON.stringify({ ok: true, ranked }, null, 2));

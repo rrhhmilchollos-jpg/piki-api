@@ -3970,7 +3970,7 @@ app.get("/api/v1/riders/:id/offers", requireRole("rider"), async (req, res) => {
   const restaurantIds = offers.map((offer) => offer.restaurantId).filter(Boolean);
   const customerIds = offers.map((offer) => offer.customerId).filter((value): value is mongoose.Types.ObjectId => Boolean(value) && mongoose.isValidObjectId(value));
   const [restaurants, customers] = await Promise.all([
-    Restaurant.find({ _id: { $in: restaurantIds } }).select("name address phone cuisine etaMinutes deliveryFeeCents").lean().exec(),
+    Restaurant.find({ _id: { $in: restaurantIds } }).select("name address phone cuisine etaMinutes deliveryFeeCents image").lean().exec(),
     CustomerAccount.find({ _id: { $in: customerIds } }).select("name").lean().exec(),
   ]);
   const restaurantById = new Map(restaurants.map((restaurant: any) => [String(restaurant._id), restaurant]));
@@ -4012,7 +4012,7 @@ partnerPrepDeadlineAt: offer.partnerPrepDeadlineAt || null,
       vehicle: riderProfile?.vehicle || "unknown",
       phase: phase[offer.status] || "assigned",
       etaMinutes: offer.assignmentExpiresAt ? Math.max(0, Math.ceil((new Date(offer.assignmentExpiresAt).getTime() - now) / 60000)) : null,
-      restaurant: restaurant ? { name: restaurant.name, address: restaurant.address || "", phone: restaurant.phone || "", cuisine: restaurant.cuisine || "", etaMinutes: restaurant.etaMinutes || [] } : null,
+      restaurant: restaurant ? { name: restaurant.name, address: restaurant.address || "", phone: restaurant.phone || "", cuisine: restaurant.cuisine || "", etaMinutes: restaurant.etaMinutes || [], imageUrl: restaurant.image || "" } : null,
       customerName: customerPhase ? customer?.name || offer.customerName || "Cliente" : null,
       deliveryAddress: customerPhase ? offer.deliveryAddress || "" : null,
       deliveryNote: customerPhase ? offer.deliveryNote || null : null,
