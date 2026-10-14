@@ -970,6 +970,11 @@ app.get("/api/v1/catalog/restaurants", async (req, res) => {
     // partnerProfile.documents having select:false nested fields.
     .select("slug name cuisine category locality partnerGroupKey tagline etaMinutes deliveryFeeCents rating reviews promoted image accent phone address location menu isActive onboardingStatus availabilityStatus upcomingAt upcomingMessage")
     .sort({ promoted: -1, rating: -1, reviews: -1 }).lean().exec();
+  const catalogPriority: Record<string, number> = {
+    "alibaba-kebab-xativa": 0,
+    "kings-tacos-xativa": 1,
+  };
+  restaurants.sort((left: any, right: any) => (catalogPriority[left.slug] ?? 10) - (catalogPriority[right.slug] ?? 10));
   const body = { restaurants: restaurants.map((restaurant: any) => presentCustomerCatalogRestaurant(restaurant)) };
   catalogCache.set(cacheKey, { expiresAt: Date.now() + CATALOG_CACHE_MS, body });
   void sharedCacheSet(`piki:catalog:${cacheKey}`, body, 30);
@@ -4295,6 +4300,10 @@ async function repairConfiguredPartnerAccess() {
           upcomingMessage: "Disponible muy pronto",
           onboardingStatus: "approved",
           isActive: false,
+          ...(location.slug === "alibaba-kebab-xativa" ? {
+            image: "https://glovo.dhmedia.io/image/stores-glovo/stores/ec0c56634066c61c377459150e646d1c604d45d816253eb90aba007057bf2269?t=W3sicmVzaXplIjp7Im1vZGUiOiJmaWxsIiwid2lkdGgiOjEyODAsImhlaWdodCI6MTIwfX0seyJ3ZWJwIjp7InEiOiJsb3cifX1d",
+            promoted: true,
+          } : {}),
         },
         $setOnInsert: { slug: location.slug, tagline: "Próximo partner PIKI en Xàtiva", phone: "", address: "Xàtiva" },
       },
