@@ -4301,6 +4301,12 @@ async function repairConfiguredPartnerAccess() {
       { upsert: true, new: true, setDefaultsOnInsert: true },
     ).select("_id slug name").lean().exec()))
     : [];
+  if (process.env.REPAIR_PARTNER_ALIBABA_GO_LIVE === "true") {
+    await Restaurant.updateOne(
+      { slug: "alibaba-kebab-xativa", tenantId: account.tenantId || null, onboardingStatus: "approved" },
+      { $set: { availabilityStatus: "available", upcomingMessage: "", isActive: true } },
+    ).exec();
+  }
   const portfolioIds = [restaurant._id, ...assignedRestaurants.map((location: any) => location._id)];
   if (includeXativaTestPortfolio && new Set(assignedRestaurants.map((location: any) => location.slug)).size !== COMING_SOON_SLUGS.length) {
     throw new Error("Configured Xàtiva test portfolio does not match the public catalog");

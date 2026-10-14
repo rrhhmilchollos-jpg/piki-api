@@ -22,6 +22,8 @@ services:
         value: "true"
       - key: REPAIR_PARTNER_SLUG
         value: kfc-xativa-qa
+      - key: REPAIR_PARTNER_ALIBABA_GO_LIVE
+        value: "true"
       - key: CORS_ORIGINS
         sync: false
       - key: UPSTASH_REDIS_REST_URL
