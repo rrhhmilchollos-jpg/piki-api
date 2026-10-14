@@ -4262,7 +4262,7 @@ app.post("/api/v1/finance/rider-payouts/prepare", requireRole("admin", "finance"
   const parsed = z.object({ riderId: z.string().regex(/^[a-f\d]{24}$/i), startsAt: z.coerce.date(), endsAt: z.coerce.date() }).refine((value) => value.endsAt > value.startsAt, "INVALID_PAYOUT_PERIOD").safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_RIDER_PAYOUT_PERIOD", details: parsed.error.flatten() });
   const riderId = objectId(parsed.data.riderId); if (!riderId) return res.status(400).json({ error: "INVALID_RIDER_ID" });
-  const rider = await Rider.findOne({ _id: riderId, ...tenantScope(req) }).select("_id riderCode name").lean().exec(); if (!rider) return res.status(404).json({ error: "RIDER_NOT_FOUND" });
+  const rider = await Rider.findOne({ _id: riderId, ...tenantScope(req) }).select("_id riderCode name").lean().exec() as any; if (!rider) return res.status(404).json({ error: "RIDER_NOT_FOUND" });
   const orders = await Order.find({ ...tenantScope(req), riderId, status: "delivered", paymentState: "paid", deliveredAt: { $gte: parsed.data.startsAt, $lt: parsed.data.endsAt }, riderPayoutStatus: { $in: ["pending", "eligible"] }, riderPayoutBatchId: null }).select("_id riderEarningsCents").lean().exec() as any[];
   if (!orders.length) return res.status(409).json({ error: "NO_RIDER_PAYOUTS_ELIGIBLE" });
   const amountCents = orders.reduce((sum, order) => sum + Number(order.riderEarningsCents || 0), 0);
