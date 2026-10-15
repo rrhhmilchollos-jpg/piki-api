@@ -1725,6 +1725,27 @@ app.get("/api/v1/admin/restaurants", requireRole("admin"), async (req, res) => {
   return res.json({ restaurants: restaurants.map((restaurant: any) => ({ ...restaurant, partnerCode: onboardingCode("P", restaurant._id) })) });
 });
 
+const partnerCreateSchema = z.object({
+  name: z.string().trim().min(2).max(160), cuisine: z.string().trim().min(2).max(120), category: z.string().trim().min(2).max(120),
+  email: z.union([z.string().email().max(254), z.literal("")]).default(""), phone: z.string().trim().max(40).default(""), address: z.string().trim().max(280).default(""), locality: z.string().trim().max(120).default(""),
+  deliveryFeeCents: z.number().int().min(0).max(10000).default(0), commissionRateBps: z.number().int().min(0).max(5000).default(1800),
+}).strict();
+
+app.post("/api/v1/admin/restaurants", requireOwner(), async (req, res) => {
+  const parsed = partnerCreateSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "INVALID_PARTNER_CREATE", details: parsed.error.flatten() });
+  const baseSlug = parsed.data.name.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "") || "partner";
+  const slug = `${baseSlug}-${Date.now().toString(36)}`;
+  try {
+    const restaurant = await Restaurant.create({ ...parsed.data, slug, tenantId: (req.auth as any)?.tenantId || null, onboardingStatus: "pending_review", isActive: false, availabilityStatus: "coming_soon", partnerProfile: { commissionRateBps: parsed.data.commissionRateBps } });
+    await AccessAuthorization.create({ employeeId: objectId(String(req.auth!.employeeId!)), action: "partner_created", previousStatus: null, nextStatus: "pending_review", previousRole: null, nextRole: "partner", accessLevel: "superadmin", actorEmployeeId: objectId(String(req.auth!.employeeId!)), reason: `Partner creado por superadmin: ${restaurant.name}.` });
+    return res.status(201).json({ created: true, restaurant: { ...restaurant.toObject(), id: String(restaurant._id), partnerCode: publicPartnerCode(restaurant._id), commissionRateBps: parsed.data.commissionRateBps, commissionPercent: parsed.data.commissionRateBps / 100 } });
+  } catch (error: any) {
+    if (error?.code === 11000) return res.status(409).json({ error: "PARTNER_SLUG_ALREADY_EXISTS" });
+    throw error;
+  }
+});
+
 const partnerSettingsSchema = z.object({
   name: z.string().trim().min(2).max(160).optional(),
   cuisine: z.string().trim().min(2).max(120).optional(),
@@ -1808,6 +1829,15 @@ app.patch("/api/v1/admin/restaurants/:id/status", requireRole("admin"), async (r
     await notifyOnboarding({ channel: "admin", type: "onboarding.partner_application.approved", entityId: String(restaurant._id), tenantId: (restaurant as any).tenantId });
   }
   return res.json({ restaurant, partnerAccount: partnerAccount ? { id: String(partnerAccount._id), access: parsed.data.status === "approved" ? "enabled" : "disabled" } : null });
+});
+
+app.delete("/api/v1/admin/restaurants/:id", requireOwner(), async (req, res) => {
+  const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
+  if (!id) return res.status(400).json({ error: "INVALID_RESTAURANT_ID" });
+  const restaurant = await Restaurant.findOneAndUpdate({ _id: id, ...tenantScope(req) }, { $set: { isActive: false, onboardingStatus: "suspended", availabilityStatus: "coming_soon", upcomingMessage: "Archivado por PIKI" } }, { new: true }).select("_id name slug isActive onboardingStatus availabilityStatus").lean().exec() as any;
+  if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
+  await AccessAuthorization.create({ employeeId: objectId(String(req.auth!.employeeId!)), action: "partner_archived", previousStatus: "approved", nextStatus: "suspended", previousRole: "partner", nextRole: "partner", accessLevel: "superadmin", actorEmployeeId: objectId(String(req.auth!.employeeId!)), reason: `Partner archivado de forma reversible: ${restaurant.name}.` });
+  return res.json({ archived: true, restaurant });
 });
 
 app.patch("/api/v1/admin/restaurants/:id/demo-visibility", requireOwner(), async (req, res) => {
@@ -4571,6 +4601,8 @@ async function repairConfiguredPartnerAccess() {
           ...(location.slug === "alibaba-kebab-xativa" ? {
             image: "https://glovo.dhmedia.io/image/stores-glovo/stores/ec0c56634066c61c377459150e646d1c604d45d816253eb90aba007057bf2269?t=W3sicmVzaXplIjp7Im1vZGUiOiJmaWxsIiwid2lkdGgiOjEyODAsImhlaWdodCI6MTIwfX0seyJ3ZWJwIjp7InEiOiJsb3cifX1d",
             promoted: true,
+            deliveryFeeCents: 299,
+            "partnerProfile.commissionRateBps": 1500,
           } : {}),
         },
         $setOnInsert: { slug: location.slug, tagline: "Próximo partner PIKI en Xàtiva", phone: "", address: "Xàtiva" },
@@ -4582,7 +4614,7 @@ async function repairConfiguredPartnerAccess() {
   if (alibabaGoLive) {
     await Restaurant.updateOne(
       { slug: "alibaba-kebab-xativa", tenantId: account.tenantId || null, onboardingStatus: "approved" },
-      { $set: { availabilityStatus: "available", upcomingMessage: "", isActive: true } },
+      { $set: { availabilityStatus: "available", upcomingMessage: "", isActive: true, deliveryFeeCents: 299, "partnerProfile.commissionRateBps": 1500 } },
     ).exec();
   }
   const kingsGoLive = process.env.REPAIR_PARTNER_KINGS_GO_LIVE === "true" || email === "rrhh.milchollos@gmail.com";
