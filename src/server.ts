@@ -254,7 +254,7 @@ async function fleetCanAccessRider(req: express.Request, riderId: mongoose.Types
   const employee = await employeeScope(req);
   return Boolean(await Rider.exists({ _id: riderId, ...buildFleetEntityScope({ tenantId: req.auth?.tenantId, role: req.auth?.role, fleetId: employee?.fleetId }) }));
 }
-const locationSchema = z.object({ latitude: z.number().min(-90).max(90), longitude: z.number().min(-180).max(180), accuracy: z.number().min(0).max(10_000).optional() });
+const locationSchema = z.object({ latitude: z.number().min(-90).max(90), longitude: z.number().min(-180).max(180), accuracy: z.number().min(0).max(500).optional() });
 const customerModifierSelectionSchema = z.object({ groupId: z.string().min(1).max(80), optionIds: z.array(z.string().min(1).max(80)).max(12) });
 const orderItemSchema = z.object({ itemId: z.string().min(1), quantity: z.number().int().min(1).max(20), selections: z.array(customerModifierSelectionSchema).max(12).optional() });
 const createOrderSchema = z.object({ restaurantId: z.string().min(1), deliveryAddress: z.string().min(5).max(280), deliveryNote: z.string().trim().max(500).default(""), deliveryLocation: locationSchema, items: z.array(orderItemSchema).min(1).max(50), paymentMethod: z.string().optional().default("cash") });
@@ -283,7 +283,7 @@ const pickupQrIsValid = (orderCode: string, raw: unknown) => {
 };
 const riderLocationSchema = locationSchema.extend({ riderId: z.string().min(1) });
 const trackingSessionCreateSchema = z.object({ shiftId: z.string().regex(/^[a-f\d]{24}$/).optional(), platform: z.enum(["ios", "android", "web"]), appVersion: z.string().trim().min(1).max(80).default("unknown"), consentVersion: z.string().trim().min(1).max(80) });
-const trackingSampleSchema = z.object({ sampleId: z.string().trim().min(8).max(160), latitude: z.number().min(-90).max(90), longitude: z.number().min(-180).max(180), accuracyMeters: z.number().min(0).max(10_000), recordedAt: z.coerce.date() });
+const trackingSampleSchema = z.object({ sampleId: z.string().trim().min(8).max(160), latitude: z.number().min(-90).max(90), longitude: z.number().min(-180).max(180), accuracyMeters: z.number().min(0).max(500), recordedAt: z.coerce.date() });
 const trackingBatchSchema = z.object({ sessionId: z.string().regex(/^[a-f\d]{24}$/), samples: z.array(trackingSampleSchema).min(1).max(100) });
 const zoneSchema = z.object({ name: z.string().min(2).max(120), slug: z.string().regex(/^[a-z0-9-]+$/), serviceFeeCents: z.number().int().min(0).max(10000).default(0), maxEtaMinutes: z.number().int().min(1).max(240).default(60), polygon: z.object({ coordinates: z.array(z.array(z.array(z.number()))).min(1) }) });
 const dispatchSchema = z.object({ preparationMinutes: z.coerce.number().int().min(1).max(180).default(PARTNER_PREPARATION_LIMIT_MINUTES), offerSeconds: z.coerce.number().int().min(15).max(180).default(60), maxCustomerEtaMinutes: z.coerce.number().int().min(10).max(240).default(CUSTOMER_DELIVERY_TARGET_MINUTES) });
@@ -3331,6 +3331,11 @@ app.post("/api/v1/riders/:riderId/orders/:orderId/confirm-delivery", requireRole
   const order = await Order.findOne({ _id: orderId, riderId, assignmentState: "assigned" }).lean().exec() as any;
   if (!order) return res.status(404).json({ error: "ASSIGNED_ORDER_NOT_FOUND" });
   if (order.status !== "on_the_way") return res.status(409).json({ error: "ORDER_NOT_ON_THE_WAY", message: "Primero confirma que has recogido el pedido e iniciado la ruta." });
+  const rider = await Rider.findById(riderId).select("location lastLocationAt").lean().exec() as any;
+  if (!rider?.lastLocationAt || new Date(rider.lastLocationAt).getTime() < Date.now() - 90_000) return res.status(409).json({ error: "FRESH_LOCATION_REQUIRED", message: "Actualiza tu GPS antes de confirmar la entrega." });
+  const deliveryDistanceMeters = pointDistanceMeters(rider.location, order.deliveryLocation);
+  if (deliveryDistanceMeters == null) return res.status(409).json({ error: "DELIVERY_LOCATION_REQUIRED", message: "No se puede verificar la entrega: falta una ubicación GPS válida del cliente." });
+  if (deliveryDistanceMeters > DELIVERY_CONFIRMATION_RADIUS_METERS) return res.status(409).json({ error: "CUSTOMER_TOO_FAR", message: `Aún estás a ${Math.round(deliveryDistanceMeters)} m de la dirección del cliente. Acércate para confirmar la entrega.`, distanceMeters: deliveryDistanceMeters, confirmationRadiusMeters: DELIVERY_CONFIRMATION_RADIUS_METERS });
   if (!deliveryQrIsValid(order.publicCode, req.body?.deliveryQr)) return res.status(422).json({ error: "DELIVERY_QR_INVALID", message: "Escanea el QR o introduce el PIN que proporciona el Customer antes de confirmar la entrega." });
   if (order.paymentMethod === "stripe") {
     if (!order.stripePaymentIntentId || order.paymentState !== "authorized") return res.status(409).json({ error: "PAYMENT_NOT_AUTHORIZED", message: "El pago online todavía no está autorizado para capturarse." });
@@ -3741,7 +3746,8 @@ const automaticDispatchSweepStats = {
   lastError: null as string | null,
 };
 const PICKUP_REASSIGN_AFTER_MS = Math.max(60_000, Number(process.env.PIKI_PICKUP_REASSIGN_AFTER_MINUTES || 15) * 60_000);
-const PICKUP_ARRIVAL_RADIUS_METERS = Math.max(1, Number(process.env.PIKI_PICKUP_ARRIVAL_RADIUS_METERS || 10));
+const PICKUP_ARRIVAL_RADIUS_METERS = Math.max(30, Number(process.env.PIKI_PICKUP_ARRIVAL_RADIUS_METERS || 80));
+const DELIVERY_CONFIRMATION_RADIUS_METERS = Math.max(30, Number(process.env.PIKI_DELIVERY_CONFIRMATION_RADIUS_METERS || 80));
 async function reassignLatePickupOrders() {
   const now = new Date();
   let reassigned = 0;
@@ -4433,7 +4439,7 @@ app.get("/api/v1/admin/operations/health", requireRole("admin", "fleet"), async 
     else if (!hasGps || !last) acc.missingGps += 1;
     return acc;
   }, { total: 0, online: 0, offline: 0, freshGps: 0, staleGps: 0, missingGps: 0 });
-  return res.json({ service: "piki-api", generatedAt: new Date().toISOString(), riders: summary, dispatch: { queue: dispatchQueue, activeOffers, activeOrders }, automaticDispatchSweep: { ...automaticDispatchSweepStats, intervalSeconds: 5, healthy: automaticDispatchSweepStats.runs > 0 && automaticDispatchSweepStats.errors === 0 && Boolean(automaticDispatchSweepStats.lastCompletedAt) }, thresholds: { freshGpsSeconds: 90, staleGpsMinutes: 10, pickupReassignMinutes: Math.round(PICKUP_REASSIGN_AFTER_MS / 60_000), pickupArrivalRadiusMeters: PICKUP_ARRIVAL_RADIUS_METERS, partnerPreparationMinutes: PARTNER_PREPARATION_LIMIT_MINUTES, customerDeliveryTargetMinutes: CUSTOMER_DELIVERY_TARGET_MINUTES } });
+  return res.json({ service: "piki-api", generatedAt: new Date().toISOString(), riders: summary, dispatch: { queue: dispatchQueue, activeOffers, activeOrders }, automaticDispatchSweep: { ...automaticDispatchSweepStats, intervalSeconds: 5, healthy: automaticDispatchSweepStats.runs > 0 && automaticDispatchSweepStats.errors === 0 && Boolean(automaticDispatchSweepStats.lastCompletedAt) }, thresholds: { freshGpsSeconds: 90, staleGpsMinutes: 10, pickupReassignMinutes: Math.round(PICKUP_REASSIGN_AFTER_MS / 60_000), pickupArrivalRadiusMeters: PICKUP_ARRIVAL_RADIUS_METERS, deliveryConfirmationRadiusMeters: DELIVERY_CONFIRMATION_RADIUS_METERS, partnerPreparationMinutes: PARTNER_PREPARATION_LIMIT_MINUTES, customerDeliveryTargetMinutes: CUSTOMER_DELIVERY_TARGET_MINUTES } });
 });
 
 app.get("/api/v1/admin/operations/live", requireRole("admin"), async (req, res) => {
