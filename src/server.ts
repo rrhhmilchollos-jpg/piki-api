@@ -4524,16 +4524,16 @@ async function repairConfiguredPartnerAccess() {
   // owner as a safe bootstrap fallback so its idempotent portfolio repair
   // still runs after deployment.
   const email = String(process.env.REPAIR_PARTNER_EMAIL || "rrhh.milchollos@gmail.com").trim().toLowerCase();
-  const configuredPartnerSlug = String(process.env.REPAIR_PARTNER_SLUG || "kfc-xativa-qa").trim().toLowerCase();
+  const configuredPartnerSlug = String(process.env.REPAIR_PARTNER_SLUG || "").trim().toLowerCase();
   if (!email) return;
   const account = await EmployeeAccount.findOne({ email }).select("_id email tenantId restaurantId restaurantIds apiRole jobRole roles primaryRole active authorizationStatus ownerProtected").lean().exec() as any;
   if (!account) { console.log(JSON.stringify({ event: "partner_access_repair", email, result: "account_not_found" })); return; }
 
-  // The production Render service may retain an older Blueprint environment.
-  // Keep the explicitly allow-listed QA portfolio self-healing for the owner
-  // account, while all other partner repair paths remain opt-in.
+  // Never recreate the retired KFC QA portfolio implicitly. Any repair must
+  // name a non-QA staging slug explicitly.
   const createOrUseTestRestaurant = process.env.REPAIR_PARTNER_CREATE_TEST === "true"
-    || (email === ownerEmail && configuredPartnerSlug === "kfc-xativa-qa");
+    && Boolean(configuredPartnerSlug)
+    && !["kfc-xativa-qa", "kfc-xativa-test"].includes(configuredPartnerSlug);
   let restaurant: any = null;
   if (createOrUseTestRestaurant) {
     // The exact test slug is unique; adopting a legacy record also ensures it
@@ -4553,35 +4553,10 @@ async function repairConfiguredPartnerAccess() {
   if (!restaurant) { console.log(JSON.stringify({ event: "partner_access_repair", email, result: "restaurant_not_found", accountId: String(account._id) })); return; }
 
   const isProtectedOwner = Boolean(account.ownerProtected && email === ownerEmail);
-  // This function only runs for REPAIR_PARTNER_EMAIL. Keep the demonstration
-  // menu available to that explicitly configured Partner even if an old
-  // owner flag has not yet been migrated in MongoDB.
+  // KFC QA is retired and must never be restored by a startup repair.
   if (restaurant.slug === "kfc-xativa-test" || restaurant.slug === "kfc-xativa-qa") {
-    const seeded = await Restaurant.findOneAndUpdate(
-      {
-        _id: restaurant._id,
-        $or: [
-          { demoMenuVersion: { $lt: PARTNER_DEMO_MENU_VERSION } },
-          { demoMenuVersion: { $exists: false } },
-        ],
-      },
-      {
-        $set: {
-          internalDemo: restaurant.slug !== "kfc-xativa-qa",
-          demoMenuVersion: PARTNER_DEMO_MENU_VERSION,
-          tagline: restaurant.slug === "kfc-xativa-qa" ? "Local QA de Xàtiva habilitado para pruebas operativas reales." : "Entorno de demostración interna de PIKI · sin afiliación comercial.",
-          address: "Calle Sor Isabel de Villena 82, bajo, Novelé, Valencia",
-          locality: "Novetlè",
-          location: { type: "Point", coordinates: [-0.5468067, 38.9817572] },
-          menu: partnerDemoMenu,
-        },
-      },
-      { new: true },
-    ).select("_id email slug name tenantId onboardingStatus isActive internalDemo demoMenuVersion").lean().exec();
-    if (seeded) {
-      restaurant = seeded;
-      console.log(JSON.stringify({ event: "partner_demo_menu_restored", restaurantId: String(restaurant._id), menuVersion: PARTNER_DEMO_MENU_VERSION, itemCount: partnerDemoMenu.length }));
-    }
+    console.warn(JSON.stringify({ event: "partner_access_repair_skipped_retired_qa", email, slug: restaurant.slug }));
+    return;
   }
 
   // The repair itself is explicitly allow-listed by REPAIR_PARTNER_EMAIL in

@@ -1,9 +1,9 @@
 import mongoose from "mongoose";
 
-const RUN_ID = "purge-test-data-v1";
+const RUN_ID = "purge-test-data-v2";
 const TEST_EMAIL = /(?:\.test|@example\.test)$/i;
 const QA_RESTAURANT_NAMES = ["KFC XATIVA QA", "PIKI QA Kitchen"];
-const QA_RESTAURANT_SLUGS = ["piki-qa-kitchen"];
+const QA_RESTAURANT_SLUGS = ["piki-qa-kitchen", "kfc-xativa-qa", "kfc-xativa-test"];
 const QA_RESTAURANT_GROUPS = ["piki-qa"];
 const QA_RIDER_EMAILS = ["qa-rider@pikidelivery.test"];
 const QA_PARTNER_EMAILS = ["qa-partner@pikidelivery.test"];
