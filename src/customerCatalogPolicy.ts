@@ -30,7 +30,17 @@ export function applyAlibabaCommissionCents(cents: number): number { return Math
 function applyAlibabaMenuPricing<T extends Record<string, any>>(item: T): T {
   const priced = { ...item, price: Number((applyAlibabaCommissionCents(Number(item.price || 0) * 100) / 100).toFixed(2)) };
   if (!Array.isArray(item.modifiers)) return priced;
-  return { ...priced, modifiers: item.modifiers.map((modifier: any) => ({ ...modifier, price: Number((applyAlibabaCommissionCents(Number(modifier.price || 0) * 100) / 100).toFixed(2)), options: Array.isArray(modifier.options) ? modifier.options.map((option: any) => ({ ...option, price: Number((applyAlibabaCommissionCents(Number(option.price || 0) * 100) / 100).toFixed(2)) })) : modifier.options })) };
+  const modifiers = item.modifiers.map((modifier: any) => ({
+    ...modifier,
+    price: Number((applyAlibabaCommissionCents(Number(modifier.price || 0) * 100) / 100).toFixed(2)),
+    options: Array.isArray(modifier.options)
+      ? modifier.options.map((option: any) => ({ ...option, price: Number((applyAlibabaCommissionCents(Number(option.price || 0) * 100) / 100).toFixed(2)) }))
+      : modifier.options,
+  }));
+  // Alibaba's imported menu used `modifiers`; Customer and checkout use the
+  // canonical `modifierGroups` contract. Publish both during migration so the
+  // + button opens the real option selector and the server can quote it.
+  return { ...priced, modifiers, modifierGroups: modifiers };
 }
 export function customerMenuForRestaurant<T extends { slug?: string; menu?: any[] }>(restaurant: T): any[] {
   const menu = Array.isArray(restaurant.menu) ? restaurant.menu : [];
