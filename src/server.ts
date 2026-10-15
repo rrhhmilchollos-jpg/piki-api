@@ -3541,9 +3541,10 @@ app.get("/api/v1/riders/:id/slots", requireRole("admin", "rider", "fleet"), asyn
 });
 
 function madridNow(instant = new Date()) {
-  const parts = new Intl.DateTimeFormat("en-CA", { timeZone: "Europe/Madrid", year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false }).formatToParts(instant);
+  const parts = new Intl.DateTimeFormat("en-CA", { timeZone: "Europe/Madrid", year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false, hourCycle: "h23" }).formatToParts(instant);
   const values = Object.fromEntries(parts.filter((part) => part.type !== "literal").map((part) => [part.type, part.value]));
-  return { date: `${values.year}-${values.month}-${values.day}`, time: `${values.hour}:${values.minute}`, iso: instant.toISOString(), timeZone: "Europe/Madrid" };
+  const hour = values.hour === "24" ? "00" : values.hour;
+  return { date: `${values.year}-${values.month}-${values.day}`, time: `${hour}:${values.minute}`, iso: instant.toISOString(), timeZone: "Europe/Madrid" };
 }
 function previousCalendarDate(date: string) { const value = new Date(`${date}T12:00:00Z`); value.setUTCDate(value.getUTCDate() - 1); return value.toISOString().slice(0, 10); }
 function slotContainsTime(slot: { startTime: string; endTime: string }, time: string) { return slot.startTime < slot.endTime ? slot.startTime <= time && time < slot.endTime : time >= slot.startTime || time < slot.endTime; }
