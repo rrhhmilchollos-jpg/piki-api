@@ -16,14 +16,6 @@ services:
         value: piki
       - key: ADMIN_APP_URL
         value: https://admin.pikidelivery.com
-      - key: REPAIR_PARTNER_EMAIL
-        value: rrhh.milchollos@gmail.com
-      - key: REPAIR_PARTNER_CREATE_TEST
-        value: "true"
-      - key: REPAIR_PARTNER_SLUG
-        value: kfc-xativa-qa
-      - key: REPAIR_PARTNER_ALIBABA_GO_LIVE
-        value: "true"
       - key: CORS_ORIGINS
         sync: false
       - key: UPSTASH_REDIS_REST_URL
@@ -40,23 +32,3 @@ services:
         sync: false
       - key: GOOGLE_MAPS_API_KEY
         sync: false
-  - type: web
-    name: piki-dispatch-worker
-    runtime: docker
-    region: frankfurt
-    plan: starter
-    dockerfilePath: ./Dockerfile
-    startCommand: npm run start:dispatch-worker
-    healthCheckPath: /health
-    autoDeploy: true
-    envVars:
-      - key: NODE_ENV
-        value: production
-      - key: MONGODB_URI
-        sync: false
-      - key: MONGODB_DB
-        value: piki
-      - key: PIKI_DISPATCH_WORKER_POLL_MS
-        value: "1000"
-      - key: PIKI_DISPATCH_WORKER_BATCH_SIZE
-        value: "25"

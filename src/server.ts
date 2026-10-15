@@ -4162,7 +4162,10 @@ app.get("/api/v1/riders/:id/offers", requireRole("rider"), async (req, res) => {
   const enrichedOffers = offers.map((offer) => {
     const restaurant = restaurantById.get(String(offer.restaurantId)) as any;
     const customer = customerById.get(String(offer.customerId)) as any;
-    const customerPhase = ["picked_up", "on_the_way"].includes(offer.status);
+    // Once the offer is atomically assigned, the Rider needs the final
+    // destination data to prepare and execute the route. Never expose it for
+    // an unassigned offer, but do not hide it while the order is at the Partner.
+    const customerPhase = offer.assignmentState === "assigned" && offer.status !== "pending";
     return {
       _id: offer._id,
       publicCode: offer.publicCode,
@@ -4515,6 +4518,7 @@ app.use((error: any, req: express.Request, res: express.Response, next: express.
 });
 
 async function repairConfiguredPartnerAccess() {
+  if (process.env.REPAIR_PARTNER_ACCESS_ENABLED !== "true") return;
   // Render does not retroactively synchronize Blueprint variables into this
   // existing service. Keep this one explicitly authorised demonstration
   // owner as a safe bootstrap fallback so its idempotent portfolio repair
