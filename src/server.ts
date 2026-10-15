@@ -1028,12 +1028,17 @@ app.get("/api/v1/locations/reverse", async (req, res) => {
   if (shared) { geocodeCache.set(cacheKey, { expiresAt: Date.now() + GEOCODE_CACHE_MS, body: shared }); res.setHeader("Cache-Control", "public, max-age=300, s-maxage=300, stale-while-revalidate=600, stale-if-error=900"); return res.json(shared); }
   const url = new URL("https://nominatim.openstreetmap.org/reverse");
   url.searchParams.set("lat", String(latitude)); url.searchParams.set("lon", String(longitude));
-  url.searchParams.set("format", "jsonv2"); url.searchParams.set("zoom", "18");
+  url.searchParams.set("format", "jsonv2"); url.searchParams.set("zoom", "18"); url.searchParams.set("addressdetails", "1");
   try {
     const response = await boundedFetch(url, { headers: { "User-Agent": "PIKI-Delivery/0.2 (+https://pikidelivery.com)" } });
     if (!response.ok) return res.json({ label: `Ubicación GPS ${latitude.toFixed(5)}, ${longitude.toFixed(5)}`, latitude, longitude, degraded: true });
-    const row = await response.json() as { display_name?: string };
-    const body = { label: String(row.display_name || `Ubicación GPS ${latitude.toFixed(5)}, ${longitude.toFixed(5)}`), latitude, longitude };
+    const row = await response.json() as { display_name?: string; address?: Record<string, string> };
+    const address = row.address || {};
+    const locality = address.village || address.town || address.city || address.municipality || address.city_district || "";
+    const road = [address.road, address.house_number].filter(Boolean).join(" ");
+    const localityLabel = [address.postcode, locality].filter(Boolean).join(" ");
+    const canonicalLabel = [road, localityLabel].filter(Boolean).join(", ");
+    const body = { label: canonicalLabel || String(row.display_name || `Ubicación GPS ${latitude.toFixed(5)}, ${longitude.toFixed(5)}`), latitude, longitude, locality: locality || null, address };
     geocodeCache.set(cacheKey, { expiresAt: Date.now() + GEOCODE_CACHE_MS, body });
     void sharedCacheSet(`piki:geocode:${cacheKey}`, body, 300);
     res.setHeader("Cache-Control", "public, max-age=300, s-maxage=300, stale-while-revalidate=600, stale-if-error=900");
