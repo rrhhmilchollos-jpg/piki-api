@@ -3516,6 +3516,7 @@ app.patch("/api/v1/admin/riders/:id/profile", requireOwner(), async (req, res) =
   if (!updated) return res.status(404).json({ error: "RIDER_NOT_FOUND" });
   const ownerId = objectId(String(req.auth!.employeeId!));
   if (ownerId) await AccessAuthorization.create({ employeeId: riderId, action: "settings_updated", previousStatus: "approved", nextStatus: "approved", previousRole: "rider", nextRole: "rider", accessLevel: "superadmin", actorEmployeeId: ownerId, reason: "Superadmin actualizó el perfil operativo del Rider." });
+  await recordGovernanceEvent({ actor: { employeeId: ownerId, role: "admin", tenantId: (req.auth as any)?.tenantId }, action: "rider_admin_profile_updated", targetType: "rider", targetId: riderId, before: null, after: { fields: Object.keys(fields), fleetId: fleetId ?? undefined }, reason: "Cambio operativo realizado por Superadmin; el Rider no puede modificar configuración protegida." });
   return res.json({ updated: true, profile: { ...updated, id: String(updated._id), riderCode: updated.riderCode || publicRiderCode(updated._id) } });
 });
 app.patch("/api/v1/riders/:id/status", requireRole("admin", "rider", "fleet"), async (req, res) => {
