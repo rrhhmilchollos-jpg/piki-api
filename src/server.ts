@@ -2866,6 +2866,10 @@ app.get("/api/v1/admin/support/orders/search", requireRole(...supportOperatorRol
 app.get("/api/v1/admin/support/tickets", requireRole(...supportInboxRoles), async (req, res) => {
   const filter: Record<string, unknown> = { ...supportTenantScope(req), ...ticketRoleScope(req) };
   if (typeof req.query.status === "string" && req.query.status !== "all") filter.status = req.query.status;
+  if (typeof req.query.priority === "string" && req.query.priority !== "all") filter.priority = req.query.priority;
+  if (typeof req.query.source === "string" && req.query.source !== "all") filter.sourceSurface = req.query.source;
+  if (req.query.assigned === "mine") filter.assignedTo = req.auth?.employeeId ? objectId(String(req.auth.employeeId)) : null;
+  if (req.query.assigned === "unassigned") filter.assignedTo = null;
   if (typeof req.query.q === "string" && req.query.q.trim()) { const q = req.query.q.trim(); filter.$or = [{ ticketNumber: q }, { reporterEmail: { $regex: q, $options: "i" } }, { subject: { $regex: q, $options: "i" } }]; }
   const tickets = await SupportTicket.find(filter).sort({ updatedAt: -1 }).limit(500).populate("assignedTo", "name email").lean().exec();
   return res.json({ tickets: await enrichSupportTickets(tickets) });
@@ -2883,6 +2887,22 @@ app.post("/api/v1/admin/support/tickets", requireRole(...supportInboxRoles), asy
 async function supportAgent(req: express.Request) {
   return req.auth?.employeeId ? await EmployeeAccount.findOne({ _id: req.auth.employeeId, ...tenantScope(req) }).select("_id name email").lean().exec() as any : null;
 }
+app.post("/api/v1/admin/support/tickets/:id/claim", requireRole(...supportInboxRoles), async (req, res) => {
+  const id = objectId(String(req.params.id)); if (!id) return res.status(400).json({ error: "INVALID_TICKET_ID" });
+  const agent = await supportAgent(req); if (!agent) return res.status(403).json({ error: "SUPPORT_AGENT_NOT_FOUND" });
+  const current = await SupportTicket.findOne({ _id: id, ...supportTenantScope(req), ...ticketRoleScope(req) }).select("assignedTo status tenantId").lean().exec() as any;
+  if (!current) return res.status(404).json({ error: "TICKET_NOT_FOUND" });
+  if (current.assignedTo && String(current.assignedTo) !== String(agent._id)) return res.status(409).json({ error: "SUPPORT_TICKET_ASSIGNED", assignedTo: String(current.assignedTo) });
+  const actorEmployeeId = objectId(String(req.auth?.employeeId || ""));
+  const ticket = await SupportTicket.findOneAndUpdate(
+    { _id: id, ...supportTenantScope(req), ...ticketRoleScope(req), $or: [{ assignedTo: null }, { assignedTo: agent._id }] },
+    { $set: { assignedTo: agent._id, status: ["resolved", "closed"].includes(current.status) ? current.status : "in_progress" }, $push: { actions: { action: "ticket_claimed", actorEmployeeId, metadata: { agentName: String(agent.name || agent.email || "Agente de soporte") } } } },
+    { new: true },
+  ).populate("assignedTo", "name email").lean().exec();
+  if (!ticket) return res.status(409).json({ error: "SUPPORT_TICKET_CHANGED_RETRY" });
+  void publishRealtimeEvent({ channel: "admin", audienceKey: tenantAudienceKey((ticket as any).tenantId, "admin"), tenantId: (ticket as any).tenantId, type: "support.ticket_updated", payload: { ticketId: String(id), status: (ticket as any).status, assignedTo: String(agent._id) } }).catch(() => undefined);
+  return res.json({ ticket });
+});
 async function riderForSupportTicket(ticket: any) {
   if (ticket.orderId) { const order = await Order.findById(ticket.orderId).select("riderId").lean().exec() as any; if (order?.riderId) return String(order.riderId); }
   const rider = ticket.reporterEmail ? await Rider.findOne({ email: ticket.reporterEmail }).select("_id").lean().exec() as any : null;
