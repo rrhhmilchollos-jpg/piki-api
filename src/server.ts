@@ -4590,6 +4590,9 @@ async function repairConfiguredPartnerAccess() {
             promoted: true,
             deliveryFeeCents: 299,
             "partnerProfile.commissionRateBps": 1500,
+          } : location.slug === "rooster-kebab-xativa" || location.slug === "nakama-sushi-xativa" ? {
+            deliveryFeeCents: 299,
+            "partnerProfile.commissionRateBps": 2300,
           } : {}),
         },
         $setOnInsert: { slug: location.slug, tagline: "Próximo partner PIKI en Xàtiva", phone: "", address: "Xàtiva" },
@@ -4604,7 +4607,9 @@ async function repairConfiguredPartnerAccess() {
       { $set: { availabilityStatus: "available", upcomingMessage: "", isActive: true, deliveryFeeCents: 299, "partnerProfile.commissionRateBps": 1500 } },
     ).exec();
   }
-  const kingsGoLive = process.env.REPAIR_PARTNER_KINGS_GO_LIVE === "true" || email === "rrhh.milchollos@gmail.com";
+  // Public availability must be an explicit operational decision; merely
+  // logging in as the owner must never make Kings Tacos visible to customers.
+  const kingsGoLive = process.env.REPAIR_PARTNER_KINGS_GO_LIVE === "true";
   if (kingsGoLive) {
     await Restaurant.updateOne(
       { slug: "kings-tacos-xativa", tenantId: account.tenantId || null, onboardingStatus: "approved" },

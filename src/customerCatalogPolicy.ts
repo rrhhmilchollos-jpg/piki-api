@@ -1,5 +1,5 @@
-export const COMING_SOON_SLUGS = ["kings-tacos-xativa", "eleven-burgers-xativa", "nakama-sushi-xativa", "rooster-kebab-xativa", "alibaba-kebab-xativa"] as const;
-export const CUSTOMER_HIDDEN_TEST_SLUGS = ["kfc-xativa-qa", "kfc-xativa-test", "partner-test"] as const;
+export const COMING_SOON_SLUGS = ["eleven-burgers-xativa", "nakama-sushi-xativa", "rooster-kebab-xativa", "alibaba-kebab-xativa"] as const;
+export const CUSTOMER_HIDDEN_TEST_SLUGS = ["kfc-xativa-qa", "kfc-xativa-test", "partner-test", "kings-tacos-xativa"] as const;
 export const CUSTOMER_ORDERABLE_RESTAURANT_FILTER = {
   slug: { $nin: [...CUSTOMER_HIDDEN_TEST_SLUGS] }, internalDemo: { $ne: true }, isActive: true, onboardingStatus: "approved", availabilityStatus: "available", "menu.0": { $exists: true },
 };
@@ -25,16 +25,25 @@ export function presentCustomerCatalogRestaurant<T extends { name: string; slug?
   return { ...restaurant, menu: customerMenuForRestaurant(restaurant), name: customerCatalogRestaurantName(restaurant), comingSoon, withinHours, orderable, availabilityLabel: comingSoon ? "Disponible muy pronto" : withinHours ? "" : "Cerrado ahora" };
 }
 export const ALIBABA_KEBAB_SLUG = "alibaba-kebab-xativa";
-export const ALIBABA_PARTNER_COMMISSION_RATE = 0.18;
-export function applyAlibabaCommissionCents(cents: number): number { return Math.ceil(Math.max(0, Number(cents) || 0) * (1 + ALIBABA_PARTNER_COMMISSION_RATE)); }
-function applyAlibabaMenuPricing<T extends Record<string, any>>(item: T): T {
-  const priced = { ...item, price: Number((applyAlibabaCommissionCents(Number(item.price || 0) * 100) / 100).toFixed(2)) };
+export const PARTNER_COMMISSION_RATES: Record<string, number> = {
+  [ALIBABA_KEBAB_SLUG]: 0.15,
+  "rooster-kebab-xativa": 0.23,
+  "nakama-sushi-xativa": 0.23,
+};
+export const DEFAULT_CUSTOMER_COMMISSION_RATE = 0.18;
+export function customerCommissionRate(restaurant: { slug?: string; partnerProfile?: { commissionRateBps?: number } }): number {
+  if (Number.isInteger(restaurant.partnerProfile?.commissionRateBps)) return Math.max(0, Math.min(1, Number(restaurant.partnerProfile!.commissionRateBps) / 10_000));
+  return PARTNER_COMMISSION_RATES[restaurant.slug || ""] ?? DEFAULT_CUSTOMER_COMMISSION_RATE;
+}
+function applyPartnerMenuPricing<T extends Record<string, any>>(item: T, rate: number): T {
+  const apply = (value: unknown) => Number((Math.ceil(Math.max(0, Number(value || 0) * 100) * (1 + rate)) / 100).toFixed(2));
+  const priced = { ...item, price: apply(item.price) };
   if (!Array.isArray(item.modifiers)) return priced;
   const modifiers = item.modifiers.map((modifier: any) => ({
     ...modifier,
-    price: Number((applyAlibabaCommissionCents(Number(modifier.price || 0) * 100) / 100).toFixed(2)),
+    price: apply(modifier.price),
     options: Array.isArray(modifier.options)
-      ? modifier.options.map((option: any) => ({ ...option, price: Number((applyAlibabaCommissionCents(Number(option.price || 0) * 100) / 100).toFixed(2)) }))
+      ? modifier.options.map((option: any) => ({ ...option, price: apply(option.price) }))
       : modifier.options,
   }));
   // Alibaba's imported menu used `modifiers`; Customer and checkout use the
@@ -44,5 +53,6 @@ function applyAlibabaMenuPricing<T extends Record<string, any>>(item: T): T {
 }
 export function customerMenuForRestaurant<T extends { slug?: string; menu?: any[] }>(restaurant: T): any[] {
   const menu = Array.isArray(restaurant.menu) ? restaurant.menu : [];
-  return restaurant.slug === ALIBABA_KEBAB_SLUG ? menu.map(applyAlibabaMenuPricing) : menu;
+  const rate = customerCommissionRate(restaurant as T & { partnerProfile?: { commissionRateBps?: number } });
+  return rate > 0 ? menu.map((item) => applyPartnerMenuPricing(item, rate)) : menu;
 }
