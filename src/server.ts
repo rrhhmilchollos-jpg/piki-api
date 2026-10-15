@@ -1434,7 +1434,7 @@ app.get("/api/v1/partners/profile", requireRole("partner"), async (req, res) => 
   if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
   return res.json({ profile: { id: String(restaurant._id), partnerCode: restaurant.partnerCode || publicPartnerCode(restaurant._id), name: restaurant.name, email: restaurant.email, phone: restaurant.phone, address: restaurant.address, locality: restaurant.locality, commissionRateBps: Number(restaurant.partnerProfile?.commissionRateBps ?? DEFAULT_PARTNER_COMMISSION_BPS), commissionPercent: Number(restaurant.partnerProfile?.commissionRateBps ?? DEFAULT_PARTNER_COMMISSION_BPS) / 100 } });
 });
-const partnerBasicProfileSchema = z.object({ email: z.string().email().max(254).optional(), phone: z.string().trim().max(40).optional() }).strict();
+const partnerBasicProfileSchema = z.object({ email: z.union([z.string().email().max(254), z.literal("")]).optional(), phone: z.string().trim().max(40).optional() }).strict();
 app.patch("/api/v1/partners/profile", requireRole("partner"), async (req, res) => {
   const access = await partnerAccessForRequest(req);
   if (!access || !partnerCan(access.roles, "store:write")) return res.status(403).json({ error: "PARTNER_PERMISSION_DENIED", permission: "store:write" });
