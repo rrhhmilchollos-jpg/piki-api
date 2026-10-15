@@ -1867,9 +1867,10 @@ app.patch("/api/v1/admin/restaurants/:id/commission", requireOwner(), async (req
   if (!id) return res.status(400).json({ error: "INVALID_RESTAURANT_ID" });
   const parsed = partnerCommissionSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_PARTNER_COMMISSION", details: parsed.error.flatten() });
-  const restaurant = await Restaurant.findOneAndUpdate({ _id: id, ...tenantScope(req) }, { $set: { "partnerProfile.commissionRateBps": 1800 } }, { new: true }).select("_id name slug partnerProfile.commissionRateBps").lean().exec() as any;
+  const restaurant = await Restaurant.findOneAndUpdate({ _id: id, ...tenantScope(req) }, { $set: { "partnerProfile.commissionRateBps": parsed.data.commissionRateBps } }, { new: true }).select("_id name slug partnerProfile.commissionRateBps").lean().exec() as any;
   if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
-  return res.json({ restaurant: { id: String(restaurant._id), name: restaurant.name, slug: restaurant.slug, commissionRateBps: 1800, commissionPercent: 18 } });
+  const commissionRateBps = Number(restaurant.partnerProfile?.commissionRateBps ?? parsed.data.commissionRateBps);
+  return res.json({ restaurant: { id: String(restaurant._id), name: restaurant.name, slug: restaurant.slug, commissionRateBps, commissionPercent: commissionRateBps / 100 } });
 });
 
 app.patch("/api/v1/admin/restaurants/:id/configuration", requireOwner(), async (req, res) => {
