@@ -1,6 +1,6 @@
 import mongoose from "mongoose";
 import "dotenv/config";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { CustomerAccount, EmployeeAccount, Restaurant, Rider } from "../src/models.js";
 import { hashPassword } from "../src/employeeAuth.js";
@@ -101,17 +101,26 @@ try {
     { upsert: true, new: true, setDefaultsOnInsert: true },
   ).lean();
 
-  const alibaba = await Restaurant.findOne({ slug: "alibaba-kebab-xativa" }).select("_id menu").lean() as any;
-  if (alibaba && Array.isArray(alibaba.menu)) {
-    const menu = alibaba.menu.map((item: any) => ({
+  const fixturePath = resolve(process.cwd(), "scripts/fixtures/alibaba-staging-menu.json");
+  const alibabaFixture = JSON.parse(await readFile(fixturePath, "utf8")) as any;
+  const existingAlibaba = await Restaurant.findOne({ slug: "alibaba-kebab-xativa" }).select("_id menu").lean() as any;
+  const sourceMenu = existingAlibaba && Array.isArray(existingAlibaba.menu) && existingAlibaba.menu.length > 0
+    ? existingAlibaba.menu
+    : alibabaFixture.menu;
+  if (Array.isArray(sourceMenu) && sourceMenu.length > 0) {
+    const menu = sourceMenu.map((item: any) => ({
       ...item,
       modifiers: alibabaModifierGroups(item),
       modifierGroups: alibabaModifierGroups(item),
     }));
-    await Restaurant.updateOne({ _id: alibaba._id }, { $set: { menu } }).exec();
-    console.log(JSON.stringify({ ok: true, stagingAlibaba: true, restaurantSlug: "alibaba-kebab-xativa", configuredProducts: menu.filter((item: any) => item.modifierGroups?.length).length }));
+    const alibaba = await Restaurant.findOneAndUpdate(
+      { slug: "alibaba-kebab-xativa" },
+      { $set: { ...alibabaFixture, menu, onboardingStatus: "approved", availabilityStatus: "available", isActive: true, "partnerProfile.commissionRateBps": 1500 }, $setOnInsert: { slug: "alibaba-kebab-xativa" } },
+      { upsert: true, new: true, setDefaultsOnInsert: true },
+    ).select("_id menu").lean() as any;
+    console.log(JSON.stringify({ ok: true, stagingAlibaba: true, restaurantSlug: "alibaba-kebab-xativa", restaurantId: alibaba?._id, configuredProducts: menu.filter((item: any) => item.modifierGroups?.length).length }));
   } else {
-    console.log(JSON.stringify({ ok: true, stagingAlibaba: false, message: "Alibaba no existe todavía en la base staging; no se ha creado ni inventado ningún partner." }));
+    throw new Error("Alibaba staging fixture has no menu items");
   }
 
   const rider = await Rider.findOneAndUpdate(
