@@ -2713,7 +2713,11 @@ app.post("/api/v1/orders", rateLimit(20, 60_000, "orders-create"), async (req, r
     platformNetBeforeProcessingCents: marketplace.platformNetBeforeProcessingCents,
     payoutStatus: "pending", paymentMethod: parsed.data.paymentMethod, paymentState: "pending", statusHistory: [{ status: "pending", actorRole: "customer", reason: parsed.data.paymentMethod === "cash" ? "Pedido a contrarreembolso; cobro pendiente hasta la entrega" : "Pedido creado con política de cobertura Xàtiva" }] });
   if (parsed.data.paymentMethod === "cash") {
-    const dispatch = enqueueOrderForDispatch(order._id as mongoose.Types.ObjectId).catch((error) => console.warn("Dispatch outbox enqueue failed", error instanceof Error ? error.message : error));
+    // QA orders stay inside their isolated tenant and may target only the
+    // dedicated test rider created for the same runId. Commercial orders keep
+    // the normal nearby-rider pool because qaRunId is staging-only.
+    const preferredQaRiderId = parsed.data.qaRunId ? objectId(parsed.data.qaRiderId || "") || undefined : undefined;
+    const dispatch = enqueueOrderForDispatch(order._id as mongoose.Types.ObjectId, preferredQaRiderId).catch((error) => console.warn("Dispatch outbox enqueue failed", error instanceof Error ? error.message : error));
     await Promise.all([dispatch, publishOrderIntakeEvents(order, { settlement: "cash_due", message: "Contrarreembolso: el Rider cobrará en efectivo al entregar." })]);
   }
   res.status(201).json({ order: { id: order.id, publicCode, displayCode: order.displayCode, displayCodeDate: order.displayCodeDate, status: order.status, paymentState: parsed.data.paymentMethod === "cash" ? "pending_cash_collection" : order.paymentState, paymentMethod: parsed.data.paymentMethod, cashDueAtDelivery: parsed.data.paymentMethod === "cash", deliveryQrUrl: deliveryQrUrl(publicCode), subtotalCents, deliveryFeeCents, serviceFeeCents, totalCents,
