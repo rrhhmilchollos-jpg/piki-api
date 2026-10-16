@@ -8,7 +8,7 @@ COPY scripts ./scripts
 RUN npm run check && npm run build
 RUN npx esbuild scripts/seed-alibaba-staging.ts --platform=node --packages=external --bundle --format=esm --outfile=dist/seed-alibaba-staging.mjs
 RUN npx esbuild scripts/seed-staging-qa.ts --platform=node --packages=external --bundle --format=esm --outfile=dist/seed-staging-qa.mjs
-RUN npx esbuild scripts/cleanup-staging-qa.ts --platform=node --packages=external --bundle --format=esm --outfile=dist/cleanup-staging-qa.mjs
+RUN npx esbuild scripts/run-cleanup-staging-qa.ts --platform=node --packages=external --bundle --format=esm --outfile=dist/cleanup-staging-qa.mjs
 
 FROM node:22-alpine
 WORKDIR /app
