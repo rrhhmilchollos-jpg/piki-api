@@ -1781,8 +1781,8 @@ app.patch("/api/v1/admin/restaurants/:id/settings", requireOwner(), async (req, 
   if (!id) return res.status(400).json({ error: "INVALID_RESTAURANT_ID" });
   const parsed = partnerSettingsSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_PARTNER_SETTINGS", details: parsed.error.flatten() });
-  const { commissionRateBps, ...settings } = parsed.data;
-  const update = { ...settings, ...(commissionRateBps === undefined ? {} : { "partnerProfile.commissionRateBps": commissionRateBps }) };
+  const { commissionRateBps: _ignoredCommissionRateBps, ...settings } = parsed.data;
+  const update = { ...settings, "partnerProfile.commissionRateBps": DEFAULT_PARTNER_COMMISSION_BPS };
   const restaurant = await Restaurant.findOneAndUpdate({ _id: id, ...tenantScope(req) }, { $set: update }, { new: true }).select("_id slug name cuisine category phone email address locality deliveryFeeCents isActive availabilityStatus promoted image location onboardingStatus partnerProfile.commissionRateBps").lean().exec() as any;
   if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
   await AccessAuthorization.create({ employeeId: objectId(String(req.auth!.employeeId!)), action: "settings_updated", previousStatus: "approved", nextStatus: "approved", previousRole: "partner", nextRole: "partner", accessLevel: "superadmin", actorEmployeeId: objectId(String(req.auth!.employeeId!)), reason: `Configuración protegida actualizada para ${restaurant.name}; comisión definida por PIKI superadmin.` });

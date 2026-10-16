@@ -26,9 +26,9 @@ export function presentCustomerCatalogRestaurant<T extends { name: string; slug?
 }
 export const ALIBABA_KEBAB_SLUG = "alibaba-kebab-xativa";
 export const PARTNER_COMMISSION_RATES: Record<string, number> = {
-  [ALIBABA_KEBAB_SLUG]: 0.15,
-  "rooster-kebab-xativa": 0.23,
-  "nakama-sushi-xativa": 0.23,
+  [ALIBABA_KEBAB_SLUG]: 0.18,
+  "rooster-kebab-xativa": 0.18,
+  "nakama-sushi-xativa": 0.18,
 };
 export const DEFAULT_CUSTOMER_COMMISSION_RATE = 0.18;
 const ALIBABA_OPTIONS = {
@@ -51,17 +51,17 @@ function alibabaModifierGroups(item: Record<string, any>) {
   return groups;
 }
 export function customerCommissionRate(restaurant: { slug?: string; partnerProfile?: { commissionRateBps?: number } }): number {
-  if (Number.isInteger(restaurant.partnerProfile?.commissionRateBps)) return Math.max(0, Math.min(1, Number(restaurant.partnerProfile!.commissionRateBps) / 10_000));
-  return PARTNER_COMMISSION_RATES[restaurant.slug || ""] ?? DEFAULT_CUSTOMER_COMMISSION_RATE;
+  // La tarifa es una regla comercial de PIKI, no un dato editable por Partner.
+  return DEFAULT_CUSTOMER_COMMISSION_RATE;
 }
-function applyPartnerMenuPricing<T extends Record<string, any>>(item: T, rate: number): T {
+function applyPartnerMenuPricing<T extends Record<string, any>>(item: T, rate: number, restaurantSlug = ""): T {
   const apply = (value: unknown) => Number((Math.ceil(Math.max(0, Number(value || 0) * 100) * (1 + rate)) / 100).toFixed(2));
   const priced = { ...item, price: apply(item.price) };
   const sourceModifiers = Array.isArray(item.modifiers) && item.modifiers.length
     ? item.modifiers
     : Array.isArray(item.modifierGroups) && item.modifierGroups.length
       ? item.modifierGroups
-      : item.slug === ALIBABA_KEBAB_SLUG || String(item.id || "").startsWith("alibaba-")
+      : restaurantSlug === ALIBABA_KEBAB_SLUG || String(item.id || "").startsWith("alibaba-")
         ? alibabaModifierGroups(item)
         : null;
   if (!sourceModifiers) return priced;
@@ -87,5 +87,5 @@ function applyPartnerMenuPricing<T extends Record<string, any>>(item: T, rate: n
 export function customerMenuForRestaurant<T extends { slug?: string; menu?: any[] }>(restaurant: T): any[] {
   const menu = Array.isArray(restaurant.menu) ? restaurant.menu : [];
   const rate = customerCommissionRate(restaurant as T & { partnerProfile?: { commissionRateBps?: number } });
-  return rate > 0 ? menu.map((item) => applyPartnerMenuPricing(item, rate)) : menu;
+  return rate > 0 ? menu.map((item) => applyPartnerMenuPricing(item, rate, restaurant.slug || "")) : menu;
 }
