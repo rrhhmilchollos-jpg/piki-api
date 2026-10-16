@@ -1051,6 +1051,11 @@ app.get("/api/v1/locations/search", async (req, res) => {
     const response = await boundedFetch(url, { headers: geocoderHeaders });
     if (!response.ok) throw new Error(`Nominatim HTTP ${response.status}`);
     const rows = await response.json() as Array<{ place_id: number; display_name: string; lat: string; lon: string; type?: string; address?: Record<string, string> }>;
+    if (rows.length === 0) {
+      const results = await searchPhoton(query); const body = { results, provider: "photon" };
+      geocodeCache.set(cacheKey, { expiresAt: Date.now() + GEOCODE_CACHE_MS, body }); void sharedCacheSet(`piki:geocode:${cacheKey}`, body, 300);
+      res.setHeader("Cache-Control", "public, max-age=300, s-maxage=300, stale-while-revalidate=600, stale-if-error=900"); return res.json(body);
+    }
     const body = { results: rows.map((row) => ({ id: row.place_id, label: row.display_name, latitude: Number(row.lat), longitude: Number(row.lon), type: row.type || "address", address: row.address || {} })) };
     geocodeCache.set(cacheKey, { expiresAt: Date.now() + GEOCODE_CACHE_MS, body });
     void sharedCacheSet(`piki:geocode:${cacheKey}`, body, 300);
