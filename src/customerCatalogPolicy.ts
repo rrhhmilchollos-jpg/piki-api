@@ -38,13 +38,25 @@ export function customerCommissionRate(restaurant: { slug?: string; partnerProfi
 function applyPartnerMenuPricing<T extends Record<string, any>>(item: T, rate: number): T {
   const apply = (value: unknown) => Number((Math.ceil(Math.max(0, Number(value || 0) * 100) * (1 + rate)) / 100).toFixed(2));
   const priced = { ...item, price: apply(item.price) };
-  if (!Array.isArray(item.modifiers)) return priced;
-  const modifiers = item.modifiers.map((modifier: any) => ({
+  const sourceModifiers = Array.isArray(item.modifiers)
+    ? item.modifiers
+    : Array.isArray(item.modifierGroups)
+      ? item.modifierGroups
+      : null;
+  if (!sourceModifiers) return priced;
+  const modifiers = sourceModifiers.map((modifier: any, groupIndex: number) => ({
     ...modifier,
+    id: String(modifier.id || `${String(item.id || "item")}-group-${groupIndex + 1}`),
+    name: String(modifier.name || modifier.title || modifier.label || `Opciones ${groupIndex + 1}`),
     price: apply(modifier.price),
-    options: Array.isArray(modifier.options)
-      ? modifier.options.map((option: any) => ({ ...option, price: apply(option.price) }))
-      : modifier.options,
+    options: (Array.isArray(modifier.options) ? modifier.options : Array.isArray(modifier.items) ? modifier.items : [])
+      .map((option: any, optionIndex: number) => ({
+        ...option,
+        id: String(option.id || `${String(modifier.id || groupIndex)}-option-${optionIndex + 1}`),
+        name: String(option.name || option.title || option.label || `Opción ${optionIndex + 1}`),
+        price: apply(option.price),
+      }))
+      .filter((option: any) => option.name),
   }));
   // Alibaba's imported menu used `modifiers`; Customer and checkout use the
   // canonical `modifierGroups` contract. Publish both during migration so the
