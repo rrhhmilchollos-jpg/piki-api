@@ -20,3 +20,17 @@ test('un restaurante aprobado, activo y disponible se presenta como operable', (
   assert.equal(view.orderable, true);
   assert.equal(view.comingSoon, false);
 });
+
+test('Alibaba conserva el configurador cuando el registro legacy trae complementos vacíos', () => {
+  const view = presentCustomerCatalogRestaurant({
+    name: 'Alibaba Kebab Xàtiva',
+    slug: 'alibaba-kebab-xativa',
+    availabilityStatus: 'coming_soon',
+    isActive: false,
+    onboardingStatus: 'approved',
+    menu: [{ id: 'alibaba-01', name: 'Menú 10', price: 10.5, modifiers: [], modifierGroups: [] }],
+  });
+  assert.equal(view.menu[0].modifierGroups.length, 1);
+  assert.equal(view.menu[0].modifierGroups[0].options.length, 5);
+  assert.equal(view.menu[0].modifierGroups[0].minSelections, 1);
+});

@@ -31,6 +31,25 @@ export const PARTNER_COMMISSION_RATES: Record<string, number> = {
   "nakama-sushi-xativa": 0.23,
 };
 export const DEFAULT_CUSTOMER_COMMISSION_RATE = 0.18;
+const ALIBABA_OPTIONS = {
+  drinks: [
+    ["coca-cola", "Coca-Cola Original", 0], ["coca-cola-zero", "Coca-Cola Zero", 0],
+    ["fanta-naranja", "Fanta Naranja", 0], ["nestea-limon", "Nestea Limón", 0], ["aquarius-limon", "Aquarius Limón", 0],
+  ],
+  sauces: [["salsa-yogur", "Salsa de yogur", 0], ["salsa-picante", "Salsa picante", 0], ["salsa-barbacoa", "Salsa barbacoa", 0.5]],
+  extras: [["extra-queso", "Queso", 1], ["extra-carne", "Carne extra", 2], ["extra-gratinado", "Gratinado", 1.9]],
+} as const;
+function alibabaOptions(prefix: string, values: readonly (readonly [string, string, number])[]) {
+  return values.map(([id, name, price]) => ({ id: `alibaba-${prefix}-${id}`, name, price }));
+}
+function alibabaModifierGroups(item: Record<string, any>) {
+  const name = String(item.name || "").toLocaleLowerCase("es-ES");
+  const groups: any[] = [];
+  if (name.includes("menú") || name.includes("menu")) groups.push({ id: `${item.id}-bebida`, name: "Elige tu bebida", description: "Incluida en el menú", minSelections: 1, maxSelections: 1, options: alibabaOptions("bebida", ALIBABA_OPTIONS.drinks) });
+  if (name.includes("doner") || name.includes("kebab") || name.includes("carne")) groups.push({ id: `${item.id}-salsa`, name: "Elige tu salsa", description: "Puedes escoger una salsa", minSelections: 0, maxSelections: 1, options: alibabaOptions("salsa", ALIBABA_OPTIONS.sauces) });
+  if (name.includes("doner") || name.includes("kebab") || name.includes("carne") || name.includes("plato")) groups.push({ id: `${item.id}-extras`, name: "¿Quieres añadir extras?", description: "Extras opcionales para tu pedido", minSelections: 0, maxSelections: 3, options: alibabaOptions("extra", ALIBABA_OPTIONS.extras) });
+  return groups;
+}
 export function customerCommissionRate(restaurant: { slug?: string; partnerProfile?: { commissionRateBps?: number } }): number {
   if (Number.isInteger(restaurant.partnerProfile?.commissionRateBps)) return Math.max(0, Math.min(1, Number(restaurant.partnerProfile!.commissionRateBps) / 10_000));
   return PARTNER_COMMISSION_RATES[restaurant.slug || ""] ?? DEFAULT_CUSTOMER_COMMISSION_RATE;
@@ -38,11 +57,13 @@ export function customerCommissionRate(restaurant: { slug?: string; partnerProfi
 function applyPartnerMenuPricing<T extends Record<string, any>>(item: T, rate: number): T {
   const apply = (value: unknown) => Number((Math.ceil(Math.max(0, Number(value || 0) * 100) * (1 + rate)) / 100).toFixed(2));
   const priced = { ...item, price: apply(item.price) };
-  const sourceModifiers = Array.isArray(item.modifiers)
+  const sourceModifiers = Array.isArray(item.modifiers) && item.modifiers.length
     ? item.modifiers
-    : Array.isArray(item.modifierGroups)
+    : Array.isArray(item.modifierGroups) && item.modifierGroups.length
       ? item.modifierGroups
-      : null;
+      : item.slug === ALIBABA_KEBAB_SLUG || String(item.id || "").startsWith("alibaba-")
+        ? alibabaModifierGroups(item)
+        : null;
   if (!sourceModifiers) return priced;
   const modifiers = sourceModifiers.map((modifier: any, groupIndex: number) => ({
     ...modifier,
