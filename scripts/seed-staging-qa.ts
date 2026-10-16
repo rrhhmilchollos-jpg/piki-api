@@ -1,4 +1,5 @@
 import mongoose from "mongoose";
+import { randomBytes, scryptSync } from "node:crypto";
 import "dotenv/config";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
@@ -37,6 +38,8 @@ function alibabaModifierGroups(item: any) {
   if (name.includes("doner") || name.includes("kebab") || name.includes("carne") || name.includes("plato")) groups.push({ id: `alibaba-${item.id}-extras`, name: "¿Quieres añadir extras?", description: "Extras opcionales para tu pedido", minSelections: 0, maxSelections: 3, options: options("extra", meatExtras) });
   return groups;
 }
+
+const hashCustomerPassword = (value: string, salt = randomBytes(16).toString("hex")) => `${salt}:${scryptSync(value, salt, 64).toString("hex")}`;
 
 function madridDateAndTime(date = new Date()) {
   const parts = new Intl.DateTimeFormat("en-CA", { timeZone: "Europe/Madrid", year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hourCycle: "h23" }).formatToParts(date);
@@ -113,6 +116,7 @@ export async function seedStagingQaRun(runId: string, options: { manifestPath?: 
     ).exec();
 
     const passwordHash = hashPassword(process.env.QA_PASSWORD);
+    const customerPasswordHash = hashCustomerPassword(process.env.QA_PASSWORD);
     const employeeSeeds = [
       [adminEmail, "QA Admin", "admin"],
       [partnerEmail, "QA Partner", "partner"],
@@ -134,7 +138,7 @@ export async function seedStagingQaRun(runId: string, options: { manifestPath?: 
 
     const customer = await CustomerAccount.findOneAndUpdate(
       { email: customerEmail },
-      { $set: { tenantId: tenant._id, qaRunId: runId, name: "PIKI QA Customer", passwordHash, deliveryAddress: "Carrer de la Prova 2, Xàtiva", deliveryLocation: { type: "Point", coordinates: [-0.5187, 38.9903] }, lastSignedIn: now } },
+      { $set: { tenantId: tenant._id, qaRunId: runId, name: "PIKI QA Customer", passwordHash: customerPasswordHash, deliveryAddress: "Carrer de la Prova 2, Xàtiva", deliveryLocation: { type: "Point", coordinates: [-0.5187, 38.9903] }, lastSignedIn: now } },
       { upsert: true, new: true, setDefaultsOnInsert: true },
     ).select("_id email").lean() as any;
     if (!customer?._id) throw new Error("QA customer could not be created");
