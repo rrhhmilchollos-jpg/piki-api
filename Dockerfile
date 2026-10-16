@@ -21,5 +21,7 @@ RUN npm install --omit=dev
 COPY --from=build /app/dist ./dist
 COPY --from=build /app/src/assets ./dist/assets
 COPY --from=build /app/scripts/fixtures/alibaba-staging-menu.json ./dist/fixtures/alibaba-staging-menu.json
+COPY scripts/start-staging-with-worker.sh ./scripts/start-staging-with-worker.sh
+RUN chmod +x ./scripts/start-staging-with-worker.sh
 EXPOSE 3000
-CMD ["sh", "-c", "if [ \"$NODE_ENV\" = \"staging\" ] && [ \"$ALLOW_QA_SEED\" = \"true\" ]; then node dist/seed-staging-qa.mjs; elif [ \"$NODE_ENV\" = \"staging\" ] && [ \"$RUN_ALIBABA_STAGING_SEED\" = \"true\" ]; then node dist/seed-alibaba-staging.mjs; fi; npm start"]
+CMD ["sh", "-c", "if [ \"$NODE_ENV\" = \"staging\" ] && [ \"$ALLOW_QA_SEED\" = \"true\" ]; then node dist/seed-staging-qa.mjs; elif [ \"$NODE_ENV\" = \"staging\" ] && [ \"$RUN_ALIBABA_STAGING_SEED\" = \"true\" ]; then node dist/seed-alibaba-staging.mjs; fi; if [ \"$NODE_ENV\" = \"staging\" ] && [ \"$PIKI_RUN_DISPATCH_WORKER\" = \"true\" ]; then ./scripts/start-staging-with-worker.sh; else npm start; fi"]
