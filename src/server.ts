@@ -257,7 +257,7 @@ async function fleetCanAccessRider(req: express.Request, riderId: mongoose.Types
 const locationSchema = z.object({ latitude: z.number().min(-90).max(90), longitude: z.number().min(-180).max(180), accuracy: z.number().min(0).max(500).optional() });
 const customerModifierSelectionSchema = z.object({ groupId: z.string().min(1).max(80), optionIds: z.array(z.string().min(1).max(80)).max(12) });
 const orderItemSchema = z.object({ itemId: z.string().min(1), quantity: z.number().int().min(1).max(20), selections: z.array(customerModifierSelectionSchema).max(12).optional() });
-const createOrderSchema = z.object({ restaurantId: z.string().min(1), deliveryAddress: z.string().min(5).max(280), deliveryNote: z.string().trim().max(500).default(""), deliveryLocation: locationSchema, items: z.array(orderItemSchema).min(1).max(50), paymentMethod: z.string().optional().default("cash") });
+const createOrderSchema = z.object({ restaurantId: z.string().min(1), deliveryAddress: z.string().min(5).max(280), deliveryNote: z.string().trim().max(500).default(""), deliveryLocation: locationSchema, items: z.array(orderItemSchema).min(1).max(50), paymentMethod: z.string().optional().default("cash"), qaRunId: z.string().regex(/^qa-[a-z0-9-]{8,64}$/).optional(), qaRiderId: z.string().optional() });
 const deliveryQrSecret = String(process.env.DELIVERY_QR_SECRET || "").trim();
 if (process.env.NODE_ENV === "production" && !deliveryQrSecret) throw new Error("DELIVERY_QR_SECRET is required in production");
 const deliveryQrSignature = (orderCode: string) => createHmac("sha256", deliveryQrSecret || "development-only-delivery-qr-secret").update(`delivery:${orderCode}`).digest("hex").slice(0, 24);
@@ -2619,6 +2619,12 @@ app.delete("/api/v1/rider-slots/:id", requireRole("admin", "fleet"), async (req,
 app.post("/api/v1/orders", rateLimit(20, 60_000, "orders-create"), async (req, res) => {
   const parsed = createOrderSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_ORDER", details: parsed.error.flatten() });
+  if (parsed.data.qaRunId && process.env.NODE_ENV !== "staging") return res.status(403).json({ error: "QA_ONLY_STAGING" });
+  if (parsed.data.qaRunId && !parsed.data.qaRiderId) return res.status(400).json({ error: "QA_RIDER_REQUIRED" });
+  if (parsed.data.qaRunId && parsed.data.qaRiderId) {
+    const qaRider = await Rider.findOne({ _id: objectId(parsed.data.qaRiderId), isTestRider: true, qaRunId: parsed.data.qaRunId }).select("_id").lean().exec();
+    if (!qaRider) return res.status(400).json({ error: "QA_RIDER_NOT_FOUND" });
+  }
   if (!["cash", "stripe"].includes(parsed.data.paymentMethod)) return res.status(409).json({ error: "PAYMENT_METHOD_UNAVAILABLE", message: "Método de pago no disponible." });
   const restaurantObjectId = objectId(parsed.data.restaurantId);
   if (!restaurantObjectId) return res.status(400).json({ error: "INVALID_RESTAURANT_ID" });
@@ -2665,7 +2671,7 @@ app.post("/api/v1/orders", rateLimit(20, 60_000, "orders-create"), async (req, r
   const publicCode = await createRandomOrderCode();
   const dailyCode = await createDailyDisplayCode();
   const authenticatedCustomer = await currentCustomer(req) as any;
-  const order = await Order.create({ tenantId: restaurant.tenantId || null, publicCode, ...dailyCode, restaurantId: restaurant._id, customerId: authenticatedCustomer?._id || null, customerName: String(authenticatedCustomer?.name || "").trim(), items: normalizedItems, deliveryAddress: parsed.data.deliveryAddress, deliveryNote: parsed.data.deliveryNote, deliveryLocation: { type: "Point", coordinates: deliveryPoint }, coveragePolicySlug: coverage.policySlug, coveragePolicyVersion: coverage.policyVersion, coverageDecision: coverage.reason, straightLineDistanceKm: coverage.straightLineDistanceKm, withinMunicipality: coverage.withinMunicipality, deliveryBaseFeeCents: coverage.deliveryBaseFeeCents, outsideMunicipalitySurchargeCents: coverage.outsideMunicipalitySurchargeCents, routeDistanceKm: route.routeDistanceKm, routeDurationMinutes: route.routeDurationMinutes, routeProvider: route.routeProvider, routingDegraded: route.routingDegraded, requiredVehicleClasses: route.requiredVehicleClasses, subtotalCents, deliveryFeeCents, serviceFeeCents, totalCents,
+  const order = await Order.create({ tenantId: restaurant.tenantId || null, ...(parsed.data.qaRunId ? { qaRunId: parsed.data.qaRunId, qaRiderId: objectId(parsed.data.qaRiderId || "") || null, isTestOrder: true } : {}), publicCode, ...dailyCode, restaurantId: restaurant._id, customerId: authenticatedCustomer?._id || null, customerName: String(authenticatedCustomer?.name || "").trim(), items: normalizedItems, deliveryAddress: parsed.data.deliveryAddress, deliveryNote: parsed.data.deliveryNote, deliveryLocation: { type: "Point", coordinates: deliveryPoint }, coveragePolicySlug: coverage.policySlug, coveragePolicyVersion: coverage.policyVersion, coverageDecision: coverage.reason, straightLineDistanceKm: coverage.straightLineDistanceKm, withinMunicipality: coverage.withinMunicipality, deliveryBaseFeeCents: coverage.deliveryBaseFeeCents, outsideMunicipalitySurchargeCents: coverage.outsideMunicipalitySurchargeCents, routeDistanceKm: route.routeDistanceKm, routeDurationMinutes: route.routeDurationMinutes, routeProvider: route.routeProvider, routingDegraded: route.routingDegraded, requiredVehicleClasses: route.requiredVehicleClasses, subtotalCents, deliveryFeeCents, serviceFeeCents, totalCents,
     marketplaceCommissionRateBps: marketplace.commissionRateBps,
     marketplaceCommissionCents: marketplace.platformCommissionCents,
     partnerPayoutCents: marketplace.partnerPayoutCents,
