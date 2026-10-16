@@ -155,6 +155,24 @@ export async function handleCustomerTrpc(req: Request, res: Response) {
       return reply(res, row ? restaurantView(row) : null);
     }
     if (procedure === "auth.me") return reply(res, await currentCustomer(req).then((user) => publicUser(user)));
+    if (procedure === "customer.profile.get" || procedure === "customer.profile.update") {
+      const user = await currentCustomer(req) as any;
+      if (!user) return fail(res, "Inicia sesión para consultar tu perfil.", "AUTH_REQUIRED");
+      if (procedure === "customer.profile.update") {
+        const name = input?.name === undefined ? String(user.name || "").trim() : String(input.name || "").trim();
+        const phone = input?.phone === undefined ? String(user.phone || "").trim() : String(input.phone || "").trim();
+        const locality = input?.locality === undefined ? String(user.locality || "").trim() : String(input.locality || "").trim();
+        const addressInput = input?.address ?? input?.deliveryAddress;
+        const address = addressInput === undefined ? String(user.deliveryAddress || "").trim() : String(addressInput || "").trim();
+        if (name.length < 2 || name.length > 160 || phone.length > 40 || locality.length > 120 || address.length > 280) return fail(res, "Revisa los datos del perfil e inténtalo de nuevo.", "BAD_REQUEST");
+        const update: Record<string, unknown> = { name, phone, locality };
+        if (addressInput !== undefined) { update.deliveryAddress = address || null; update.deliveryAddressUpdatedAt = new Date(); }
+        const updated = await CustomerAccount.findOneAndUpdate({ _id: user._id }, { $set: update }, { new: true }).lean().exec() as any;
+        if (!updated) return fail(res, "No se pudo actualizar el perfil.", "NOT_FOUND");
+        return reply(res, { saved: true, profile: { id: String(updated._id), name: updated.name, email: updated.email, phone: updated.phone || "", locality: updated.locality || "", address: updated.deliveryAddress || "", updatedAt: updated.updatedAt || null } });
+      }
+      return reply(res, { id: String(user._id), name: user.name, email: user.email, phone: user.phone || "", locality: user.locality || "", address: user.deliveryAddress || "", updatedAt: user.updatedAt || null });
+    }
     if (procedure === "customer.orders.list") {
       const user = await currentCustomer(req) as any;
       if (!user) return fail(res, "Inicia sesión para consultar tus pedidos.", "AUTH_REQUIRED");
