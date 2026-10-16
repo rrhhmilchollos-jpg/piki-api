@@ -43,6 +43,7 @@ import { postMarketplaceOrderLedger, preparePartnerPayoutBatch } from "./marketp
 import { extractAndParseMenu, readAssetBytes } from "./menuImport.js";
 import { purgeTestDataIfEnabled } from "./purgeTestData.js";
 import { cleanupStagingQaRun } from "../scripts/cleanup-staging-qa.js";
+import { seedStagingQaRun } from "../scripts/seed-staging-qa.js";
 import { validateDocumentRequestSubmission } from "./onboardingDocumentPolicy.js";
 import { dispatchInitialIdempotencyKey, dispatchRequeueIdempotencyKey, enqueueDispatchOutbox, processDispatchOutboxBatch, type DispatchOutboxEvent } from "./dispatchOutbox.js";
 import { buildFleetEntityScope, buildTenantScope } from "./tenantScope.js";
@@ -404,6 +405,21 @@ app.get("/ready", (_req, res) => {
   return res.json({ service: "piki-api", status: "ready" });
 });
 app.get("/api/v1", (_req, res) => res.json({ name: "PIKI API", status: databaseReady ? "ready" : "initializing" }));
+app.post("/api/v1/internal/qa/bootstrap", async (req, res) => {
+  // The test fixture is only available on Staging and requires the same ephemeral secret as cleanup.
+  if (process.env.NODE_ENV !== "staging" || process.env.ALLOW_QA_SEED !== "true") return res.status(404).json({ error: "NOT_FOUND" });
+  const secret = String(process.env.QA_PASSWORD || "");
+  if (!secret || req.header("x-piki-qa-secret") !== secret) return res.status(401).json({ error: "QA_AUTH_REQUIRED" });
+  const runId = String(req.body?.runId || "").trim();
+  if (!/^qa-[a-z0-9-]{8,64}$/.test(runId)) return res.status(400).json({ error: "INVALID_QA_RUN_ID" });
+  try {
+    const result = await seedStagingQaRun(runId);
+    return res.status(201).json(result);
+  } catch (error) {
+    console.error("Staging QA bootstrap failed", error instanceof Error ? error.message : error);
+    return res.status(500).json({ error: "QA_BOOTSTRAP_FAILED" });
+  }
+});
 app.post("/api/v1/internal/qa/cleanup", async (req, res) => {
   // This endpoint exists only on the isolated Staging service. It has no production path,
   // requires the ephemeral QA secret, and can only delete data carrying an explicit runId.
