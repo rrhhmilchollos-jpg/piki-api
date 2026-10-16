@@ -87,7 +87,8 @@ async function start() {
     try {
       // Expiry and late-pickup recovery are executed in this dedicated worker,
       // never by a web API interval. Each recovery writes a new outbox event.
-      await dispatch.runDispatchMaintenance();
+      const maintenance = await dispatch.runDispatchMaintenance();
+      if (workerStats.polls % 12 === 0) console.log(JSON.stringify({ event: "dispatch_maintenance", workerId, ...maintenance }));
       const result = await processDispatchOutboxBatch(workerId, handle, { batchSize });
       workerStats.processed += result.processed;
       workerStats.deadLettered += result.deadLettered;
