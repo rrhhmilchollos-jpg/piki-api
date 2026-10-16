@@ -157,7 +157,10 @@ try {
   const catalog = (await request("/api/v1/catalog/restaurants")).body;
   const restaurant = (catalog?.restaurants || []).find((entry: any) => entry.slug === restaurantSlug);
   assert(restaurant, `La cocina QA ${restaurantSlug} no está publicada en el catálogo de Staging`);
-  const item = (restaurant.menu || []).find((entry: any) => entry.available !== false);
+  // Use a product without mandatory modifier selections so this runner reaches
+  // the cash-cap assertion instead of failing earlier with INVALID_MENU_ITEM.
+  const item = (restaurant.menu || []).find((entry: any) => entry.available !== false && !(entry.modifierGroups || entry.modifiers || []).some((group: any) => Number(group.minSelections || 0) > 0))
+    || (restaurant.menu || []).find((entry: any) => entry.available !== false);
   assert(item, "La cocina QA no tiene productos disponibles");
 
   const riderMe = (await request("/api/v1/auth/employee/me", {}, riderToken, { "x-piki-surface": "rider" })).body;
@@ -189,7 +192,8 @@ try {
     headers: { "content-type": "application/json", cookie: customerCookie },
     body: JSON.stringify({ restaurantId: restaurant.id || restaurant._id, items: [{ itemId: item.id, quantity: 20 }], deliveryAddress: "Carrer de la Prova 2, Xàtiva", deliveryLocation: { latitude: 38.9903, longitude: -0.5187 }, paymentMethod: "cash", qaRunId: runId, qaRiderId: activeRiderId }),
   });
-  assert(blockedCash.status === 422, `El límite de efectivo 48,99 € no bloqueó el pedido QA sobredimensionado (HTTP ${blockedCash.status})`);
+  const blockedCashBody = await blockedCash.json().catch(() => null);
+  assert(blockedCash.status === 422 && blockedCashBody?.error === "CASH_ORDER_TOTAL_EXCEEDS_LIMIT", `El límite de efectivo 48,99 € no devolvió el rechazo esperado: HTTP ${blockedCash.status} ${JSON.stringify(blockedCashBody)}`);
 
   const created = await request("/api/v1/orders", {
     method: "POST",
