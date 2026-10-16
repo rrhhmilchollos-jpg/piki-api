@@ -6,6 +6,7 @@ const riderId = String(process.env.PIKI_E2E_RIDER_ID || "").trim();
 const partnerToken = String(process.env.PIKI_E2E_PARTNER_TOKEN || "").trim();
 const confirm = process.env.PIKI_E2E_CONFIRM === "YES";
 const timeoutMs = Number(process.env.PIKI_E2E_TIMEOUT_MS || 90_000);
+const expectedCommissionBps = Number(process.env.PIKI_E2E_EXPECTED_COMMISSION_BPS || 1800);
 
 if (/production|api\.pikidelivery\.com/i.test(baseUrl)) throw new Error("E2E solo permite un endpoint de staging/QA");
 if (!riderToken || !riderId) throw new Error("PIKI_E2E_RIDER_TOKEN y PIKI_E2E_RIDER_ID son obligatorios");
@@ -30,15 +31,21 @@ function assert(condition: unknown, message: string): asserts condition {
 const catalog = await request("/api/v1/catalog/restaurants");
 const restaurant = (catalog.restaurants || []).find((entry: any) => entry.slug === "alibaba-kebab-xativa");
 assert(restaurant, "Alibaba Kebab Xàtiva no está publicado en el catálogo de staging");
-const item = (restaurant.menu || []).find((entry: any) => entry.available !== false);
+const item = (restaurant.menu || []).find((entry: any) => entry.available !== false && (entry.modifierGroups || entry.modifiers || []).length > 0)
+  || (restaurant.menu || []).find((entry: any) => entry.available !== false);
 assert(item, "Alibaba Kebab no tiene productos disponibles en staging");
+const groups = item.modifierGroups || item.modifiers || [];
+const selections = groups
+  .filter((group: any) => Number(group.minSelections || (group.required ? 1 : 0)) > 0)
+  .map((group: any) => ({ groupId: String(group.id), optionIds: [String(group.options?.[0]?.id || "")] }));
+assert(selections.every((selection: any) => selection.optionIds[0]), `El producto ${item.id} tiene un complemento obligatorio sin opciones`);
 
 const subtotalCents = Math.round(Number(item.price) * 100);
 const orderResult = await request("/api/v1/orders", {
   method: "POST",
   body: JSON.stringify({
     restaurantId: restaurant.id || restaurant._id,
-    items: [{ itemId: item.id, quantity: 1 }],
+    items: [{ itemId: item.id, quantity: 1, selections }],
     deliveryAddress: "Plaça de la Bassa, Xàtiva, Valencia",
     deliveryNote: "E2E staging Alibaba Kebab",
     deliveryLocation: { latitude: 38.9904, longitude: -0.5186 },
@@ -47,7 +54,7 @@ const orderResult = await request("/api/v1/orders", {
 });
 const order = orderResult.order;
 assert(order?.id && order.publicCode, "La API no devolvió un pedido E2E válido");
-assert(order.marketplace?.commissionRateBps === 1800, `Comisión inesperada: ${order.marketplace?.commissionRateBps}`);
+assert(order.marketplace?.commissionRateBps === expectedCommissionBps, `Comisión inesperada: ${order.marketplace?.commissionRateBps}; esperada: ${expectedCommissionBps}`);
 
 const deadline = Date.now() + timeoutMs;
 let offer: any = null;
@@ -71,7 +78,7 @@ console.log(JSON.stringify({
   ok: true,
   environment: "staging",
   restaurant: { id: restaurant.id || restaurant._id, slug: restaurant.slug, name: restaurant.name },
-  item: { id: item.id, name: item.name, priceCents: subtotalCents },
+  item: { id: item.id, name: item.name, priceCents: subtotalCents, selections },
   order: { id: order.id, publicCode: order.publicCode, paymentMethod: order.paymentMethod, commissionRateBps: order.marketplace.commissionRateBps },
   rider: { id: riderId, offerReceived: true, accepted: true },
   partner: { automatedToReadyForPickup: Boolean(partnerToken) },
