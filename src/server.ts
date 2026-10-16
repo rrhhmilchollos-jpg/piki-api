@@ -33,6 +33,7 @@ import { buildApprovedRiderOperationalProfile } from "./riderApproval.js";
 import { COMING_SOON_SLUGS, CUSTOMER_CATALOG_RESTAURANT_FILTER, CUSTOMER_ORDERABLE_RESTAURANT_FILTER, customerMenuForRestaurant, presentCustomerCatalogRestaurant } from "./customerCatalogPolicy.js";
 import { PARTNER_DEMO_MENU_VERSION, partnerDemoMenu } from "./partnerDemoMenu.js";
 import { KINGS_TACOS_COVER_IMAGE, kingsTacosMenu } from "./kingsTacosMenu.js";
+import { ALIBABA_KEBAB_COVER_IMAGE, alibabaKebabMenu } from "./alibabaKebabMenu.js";
 import { configuredPartnerRestaurantUpsert } from "./partnerRepairPolicy.js";
 import { quoteMenuItem, usesReferenceAddOns } from "./menuModifiers.js";
 import { decideLatePickup, pointDistanceMeters } from "./pickupPolicy.js";
@@ -4611,10 +4612,11 @@ async function repairConfiguredPartnerAccess() {
           onboardingStatus: "approved",
           isActive: false,
           ...(location.slug === "alibaba-kebab-xativa" ? {
-            image: "https://glovo.dhmedia.io/image/stores-glovo/stores/ec0c56634066c61c377459150e646d1c604d45d816253eb90aba007057bf2269?t=W3sicmVzaXplIjp7Im1vZGUiOiJmaWxsIiwid2lkdGgiOjEyODAsImhlaWdodCI6MTIwfX0seyJ3ZWJwIjp7InEiOiJsb3cifX1d",
+            image: ALIBABA_KEBAB_COVER_IMAGE,
             promoted: true,
             deliveryFeeCents: 299,
             "partnerProfile.commissionRateBps": 1500,
+            menu: alibabaKebabMenu,
           } : location.slug === "rooster-kebab-xativa" || location.slug === "nakama-sushi-xativa" ? {
             deliveryFeeCents: 299,
             "partnerProfile.commissionRateBps": 2300,
