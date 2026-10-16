@@ -89,9 +89,3 @@ export async function cleanupStagingQaRun(runId: string): Promise<QaCleanupResul
     if (opensConnection) await mongoose.disconnect();
   }
 }
-
-if (import.meta.url === `file://${process.argv[1]}`) {
-  const runId = String(process.env.E2E_RUN_ID || "").trim();
-  const result = await cleanupStagingQaRun(runId);
-  console.log(JSON.stringify(result, null, 2));
-}
