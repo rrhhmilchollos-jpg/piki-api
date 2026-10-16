@@ -115,7 +115,7 @@ try {
     }));
     const alibaba = await Restaurant.findOneAndUpdate(
       { slug: "alibaba-kebab-xativa" },
-      { $set: { ...alibabaFixture, menu, onboardingStatus: "approved", availabilityStatus: "available", isActive: true, "partnerProfile.commissionRateBps": 1500 }, $setOnInsert: { slug: "alibaba-kebab-xativa" } },
+      { $set: { ...alibabaFixture, menu, onboardingStatus: "approved", availabilityStatus: "available", isActive: true, "partnerProfile.commissionRateBps": 1500 } },
       { upsert: true, new: true, setDefaultsOnInsert: true },
     ).select("_id menu").lean() as any;
     console.log(JSON.stringify({ ok: true, stagingAlibaba: true, restaurantSlug: "alibaba-kebab-xativa", restaurantId: alibaba?._id, configuredProducts: menu.filter((item: any) => item.modifierGroups?.length).length }));

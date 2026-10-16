@@ -39,7 +39,7 @@ await mongoose.connect(process.env.MONGODB_URI, { dbName, serverSelectionTimeout
 try {
   const restaurant = await Restaurant.findOneAndUpdate(
     { slug: "alibaba-kebab-xativa" },
-    { $set: { ...fixture, menu, onboardingStatus: "approved", availabilityStatus: "available", isActive: true, "partnerProfile.commissionRateBps": 1500 }, $setOnInsert: { slug: "alibaba-kebab-xativa" } },
+    { $set: { ...fixture, menu, onboardingStatus: "approved", availabilityStatus: "available", isActive: true, "partnerProfile.commissionRateBps": 1500 } },
     { upsert: true, new: true, setDefaultsOnInsert: true },
   ).select("_id menu").lean() as any;
   console.log(JSON.stringify({ ok: true, environment: "staging", restaurantId: restaurant?._id, products: menu.length, configurableProducts: menu.filter((item: any) => item.modifierGroups.length).length }));
