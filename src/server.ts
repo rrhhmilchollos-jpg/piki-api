@@ -67,6 +67,34 @@ const geocodeCache = new Map<string, { expiresAt: number; body: any }>();
 const CATALOG_CACHE_MS = 30_000;
 const GEOCODE_CACHE_MS = 300_000;
 const boundedFetch = (input: string | URL, init: RequestInit = {}) => fetch(input, { ...init, signal: AbortSignal.timeout(1_200) });
+const geocoderHeaders = { "User-Agent": "PIKI-Delivery/0.2 (+https://pikidelivery.com)" };
+
+type PhotonFeature = { properties?: Record<string, string | undefined>; geometry?: { coordinates?: [number, number] } };
+function photonAddress(properties: Record<string, string | undefined>) {
+  const locality = properties.city || properties.town || properties.village || properties.locality || properties.district || "";
+  const road = [properties.street || properties.name, properties.housenumber].filter(Boolean).join(" ");
+  return { road, locality, postcode: properties.postcode || "" };
+}
+async function searchPhoton(query: string) {
+  const url = new URL("https://photon.komoot.io/api/");
+  url.searchParams.set("q", `${query}, Comunitat Valenciana, España`); url.searchParams.set("limit", "8");
+  const response = await boundedFetch(url, { headers: geocoderHeaders });
+  if (!response.ok) throw new Error(`Photon HTTP ${response.status}`);
+  const payload = await response.json() as { features?: PhotonFeature[] };
+  return (payload.features || []).map((feature, index) => {
+    const properties = feature.properties || {}; const coordinates = feature.geometry?.coordinates; const address = photonAddress(properties);
+    const label = [address.road, [address.postcode, address.locality].filter(Boolean).join(" ")].filter(Boolean).join(", ") || [properties.name, address.locality].filter(Boolean).join(", ");
+    return { id: `photon:${properties.osm_type || "feature"}:${properties.osm_id || index}`, label, latitude: Number(coordinates?.[1]), longitude: Number(coordinates?.[0]), type: properties.type || "address", address: properties };
+  }).filter((row) => Number.isFinite(row.latitude) && Number.isFinite(row.longitude));
+}
+async function reversePhoton(latitude: number, longitude: number) {
+  const url = new URL("https://photon.komoot.io/reverse"); url.searchParams.set("lat", String(latitude)); url.searchParams.set("lon", String(longitude));
+  const response = await boundedFetch(url, { headers: geocoderHeaders });
+  if (!response.ok) throw new Error(`Photon HTTP ${response.status}`);
+  const payload = await response.json() as { features?: PhotonFeature[] }; const properties = payload.features?.[0]?.properties || {}; const address = photonAddress(properties);
+  const label = [address.road, [address.postcode, address.locality].filter(Boolean).join(" ")].filter(Boolean).join(", ");
+  return { label: label || `Ubicación GPS ${latitude.toFixed(5)}, ${longitude.toFixed(5)}`, latitude, longitude, locality: address.locality || null, address: properties };
+}
 mongoose.connection.on("connected", () => { databaseReady = true; startRealtimeRelay(); void syncPublicIds().catch((error) => console.error("Public ID sync failed", error)); });
 mongoose.connection.on("disconnected", () => { databaseReady = false; console.warn("MongoDB disconnected; API entering not-ready state"); });
 mongoose.connection.on("error", (error) => { databaseReady = false; console.error("MongoDB connection error", error instanceof Error ? error.message : error); });
@@ -1020,8 +1048,8 @@ app.get("/api/v1/locations/search", async (req, res) => {
   url.searchParams.set("addressdetails", "1");
   url.searchParams.set("limit", "8");
   try {
-    const response = await boundedFetch(url, { headers: { "User-Agent": "PIKI-Delivery/0.2 (+https://pikidelivery.com)" } });
-    if (!response.ok) return res.json({ results: [], degraded: true });
+    const response = await boundedFetch(url, { headers: geocoderHeaders });
+    if (!response.ok) throw new Error(`Nominatim HTTP ${response.status}`);
     const rows = await response.json() as Array<{ place_id: number; display_name: string; lat: string; lon: string; type?: string; address?: Record<string, string> }>;
     const body = { results: rows.map((row) => ({ id: row.place_id, label: row.display_name, latitude: Number(row.lat), longitude: Number(row.lon), type: row.type || "address", address: row.address || {} })) };
     geocodeCache.set(cacheKey, { expiresAt: Date.now() + GEOCODE_CACHE_MS, body });
@@ -1029,7 +1057,11 @@ app.get("/api/v1/locations/search", async (req, res) => {
     res.setHeader("Cache-Control", "public, max-age=300, s-maxage=300, stale-while-revalidate=600, stale-if-error=900");
     return res.json(body);
   } catch {
-    return res.json({ results: [], degraded: true, message: "Geocoder temporalmente no disponible" });
+    try {
+      const results = await searchPhoton(query); const body = { results, provider: "photon" };
+      geocodeCache.set(cacheKey, { expiresAt: Date.now() + GEOCODE_CACHE_MS, body }); void sharedCacheSet(`piki:geocode:${cacheKey}`, body, 300);
+      res.setHeader("Cache-Control", "public, max-age=300, s-maxage=300, stale-while-revalidate=600, stale-if-error=900"); return res.json(body);
+    } catch { return res.json({ results: [], degraded: true, message: "Geocoder temporalmente no disponible" }); }
   }
 });
 
@@ -1045,8 +1077,8 @@ app.get("/api/v1/locations/reverse", async (req, res) => {
   url.searchParams.set("lat", String(latitude)); url.searchParams.set("lon", String(longitude));
   url.searchParams.set("format", "jsonv2"); url.searchParams.set("zoom", "18"); url.searchParams.set("addressdetails", "1");
   try {
-    const response = await boundedFetch(url, { headers: { "User-Agent": "PIKI-Delivery/0.2 (+https://pikidelivery.com)" } });
-    if (!response.ok) return res.json({ label: `Ubicación GPS ${latitude.toFixed(5)}, ${longitude.toFixed(5)}`, latitude, longitude, degraded: true });
+    const response = await boundedFetch(url, { headers: geocoderHeaders });
+    if (!response.ok) throw new Error(`Nominatim HTTP ${response.status}`);
     const row = await response.json() as { display_name?: string; address?: Record<string, string> };
     const address = row.address || {};
     const locality = address.village || address.town || address.city || address.municipality || address.city_district || "";
@@ -1058,7 +1090,12 @@ app.get("/api/v1/locations/reverse", async (req, res) => {
     void sharedCacheSet(`piki:geocode:${cacheKey}`, body, 300);
     res.setHeader("Cache-Control", "public, max-age=300, s-maxage=300, stale-while-revalidate=600, stale-if-error=900");
     return res.json(body);
-  } catch { return res.json({ label: `Ubicación GPS ${latitude.toFixed(5)}, ${longitude.toFixed(5)}`, latitude, longitude, degraded: true }); }
+  } catch {
+    try {
+      const body = await reversePhoton(latitude, longitude); geocodeCache.set(cacheKey, { expiresAt: Date.now() + GEOCODE_CACHE_MS, body }); void sharedCacheSet(`piki:geocode:${cacheKey}`, body, 300);
+      res.setHeader("Cache-Control", "public, max-age=300, s-maxage=300, stale-while-revalidate=600, stale-if-error=900"); return res.json(body);
+    } catch { return res.json({ label: `Ubicación GPS ${latitude.toFixed(5)}, ${longitude.toFixed(5)}`, latitude, longitude, degraded: true }); }
+  }
 });
 
 app.get("/api/v1/coverage", async (req, res) => {
