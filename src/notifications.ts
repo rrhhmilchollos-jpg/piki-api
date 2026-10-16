@@ -152,6 +152,12 @@ export function buildNoticeCopy(input: RealtimeNotificationInput, recipient: Rec
     if (recipient.surface !== "rider") return null;
     return { category: "delivery", title: "Nuevo reparto asignado", body: `Tienes una nueva oferta para ${orderRef}.`, url, entityType: "order", entityId: orderId };
   }
+  if (["rider.shift_start_reminder", "rider.shift_connection_warning", "rider.shift_auto_revoked", "rider.shift_dispatch_shielded"].includes(input.type)) {
+    if (recipient.surface !== "rider") return null;
+    const title = String(input.payload.title || "Actualización de jornada").slice(0, 120);
+    const body = String(input.payload.message || "Revisa tu jornada en la app Rider.").slice(0, 240);
+    return { category: "shift", title, body, url: "/?section=Jornada", entityType: "rider_shift", entityId: String(input.payload.slotId || "") };
+  }
   if (input.type === "order.message") {
     if (recipient.surface !== "rider") return null;
     return {

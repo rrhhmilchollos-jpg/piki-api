@@ -359,7 +359,7 @@ const governanceAuditEventSchema = new Schema({
 }, { timestamps: true, collection: "governance_audit_events" });
 governanceAuditEventSchema.index({ targetType: 1, targetId: 1, createdAt: -1 });
 const riderSlotSchema = new Schema({
-  tenantId: { type: Schema.Types.ObjectId, ref: "Tenant", default: null, index: true }, riderId: { type: Schema.Types.ObjectId, ref: "Rider", required: true, index: true }, zoneSlug: { type: String, required: true }, date: { type: String, required: true }, startTime: { type: String, required: true }, endTime: { type: String, required: true }, status: { type: String, enum: ["planned", "active", "completed", "cancelled"], default: "planned" }, notes: { type: String, default: "" } }, { timestamps: true, collection: "rider_slots" });
+  tenantId: { type: Schema.Types.ObjectId, ref: "Tenant", default: null, index: true }, riderId: { type: Schema.Types.ObjectId, ref: "Rider", required: true, index: true }, zoneSlug: { type: String, required: true }, date: { type: String, required: true }, startTime: { type: String, required: true }, endTime: { type: String, required: true }, status: { type: String, enum: ["planned", "active", "completed", "cancelled"], default: "planned" }, notes: { type: String, default: "" }, connectionReminderSentAt: { type: Date, default: null, index: true }, connectionWarningAt: { type: Date, default: null, index: true }, connectionRevokedAt: { type: Date, default: null, index: true }, dispatchShieldedAt: { type: Date, default: null, index: true } }, { timestamps: true, collection: "rider_slots" });
 riderSlotSchema.index({ tenantId: 1, riderId: 1, date: 1, startTime: 1 }, { unique: true });
 riderSlotSchema.index({ tenantId: 1, date: 1, status: 1 });
 

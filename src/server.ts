@@ -49,6 +49,7 @@ import { dispatchInitialIdempotencyKey, dispatchRequeueIdempotencyKey, enqueueDi
 import { buildFleetEntityScope, buildTenantScope } from "./tenantScope.js";
 import { authenticationOptions, registrationOptions, verifyAuthentication, verifyRegistration } from "./passkeys.js";
 import { markPartnerBatchPaid, markRiderBatchPaid, publicPartnerCode, publicRiderCode, recordGovernanceEvent, syncPublicIds } from "./pikiGovernance.js";
+import { isDispatchShielded, runRiderShiftAutomation } from "./riderShiftAutomation.js";
 
 export const app = express();
 app.set("trust proxy", 1);
@@ -3717,8 +3718,8 @@ async function findNextRiderSlot(riderId: mongoose.Types.ObjectId, now: ReturnTy
 
 async function currentSlotRiderIds(scope: Record<string, unknown> = {}) {
   const now = madridNow();
-  const candidates = await RiderSlot.find({ ...scope, date: { $in: [now.date, previousCalendarDate(now.date)] }, status: { $in: ["planned", "active"] } }).select("riderId date startTime endTime").lean().exec();
-  return [...new Set(candidates.filter((candidate: any) => slotContainsTime(candidate, now.time) && (candidate.date === now.date || candidate.startTime >= candidate.endTime)).map((candidate: any) => candidate.riderId))];
+  const candidates = await RiderSlot.find({ ...scope, date: { $in: [now.date, previousCalendarDate(now.date)] }, status: { $in: ["planned", "active"] } }).select("riderId date startTime endTime status").lean().exec();
+  return [...new Set(candidates.filter((candidate: any) => slotContainsTime(candidate, now.time) && (candidate.date === now.date || candidate.startTime >= candidate.endTime) && !isDispatchShielded(new Date(), candidate)).map((candidate: any) => candidate.riderId))];
 }
 
 async function canAccessRiderShift(riderId: mongoose.Types.ObjectId, req: express.Request) {
@@ -4150,9 +4151,9 @@ async function runAutomaticDispatchSweep() {
 }
 /** Called exclusively by the explicit dispatch worker process. */
 export async function runDispatchMaintenance() {
-  if (mongoose.connection.readyState !== 1) return { reassigned: 0, expiredOffers: 0 };
-  const [reassigned, expiredOffers] = await Promise.all([reassignLatePickupOrders(), expireStaleOffers()]);
-  return { reassigned, expiredOffers };
+  if (mongoose.connection.readyState !== 1) return { reassigned: 0, expiredOffers: 0, riderShifts: { reminders: 0, warnings: 0, revoked: 0, shielded: 0 } };
+  const [reassigned, expiredOffers, riderShifts] = await Promise.all([reassignLatePickupOrders(), expireStaleOffers(), runRiderShiftAutomation()]);
+  return { reassigned, expiredOffers, riderShifts };
 }
 async function findDispatchOrder(orderId: mongoose.Types.ObjectId, req: express.Request) {
   const scoped = await Order.findOne({ _id: orderId, ...tenantScope(req) }).lean().exec() as any;
