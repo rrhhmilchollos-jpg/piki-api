@@ -587,9 +587,17 @@ app.all("/api/trpc/:procedure", handleCustomerTrpc);
 app.get("/api/v1/auth/status", (_req, res) => res.json({ authentication: "bearer" }));
 const employeeSessionRoles = ["admin", "partner", "rider", "fleet", "commercial", "gerente_comercial_zona", "finance", "support"] as const;
 const partnerOperationalRoles = ["partner_admin", "area_manager", "zone_manager", "store_manager", "manager", "cashier", "cajero", "kitchen", "cocina", "cook", "catalog", "catalogue", "menu_manager", "viewer", "read_only", "solo_lectura"] as const;
-const employeeLoginSchema = z.object({ email: z.string().email(), password: z.string().min(8).max(200), role: z.enum(employeeSessionRoles).optional() });
+const employeeLoginSchema = z.object({ identifier: z.string().trim().min(3).max(254).optional(), email: z.string().trim().min(3).max(254).optional(), password: z.string().min(8).max(200), role: z.enum(employeeSessionRoles).optional() }).refine((value) => Boolean(value.identifier || value.email), { message: "identifier_required" });
 const employeePasswordResetRequestSchema = z.object({ email: z.string().email().max(254) });
 const employeePasswordResetConfirmSchema = z.object({ token: z.string().min(40).max(200), newPassword: z.string().min(12).max(200).regex(/[A-Z]/).regex(/[a-z]/).regex(/[0-9]/) });
+function employeeCodeFor(value: unknown) { return `PIKI-E-${String(value).replace(/[^a-z0-9]/gi, "").slice(-8).toUpperCase()}`; }
+async function backfillEmployeeCodes() {
+  const employees = await EmployeeAccount.find({ $or: [{ employeeCode: null }, { employeeCode: { $exists: false } }] }).select("_id").lean().exec() as any[];
+  if (!employees.length) return 0;
+  const result = await EmployeeAccount.bulkWrite(employees.map((employee) => ({ updateOne: { filter: { _id: employee._id, $or: [{ employeeCode: null }, { employeeCode: { $exists: false } }] }, update: { $set: { employeeCode: employeeCodeFor(employee._id) } } } })));
+  console.log(JSON.stringify({ event: "employee_code_backfill", matched: result.matchedCount, modified: result.modifiedCount }));
+  return result.modifiedCount;
+}
 const employeeCredentialSurfaces = ["admin", "partner", "rider", "fleet"] as const;
 type EmployeeCredentialSurface = (typeof employeeCredentialSurfaces)[number];
 const employeeCredentialAppUrls: Record<EmployeeCredentialSurface, string> = {
@@ -678,9 +686,9 @@ app.post("/api/v1/auth/employee/password-reset/confirm", rateLimit(8, 15 * 60_00
 });
 app.post("/api/v1/auth/employee/login", async (req, res) => {
   const parsed = employeeLoginSchema.safeParse(req.body); if (!parsed.success) return res.status(400).json({ error: "INVALID_LOGIN" });
-  const identifier = parsed.data.email.trim().toLowerCase();
+  const identifier = String(parsed.data.identifier || parsed.data.email || "").trim().toLowerCase();
   if (String(req.headers["x-piki-surface"] || "").toLowerCase() === "admin" && identifier !== ownerEmail) { /* subadmins are allowed; destructive operations remain superadmin-only */ }
-  let employee = await EmployeeAccount.findOne({ email: identifier }).select("+passwordHash").exec() as any;
+  let employee = await EmployeeAccount.findOne({ $or: [{ email: identifier }, { employeeCode: identifier.toUpperCase() }] }).select("+passwordHash").exec() as any;
   if (!employee && /^piki-p-[a-z0-9-]+$/i.test(identifier)) {
     const restaurants = await Restaurant.find({ onboardingStatus: "approved" }).select("_id").lean().exec() as any[];
     const restaurant = restaurants.find((item) => onboardingCode("P", item._id)?.toLowerCase() === identifier);
@@ -698,7 +706,7 @@ app.post("/api/v1/auth/employee/login", async (req, res) => {
   if (!role) return res.status(403).json({ error: "SURFACE_ROLE_MISMATCH", message: "Esta cuenta no tiene acceso a esta aplicación." });
   const issued = await issueEmployeeSession(employee, surface, requestedRole);
   if (!issued) return res.status(403).json({ error: "SURFACE_ROLE_MISMATCH" });
-  return res.json({ accessToken: issued.token, requiresPasswordChange: Boolean(employee.mustChangePassword), employee: { id: employee.id, name: employee.name, email: employee.email, jobRole: role === "rider" ? "rider" : employee.jobRole, roles: employee.roles?.length ? employee.roles : [employee.apiRole], primaryRole: employee.primaryRole || employee.apiRole, apiRole: issued.role, accessLevel: employee.accessLevel || (employee.email === ownerEmail ? "superadmin" : "subadmin"), authorizationStatus: employee.authorizationStatus || "approved", portfolioId: employee.portfolioId, fleetId: employee.fleetId, zoneSlugs: employee.zoneSlugs } });
+  return res.json({ accessToken: issued.token, requiresPasswordChange: Boolean(employee.mustChangePassword), employee: { id: employee.id, employeeCode: employee.employeeCode || employeeCodeFor(employee._id), name: employee.name, email: employee.email, jobRole: role === "rider" ? "rider" : employee.jobRole, roles: employee.roles?.length ? employee.roles : [employee.apiRole], primaryRole: employee.primaryRole || employee.apiRole, apiRole: issued.role, accessLevel: employee.accessLevel || (employee.email === ownerEmail ? "superadmin" : "subadmin"), authorizationStatus: employee.authorizationStatus || "approved", portfolioId: employee.portfolioId, fleetId: employee.fleetId, zoneSlugs: employee.zoneSlugs } });
 });
 app.post("/api/v1/auth/employee/switch-role", requireRole("admin", "partner", "rider", "fleet", "commercial", "gerente_comercial_zona", "finance", "support"), async (req, res) => {
   const parsed = z.object({ role: z.enum(employeeSessionRoles) }).safeParse(req.body);
@@ -718,11 +726,11 @@ app.post("/api/v1/auth/employee/logout", requireRole("admin", "partner", "rider"
   return res.status(204).end();
 });
 app.get("/api/v1/auth/employee/me", requireRole("admin", "partner", "rider", "fleet", "commercial", "gerente_comercial_zona", "finance", "support"), async (req, res) => {
-  const employee = req.auth?.employeeId ? await EmployeeAccount.findOne({ _id: req.auth.employeeId, ...tenantScope(req) }).select("name email tenantId ownerProtected accessLevel authorizationStatus jobRole apiRole roles partnerRoles primaryRole zoneSlugs restaurantId restaurantIds").lean().exec() as any : null;
+  const employee = req.auth?.employeeId ? await EmployeeAccount.findOne({ _id: req.auth.employeeId, ...tenantScope(req) }).select("name email employeeCode tenantId ownerProtected accessLevel authorizationStatus jobRole apiRole roles partnerRoles primaryRole zoneSlugs restaurantId restaurantIds").lean().exec() as any : null;
   const roles = partnerRolesForEmployee(employee);
   const permissions = [...permissionsForPartnerRoles(roles)];
   const locations = employee ? await partnerLocationsFor(employee, roles, permissions) : [];
-  return res.json({ employee: { id: req.auth?.employeeId, name: employee?.name || null, email: employee?.email || null, role: req.auth?.role, accessLevel: employee?.accessLevel || "subadmin", authorizationStatus: employee?.authorizationStatus || "approved", ownerProtected: Boolean(employee?.ownerProtected), jobRole: employee?.jobRole || null, apiRole: employee?.apiRole || req.auth?.role || null, roles, permissions, primaryRole: employee?.primaryRole || employee?.apiRole || req.auth?.role, zoneSlugs: employee?.zoneSlugs || [], locations, mustChangePassword: Boolean(req.auth?.mustChangePassword) } });
+  return res.json({ employee: { id: req.auth?.employeeId, employeeCode: employee?.employeeCode || (req.auth?.employeeId ? employeeCodeFor(req.auth.employeeId) : null), name: employee?.name || null, email: employee?.email || null, role: req.auth?.role, accessLevel: employee?.accessLevel || "subadmin", authorizationStatus: employee?.authorizationStatus || "approved", ownerProtected: Boolean(employee?.ownerProtected), jobRole: employee?.jobRole || null, apiRole: employee?.apiRole || req.auth?.role || null, roles, permissions, primaryRole: employee?.primaryRole || employee?.apiRole || req.auth?.role, zoneSlugs: employee?.zoneSlugs || [], locations, mustChangePassword: Boolean(req.auth?.mustChangePassword) } });
 });
 app.post("/api/v1/auth/employee/change-password", requireRole("admin", "partner", "rider", "fleet", "commercial", "gerente_comercial_zona", "finance", "support"), async (req, res) => {
   const parsed = z.object({ currentPassword: z.string().min(8), newPassword: z.string().min(12).max(200).regex(/[A-Z]/).regex(/[a-z]/).regex(/[0-9]/) }).safeParse(req.body);
@@ -750,7 +758,8 @@ app.post("/api/v1/admin/employees", requireOwner(), async (req, res) => {
   const primaryRole = parsed.data.primaryRole || roles[0];
   const temporaryPassword = generateTemporaryPassword();
   try {
-    const employee = await EmployeeAccount.create({ ...parsed.data, roles, primaryRole, accessLevel: "subadmin", authorizationStatus: "approved", authorizedAt: new Date(), authorizedBy: req.auth?.employeeId ? objectId(req.auth.employeeId) : null, restaurantId: parsed.data.restaurantId ? objectId(parsed.data.restaurantId) : null, fleetId: parsed.data.fleetId ? objectId(parsed.data.fleetId) : null, apiRole, passwordHash: hashPassword(temporaryPassword), mustChangePassword: true, active: true });
+    const employeeId = new mongoose.Types.ObjectId();
+    const employee = await EmployeeAccount.create({ _id: employeeId, employeeCode: employeeCodeFor(employeeId), ...parsed.data, roles, primaryRole, accessLevel: "subadmin", authorizationStatus: "approved", authorizedAt: new Date(), authorizedBy: req.auth?.employeeId ? objectId(req.auth.employeeId) : null, restaurantId: parsed.data.restaurantId ? objectId(parsed.data.restaurantId) : null, fleetId: parsed.data.fleetId ? objectId(parsed.data.fleetId) : null, apiRole, passwordHash: hashPassword(temporaryPassword), mustChangePassword: true, active: true });
     await AccessAuthorization.create({ employeeId: employee._id, action: "created", previousStatus: null, nextStatus: "approved", previousRole: null, nextRole: apiRole, accessLevel: "subadmin", actorEmployeeId: objectId(req.auth!.employeeId!), reason: "Cuenta creada y autorizada por RRHH superadmin." });
     const surface = preferredCredentialSurface(employee);
     let activationEmail: { sent: boolean; error?: string; surface?: EmployeeCredentialSurface } = { sent: false };
@@ -759,7 +768,7 @@ app.post("/api/v1/admin/employees", requireOwner(), async (req, res) => {
       activationEmail = { sent: delivery.sent, error: delivery.error, surface };
       if (delivery.sent) await AccessAuthorization.create({ employeeId: employee._id, action: "credentials_sent", previousStatus: "approved", nextStatus: "approved", previousRole: apiRole, nextRole: apiRole, accessLevel: "subadmin", actorEmployeeId: objectId(req.auth!.employeeId!), reason: `Enlace de activación enviado para ${employeeCredentialLabels[surface]}.` });
     }
-    return res.status(201).json({ employee: { id: employee.id, name: employee.name, email: employee.email, jobRole: employee.jobRole, apiRole: employee.apiRole, roles: employee.roles?.length ? employee.roles : [employee.apiRole], primaryRole: employee.primaryRole || employee.apiRole, portfolioId: employee.portfolioId, fleetId: employee.fleetId, zoneSlugs: employee.zoneSlugs, active: employee.active }, activationEmail, warning: activationEmail.sent ? undefined : "La cuenta se creó, pero no se pudo confirmar el envío del enlace. Usa “Enviar activación” cuando el correo corporativo esté disponible." });
+    return res.status(201).json({ employee: { id: employee.id, employeeCode: employee.employeeCode, name: employee.name, email: employee.email, jobRole: employee.jobRole, apiRole: employee.apiRole, roles: employee.roles?.length ? employee.roles : [employee.apiRole], primaryRole: employee.primaryRole || employee.apiRole, portfolioId: employee.portfolioId, fleetId: employee.fleetId, zoneSlugs: employee.zoneSlugs, active: employee.active }, activationEmail, warning: activationEmail.sent ? undefined : "La cuenta se creó, pero no se pudo confirmar el envío del enlace. Usa “Enviar activación” cuando el correo corporativo esté disponible." });
   } catch (error) { if ((error as any)?.code === 11000) return res.status(409).json({ error: "EMPLOYEE_EMAIL_ALREADY_EXISTS" }); throw error; }
 });
 const onboardingRequestSchema = z.object({
@@ -822,7 +831,7 @@ app.post("/api/v1/admin/tenants/:id/memberships", requireOwner(), async (req, re
   await EmployeeAccount.updateOne({ _id: employeeId }, { $set: { tenantId } }).exec();
   return res.status(201).json({ membership });
 });
-app.get("/api/v1/admin/employees", requireRole("admin"), async (_req, res) => res.json({ employees: await EmployeeAccount.find({ email: { $ne: ownerEmail }, hiddenFromAdmin: { $ne: true } }).select("name email jobRole apiRole roles primaryRole accessLevel authorizationStatus authorizedAt authorizedBy authorizationReason portfolioId fleetId zoneSlugs active mustChangePassword lastLoginAt createdAt").sort({ createdAt: -1 }).lean().exec() }));
+app.get("/api/v1/admin/employees", requireRole("admin"), async (_req, res) => res.json({ employees: await EmployeeAccount.find({ email: { $ne: ownerEmail }, hiddenFromAdmin: { $ne: true } }).select("name email employeeCode jobRole apiRole roles primaryRole accessLevel authorizationStatus authorizedAt authorizedBy authorizationReason portfolioId fleetId zoneSlugs active mustChangePassword lastLoginAt createdAt").sort({ createdAt: -1 }).lean().exec() }));
 app.get("/api/v1/admin/authorization-audit", requireOwner(), async (req, res) => {
   const email = typeof req.query.email === "string" ? req.query.email.toLowerCase() : undefined;
   const employee = email ? await EmployeeAccount.findOne({ email }).select("_id name email jobRole apiRole accessLevel authorizationStatus authorizedAt authorizedBy authorizationReason active").lean().exec() as any : null;
@@ -1543,7 +1552,7 @@ app.get("/api/v1/partners/kitchen/orders", requireRole("partner"), async (req, r
   if (!allowed) return res.status(403).json({ error: "PARTNER_PERMISSION_DENIED", permission: "orders:read" });
   const restaurantId = await employeeRestaurant(req, access);
   if (!restaurantId) return res.status(403).json({ error: access?.restaurantIds.length ? "PARTNER_RESTAURANT_ACCESS_DENIED" : "PARTNER_RESTAURANT_NOT_ASSIGNED" });
-  const orders = await Order.find({ restaurantId, ...tenantScope(req), ...dispatchablePaymentFilter, status: { $in: ["pending", "accepted", "preparing", "ready_for_pickup", "picked_up", "on_the_way"] } }).sort({ createdAt: 1 }).lean().exec() as any[];
+  const orders = await Order.find({ restaurantId, ...tenantScope(req), ...dispatchablePaymentFilter, archivedAt: null, status: { $in: ["pending", "accepted", "preparing", "ready_for_pickup", "picked_up", "on_the_way"] } }).sort({ createdAt: 1 }).lean().exec() as any[];
   const [restaurantRecord, customers, riders] = await Promise.all([
     Restaurant.findOne({ _id: restaurantId, ...tenantScope(req) }).select("name address phone cuisine location").lean().exec(),
     CustomerAccount.find({ _id: { $in: orders.map((order) => order.customerId).filter(Boolean) }, ...tenantScope(req) }).select("name email").lean().exec(),
@@ -3585,6 +3594,24 @@ function madridNow(instant = new Date()) {
   return { date: `${values.year}-${values.month}-${values.day}`, time: `${hour}:${values.minute}`, iso: instant.toISOString(), timeZone: "Europe/Madrid" };
 }
 function previousCalendarDate(date: string) { const value = new Date(`${date}T12:00:00Z`); value.setUTCDate(value.getUTCDate() - 1); return value.toISOString().slice(0, 10); }
+function madridDayStartUtc(instant = new Date()) {
+  const { date } = madridNow(instant);
+  const [, year, month, day] = date.match(/^(\d{4})-(\d{2})-(\d{2})$/) || [];
+  const offsetPart = new Intl.DateTimeFormat("en-US", { timeZone: "Europe/Madrid", timeZoneName: "longOffset" }).formatToParts(instant).find((part) => part.type === "timeZoneName")?.value || "GMT+00:00";
+  const match = offsetPart.match(/^GMT([+-])(\d{2}):(\d{2})$/);
+  const offsetMinutes = match ? (match[1] === "+" ? 1 : -1) * (Number(match[2]) * 60 + Number(match[3])) : 0;
+  return new Date(Date.UTC(Number(year), Number(month) - 1, Number(day)) - offsetMinutes * 60_000);
+}
+let lastPartnerArchiveDate = "";
+async function archivePreviousDayPartnerOrders() {
+  const madridDate = madridNow().date;
+  if (lastPartnerArchiveDate === madridDate) return 0;
+  const cutoff = madridDayStartUtc();
+  const result = await Order.updateMany({ archivedAt: null, status: { $in: ["delivered", "cancelled"] }, $or: [{ deliveredAt: { $lt: cutoff } }, { cancelledAt: { $lt: cutoff } }] }, { $set: { archivedAt: cutoff } }).exec();
+  lastPartnerArchiveDate = madridDate;
+  if (result.modifiedCount) console.log(JSON.stringify({ event: "partner_previous_day_orders_archived", madridDate, count: result.modifiedCount }));
+  return result.modifiedCount;
+}
 function slotContainsTime(slot: { startTime: string; endTime: string }, time: string) { return slot.startTime < slot.endTime ? slot.startTime <= time && time < slot.endTime : time >= slot.startTime || time < slot.endTime; }
 
 async function expireRiderSlots(riderId: mongoose.Types.ObjectId, now: ReturnType<typeof madridNow>) {
@@ -3773,6 +3800,7 @@ const automaticDispatchSweepStats = {
   reassigned: 0,
   expiredOffers: 0,
   queued: 0,
+  archivedTerminalOrders: 0,
   lastStartedAt: null as string | null,
   lastCompletedAt: null as string | null,
   lastDurationMs: null as number | null,
@@ -4023,14 +4051,14 @@ async function runAutomaticDispatchSweep() {
   const startedAt = Date.now();
   automaticDispatchSweepStats.lastStartedAt = new Date(startedAt).toISOString();
   try {
-    const reassigned = await reassignLatePickupOrders();
-    const expiredOffers = await expireStaleOffers();
+    const [reassigned, expiredOffers, archivedTerminalOrders] = await Promise.all([reassignLatePickupOrders(), expireStaleOffers(), archivePreviousDayPartnerOrders()]);
     const candidates = await Order.find({ riderId: null, assignmentState: { $in: ["unassigned", "expired", "rejected"] }, ...dispatchablePaymentFilter, status: { $in: [...dispatchableOrderStatuses] } }).select("_id").sort({ createdAt: 1 }).limit(25).lean().exec();
     for (const order of candidates) void enqueueOrderForDispatch(order._id as mongoose.Types.ObjectId).catch((error) => console.error("Dispatch outbox enqueue failed", error));
     automaticDispatchSweepStats.runs += 1;
     automaticDispatchSweepStats.reassigned += reassigned;
     automaticDispatchSweepStats.expiredOffers += expiredOffers;
     automaticDispatchSweepStats.queued += candidates.length;
+    automaticDispatchSweepStats.archivedTerminalOrders += archivedTerminalOrders;
     automaticDispatchSweepStats.lastCompletedAt = new Date().toISOString();
     automaticDispatchSweepStats.lastDurationMs = Date.now() - startedAt;
     automaticDispatchSweepStats.lastError = null;
@@ -4045,9 +4073,9 @@ async function runAutomaticDispatchSweep() {
 }
 /** Called exclusively by the explicit dispatch worker process. */
 export async function runDispatchMaintenance() {
-  if (mongoose.connection.readyState !== 1) return { reassigned: 0, expiredOffers: 0 };
-  const [reassigned, expiredOffers] = await Promise.all([reassignLatePickupOrders(), expireStaleOffers()]);
-  return { reassigned, expiredOffers };
+  if (mongoose.connection.readyState !== 1) return { reassigned: 0, expiredOffers: 0, archivedTerminalOrders: 0 };
+  const [reassigned, expiredOffers, archivedTerminalOrders] = await Promise.all([reassignLatePickupOrders(), expireStaleOffers(), archivePreviousDayPartnerOrders()]);
+  return { reassigned, expiredOffers, archivedTerminalOrders };
 }
 async function findDispatchOrder(orderId: mongoose.Types.ObjectId, req: express.Request) {
   const scoped = await Order.findOne({ _id: orderId, ...tenantScope(req) }).lean().exec() as any;
@@ -4682,6 +4710,7 @@ async function start() {
     await ensureExpiresAtTtlIndex("employee_sessions");
     await ensureExpiresAtTtlIndex("employee_password_resets");
     await ensureIndexes();
+    await backfillEmployeeCodes();
     startRealtimeRelay();
     startNotificationWorker();
     await repairConfiguredPartnerAccess();
