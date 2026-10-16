@@ -11,3 +11,12 @@ test("dispatch chooses the closest eligible rider to the restaurant before tie-b
   assert.equal(ranked[0]?.riderId, "near");
   assert.ok((ranked[0]?.pickupDistanceKm ?? Infinity) < (ranked[1]?.pickupDistanceKm ?? -Infinity));
 });
+
+test("dispatch allows a busy rider to receive a second order only when capacity is two", () => {
+  const now = new Date("2026-10-06T00:00:00.000Z");
+  const rider = { id: "rider-1", status: "busy" as const, vehicle: "bike" as const, location: { coordinates: [-0.38, 39.47] }, lastLocationAt: now, activeOrderCount: 1 };
+  const normal = rankDispatchCandidates([rider], { restaurantLocation: [-0.375, 39.47], customerLocation: [-0.36, 39.47], preparationMinutes: 15, now, maxConcurrentOrders: 1 });
+  const saturated = rankDispatchCandidates([rider], { restaurantLocation: [-0.375, 39.47], customerLocation: [-0.36, 39.47], preparationMinutes: 15, now, maxConcurrentOrders: 2 });
+  assert.equal(normal.length, 0);
+  assert.equal(saturated[0]?.riderId, "rider-1");
+});
