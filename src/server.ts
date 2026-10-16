@@ -1785,6 +1785,73 @@ app.post("/api/v1/admin/restaurants", requireOwner(), async (req, res) => {
   }
 });
 
+const manualOnboardingSchema = z.discriminatedUnion("requestType", [
+  z.object({
+    requestType: z.literal("partner"),
+    name: z.string().trim().min(2).max(160),
+    email: z.string().trim().email().max(254),
+    phone: z.string().trim().min(6).max(40),
+    cuisine: z.string().trim().min(2).max(120),
+    category: z.string().trim().min(2).max(120),
+    address: z.string().trim().min(5).max(280),
+    locality: z.string().trim().min(2).max(120),
+    commissionRateBps: z.coerce.number().int().min(0).max(5000).default(DEFAULT_PARTNER_COMMISSION_BPS),
+  }).strict(),
+  z.object({
+    requestType: z.literal("rider"),
+    name: z.string().trim().min(2).max(160),
+    email: z.string().trim().email().max(254),
+    phone: z.string().trim().min(6).max(40),
+    city: z.string().trim().min(2).max(120),
+    vehicle: z.enum(["bike", "electric_bike", "electric_scooter", "motorcycle", "scooter", "car"]),
+    availability: z.string().trim().min(2).max(160),
+    fleetId: z.string().regex(/^[a-f\d]{24}$/).nullable().optional(),
+  }).strict(),
+]);
+
+/**
+ * Creates the operational entity and its disabled login together. This is
+ * intentionally owner-only: manual onboarding never approves documents,
+ * activates a restaurant, or enables Rider dispatch access.
+ */
+app.post("/api/v1/admin/manual-onboarding", requireOwner(), async (req, res) => {
+  const parsed = manualOnboardingSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "INVALID_MANUAL_ONBOARDING", details: parsed.error.flatten() });
+  const email = parsed.data.email.toLowerCase();
+  const tenant = tenantScope(req);
+  if (await EmployeeAccount.exists({ email })) return res.status(409).json({ error: "EMPLOYEE_EMAIL_ALREADY_EXISTS", message: "Ya existe una cuenta con ese correo." });
+  if (parsed.data.requestType === "rider" && await Rider.exists({ email })) return res.status(409).json({ error: "RIDER_EMAIL_ALREADY_EXISTS", message: "Ya existe un rider con ese correo." });
+  if (parsed.data.requestType === "rider" && parsed.data.fleetId) {
+    const fleet = await Fleet.findOne({ _id: objectId(parsed.data.fleetId), ...tenant, isActive: true }).select("_id").lean().exec();
+    if (!fleet) return res.status(404).json({ error: "FLEET_NOT_FOUND_OR_INACTIVE", message: "La flota seleccionada no existe o no está activa." });
+  }
+  const temporaryPassword = generateTemporaryPassword();
+  let restaurant: any = null;
+  let rider: any = null;
+  let application: any = null;
+  let employee: any = null;
+  try {
+    if (parsed.data.requestType === "partner") {
+      const baseSlug = parsed.data.name.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "") || "partner";
+      restaurant = await Restaurant.create({ ...tenant, slug: `${baseSlug}-${Date.now().toString(36)}`, name: parsed.data.name, cuisine: parsed.data.cuisine, category: parsed.data.category, email, phone: parsed.data.phone, address: parsed.data.address, locality: parsed.data.locality, partnerProfile: { commissionRateBps: parsed.data.commissionRateBps }, onboardingStage: "profile", onboardingStatus: "pending_review", isActive: false, availabilityStatus: "coming_soon", marketplaceCompliance: { pikiStatus: "pending", stripeStatus: "not_created", chargesEnabled: false, payoutsEnabled: false }, onboardingChecklist: { profile: true, documents: false, stripe: false, adminReview: false } });
+      employee = await EmployeeAccount.create({ ...tenant, name: parsed.data.name, email, jobRole: "partner", apiRole: "partner", roles: ["partner"], partnerRoles: ["partner_admin"], accessLevel: "subadmin", authorizationStatus: "pending", authorizedAt: null, restaurantId: restaurant._id, restaurantIds: [restaurant._id], passwordHash: hashPassword(temporaryPassword), mustChangePassword: true, active: false });
+    } else {
+      rider = await Rider.create({ ...tenant, riderCode: `R-${Date.now().toString(36).toUpperCase()}`, name: parsed.data.name, email, phone: parsed.data.phone, city: parsed.data.city, availability: parsed.data.availability, vehicle: parsed.data.vehicle, fleetId: parsed.data.fleetId ? objectId(parsed.data.fleetId) : null, status: "offline", lifecycleStatus: "pending_documents", lifecycleReason: "Alta manual pendiente de documentación y aprobación.", reliabilityScore: 0.75, ratingScore: 0.75 });
+      application = await RiderApplication.create({ ...tenant, name: parsed.data.name, email, phone: parsed.data.phone, city: parsed.data.city, vehicle: parsed.data.vehicle, availability: parsed.data.availability, socialSecurityNumber: "PENDIENTE_MANUAL", identityVerificationMethod: "online_scan", identityVerificationStatus: "pending", safetyDeclarationAccepted: false, documents: [], status: "pending", source: "admin_manual", notes: "Alta creada manualmente por Superadmin; solicitar DNI, licencia y seguro antes de aprobar.", assignedFleetId: parsed.data.fleetId ? objectId(parsed.data.fleetId) : null });
+      employee = await EmployeeAccount.create({ ...tenant, name: parsed.data.name, email, jobRole: "rider", apiRole: "rider", roles: ["rider"], accessLevel: "subadmin", authorizationStatus: "pending", authorizedAt: null, passwordHash: hashPassword(temporaryPassword), mustChangePassword: true, active: false });
+    }
+    await AccessAuthorization.create({ employeeId: employee._id, action: "manual_onboarding_created", previousStatus: null, nextStatus: "pending", previousRole: null, nextRole: parsed.data.requestType, accessLevel: "superadmin", actorEmployeeId: objectId(String(req.auth!.employeeId!)), reason: `Alta manual de ${parsed.data.requestType}; pendiente de documentación y aprobación.` });
+    return res.status(201).json({ created: true, requestType: parsed.data.requestType, entityId: String(parsed.data.requestType === "partner" ? restaurant._id : rider._id), applicationId: application ? String(application._id) : null, employeeId: String(employee._id), status: "pending_review", login: { enabled: false, activation: "Se habilitará después de revisar documentación y aprobar el expediente." } });
+  } catch (error: any) {
+    if (employee?._id) await EmployeeAccount.deleteOne({ _id: employee._id }).exec().catch(() => undefined);
+    if (application?._id) await RiderApplication.deleteOne({ _id: application._id }).exec().catch(() => undefined);
+    if (rider?._id) await Rider.deleteOne({ _id: rider._id }).exec().catch(() => undefined);
+    if (restaurant?._id) await Restaurant.deleteOne({ _id: restaurant._id }).exec().catch(() => undefined);
+    if (error?.code === 11000) return res.status(409).json({ error: "MANUAL_ONBOARDING_DUPLICATE", message: "Ya existe una entidad o cuenta con alguno de esos datos." });
+    throw error;
+  }
+});
+
 const partnerSettingsSchema = z.object({
   name: z.string().trim().min(2).max(160).optional(),
   cuisine: z.string().trim().min(2).max(120).optional(),
