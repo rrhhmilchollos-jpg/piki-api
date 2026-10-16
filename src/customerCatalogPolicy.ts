@@ -51,8 +51,10 @@ function alibabaModifierGroups(item: Record<string, any>) {
   return groups;
 }
 export function customerCommissionRate(restaurant: { slug?: string; partnerProfile?: { commissionRateBps?: number } }): number {
-  // La tarifa es una regla comercial de PIKI, no un dato editable por Partner.
-  return DEFAULT_CUSTOMER_COMMISSION_RATE;
+  if (Number.isInteger(restaurant.partnerProfile?.commissionRateBps)) {
+    return Math.max(0, Math.min(1, Number(restaurant.partnerProfile!.commissionRateBps) / 10_000));
+  }
+  return PARTNER_COMMISSION_RATES[restaurant.slug || ""] ?? DEFAULT_CUSTOMER_COMMISSION_RATE;
 }
 function applyPartnerMenuPricing<T extends Record<string, any>>(item: T, rate: number, restaurantSlug = ""): T {
   const apply = (value: unknown) => Number((Math.ceil(Math.max(0, Number(value || 0) * 100) * (1 + rate)) / 100).toFixed(2));
