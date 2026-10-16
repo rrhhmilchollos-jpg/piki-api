@@ -16,6 +16,45 @@ const now = new Date();
 const restaurantSlug = "piki-qa-kitchen";
 const riderEmail = "qa-rider@pikidelivery.test";
 
+const drinks = [
+  ["coca-cola", "Coca-Cola Original", 0],
+  ["coca-cola-zero", "Coca-Cola Zero", 0],
+  ["fanta-naranja", "Fanta Naranja", 0],
+  ["nestea-limon", "Nestea Limón", 0],
+  ["aquarius-limon", "Aquarius Limón", 0],
+] as const;
+
+const sauces = [
+  ["salsa-yogur", "Salsa de yogur", 0],
+  ["salsa-picante", "Salsa picante", 0],
+  ["salsa-barbacoa", "Salsa barbacoa", 0.5],
+] as const;
+
+const meatExtras = [
+  ["extra-queso", "Queso", 1],
+  ["extra-carne", "Carne extra", 2],
+  ["extra-gratinado", "Gratinado", 1.9],
+] as const;
+
+function options(prefix: string, rows: readonly (readonly [string, string, number])[]) {
+  return rows.map(([id, name, price]) => ({ id: `alibaba-${prefix}-${id}`, name, price }));
+}
+
+function alibabaModifierGroups(item: any) {
+  const name = String(item?.name || "").toLocaleLowerCase("es-ES");
+  const groups: any[] = [];
+  if (name.includes("menú") || name.includes("menu")) {
+    groups.push({ id: `alibaba-${item.id}-bebida`, name: "Elige tu bebida", description: "Incluida en el menú", minSelections: 1, maxSelections: 1, options: options("bebida", drinks) });
+  }
+  if (name.includes("doner") || name.includes("kebab") || name.includes("carne")) {
+    groups.push({ id: `alibaba-${item.id}-salsa`, name: "Elige tu salsa", description: "Puedes escoger una salsa", minSelections: 0, maxSelections: 1, options: options("salsa", sauces) });
+  }
+  if (name.includes("doner") || name.includes("kebab") || name.includes("carne") || name.includes("plato")) {
+    groups.push({ id: `alibaba-${item.id}-extras`, name: "¿Quieres añadir extras?", description: "Extras opcionales para tu pedido", minSelections: 0, maxSelections: 3, options: options("extra", meatExtras) });
+  }
+  return groups;
+}
+
 await mongoose.connect(process.env.MONGODB_URI, { dbName, serverSelectionTimeoutMS: 10_000 });
 try {
   const restaurant = await Restaurant.findOneAndUpdate(
@@ -61,6 +100,19 @@ try {
     },
     { upsert: true, new: true, setDefaultsOnInsert: true },
   ).lean();
+
+  const alibaba = await Restaurant.findOne({ slug: "alibaba-kebab-xativa" }).select("_id menu").lean() as any;
+  if (alibaba && Array.isArray(alibaba.menu)) {
+    const menu = alibaba.menu.map((item: any) => ({
+      ...item,
+      modifiers: alibabaModifierGroups(item),
+      modifierGroups: alibabaModifierGroups(item),
+    }));
+    await Restaurant.updateOne({ _id: alibaba._id }, { $set: { menu } }).exec();
+    console.log(JSON.stringify({ ok: true, stagingAlibaba: true, restaurantSlug: "alibaba-kebab-xativa", configuredProducts: menu.filter((item: any) => item.modifierGroups?.length).length }));
+  } else {
+    console.log(JSON.stringify({ ok: true, stagingAlibaba: false, message: "Alibaba no existe todavía en la base staging; no se ha creado ni inventado ningún partner." }));
+  }
 
   const rider = await Rider.findOneAndUpdate(
     { email: riderEmail },
