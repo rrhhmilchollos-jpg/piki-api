@@ -10,11 +10,15 @@ if (process.env.ALLOW_QA_SEED !== "true") throw new Error("Set ALLOW_QA_SEED=tru
 if (!process.env.MONGODB_URI) throw new Error("MONGODB_URI is required");
 if (!process.env.QA_PASSWORD || process.env.QA_PASSWORD.length < 12) throw new Error("QA_PASSWORD must be set and contain at least 12 characters");
 
+const runId = String(process.env.E2E_RUN_ID || "").trim();
+if (!/^qa-[a-z0-9-]{8,64}$/.test(runId)) throw new Error("E2E_RUN_ID must have format qa-... and be unique");
 const dbName = process.env.MONGODB_DB;
 if (!dbName || !/staging|qa|test/i.test(dbName)) throw new Error("MONGODB_DB must explicitly name a staging/QA/test database");
 const now = new Date();
-const restaurantSlug = "piki-qa-kitchen";
-const riderEmail = "qa-rider@pikidelivery.test";
+const runSuffix = runId.slice(3);
+const restaurantSlug = `piki-qa-kitchen-${runSuffix}`;
+const riderEmail = `qa-rider-${runSuffix}@pikidelivery.test`;
+const customerEmail = `qa-customer-${runSuffix}@pikidelivery.test`;
 
 const drinks = [
   ["coca-cola", "Coca-Cola Original", 0],
@@ -65,7 +69,8 @@ try {
         cuisine: "Test",
         category: "QA",
         locality: "Xàtiva",
-        partnerGroupKey: "piki-qa",
+        partnerGroupKey: `piki-qa-${runId}`,
+        qaRunId: runId,
         tagline: "Restaurante de pruebas de staging",
         etaMinutes: [15, 25],
         deliveryFeeCents: 199,
@@ -103,31 +108,21 @@ try {
 
   const fixturePath = resolve(process.cwd(), "scripts/fixtures/alibaba-staging-menu.json");
   const alibabaFixture = JSON.parse(await readFile(fixturePath, "utf8")) as any;
-  const existingAlibaba = await Restaurant.findOne({ slug: "alibaba-kebab-xativa" }).select("_id menu").lean() as any;
-  const sourceMenu = existingAlibaba && Array.isArray(existingAlibaba.menu) && existingAlibaba.menu.length > 0
-    ? existingAlibaba.menu
-    : alibabaFixture.menu;
-  if (Array.isArray(sourceMenu) && sourceMenu.length > 0) {
-    const menu = sourceMenu.map((item: any) => ({
-      ...item,
-      modifiers: alibabaModifierGroups(item),
-      modifierGroups: alibabaModifierGroups(item),
-    }));
-    const alibaba = await Restaurant.findOneAndUpdate(
-      { slug: "alibaba-kebab-xativa" },
-      { $set: { ...alibabaFixture, menu, onboardingStatus: "approved", availabilityStatus: "available", isActive: true, "partnerProfile.commissionRateBps": 1500 } },
-      { upsert: true, new: true, setDefaultsOnInsert: true },
-    ).select("_id menu").lean() as any;
-    console.log(JSON.stringify({ ok: true, stagingAlibaba: true, restaurantSlug: "alibaba-kebab-xativa", restaurantId: alibaba?._id, configuredProducts: menu.filter((item: any) => item.modifierGroups?.length).length }));
-  } else {
-    throw new Error("Alibaba staging fixture has no menu items");
-  }
+  const existingAlibaba = await Restaurant.findOne({ slug: "alibaba-kebab-xativa" }).select("menu").lean() as any;
+  const sourceMenu = existingAlibaba && Array.isArray(existingAlibaba.menu) && existingAlibaba.menu.length > 0 ? existingAlibaba.menu : alibabaFixture.menu;
+  if (!Array.isArray(sourceMenu) || sourceMenu.length === 0) throw new Error("Alibaba staging fixture has no menu items");
+  const qaMenu = sourceMenu.map((item: any) => ({ ...item, modifiers: alibabaModifierGroups(item), modifierGroups: alibabaModifierGroups(item) }));
+  await Restaurant.updateOne(
+    { _id: restaurant._id, qaRunId: runId },
+    { $set: { menu: qaMenu, "partnerProfile.commissionRateBps": 1500 } },
+  ).exec();
+  console.log(JSON.stringify({ ok: true, stagingQaKitchen: true, restaurantSlug, restaurantId: restaurant._id, commissionRateBps: 1500, configuredProducts: qaMenu.filter((item: any) => item.modifierGroups?.length).length }));
 
   const rider = await Rider.findOneAndUpdate(
     { email: riderEmail },
     {
       $set: {
-        isTestRider: true, name: "PIKI QA Rider", phone: "+34600000001", city: "Xàtiva",
+        isTestRider: true, qaRunId: runId, name: "PIKI QA Rider", phone: "+34600000001", city: "Xàtiva",
         availability: "Todos los días · QA staging", zoneSlug: "xativa", status: "available",
         vehicle: "electric_scooter", location: { type: "Point", coordinates: [-0.5188, 38.9905] },
         lastLocationAt: now, reliabilityScore: 1,
@@ -142,30 +137,29 @@ try {
   }
   const passwordHash = hashPassword(process.env.QA_PASSWORD);
   const employeeSeeds = [
-    ["qa-admin@pikidelivery.test", "QA Admin", "admin"],
-    ["qa-partner@pikidelivery.test", "QA Partner", "partner"],
+    [`qa-admin-${runSuffix}@pikidelivery.test`, "QA Admin", "admin"],
+    [`qa-partner-${runSuffix}@pikidelivery.test`, "QA Partner", "partner"],
     [riderEmail, "PIKI QA Rider", "rider"],
-    ["qa-fleet@pikidelivery.test", "QA Fleet", "fleet"],
-    ["qa-support@pikidelivery.test", "QA Support", "support"],
+    [`qa-fleet-${runSuffix}@pikidelivery.test`, "QA Fleet", "fleet"],
+    [`qa-support-${runSuffix}@pikidelivery.test`, "QA Support", "support"],
   ] as const;
   const employees: Record<string, string> = {};
   for (const [email, name, role] of employeeSeeds) {
     const employee = await EmployeeAccount.findOneAndUpdate(
       { email },
-      { $set: { name, jobRole: role, apiRole: role, roles: [role], accessLevel: "subadmin", authorizationStatus: "approved", authorizedAt: now, passwordHash, mustChangePassword: false, active: true, restaurantId: role === "partner" ? restaurant._id : null, restaurantIds: role === "partner" ? [restaurant._id] : [] }, $setOnInsert: { portfolioId: `qa_${role}` } },
+      { $set: { qaRunId: runId, name, jobRole: role, apiRole: role, roles: [role], accessLevel: "subadmin", authorizationStatus: "approved", authorizedAt: now, passwordHash, mustChangePassword: false, active: true, restaurantId: role === "partner" ? restaurant._id : null, restaurantIds: role === "partner" ? [restaurant._id] : [] }, $setOnInsert: { portfolioId: `qa_${role}` } },
       { upsert: true, new: true, setDefaultsOnInsert: true },
     ).select("_id email").lean();
     if (employee) employees[role] = String(employee._id);
   }
   const customer = await CustomerAccount.findOneAndUpdate(
-    { email: "qa-customer@pikidelivery.test" },
-    { $set: { name: "PIKI QA Customer", passwordHash, deliveryAddress: "Carrer de la Prova 2, Xàtiva", deliveryLocation: { type: "Point", coordinates: [-0.5187, 38.9903] }, lastSignedIn: now } },
+    { email: customerEmail },
+    { $set: { qaRunId: runId, name: "PIKI QA Customer", passwordHash, deliveryAddress: "Carrer de la Prova 2, Xàtiva", deliveryLocation: { type: "Point", coordinates: [-0.5187, 38.9903] }, lastSignedIn: now } },
     { upsert: true, new: true, setDefaultsOnInsert: true },
   ).select("_id email").lean();
-  const runId = process.env.E2E_RUN_ID;
   const manifestPath = process.env.E2E_FIXTURE_MANIFEST;
   if (runId && manifestPath) {
-    const manifest = { schemaVersion: 1, runId, surfaces: Object.fromEntries(["CUSTOMER", "RIDER", "PARTNER", "FLEET", "ADMIN", "SUPPORT"].map((surface) => [surface, { fixtures: [`Cuenta QA y datos staging preparados para ${runId}`], cleanup: [`Eliminar datos QA etiquetados con ${runId}`] }])) };
+    const manifest = { schemaVersion: 2, runId, entities: { restaurantId: String(restaurant._id), riderId: String(rider._id), customerId: customer ? String(customer._id) : null, employeeIds: Object.values(employees) }, surfaces: Object.fromEntries(["CUSTOMER", "RIDER", "PARTNER", "FLEET", "ADMIN", "SUPPORT"].map((surface) => [surface, { fixtures: [`Cuenta QA y datos staging preparados para ${runId}`], cleanup: [`Eliminar datos QA etiquetados con ${runId}`] }])) };
     const target = resolve(manifestPath);
     await mkdir(dirname(target), { recursive: true });
     await writeFile(target, `${JSON.stringify(manifest, null, 2)}\n`, "utf8");

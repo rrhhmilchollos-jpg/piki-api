@@ -4,11 +4,14 @@ const baseUrl = String(process.env.PIKI_E2E_BASE_URL || "https://piki-api-stagin
 const riderToken = String(process.env.PIKI_E2E_RIDER_TOKEN || "").trim();
 const riderId = String(process.env.PIKI_E2E_RIDER_ID || "").trim();
 const partnerToken = String(process.env.PIKI_E2E_PARTNER_TOKEN || "").trim();
+const runId = String(process.env.E2E_RUN_ID || "").trim();
+const restaurantSlug = String(process.env.PIKI_E2E_RESTAURANT_SLUG || `piki-qa-kitchen-${runId.slice(3)}`).trim().toLowerCase();
 const confirm = process.env.PIKI_E2E_CONFIRM === "YES";
 const timeoutMs = Number(process.env.PIKI_E2E_TIMEOUT_MS || 90_000);
 
 if (/production|api\.pikidelivery\.com/i.test(baseUrl)) throw new Error("E2E solo permite un endpoint de staging/QA");
 if (!riderToken || !riderId) throw new Error("PIKI_E2E_RIDER_TOKEN y PIKI_E2E_RIDER_ID son obligatorios");
+if (!/^qa-[a-z0-9-]{8,64}$/.test(runId)) throw new Error("E2E_RUN_ID debe tener formato qa-... y ser único");
 if (!confirm) throw new Error("Para crear y avanzar un pedido usa PIKI_E2E_CONFIRM=YES");
 
 async function request(path: string, init: RequestInit = {}, token?: string) {
@@ -28,10 +31,10 @@ function assert(condition: unknown, message: string): asserts condition {
 }
 
 const catalog = await request("/api/v1/catalog/restaurants");
-const restaurant = (catalog.restaurants || []).find((entry: any) => entry.slug === "alibaba-kebab-xativa");
-assert(restaurant, "Alibaba Kebab Xàtiva no está publicado en el catálogo de staging");
+const restaurant = (catalog.restaurants || []).find((entry: any) => entry.slug === restaurantSlug);
+assert(restaurant, `La cocina QA ${restaurantSlug} no está publicada en el catálogo de staging`);
 const item = (restaurant.menu || []).find((entry: any) => entry.available !== false);
-assert(item, "Alibaba Kebab no tiene productos disponibles en staging");
+assert(item, "La cocina QA no tiene productos disponibles en staging");
 
 const subtotalCents = Math.round(Number(item.price) * 100);
 const orderResult = await request("/api/v1/orders", {
@@ -40,14 +43,16 @@ const orderResult = await request("/api/v1/orders", {
     restaurantId: restaurant.id || restaurant._id,
     items: [{ itemId: item.id, quantity: 1 }],
     deliveryAddress: "Plaça de la Bassa, Xàtiva, Valencia",
-    deliveryNote: "E2E staging Alibaba Kebab",
+    deliveryNote: `E2E staging ${runId}`,
     deliveryLocation: { latitude: 38.9904, longitude: -0.5186 },
     paymentMethod: "cash",
+    qaRunId: runId,
+    qaRiderId: riderId,
   }),
 });
 const order = orderResult.order;
 assert(order?.id && order.publicCode, "La API no devolvió un pedido E2E válido");
-assert(order.marketplace?.commissionRateBps === 1800, `Comisión inesperada: ${order.marketplace?.commissionRateBps}`);
+assert(order.marketplace?.commissionRateBps === 1500, `Comisión inesperada: ${order.marketplace?.commissionRateBps}; se esperaba 1500 (15 %)`);
 
 const deadline = Date.now() + timeoutMs;
 let offer: any = null;
@@ -70,10 +75,11 @@ if (partnerToken) {
 console.log(JSON.stringify({
   ok: true,
   environment: "staging",
+  runId,
   restaurant: { id: restaurant.id || restaurant._id, slug: restaurant.slug, name: restaurant.name },
   item: { id: item.id, name: item.name, priceCents: subtotalCents },
   order: { id: order.id, publicCode: order.publicCode, paymentMethod: order.paymentMethod, commissionRateBps: order.marketplace.commissionRateBps },
   rider: { id: riderId, offerReceived: true, accepted: true },
   partner: { automatedToReadyForPickup: Boolean(partnerToken) },
-  next: partnerToken ? "Actualiza ubicación del Rider, confirma llegada/recogida y finaliza con el PIN de entrega." : "Define PIKI_E2E_PARTNER_TOKEN para automatizar los estados del Partner."
+  next: partnerToken ? "Actualiza ubicación del Rider, confirma llegada/recogida y finaliza con el PIN de entrega; ejecuta después cleanup-staging-qa con el mismo runId." : "Define PIKI_E2E_PARTNER_TOKEN para automatizar los estados del Partner."
 }, null, 2));
