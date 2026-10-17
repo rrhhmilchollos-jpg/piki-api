@@ -47,6 +47,14 @@ export function parseCustomerTrpcInput(value: unknown): any {
   return record;
 }
 
+export function customerDisplayStatus(value: unknown): string {
+  const canonicalStatus = String(value || "pending");
+  // Existing Android Customer bundles use `ready` for the preparation step.
+  // Keep `operationalStatus` alongside this compatibility value so newer
+  // bundles can show the dedicated "listo para recoger" state.
+  return canonicalStatus === "ready_for_pickup" ? "ready" : canonicalStatus;
+}
+
 function inputOf(req: Request): any {
   const body = req.body ?? {};
   const parsedBody = parseCustomerTrpcInput(body);
@@ -192,7 +200,7 @@ export async function handleCustomerTrpc(req: Request, res: Response) {
       const orders = await Order.find({ customerId: String(user._id) }).sort({ createdAt: -1 }).limit(100).select("publicCode status restaurantId totalCents createdAt updatedAt paymentState assignmentState routeDurationMinutes items").lean().exec() as any[];
       const restaurants = await Restaurant.find({ _id: { $in: orders.map((order) => order.restaurantId) } }).select("name").lean().exec() as any[];
       const names = new Map(restaurants.map((restaurant) => [String(restaurant._id), restaurant.name]));
-      return reply(res, orders.map((order) => ({ id: order.publicCode, restaurant: names.get(String(order.restaurantId)) || "Restaurante PIKI", status: order.status, total: Number(order.totalCents || 0) / 100, createdAt: order.createdAt, updatedAt: order.updatedAt, active: !["delivered", "cancelled"].includes(order.status), paymentState: order.paymentState, assignmentState: order.assignmentState, eta: order.routeDurationMinutes ? `${order.routeDurationMinutes} min` : "actualizando…", items: order.items || [] })));
+      return reply(res, orders.map((order) => ({ id: order.publicCode, restaurant: names.get(String(order.restaurantId)) || "Restaurante PIKI", status: customerDisplayStatus(order.status), operationalStatus: order.status, total: Number(order.totalCents || 0) / 100, createdAt: order.createdAt, updatedAt: order.updatedAt, active: !["delivered", "cancelled"].includes(order.status), paymentState: order.paymentState, assignmentState: order.assignmentState, eta: order.routeDurationMinutes ? `${order.routeDurationMinutes} min` : "actualizando…", items: order.items || [] })));
     }
     if (procedure === "customer.support.list") {
       const user = await currentCustomer(req) as any;
@@ -279,18 +287,18 @@ export async function handleCustomerTrpc(req: Request, res: Response) {
       if (!order) return fail(res, "Pedido no encontrado", "NOT_FOUND");
       const restaurant = await Restaurant.findById(order.restaurantId).select("name").lean().exec() as any;
       if (procedure === "order.get") {
-        return reply(res, { id: order.publicCode, restaurant: restaurant?.name || "Pedido PIKI", status: order.status, eta: order.routeDurationMinutes ? `${order.routeDurationMinutes} min` : "actualizando…" });
+        return reply(res, { id: order.publicCode, restaurant: restaurant?.name || "Pedido PIKI", status: customerDisplayStatus(order.status), operationalStatus: order.status, eta: order.routeDurationMinutes ? `${order.routeDurationMinutes} min` : "actualizando…" });
       }
       // The rider location is private until Partner has prepared the order and Rider has confirmed pickup.
       if (!order.riderId || order.assignmentState !== "assigned" || !["picked_up", "on_the_way"].includes(order.status)) {
-        return reply(res, { available: false, status: order.status, reason: "not_in_delivery" });
+        return reply(res, { available: false, status: customerDisplayStatus(order.status), operationalStatus: order.status, reason: "not_in_delivery" });
       }
       const rider = await (await import("./models.js")).Rider.findById(order.riderId).select("name vehicle photoUrl location lastLocationAt").lean().exec() as any;
       const coordinates = rider?.location?.coordinates;
       const updatedAt = rider?.lastLocationAt ? new Date(rider.lastLocationAt).getTime() : 0;
       const fresh = Array.isArray(coordinates) && coordinates.length >= 2 && updatedAt >= Date.now() - 90_000;
-      if (!fresh) return reply(res, { available: false, status: order.status, riderName: rider.name || "Tu rider", riderPhotoUrl: rider.photoUrl || null, vehicle: rider.vehicle || "bike", reason: "location_unavailable" });
-      return reply(res, { available: true, status: order.status, riderName: rider.name || "Tu rider", riderPhotoUrl: rider.photoUrl || null, vehicle: rider.vehicle || "bike", phase: "going_to_customer", etaMinutes: order.routeDurationMinutes || null, latitude: Number(coordinates[1]), longitude: Number(coordinates[0]), accuracyMeters: null, updatedAt });
+      if (!fresh) return reply(res, { available: false, status: customerDisplayStatus(order.status), operationalStatus: order.status, riderName: rider.name || "Tu rider", riderPhotoUrl: rider.photoUrl || null, vehicle: rider.vehicle || "bike", reason: "location_unavailable" });
+      return reply(res, { available: true, status: customerDisplayStatus(order.status), operationalStatus: order.status, riderName: rider.name || "Tu rider", riderPhotoUrl: rider.photoUrl || null, vehicle: rider.vehicle || "bike", phase: "going_to_customer", etaMinutes: order.routeDurationMinutes || null, latitude: Number(coordinates[1]), longitude: Number(coordinates[0]), accuracyMeters: null, updatedAt });
     }
     if (procedure === "order.deliveryCredentials") {
       const user = await currentCustomer(req) as any;
