@@ -252,6 +252,18 @@ async function fleetRiderFilter(req: express.Request): Promise<Record<string, un
   const employee = await employeeScope(req);
   return buildFleetEntityScope({ tenantId: req.auth?.tenantId, role: req.auth?.role, fleetId: employee?.fleetId });
 }
+/**
+ * The scheduling picker must also show same-tenant riders that have not been
+ * assigned to a Fleet yet. Creating a slot already claims an unassigned rider
+ * atomically; this broader scope is intentionally used only by the directory
+ * picker and never by dispatch, orders, GPS or live operations.
+ */
+async function fleetRiderSchedulingFilter(req: express.Request): Promise<Record<string, unknown>> {
+  const employee = await employeeScope(req);
+  const base = buildFleetEntityScope({ tenantId: req.auth?.tenantId, role: req.auth?.role, fleetId: employee?.fleetId });
+  if (req.auth?.role !== "fleet" || !employee?.fleetId || !Object.prototype.hasOwnProperty.call(base, "fleetId")) return base;
+  return { tenantId: base.tenantId, $or: [{ fleetId: employee.fleetId }, { fleetId: null }, { fleetId: { $exists: false } }] };
+}
 async function fleetCanAccessRider(req: express.Request, riderId: mongoose.Types.ObjectId | null) {
   if (!riderId) return false;
   const employee = await employeeScope(req);
@@ -1160,7 +1172,12 @@ app.patch("/api/v1/admin/partner-leads/:id", requireRole("admin", "commercial", 
 });
 
 const partnerDocumentSchema = z.object({ type: z.enum(["tax_id", "bank_certificate", "insurance", "activity_license", "food_sanitary_authorization", "identity", "other"]), fileName: z.string().min(1).max(180), mimeType: z.enum(DOCUMENT_UPLOAD_MIME_TYPES), sizeBytes: z.number().int().positive().max(2_500_000), sha256: z.string().regex(/^[a-f0-9]{64}$/), contentBase64: z.string().min(20).max(3_500_000) });
-const openingHoursSchema = z.record(z.string().min(2).max(15), z.object({ open: z.string().regex(/^\d{2}:\d{2}$/), close: z.string().regex(/^\d{2}:\d{2}$/), closed: z.boolean() }));
+const openingShiftSchema = z.object({ open: z.string().regex(/^\d{2}:\d{2}$/), close: z.string().regex(/^\d{2}:\d{2}$/) });
+const openingDaySchema = z.union([
+  z.object({ morning: openingShiftSchema, afternoon: openingShiftSchema, closed: z.boolean() }),
+  z.object({ open: z.string().regex(/^\d{2}:\d{2}$/), close: z.string().regex(/^\d{2}:\d{2}$/), closed: z.boolean() }).transform((value) => ({ morning: { open: value.open, close: value.close }, afternoon: { open: "00:00", close: "00:00" }, closed: value.closed })),
+]);
+const openingHoursSchema = z.record(z.string().min(2).max(15), openingDaySchema);
 const partnerSchema = z.object({ name: z.string().min(2).max(160), email: z.string().email(), password: z.string().min(12).max(200).regex(/[A-Z]/).regex(/[a-z]/).regex(/[0-9]/), phone: z.string().min(6).max(40), address: z.string().min(5).max(280), legalName: z.string().min(2).max(180), taxId: z.string().regex(/^[A-Za-z0-9-]{5,20}$/), legalForm: z.enum(["autonomo", "sl", "sa", "cooperativa", "otra"]), representativeName: z.string().min(2).max(160), representativeRole: z.string().min(2).max(100), representativeDocument: z.string().min(5).max(30), fiscalAddress: z.string().min(5).max(280), operatingAddress: z.string().min(5).max(280), postalCode: z.string().regex(/^\d{5}$/), city: z.string().min(2).max(100), province: z.string().min(2).max(100), iban: z.string().regex(/^[A-Z]{2}\d{2}[A-Z0-9]{10,30}$/), bankAccountHolder: z.string().min(2).max(180), cuisine: z.string().min(2).max(100), vatRate: z.union([z.literal(4), z.literal(10), z.literal(21)]), commissionAccepted: z.literal(true), termsAcceptedAt: z.coerce.date(), contractAccepted: z.literal(true), privacyAccepted: z.literal(true), dataProcessingAccepted: z.literal(true), pdaUnits: z.number().int().min(1).max(50), pdaUnitCostCents: z.literal(30000), pdaCostAccepted: z.literal(true), pdaCostAcceptedAt: z.coerce.date(), privacyAcceptedAt: z.coerce.date(), dataProcessingAcceptedAt: z.coerce.date(), openingHours: openingHoursSchema, documents: z.array(partnerDocumentSchema).length(5) });
 app.get("/api/v1/public/partners/:id/stripe/onboarding-link", async (req, res) => {
   const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
@@ -2542,7 +2559,7 @@ app.post("/api/v1/public/document-requests/:token/documents", async (req, res) =
 
 app.get("/api/v1/riders", requireRole("admin", "fleet"), async (req, res) => {
   const status = typeof req.query.status === "string" ? req.query.status : undefined;
-  const riders = await Rider.find({ ...(status ? { status } : {}), ...(await fleetRiderFilter(req)) }).sort({ name: 1 }).limit(200).lean().exec();
+  const riders = await Rider.find({ ...(status ? { status } : {}), ...(await fleetRiderSchedulingFilter(req)) }).sort({ name: 1 }).limit(200).lean().exec();
   return res.json({ riders });
 });
 
@@ -4729,7 +4746,7 @@ async function repairConfiguredPartnerAccess() {
             "partnerProfile.commissionRateBps": 1500,
           } : location.slug === "rooster-kebab-xativa" || location.slug === "nakama-sushi-xativa" ? {
             deliveryFeeCents: 299,
-            "partnerProfile.commissionRateBps": 2300,
+            ...(location.slug === "rooster-kebab-xativa" ? { phone: "962 04 75 35", address: "Carrer Abú Masaifa, 16, 2 bajo, 46800 Xàtiva, Valencia", promoted: true, "partnerProfile.commissionRateBps": 2500 } : { "partnerProfile.commissionRateBps": 2300 }),
           } : {}),
         },
         $setOnInsert: { slug: location.slug, tagline: "Próximo partner PIKI en Xàtiva", phone: "", address: "Xàtiva" },
@@ -4742,6 +4759,13 @@ async function repairConfiguredPartnerAccess() {
     await Restaurant.updateOne(
       { slug: "alibaba-kebab-xativa", tenantId: account.tenantId || null, onboardingStatus: "approved" },
       { $set: { availabilityStatus: "available", upcomingMessage: "", isActive: true, deliveryFeeCents: 299, "partnerProfile.commissionRateBps": 1500 } },
+    ).exec();
+  }
+  const roosterGoLive = process.env.REPAIR_PARTNER_ROOSTER_GO_LIVE === "true";
+  if (roosterGoLive) {
+    await Restaurant.updateOne(
+      { slug: "rooster-kebab-xativa", tenantId: account.tenantId || null, onboardingStatus: "approved" },
+      { $set: { availabilityStatus: "available", upcomingMessage: "", isActive: true, deliveryFeeCents: 299, phone: "962 04 75 35", address: "Carrer Abú Masaifa, 16, 2 bajo, 46800 Xàtiva, Valencia", promoted: true, "partnerProfile.commissionRateBps": 2500 } },
     ).exec();
   }
   // Public availability must be an explicit operational decision; merely
