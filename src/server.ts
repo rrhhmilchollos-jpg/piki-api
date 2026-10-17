@@ -1610,17 +1610,25 @@ app.put("/api/v1/partners/menu", requireRole("partner"), async (req, res) => {
   return res.json({ restaurant, menu: restaurant.menu || [] });
 });
 
+app.get("/api/v1/admin/restaurants/:id/menu", requireOwner(), async (req, res) => {
+  const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
+  if (!id) return res.status(400).json({ error: "INVALID_RESTAURANT_ID" });
+  const restaurant = await Restaurant.findOne({ _id: id, onboardingStatus: "approved" }).select("_id slug name menu").lean().exec() as any;
+  if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND_OR_NOT_APPROVED" });
+  return res.json({ restaurant, menu: restaurant.menu || [] });
+});
+
 app.put("/api/v1/admin/restaurants/:id/menu", requireOwner(), async (req, res) => {
   const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
   if (!id) return res.status(400).json({ error: "INVALID_RESTAURANT_ID" });
   const parsed = z.object({ items: z.array(partnerMenuItemSchema).max(500) }).safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_MENU", details: parsed.error.flatten() });
   const restaurant = await Restaurant.findOneAndUpdate(
-    { _id: id, slug: "piki-prueba", onboardingStatus: "approved" },
+    { _id: id, onboardingStatus: "approved" },
     { $set: { menu: parsed.data.items } },
     { new: true },
   ).select("_id slug name menu").lean().exec() as any;
-  if (!restaurant) return res.status(404).json({ error: "PIKI_PRUEBA_NOT_FOUND_OR_NOT_APPROVED" });
+  if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND_OR_NOT_APPROVED" });
   return res.json({ updated: true, restaurant, menu: restaurant.menu || [] });
 });
 
