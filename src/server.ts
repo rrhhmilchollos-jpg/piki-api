@@ -35,6 +35,7 @@ import { COMING_SOON_SLUGS, CUSTOMER_CATALOG_RESTAURANT_FILTER, CUSTOMER_ORDERAB
 import { PARTNER_DEMO_MENU_VERSION, partnerDemoMenu } from "./partnerDemoMenu.js";
 import { KINGS_TACOS_COVER_IMAGE, kingsTacosMenu } from "./kingsTacosMenu.js";
 import { ALIBABA_KEBAB_COVER_IMAGE, alibabaKebabMenu } from "./alibabaKebabMenu.js";
+import { mrRoosterMenu } from "./mrRoosterMenu.js";
 import { configuredPartnerRestaurantUpsert } from "./partnerRepairPolicy.js";
 import { quoteMenuItem, usesReferenceAddOns } from "./menuModifiers.js";
 import { decideLatePickup, pointDistanceMeters } from "./pickupPolicy.js";
@@ -4756,7 +4757,7 @@ async function repairConfiguredPartnerAccess() {
     { slug: "kings-tacos-xativa", name: "Kings Tacos Xàtiva", cuisine: "Mexicana", category: "Mexicana" },
     { slug: "eleven-burgers-xativa", name: "Eleven Burgers Xàtiva", cuisine: "Hamburguesas", category: "Hamburguesas" },
     { slug: "nakama-sushi-xativa", name: "Nakama Sushi Xàtiva", cuisine: "Japonesa", category: "Japonesa" },
-    { slug: "rooster-kebab-xativa", name: "Rooster Kebab Xàtiva", cuisine: "Kebab", category: "Kebab" },
+    { slug: "rooster-kebab-xativa", name: "Mr Rooster Xàtiva", cuisine: "Kebab", category: "Kebab" },
     { slug: "alibaba-kebab-xativa", name: "Alibaba Kebab Xàtiva", cuisine: "Kebab", category: "Kebab" },
   ] as const;
   const assignedRestaurants = includeXativaTestPortfolio
@@ -4770,17 +4771,21 @@ async function repairConfiguredPartnerAccess() {
           category: location.category,
           locality: "Xàtiva",
           partnerGroupKey: "xativa",
-          availabilityStatus: "coming_soon",
-          upcomingMessage: "Disponible muy pronto",
+          availabilityStatus: location.slug === "rooster-kebab-xativa" ? "available" : "coming_soon",
+          upcomingMessage: location.slug === "rooster-kebab-xativa" ? "" : "Disponible muy pronto",
           onboardingStatus: "approved",
-          isActive: false,
+          isActive: location.slug === "rooster-kebab-xativa",
           ...(location.slug === "alibaba-kebab-xativa" ? {
             image: ALIBABA_KEBAB_COVER_IMAGE,
             promoted: true,
             deliveryFeeCents: 299,
             "partnerProfile.commissionRateBps": 1500,
             menu: alibabaKebabMenu,
-          } : location.slug === "rooster-kebab-xativa" || location.slug === "nakama-sushi-xativa" ? {
+          } : location.slug === "rooster-kebab-xativa" ? {
+            deliveryFeeCents: 299,
+            "partnerProfile.commissionRateBps": 2500,
+            menu: mrRoosterMenu,
+          } : location.slug === "nakama-sushi-xativa" ? {
             deliveryFeeCents: 299,
             "partnerProfile.commissionRateBps": 2300,
           } : {}),
