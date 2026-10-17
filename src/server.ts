@@ -4386,6 +4386,7 @@ app.get("/api/v1/riders/:id/offers", requireRole("rider"), async (req, res) => {
       etaMinutes: offer.assignmentExpiresAt ? Math.max(0, Math.ceil((new Date(offer.assignmentExpiresAt).getTime() - now) / 60000)) : null,
       restaurant: restaurant ? { name: restaurant.name, address: restaurant.address || "", phone: restaurant.phone || "", cuisine: restaurant.cuisine || "", etaMinutes: restaurant.etaMinutes || [], imageUrl: restaurant.image || "", location: restaurant.location || null } : null,
       customerName: customerPhase ? customer?.name || offer.customerName || "Cliente" : null,
+      customerPhone: customerPhase ? customer?.phone || (offer as any).customerPhone || null : null,
       deliveryAddress: customerPhase ? offer.deliveryAddress || "" : null,
       deliveryNote: customerPhase ? offer.deliveryNote || null : null,
       deliveryLocation: customerPhase ? offer.deliveryLocation || null : null,
