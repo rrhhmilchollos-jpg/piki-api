@@ -9,7 +9,6 @@ export function configuredPartnerRestaurantUpsert(tenantId: unknown, email: stri
       onboardingStatus: "approved",
       isActive: true,
       internalDemo: slug !== "kfc-xativa-qa",
-      address: OPERATIONAL_ADDRESS,
       locality: "Novetlè",
       location: OPERATIONAL_LOCATION,
     },
@@ -21,6 +20,7 @@ export function configuredPartnerRestaurantUpsert(tenantId: unknown, email: stri
       partnerGroupKey: "xativa",
       tagline: "Entorno QA interno de PIKI · sin afiliación comercial.",
       phone: "",
+      address: OPERATIONAL_ADDRESS,
     },
   };
 }
