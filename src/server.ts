@@ -452,6 +452,13 @@ function requestedSurface(req: express.Request): PikiSurface | null {
   const value = String(req.header("x-piki-surface") || req.query.surface || "").toLowerCase();
   return isPikiSurface(value) ? value : null;
 }
+function isNativeCustomerContainer(req: express.Request, surface: PikiSurface | null = requestedSurface(req)): boolean {
+  if (surface !== "customer") return false;
+  if (String(req.header("x-piki-native-container") || "").toLowerCase() === "capacitor") return true;
+  const origin = String(req.header("origin") || "").toLowerCase();
+  const referer = String(req.header("referer") || "").toLowerCase();
+  return origin === "https://localhost" || referer.startsWith("https://localhost/");
+}
 async function currentNotificationPrincipal(req: express.Request): Promise<NotificationPrincipal | null> {
   const surface = requestedSurface(req);
   if (!surface) return null;
@@ -480,7 +487,11 @@ app.get("/api/v1/app-version", async (req, res) => {
   // Return that legacy sentinel only for its unversioned request so it can boot,
   // register the recovery worker, and receive the current network shell. All
   // versioned clients continue to receive the real, semver-based policy.
-  const responsePolicy = clientVersion
+  const responsePolicy = isNativeCustomerContainer(req, surface)
+    // Capacitor ships a versioned Android bundle through Google Play. A web PWA
+    // release must never trap that native shell behind an in-browser worker gate.
+    ? { ...policy, minimumVersion: "0.0.0", forceUpdate: false }
+    : clientVersion
     ? policy
     : surface === "customer"
       ? { ...policy, minimumVersion: "0.2.1", forceUpdate: false }
@@ -505,7 +516,7 @@ app.use("/api/v1", async (req, res, next) => {
   const surface = requestedSurface(req);
   const clientVersion = req.header("x-piki-client-version") || undefined;
   const clientBuildId = req.header("x-piki-client-build") || undefined;
-  if (surface && clientVersion) {
+  if (surface && clientVersion && !isNativeCustomerContainer(req, surface)) {
     const policy = await syncVersionPolicy(surface);
     if (requiresUpdate(policy, clientVersion, clientBuildId, surface)) {
       res.setHeader("Cache-Control", "no-store, max-age=0");
