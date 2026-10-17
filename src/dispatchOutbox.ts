@@ -151,6 +151,7 @@ export async function processDispatchOutboxBatch(
 ) {
   let processed = 0;
   let deadLettered = 0;
+  const deadLetters: Array<{ id: string; orderId: string; attempts: number; lastError: string }> = [];
   const batchSize = options.batchSize || 25;
   for (let index = 0; index < batchSize; index += 1) {
     const event = await claimDispatchOutboxEvent(workerId, { leaseMs: options.leaseMs });
@@ -161,10 +162,18 @@ export async function processDispatchOutboxBatch(
       processed += 1;
     } catch (error) {
       const outcome = await rescheduleDispatchOutboxEvent(event, workerId, error, options.maxAttempts);
-      if (outcome.deadLetter) deadLettered += 1;
+      if (outcome.deadLetter) {
+        deadLettered += 1;
+        deadLetters.push({
+          id: String(event._id),
+          orderId: String(event.orderId),
+          attempts: event.attempts,
+          lastError: (error instanceof Error ? error.message : String(error || "DISPATCH_FAILED")).slice(0, 300),
+        });
+      }
     }
   }
-  return { processed, deadLettered };
+  return { processed, deadLettered, deadLetters };
 }
 
 /**

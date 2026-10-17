@@ -93,7 +93,7 @@ async function start() {
       workerStats.deadLettered += result.deadLettered;
       workerStats.lastSuccessAt = new Date().toISOString();
       workerStats.lastError = null;
-      if (result.processed || result.deadLettered) console.log(JSON.stringify({ event: "dispatch_outbox_batch", workerId, ...result }));
+      if (result.processed || result.deadLettered) console.log(JSON.stringify({ event: "dispatch_outbox_batch", workerId, ...result, ...(result.deadLettered ? { deadLetters: result.deadLetters } : {}) }));
     } catch (error) {
       workerStats.pollErrors += 1;
       workerStats.lastError = error instanceof Error ? error.message : String(error);

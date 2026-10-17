@@ -4843,7 +4843,7 @@ async function start() {
           const outcome = await queueAutomaticDispatch(new mongoose.Types.ObjectId(String(event.orderId)), preferredRiderId && mongoose.isValidObjectId(preferredRiderId) ? new mongoose.Types.ObjectId(preferredRiderId) : undefined);
           if (["no_eligible_rider", "reservation_race", "database_unavailable", "in_progress"].includes(String(outcome.state))) throw new Error(`DISPATCH_${String(outcome.state).toUpperCase()}`);
         }, { batchSize: 10 });
-        if (result.processed || result.deadLettered) console.log(JSON.stringify({ event: "inline_dispatch_outbox_batch", workerId: inlineWorkerId, ...result }));
+        if (result.processed || result.deadLettered) console.log(JSON.stringify({ event: "inline_dispatch_outbox_batch", workerId: inlineWorkerId, ...result, ...(result.deadLettered ? { deadLetters: result.deadLetters } : {}) }));
       } catch (error) {
         console.error(JSON.stringify({ event: "inline_dispatch_worker_error", workerId: inlineWorkerId, error: error instanceof Error ? error.message : String(error) }));
       }
