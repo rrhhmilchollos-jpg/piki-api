@@ -4718,6 +4718,27 @@ app.use((error: any, req: express.Request, res: express.Response, next: express.
   res.status(status).json({ error: invalid ? "INVALID_REQUEST" : unavailable ? "DATABASE_UNAVAILABLE" : "INTERNAL_SERVER_ERROR" });
 });
 
+async function purgeExpiredQaPartner() {
+  const expiredRestaurants = await Restaurant.find({ slug: "kfc-xativa-qa", qaExpiresAt: { $lte: new Date() } }).select("_id").lean().exec() as any[];
+  for (const restaurant of expiredRestaurants) {
+    const orders = await Order.find({ restaurantId: restaurant._id }).select("_id").lean().exec() as any[];
+    const orderIds = orders.map((order) => order._id);
+    await Promise.all([
+      RiderOrderMessage.deleteMany({ orderId: { $in: orderIds } }).exec(),
+      DispatchDecision.deleteMany({ orderId: { $in: orderIds } }).exec(),
+      RiderAssignmentReservation.deleteMany({ orderId: { $in: orderIds } }).exec(),
+      SupportTicket.deleteMany({ orderId: { $in: orderIds } }).exec(),
+      CashLedgerEntry.deleteMany({ orderId: { $in: orderIds } }).exec(),
+      RealtimeEvent.deleteMany({ "payload.orderId": { $in: orderIds.map(String) } }).exec(),
+      Notification.deleteMany({ entityType: "order", entityId: { $in: orderIds.map(String) } }).exec(),
+      Order.deleteMany({ _id: { $in: orderIds } }).exec(),
+      EmployeeAccount.updateMany({ restaurantIds: restaurant._id }, { $pull: { restaurantIds: restaurant._id }, $unset: { restaurantId: "" } }).exec(),
+      Restaurant.deleteOne({ _id: restaurant._id }).exec(),
+    ]);
+    console.log(JSON.stringify({ event: "qa_partner_expired_and_purged", slug: "kfc-xativa-qa", restaurantId: String(restaurant._id), ordersDeleted: orderIds.length }));
+  }
+}
+
 async function repairConfiguredPartnerAccess() {
   if (process.env.REPAIR_PARTNER_ACCESS_ENABLED !== "true") return;
   // Render does not retroactively synchronize Blueprint variables into this
@@ -4746,7 +4767,7 @@ async function repairConfiguredPartnerAccess() {
     ).select("_id email slug name tenantId onboardingStatus isActive internalDemo demoMenuVersion").lean().exec();
     await Restaurant.updateOne(
       { _id: restaurant._id },
-      { $set: { name: "KFC XATIVA QA", address: "Calle Sor Isabel de Villena 88, bajo, Novetlè, Valencia", locality: "Novetlè", menu: partnerDemoMenu, onboardingStatus: "approved", isActive: true, availabilityStatus: "available" } },
+      { $set: { name: "KFC XATIVA QA", address: "Calle Sor Isabel de Villena 88, bajo, Novetlè, Valencia", locality: "Novetlè", menu: partnerDemoMenu, onboardingStatus: "approved", isActive: true, availabilityStatus: "available", qaExpiresAt: new Date(Date.now() + 3 * 60 * 60_000) } },
     ).exec();
     console.log(JSON.stringify({ event: "partner_access_repair", email, result: "test_restaurant_created_or_reused", restaurantId: String(restaurant._id), restaurantName: restaurant.name, tenantId: restaurant.tenantId ? String(restaurant.tenantId) : null }));
   } else {
@@ -4882,6 +4903,8 @@ async function start() {
     startRealtimeRelay();
     startNotificationWorker();
     await repairConfiguredPartnerAccess();
+    await purgeExpiredQaPartner();
+    setInterval(() => { void purgeExpiredQaPartner().catch((error) => console.warn("QA partner purge failed", error instanceof Error ? error.message : String(error))); }, 60_000).unref();
     await ensureMrRoosterOperational();
     await purgeTestDataIfEnabled();
     databaseReady = true;
