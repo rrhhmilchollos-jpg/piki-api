@@ -4286,7 +4286,7 @@ app.get("/api/v1/riders/:id/offers", requireRole("rider"), async (req, res) => {
   const rider = await riderAccessForRequest(riderId, req);
   if (!rider) return res.status(403).json({ error: "RIDER_ACCESS_DENIED" });
   const offers = await Order.find({ riderId, assignmentState: { $in: ["offered", "assigned"] }, status: { $nin: ["delivered", "cancelled"] } })
-.select("_id publicCode displayCode displayCodeDate restaurantId customerId customerName riderId status paymentState paymentMethod partnerPaymentRequired partnerPaymentCents subtotalCents deliveryFeeCents serviceFeeCents totalCents assignmentState assignmentExpiresAt pickupDeadlineAt partnerPrepDeadlineAt deliveryAddress deliveryNote deliveryLocation items createdAt")
+.select("_id publicCode displayCode displayCodeDate restaurantId customerId customerName riderId status paymentState paymentMethod partnerPaymentRequired partnerPaymentCents subtotalCents deliveryFeeCents serviceFeeCents totalCents assignmentState assignmentExpiresAt pickupDeadlineAt riderArrivedAt riderArrivalDistanceMeters partnerPrepDeadlineAt deliveryAddress deliveryNote deliveryLocation items createdAt")
     .sort({ createdAt: -1 }).limit(10).lean().exec() as any[];
   const riderProfile = await Rider.findById(riderId).select("vehicle").lean().exec() as any;
   const restaurantIds = offers.map((offer) => offer.restaurantId).filter(Boolean);
@@ -4305,7 +4305,11 @@ app.get("/api/v1/riders/:id/offers", requireRole("rider"), async (req, res) => {
     // Once the offer is atomically assigned, the Rider needs the final
     // destination data to prepare and execute the route. Never expose it for
     // an unassigned offer, but do not hide it while the order is at the Partner.
-    const customerPhase = offer.assignmentState === "assigned" && offer.status !== "pending";
+    // The Customer phase starts only after the Rider has physically confirmed
+    // the pickup. A ready order is still travelling to / waiting at the
+    // Partner, so exposing the customer destination before pickup shows the
+    // wrong card and sends misleading realtime data.
+    const customerPhase = offer.assignmentState === "assigned" && ["picked_up", "on_the_way"].includes(offer.status);
     return {
       _id: offer._id,
       publicCode: offer.publicCode,
@@ -4323,7 +4327,9 @@ app.get("/api/v1/riders/:id/offers", requireRole("rider"), async (req, res) => {
       assignmentState: offer.assignmentState,
       assignmentExpiresAt: offer.assignmentExpiresAt,
       pickupDeadlineAt: offer.pickupDeadlineAt,
-partnerPrepDeadlineAt: offer.partnerPrepDeadlineAt || null,
+      riderArrivedAt: offer.riderArrivedAt || null,
+      riderArrivalDistanceMeters: offer.riderArrivalDistanceMeters ?? null,
+      partnerPrepDeadlineAt: offer.partnerPrepDeadlineAt || null,
       preparationMinutes: offer.status === "ready_for_pickup" ? 0 : PARTNER_PREPARATION_LIMIT_MINUTES,
       items: (offer.items || []).map((item: any) => ({
         name: item.name || "Producto",
