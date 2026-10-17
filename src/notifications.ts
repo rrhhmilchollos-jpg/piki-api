@@ -123,8 +123,10 @@ const statusLabel: Record<string, string> = {
 
 export function buildNoticeCopy(input: RealtimeNotificationInput, recipient: Recipient): NoticeCopy | null {
   const orderId = String(input.payload.orderId || "").trim();
+  const orderCode = String(input.payload.publicCode || input.payload.orderCode || "").trim();
   const orderRef = orderReference(input.payload);
-  const customerUrl = orderId ? `/?order_id=${encodeURIComponent(orderId)}` : "/";
+  // The Customer tracking route accepts the public PIKI code, never Mongo's id.
+  const customerUrl = orderCode ? `/?order_id=${encodeURIComponent(orderCode)}` : "/";
   const employeeUrl = "/";
   const url = recipient.surface === "customer" ? customerUrl : employeeUrl;
   const entityType = orderId ? "order" : "";

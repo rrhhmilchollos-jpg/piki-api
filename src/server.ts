@@ -15,7 +15,7 @@ import { configuredAuthRoles, requireOwner, requireRole, resolveRole } from "./a
 import { EmployeeSession, issueEmployeeSession, revokeEmployeeSessions, sessionRole } from "./employeeSessions.js";
 import { isStripeSignatureError, processStripeWebhook, stripeConfigured, createSignaturitSignature, signaturitBaseUrl, signaturitConfigured, signaturitMode, signatureWebhookUrl, webhookDigest, handleCustomerTrpc, currentCustomer, issueCustomerSession, setCustomerOrderDispatcher } from "./integrations/index.js";
 import { getVersionPolicy, isPikiSurface, requiresUpdate, setVersionPolicy, syncVersionPolicy, versionPolicySchema, type PikiSurface } from "./appVersion.js";
-import { publicPushConfig, revokePushSubscription, savePushSubscription } from "./push.js";
+import { publicPushConfig, revokePushSubscription, saveFcmSubscription, savePushSubscription } from "./push.js";
 import { publishOrderStatusEvents, publishOrderIntakeEvents, publishRiderOfferEvent, publishRiderArrivalEvent, publishRiderLocationEvents, publishRiderScheduleEvent, publishRiderCustomerMessageEvent, publishRealtimeEvent, serveRealtimeEvents, startRealtimeRelay, tenantAudienceKey } from "./realtime.js";
 import { listNotifications, markAllNotificationsRead, markNotificationRead, sendDocumentRequestEmail, sendDocumentUploadEmail, startNotificationWorker, stopNotificationWorker, type NotificationPrincipal } from "./notifications.js";
 import { captureStripePaymentIntent, createCheckoutSession, createPartnerStripeOnboardingLink } from "./stripe.js";
@@ -446,6 +446,10 @@ const pushSubscriptionSchema = z.object({
     keys: z.object({ p256dh: z.string().min(16).max(1000), auth: z.string().min(8).max(1000) }).strict(),
   }).strict(),
 }).strict();
+const nativePushSubscriptionSchema = z.object({
+  token: z.string().trim().min(20).max(4096),
+  platform: z.enum(["android", "ios"]).default("android"),
+}).strict();
 const employeeSurfaceRoles: Record<Exclude<PikiSurface, "customer">, string[]> = {
   partner: ["partner"], fleet: ["fleet", "commercial", "gerente_comercial_zona"], admin: ["admin", "partner", "rider", "fleet", "commercial", "gerente_comercial_zona"], rider: ["rider"],
 };
@@ -547,6 +551,25 @@ app.post("/api/v1/push/subscriptions", rateLimit(20, 60_000, "push-subscribe"), 
     return res.status(201).json(await savePushSubscription({ surface, ownerType: "employee", ownerId: auth.employeeId, tenantId: employee?.tenantId ? String(employee.tenantId) : null, subscription: parsed.data.subscription }));
   } catch (error) {
     return res.status(503).json({ error: error instanceof Error && error.message === "PUSH_NOT_CONFIGURED" ? "PUSH_NOT_CONFIGURED" : "PUSH_SUBSCRIPTION_FAILED" });
+  }
+});
+app.post("/api/v1/push/native-subscriptions", rateLimit(20, 60_000, "native-push-subscribe"), async (req, res) => {
+  const surface = requestedSurface(req);
+  const parsed = nativePushSubscriptionSchema.safeParse(req.body);
+  if (surface !== "customer") return res.status(400).json({ error: "NATIVE_PUSH_CUSTOMER_ONLY" });
+  if (!parsed.success) return res.status(400).json({ error: "INVALID_NATIVE_PUSH_SUBSCRIPTION" });
+  const customer = await currentCustomer(req) as any;
+  if (!customer) return res.status(401).json({ error: "AUTHENTICATION_REQUIRED" });
+  try {
+    return res.status(201).json(await saveFcmSubscription({
+      surface: "customer",
+      ownerId: String(customer._id),
+      tenantId: customer.tenantId ? String(customer.tenantId) : null,
+      token: parsed.data.token,
+      platform: parsed.data.platform,
+    }));
+  } catch (error) {
+    return res.status(503).json({ error: error instanceof Error && error.message === "FCM_NOT_CONFIGURED" ? "FCM_NOT_CONFIGURED" : "NATIVE_PUSH_SUBSCRIPTION_FAILED" });
   }
 });
 app.delete("/api/v1/push/subscriptions", rateLimit(20, 60_000, "push-unsubscribe"), async (req, res) => {
