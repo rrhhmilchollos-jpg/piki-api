@@ -16,7 +16,7 @@ import { EmployeeSession, issueEmployeeSession, revokeEmployeeSessions, sessionR
 import { isStripeSignatureError, processStripeWebhook, stripeConfigured, createSignaturitSignature, signaturitBaseUrl, signaturitConfigured, signaturitMode, signatureWebhookUrl, webhookDigest, handleCustomerTrpc, currentCustomer, issueCustomerSession, setCustomerOrderDispatcher } from "./integrations/index.js";
 import { getVersionPolicy, isPikiSurface, requiresUpdate, setVersionPolicy, syncVersionPolicy, versionPolicySchema, type PikiSurface } from "./appVersion.js";
 import { publicPushConfig, revokePushSubscription, saveFcmSubscription, savePushSubscription } from "./push.js";
-import { publishOrderStatusEvents, publishOrderIntakeEvents, publishRiderOfferEvent, publishRiderArrivalEvent, publishRiderLocationEvents, publishRiderScheduleEvent, publishRiderCustomerMessageEvent, publishRealtimeEvent, serveRealtimeEvents, startRealtimeRelay, tenantAudienceKey } from "./realtime.js";
+import { publishOrderStatusEvents, publishOrderIntakeEvents, publishRiderOfferEvent, publishRiderHeadingToPartnerEvent, publishRiderArrivalEvent, publishRiderLocationEvents, publishRiderScheduleEvent, publishRiderCustomerMessageEvent, publishRealtimeEvent, serveRealtimeEvents, startRealtimeRelay, tenantAudienceKey } from "./realtime.js";
 import { listNotifications, markAllNotificationsRead, markNotificationRead, sendDocumentRequestEmail, sendDocumentUploadEmail, startNotificationWorker, stopNotificationWorker, type NotificationPrincipal } from "./notifications.js";
 import { captureStripePaymentIntent, createCheckoutSession, createPartnerStripeOnboardingLink } from "./stripe.js";
 import { rankDispatchCandidates, computeMobilityAdvice, calculateSanctionDecision, defaultSanctionPolicy } from "./algorithms/index.js";
@@ -3417,6 +3417,24 @@ app.post("/api/v1/riders/:riderId/orders/:orderId/confirm-arrival", requireRole(
   return res.json({ message: updated.status === "ready_for_pickup" ? "Llegada verificada. Ya puedes recoger el pedido." : "Llegada verificada. Espera a que el Partner termine la preparación.", order: updated });
 });
 
+app.post("/api/v1/riders/:riderId/orders/:orderId/start-pickup-route", requireRole("rider"), async (req, res) => {
+  const riderId = objectId(Array.isArray(req.params.riderId) ? req.params.riderId[0] : req.params.riderId);
+  const orderId = objectId(Array.isArray(req.params.orderId) ? req.params.orderId[0] : req.params.orderId);
+  if (!riderId || !orderId) return res.status(400).json({ error: "INVALID_PICKUP_ROUTE" });
+  const rider = await riderAccessForRequest(riderId, req);
+  if (!rider) return res.status(403).json({ error: "RIDER_ACCESS_DENIED" });
+  const order = await Order.findOne({ _id: orderId, riderId, assignmentState: "assigned", status: { $in: ["accepted", "preparing", "ready_for_pickup"] } }).lean().exec() as any;
+  if (!order) return res.status(404).json({ error: "ACTIVE_RIDER_ORDER_NOT_FOUND" });
+  if (order.riderArrivedAt) return res.status(409).json({ error: "PARTNER_ALREADY_REACHED", message: "La llegada al Partner ya está confirmada." });
+  const updated = await Order.findOneAndUpdate(
+    { _id: orderId, riderId, assignmentState: "assigned", riderArrivedAt: null, version: order.version },
+    { $set: { riderHeadingToPartnerAt: new Date() }, $inc: { version: 1 }, $push: { statusHistory: { status: order.status, actorRole: "rider", reason: "Rider inicia la ruta GPS hacia el Partner." } } },
+    { new: true },
+  ).lean().exec() as any;
+  if (!updated) return res.status(409).json({ error: "ORDER_CHANGED_RETRY" });
+  await publishRiderHeadingToPartnerEvent(updated, rider);
+  return res.json({ message: "Ruta al Partner iniciada. El Partner y el Customer ya pueden verlo.", order: updated });
+});
 app.post("/api/v1/riders/:riderId/orders/:orderId/confirm-pickup", requireRole("rider"), async (req, res) => {
   const riderId = objectId(Array.isArray(req.params.riderId) ? req.params.riderId[0] : req.params.riderId);
   const orderId = objectId(Array.isArray(req.params.orderId) ? req.params.orderId[0] : req.params.orderId);
@@ -4286,7 +4304,7 @@ app.get("/api/v1/riders/:id/offers", requireRole("rider"), async (req, res) => {
   const rider = await riderAccessForRequest(riderId, req);
   if (!rider) return res.status(403).json({ error: "RIDER_ACCESS_DENIED" });
   const offers = await Order.find({ riderId, assignmentState: { $in: ["offered", "assigned"] }, status: { $nin: ["delivered", "cancelled"] } })
-.select("_id publicCode displayCode displayCodeDate restaurantId customerId customerName riderId status paymentState paymentMethod partnerPaymentRequired partnerPaymentCents subtotalCents deliveryFeeCents serviceFeeCents totalCents assignmentState assignmentExpiresAt pickupDeadlineAt riderArrivedAt riderArrivalDistanceMeters partnerPrepDeadlineAt deliveryAddress deliveryNote deliveryLocation items createdAt")
+.select("_id publicCode displayCode displayCodeDate restaurantId customerId customerName riderId status paymentState paymentMethod partnerPaymentRequired partnerPaymentCents subtotalCents deliveryFeeCents serviceFeeCents totalCents assignmentState assignmentExpiresAt pickupDeadlineAt riderHeadingToPartnerAt riderArrivedAt riderArrivalDistanceMeters partnerPrepDeadlineAt deliveryAddress deliveryNote deliveryLocation items createdAt")
     .sort({ createdAt: -1 }).limit(10).lean().exec() as any[];
   const riderProfile = await Rider.findById(riderId).select("vehicle").lean().exec() as any;
   const restaurantIds = offers.map((offer) => offer.restaurantId).filter(Boolean);
@@ -4327,6 +4345,7 @@ app.get("/api/v1/riders/:id/offers", requireRole("rider"), async (req, res) => {
       assignmentState: offer.assignmentState,
       assignmentExpiresAt: offer.assignmentExpiresAt,
       pickupDeadlineAt: offer.pickupDeadlineAt,
+      riderHeadingToPartnerAt: offer.riderHeadingToPartnerAt || null,
       riderArrivedAt: offer.riderArrivedAt || null,
       riderArrivalDistanceMeters: offer.riderArrivalDistanceMeters ?? null,
       partnerPrepDeadlineAt: offer.partnerPrepDeadlineAt || null,

@@ -180,6 +180,18 @@ export async function publishRiderOfferEvent(order: any, riderId: string) {
     dedupeKey: `offer:rider:${String(order._id)}:${riderId}:${order.dispatchAttempts || 0}`,
   });
 }
+export async function publishRiderHeadingToPartnerEvent(order: any, rider: any) {
+  const tenantId = validTenantId(order.tenantId);
+  const base = { orderId: String(order._id), publicCode: order.publicCode, restaurantId: String(order.restaurantId), riderId: String(rider._id), status: order.status, assignmentState: order.assignmentState, headingToPartnerAt: order.riderHeadingToPartnerAt || new Date(), message: "El Rider está en camino al Partner para recoger el pedido." };
+  const events: Array<Promise<unknown>> = [
+    publishRealtimeEvent({ channel: "rider", audienceKey: `rider:${base.riderId}`, tenantId, type: "order.rider_heading_to_partner", payload: base, dedupeKey: `heading:rider:${base.orderId}:${order.version || 0}` }),
+    publishRealtimeEvent({ channel: "partner", audienceKey: `restaurant:${base.restaurantId}`, tenantId, type: "order.rider_heading_to_partner", payload: base, dedupeKey: `heading:partner:${base.orderId}:${order.version || 0}` }),
+    publishRealtimeEvent({ channel: "fleet", audienceKey: tenantAudienceKey(tenantId, "fleet"), tenantId, type: "order.rider_heading_to_partner", payload: base, dedupeKey: `heading:fleet:${base.orderId}:${order.version || 0}` }),
+    publishRealtimeEvent({ channel: "admin", audienceKey: tenantAudienceKey(tenantId, "admin"), tenantId, type: "order.rider_heading_to_partner", payload: base, dedupeKey: `heading:admin:${base.orderId}:${order.version || 0}` }),
+  ];
+  if (order.customerId && mongoose.isValidObjectId(order.customerId)) events.push(publishRealtimeEvent({ channel: "customer", audienceKey: `customer:${String(order.customerId)}`, tenantId, type: "order.rider_heading_to_partner", payload: { ...customerOrderPayload(order), ...base }, dedupeKey: `heading:customer:${base.orderId}:${order.version || 0}` }));
+  await Promise.all(events);
+}
 export async function publishRiderCustomerMessageEvent(order: any, message: any) {
   if (!order.customerId || !mongoose.isValidObjectId(order.customerId)) return;
   const messageId = String(message._id || `${order._id}:${message.createdAt || Date.now()}`);
