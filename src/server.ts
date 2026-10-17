@@ -4849,6 +4849,7 @@ async function ensureMrRoosterOperational() {
       onboardingStatus: "approved",
       isActive: true,
       deliveryFeeCents: 299,
+      image: "https://files.manuscdn.com/user_upload_by_module/session_file/310519663931061405/PSnZzuCOslUOgNQN.jpg",
       "partnerProfile.commissionRateBps": 2500,
       menu: mrRoosterMenu,
     } },

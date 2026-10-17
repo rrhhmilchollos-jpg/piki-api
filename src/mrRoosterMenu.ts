@@ -18,7 +18,14 @@ const drinks = [
   { id: "agua-330", name: "Agua 330 ml", price: 0 },
 ];
 const required = (id: string, name: string, options: unknown[]) => ({ id, name, price: 0, required: true, minSelections: 1, maxSelections: 1, options });
-const item = (id: string, name: string, price: number, category: string, description = "", modifiers: unknown[] = [], popular = false) => ({ id, name, price, category, description, image: "", allergens: ["Gluten"], modifiers, available: true, vegetarian: false, popular });
+const menuCategories = new Set(["Menús", "Menú Rooster", "Menú Familia (para 4 personas)", "Menú Recomendado", "Entrantes", "Hamburguesas", "Kebabs", "Alitas de pollo fritas picantes", "Tiras de pechuga de pollo", "Salsas", "Helados", "Bebidas sin alcohol"]);
+const item = (id: string, name: string, price: number, category: string, description = "", modifiers: unknown[] = [], popular = false) => {
+  // Normalize both source-PDF argument orders used during the import.
+  const swapped = menuCategories.has(description) && !menuCategories.has(category);
+  const finalCategory = swapped ? description : category;
+  const finalDescription = swapped ? category : description;
+  return { id, name, price, category: finalCategory, description: finalDescription, image: "", allergens: ["Gluten"], modifiers, available: true, vegetarian: false, popular };
+};
 const kebab = (id: string, name: string, price: number, description: string, options: unknown[] = meat, withBread = false, category = "Menús", popular = false) => item(id, name, price, category, description, [required("carne", "Elige tu carne", options), ...(withBread ? [required("pan", "Elige el pan", bread)] : [])], popular);
 const drinkMenu = (id: string, name: string, price: number, description: string, meatOptions: unknown[] = meat) => item(id, name, price, "Menús", description, [required("carne", "Elige tu carne", meatOptions), required("bebida", "Elige tu bebida", drinks)]);
 
