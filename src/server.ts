@@ -352,6 +352,13 @@ const MENU_IMAGE_MIME_TYPES = ["image/webp", "image/jpeg", "image/png", "image/g
 const MENU_FILE_MIME_TYPES = ["application/pdf"] as const;
 const MENU_ASSET_MIME_TYPES = [...MENU_IMAGE_MIME_TYPES, ...MENU_FILE_MIME_TYPES] as const;
 const MENU_ASSET_KINDS = ["menu_image", "menu_file"] as const;
+const ALIBABA_KEBAB_SLUG = "alibaba-kebab-xativa";
+function canonicalRestaurantMenu(restaurant: any) {
+  return restaurant?.slug === ALIBABA_KEBAB_SLUG ? alibabaKebabMenu : (Array.isArray(restaurant?.menu) ? restaurant.menu : []);
+}
+function pricedRestaurantMenu(restaurant: any) {
+  return customerMenuForRestaurant({ ...restaurant, menu: canonicalRestaurantMenu(restaurant) });
+}
 function localityKey(value: string) { return value.trim().toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "") || "sin-localidad"; }
 function organizationFolder(locality: string, restaurantId: string) { return `partners/${localityKey(locality)}/${restaurantId}/menu`; }
 function publicAssetUrl(assetId: string) { return `${process.env.PUBLIC_API_URL || "https://api.pikidelivery.com"}/api/v1/catalog/assets/${assetId}`; }
@@ -1071,7 +1078,7 @@ app.get("/api/v1/catalog/restaurants", async (req, res) => {
     "kings-tacos-xativa": 1,
   };
   restaurants.sort((left: any, right: any) => (catalogPriority[left.slug] ?? 10) - (catalogPriority[right.slug] ?? 10));
-  const body = { restaurants: restaurants.map((restaurant: any) => presentCustomerCatalogRestaurant(restaurant)) };
+  const body = { restaurants: restaurants.map((restaurant: any) => presentCustomerCatalogRestaurant({ ...restaurant, menu: canonicalRestaurantMenu(restaurant) })) };
   catalogCache.set(cacheKey, { expiresAt: Date.now() + CATALOG_CACHE_MS, body });
   void sharedCacheSet(`piki:catalog:${cacheKey}`, body, 30);
   res.setHeader("Cache-Control", "public, max-age=30, s-maxage=30, stale-while-revalidate=60, stale-if-error=120");
@@ -1160,7 +1167,7 @@ app.get("/api/v1/coverage", async (req, res) => {
         // select:false document payload nested under partnerProfile.
         .select("slug name cuisine category locality tagline etaMinutes deliveryFeeCents rating reviews promoted image accent phone address location menu availabilityStatus upcomingAt upcomingMessage")
         .sort({ promoted: -1, rating: -1, reviews: -1 }).lean().exec();
-      restaurants = rows.map((restaurant: any) => presentCustomerCatalogRestaurant(restaurant));
+      restaurants = rows.map((restaurant: any) => presentCustomerCatalogRestaurant({ ...restaurant, menu: canonicalRestaurantMenu(restaurant) }));
     } catch (error) {
       // The price decision is deterministic and must never disappear because a
       // catalogue/index query is temporarily unavailable. The storefront has
@@ -1605,7 +1612,8 @@ app.get("/api/v1/partners/menu", requireRole("partner"), async (req, res) => {
   if (!restaurantId) return res.status(403).json({ error: access?.restaurantIds.length ? "PARTNER_RESTAURANT_ACCESS_DENIED" : "PARTNER_RESTAURANT_NOT_ASSIGNED" });
   const restaurant = await Restaurant.findById(restaurantId).select("name slug internalDemo menu").lean().exec() as any;
   if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
-  return res.json({ restaurant, menu: restaurant.menu || [] });
+  const menu = canonicalRestaurantMenu(restaurant);
+  return res.json({ restaurant: { ...restaurant, menu }, menu });
 });
 app.put("/api/v1/partners/menu", requireRole("partner"), async (req, res) => {
   const { access, allowed } = await partnerRequestAccess(req, "menu:write");
@@ -1614,7 +1622,9 @@ app.put("/api/v1/partners/menu", requireRole("partner"), async (req, res) => {
   if (!restaurantId) return res.status(403).json({ error: access?.restaurantIds.length ? "PARTNER_RESTAURANT_ACCESS_DENIED" : "PARTNER_RESTAURANT_NOT_ASSIGNED" });
   const parsed = z.object({ items: z.array(partnerMenuItemSchema).max(500) }).safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_MENU", details: parsed.error.flatten() });
-  const restaurant = await Restaurant.findByIdAndUpdate(restaurantId, { $set: { menu: parsed.data.items } }, { new: true }).select("name menu").lean().exec() as any;
+  const current = await Restaurant.findById(restaurantId).select("slug").lean().exec() as any;
+  const items = current?.slug === ALIBABA_KEBAB_SLUG ? alibabaKebabMenu : parsed.data.items;
+  const restaurant = await Restaurant.findByIdAndUpdate(restaurantId, { $set: { menu: items } }, { new: true }).select("name menu slug").lean().exec() as any;
   if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
   return res.json({ restaurant, menu: restaurant.menu || [] });
 });
@@ -2740,7 +2750,7 @@ app.post("/api/v1/orders", rateLimit(20, 60_000, "orders-create"), async (req, r
   if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_AVAILABLE" });
   // El catálogo público y el checkout deben compartir exactamente la misma política de precio.
   // Alibaba aplica el 18% por producto; Kings Tacos y el resto no se alteran.
-  const pricedMenu = customerMenuForRestaurant(restaurant);
+  const pricedMenu = pricedRestaurantMenu(restaurant);
   const pricedRestaurant = { ...restaurant, menu: pricedMenu };
   const useReferenceFallback = usesReferenceAddOns(pricedRestaurant);
   const items = parsed.data.items.map((requested) => {
@@ -2817,7 +2827,7 @@ app.post("/api/v1/internal/customer-orders/sync", async (req, res) => {
   if (marketplace.customerTotalCents !== input.totalCents) return res.status(409).json({ error: "MARKETPLACE_TOTAL_MISMATCH" });
   // Customer is the source of truth: never rebuild lines from a second menu copy.
   // This prevents price/name drift between Customer, Partner and Rider screens.
-  const pricedMenu = customerMenuForRestaurant(restaurant);
+  const pricedMenu = pricedRestaurantMenu(restaurant);
   const menuById = new Map(pricedMenu.map((item: any) => [String(item.id), item]));
   const canonicalItems = input.items.map(({ itemId, name, quantity, unitPriceCents, totalCents }) => {
     const catalogItem = menuById.get(String(itemId));
