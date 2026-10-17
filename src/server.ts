@@ -67,6 +67,10 @@ const catalogCache = new Map<string, { expiresAt: number; body: { restaurants: u
 const geocodeCache = new Map<string, { expiresAt: number; body: any }>();
 const CATALOG_CACHE_MS = 30_000;
 const GEOCODE_CACHE_MS = 300_000;
+function invalidateCatalogCache() {
+  catalogCache.clear();
+  void sharedCacheDelete("piki:catalog:|");
+}
 const boundedFetch = (input: string | URL, init: RequestInit = {}) => fetch(input, { ...init, signal: AbortSignal.timeout(1_200) });
 const geocoderHeaders = { "User-Agent": "PIKI-Delivery/0.2 (+https://pikidelivery.com)" };
 
@@ -189,6 +193,10 @@ async function sharedCacheGet<T>(key: string): Promise<T | null> {
 async function sharedCacheSet(key: string, value: unknown, ttlSeconds: number): Promise<void> {
   if (!upstashRedisUrl || !upstashRedisToken) return;
   try { await fetch(`${upstashRedisUrl}/set/${encodeURIComponent(key)}/${encodeURIComponent(JSON.stringify(value))}/EX/${ttlSeconds}`, { method: "POST", headers: { Authorization: `Bearer ${upstashRedisToken}` }, signal: AbortSignal.timeout(250) }); } catch { /* local cache fallback */ }
+}
+async function sharedCacheDelete(key: string): Promise<void> {
+  if (!upstashRedisUrl || !upstashRedisToken) return;
+  try { await fetch(`${upstashRedisUrl}/del/${encodeURIComponent(key)}`, { method: "POST", headers: { Authorization: `Bearer ${upstashRedisToken}` }, signal: AbortSignal.timeout(250) }); } catch { /* local cache fallback */ }
 }
 const rateLimit = (limit: number, windowMs: number, keyPrefix: string) => async (req: express.Request, res: express.Response, next: express.NextFunction) => {
   const surfaceKey = String(req.header("x-piki-surface") || req.query.surface || "-").toLowerCase();
@@ -1629,6 +1637,7 @@ app.put("/api/v1/admin/restaurants/:id/menu", requireOwner(), async (req, res) =
     { new: true },
   ).select("_id slug name menu").lean().exec() as any;
   if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND_OR_NOT_APPROVED" });
+  invalidateCatalogCache();
   return res.json({ updated: true, restaurant, menu: restaurant.menu || [] });
 });
 
