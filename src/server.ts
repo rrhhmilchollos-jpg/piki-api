@@ -4836,6 +4836,25 @@ async function repairConfiguredPartnerAccess() {
   ).exec();
   console.log(JSON.stringify({ event: "partner_access_repair", email, result: "repaired", restaurantId: String(restaurant._id), restaurantName: restaurant.name, assignedRestaurantCount: portfolioIds.length, ownerPreserved: isProtectedOwner }));
 }
+async function ensureMrRoosterOperational() {
+  const result = await Restaurant.updateOne(
+    { slug: "rooster-kebab-xativa" },
+    { $set: {
+      name: "Mr Rooster Xàtiva",
+      cuisine: "Kebab",
+      category: "Kebab",
+      locality: "Xàtiva",
+      availabilityStatus: "available",
+      upcomingMessage: "",
+      onboardingStatus: "approved",
+      isActive: true,
+      deliveryFeeCents: 299,
+      "partnerProfile.commissionRateBps": 2500,
+      menu: mrRoosterMenu,
+    } },
+  ).exec();
+  if (result.matchedCount > 0) console.log(JSON.stringify({ event: "mr_rooster_operational", slug: "rooster-kebab-xativa", modified: result.modifiedCount > 0, menuCount: mrRoosterMenu.length, commissionRateBps: 2500 }));
+}
 async function start() {
   const uri = process.env.MONGODB_URI;
   if (uri) {
@@ -4849,6 +4868,7 @@ async function start() {
     startRealtimeRelay();
     startNotificationWorker();
     await repairConfiguredPartnerAccess();
+    await ensureMrRoosterOperational();
     await purgeTestDataIfEnabled();
     databaseReady = true;
     if (process.env.RUN_TENANT_MIGRATION === "true") {
