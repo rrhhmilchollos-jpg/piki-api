@@ -4730,11 +4730,11 @@ async function repairConfiguredPartnerAccess() {
   const account = await EmployeeAccount.findOne({ email }).select("_id email tenantId restaurantId restaurantIds apiRole jobRole roles primaryRole active authorizationStatus ownerProtected").lean().exec() as any;
   if (!account) { console.log(JSON.stringify({ event: "partner_access_repair", email, result: "account_not_found" })); return; }
 
-  // Never recreate the retired KFC QA portfolio implicitly. Any repair must
-  // name a non-QA staging slug explicitly.
+  // QA solo se crea cuando el slug se solicita explícitamente mediante la
+  // reparación autorizada; nunca se recrea de forma implícita al arrancar.
   const createOrUseTestRestaurant = process.env.REPAIR_PARTNER_CREATE_TEST === "true"
     && Boolean(configuredPartnerSlug)
-    && !["kfc-xativa-qa", "kfc-xativa-test"].includes(configuredPartnerSlug);
+    && ["kfc-xativa-qa", "kfc-xativa-test"].includes(configuredPartnerSlug);
   let restaurant: any = null;
   if (createOrUseTestRestaurant) {
     // The exact test slug is unique; adopting a legacy record also ensures it
@@ -4744,6 +4744,10 @@ async function repairConfiguredPartnerAccess() {
       configuredPartnerRestaurantUpsert(account.tenantId, email, configuredPartnerSlug),
       { upsert: true, new: true, setDefaultsOnInsert: true },
     ).select("_id email slug name tenantId onboardingStatus isActive internalDemo demoMenuVersion").lean().exec();
+    await Restaurant.updateOne(
+      { _id: restaurant._id },
+      { $set: { name: "KFC XATIVA QA", address: "Calle Sor Isabel de Villena 88, bajo, Novetlè, Valencia", locality: "Novetlè", menu: partnerDemoMenu, onboardingStatus: "approved", isActive: true, availabilityStatus: "available" } },
+    ).exec();
     console.log(JSON.stringify({ event: "partner_access_repair", email, result: "test_restaurant_created_or_reused", restaurantId: String(restaurant._id), restaurantName: restaurant.name, tenantId: restaurant.tenantId ? String(restaurant.tenantId) : null }));
   } else {
     const tenantFilter = account.tenantId ? { tenantId: account.tenantId } : { tenantId: null };
@@ -4754,11 +4758,8 @@ async function repairConfiguredPartnerAccess() {
   if (!restaurant) { console.log(JSON.stringify({ event: "partner_access_repair", email, result: "restaurant_not_found", accountId: String(account._id) })); return; }
 
   const isProtectedOwner = Boolean(account.ownerProtected && email === ownerEmail);
-  // KFC QA is retired and must never be restored by a startup repair.
-  if (restaurant.slug === "kfc-xativa-test" || restaurant.slug === "kfc-xativa-qa") {
-    console.warn(JSON.stringify({ event: "partner_access_repair_skipped_retired_qa", email, slug: restaurant.slug }));
-    return;
-  }
+  // El guard anterior solo bloqueaba la recreación implícita; aquí ya existe
+  // una solicitud explícita y autorizada para crear el entorno QA.
 
   // The repair itself is explicitly allow-listed by REPAIR_PARTNER_EMAIL in
   // render.yaml. Restore the whole fixed demonstration portfolio for that
@@ -4823,7 +4824,8 @@ async function repairConfiguredPartnerAccess() {
     ).exec();
   }
   const portfolioIds = [restaurant._id, ...assignedRestaurants.map((location: any) => location._id)];
-  if (includeXativaTestPortfolio && new Set(assignedRestaurants.map((location: any) => location.slug)).size !== COMING_SOON_SLUGS.length) {
+  const assignedSlugs = new Set(assignedRestaurants.map((location: any) => location.slug));
+  if (includeXativaTestPortfolio && COMING_SOON_SLUGS.some((slug) => !assignedSlugs.has(slug))) {
     throw new Error("Configured Xàtiva test portfolio does not match the public catalog");
   }
 

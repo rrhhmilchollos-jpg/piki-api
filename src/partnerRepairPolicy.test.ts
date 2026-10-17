@@ -7,7 +7,7 @@ test("partner restaurant upsert has no conflicting paths between Mongo operators
     const update = configuredPartnerRestaurantUpsert("tenant-1", "owner@example.com", slug);
     const conflicts = Object.keys(update.$set).filter((path) => path in update.$setOnInsert);
     assert.deepEqual(conflicts, []);
-    assert.equal(update.$setOnInsert.address, "Calle Sor Isabel de Villena 82, bajo, Novelé, Valencia");
+    assert.equal(update.$setOnInsert.address, "Calle Sor Isabel de Villena 88, bajo, Novetlè, Valencia");
     assert.equal(update.$set.locality, "Novetlè");
     assert.deepEqual(update.$set.location.coordinates, [-0.5468067, 38.9817572]);
     assert.equal(update.$setOnInsert.slug, slug);

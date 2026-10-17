@@ -1,4 +1,4 @@
-const OPERATIONAL_ADDRESS = "Calle Sor Isabel de Villena 82, bajo, Novelé, Valencia";
+const OPERATIONAL_ADDRESS = "Calle Sor Isabel de Villena 88, bajo, Novetlè, Valencia";
 const OPERATIONAL_LOCATION = { type: "Point", coordinates: [-0.5468067, 38.9817572] } as const;
 
 export function configuredPartnerRestaurantUpsert(tenantId: unknown, email: string, slug: string) {
