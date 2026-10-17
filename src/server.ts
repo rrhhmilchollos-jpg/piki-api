@@ -1923,7 +1923,11 @@ app.patch("/api/v1/admin/restaurants/:id/status", requireRole("admin"), async (r
     await AccessAuthorization.create({ employeeId: partnerAccount._id, action: parsed.data.status, previousStatus: partnerAccount.authorizationStatus || "pending", nextStatus, previousRole: "partner", nextRole: "partner", accessLevel: "subadmin", actorEmployeeId: objectId(req.auth!.employeeId!), reason: `Estado del comercio: ${parsed.data.status}` });
   }
   if (parsed.data.status === "approved" && existing.onboardingStatus !== "approved") {
-    await notifyOnboarding({ channel: "admin", type: "onboarding.partner_application.approved", entityId: String(restaurant._id), tenantId: (restaurant as any).tenantId });
+    const payload = { partnerId: String(restaurant._id), partnerName: String((restaurant as any).name || ""), onboardingStatus: "approved" };
+    await Promise.all([
+      notifyOnboarding({ channel: "admin", type: "onboarding.partner_application.approved", entityId: String(restaurant._id), tenantId: (restaurant as any).tenantId, payload }),
+      notifyOnboarding({ channel: "fleet", type: "onboarding.partner_application.approved", entityId: String(restaurant._id), tenantId: (restaurant as any).tenantId, payload }),
+    ]);
   }
   return res.json({ restaurant, partnerAccount: partnerAccount ? { id: String(partnerAccount._id), access: parsed.data.status === "approved" ? "enabled" : "disabled" } : null });
 });
@@ -4456,7 +4460,10 @@ app.patch("/api/v1/rider-applications/:id/assign-fleet", requireRole("admin", "f
   const fleet = await Fleet.findOne({ _id: fleetId, ...tenant, ...(req.auth?.role === "fleet" ? { _id: (await employeeScope(req))?.fleetId || null } : {}) }).lean() as any; if (!fleet) return res.status(404).json({ error: "FLEET_NOT_FOUND" });
   const application = await RiderApplication.findOneAndUpdate({ _id: id, ...await adminOnboardingScope(req), ...(req.auth?.role === "fleet" ? { assignedFleetId: fleet._id } : {}) }, { $set: { assignedFleetId: fleetId } }, { new: true }).lean().exec() as any;
   if (!application) return res.status(404).json({ error: "APPLICATION_NOT_FOUND" });
-  if (application.status === "approved") await Rider.updateOne({ email: application.email, ...(application.tenantId ? { tenantId: application.tenantId } : { tenantId: null }) }, { $set: { fleetId } }).exec();
+  if (application.status === "approved") {
+    const rider = await Rider.findOneAndUpdate({ email: application.email, ...(application.tenantId ? { tenantId: application.tenantId } : { tenantId: null }) }, { $set: { fleetId } }, { new: true }).select("_id riderCode name email fleetId tenantId").lean().exec() as any;
+    if (rider) await notifyOnboarding({ channel: "fleet", type: "onboarding.rider_assigned", entityId: String(rider._id), tenantId: rider.tenantId, payload: { riderId: String(rider._id), riderCode: rider.riderCode, riderName: rider.name, fleetId: String(fleetId) } });
+  }
   return res.json({ application: { ...application, applicationCode: onboardingCode("R", application._id) }, fleet });
 });
 
