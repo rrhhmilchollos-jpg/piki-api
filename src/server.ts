@@ -1,3 +1,4 @@
+import { nativeReleasePolicy } from "./nativeReleasePolicy.js";
 import "dotenv/config";
 import "express-async-errors";
 import { createHash, createHmac, randomBytes, randomInt, randomUUID } from "node:crypto";
@@ -490,7 +491,7 @@ app.get("/api/v1/app-version", async (req, res) => {
   const responsePolicy = isNativeCustomerContainer(req, surface)
     // Capacitor ships a versioned Android bundle through Google Play. A web PWA
     // release must never trap that native shell behind an in-browser worker gate.
-    ? { ...policy, minimumVersion: "0.0.0", forceUpdate: false }
+    ? nativeReleasePolicy(policy, clientVersion, clientBuildId)
     : clientVersion
     ? policy
     : surface === "customer"
