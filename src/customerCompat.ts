@@ -33,15 +33,28 @@ const checkPassword = (value: string, encoded: string) => {
 };
 const publicUser = (user: any) => user ? ({ id: String(user._id), name: user.name, email: user.email, role: "user", createdAt: user.createdAt, lastSignedIn: user.lastSignedIn }) : null;
 
+export function parseCustomerTrpcInput(value: unknown): any {
+  if (!value || typeof value !== "object") return {};
+  const record = value as Record<string, unknown>;
+  if (record.json !== undefined) return record.json;
+  // @trpc/client batches GET calls as { "0": { json: input } }. The Android
+  // Capacitor client uses this transport, so unwrap it before reading fields
+  // such as the public order code.
+  const first = record["0"];
+  if (first && typeof first === "object" && (first as Record<string, unknown>).json !== undefined) {
+    return (first as Record<string, unknown>).json;
+  }
+  return record;
+}
+
 function inputOf(req: Request): any {
   const body = req.body ?? {};
-  if (body.json) return body.json;
-  const first = body["0"];
-  if (first?.json) return first.json;
+  const parsedBody = parseCustomerTrpcInput(body);
+  if (parsedBody !== body) return parsedBody;
   if (typeof req.query.input === "string") {
-    try { const parsed = JSON.parse(req.query.input); return parsed.json ?? parsed; } catch { return {}; }
+    try { return parseCustomerTrpcInput(JSON.parse(req.query.input)); } catch { return {}; }
   }
-  return body;
+  return parsedBody;
 }
 function reply(res: Response, value: unknown) { return res.json({ result: { data: { json: value } } }); }
 function fail(res: Response, message: string, code = "BAD_REQUEST") { const status = code === "UNAUTHORIZED" || code === "AUTH_REQUIRED" ? 401 : code === "FORBIDDEN" ? 403 : code === "CONFLICT" ? 409 : code === "NOT_FOUND" ? 404 : code === "STRIPE_UNAVAILABLE" ? 503 : 400; return res.status(status).json({ error: { json: { message, code: -32000, data: { code, httpStatus: status } } } }); }
