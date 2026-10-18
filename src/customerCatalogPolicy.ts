@@ -86,8 +86,11 @@ function applyPartnerMenuPricing<T extends Record<string, any>>(item: T, rate: n
   // + button opens the real option selector and the server can quote it.
   return { ...priced, modifiers, modifierGroups: modifiers };
 }
+export function menuItemIsAvailable(item: { available?: boolean } | null | undefined): boolean {
+  return Boolean(item) && item?.available !== false;
+}
 export function customerMenuForRestaurant<T extends { slug?: string; menu?: any[] }>(restaurant: T): any[] {
-  const menu = Array.isArray(restaurant.menu) ? restaurant.menu : [];
+  const menu = Array.isArray(restaurant.menu) ? restaurant.menu.filter(menuItemIsAvailable) : [];
   const rate = customerCommissionRate(restaurant as T & { partnerProfile?: { commissionRateBps?: number } });
   return rate > 0 ? menu.map((item) => applyPartnerMenuPricing(item, rate, restaurant.slug || "")) : menu;
 }

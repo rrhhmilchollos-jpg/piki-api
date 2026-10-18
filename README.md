@@ -104,3 +104,11 @@ Stripe usa `capture_method=manual`: `payment_intent.amount_capturable_updated` d
 - Los nombres indicadores permitidos son `STRIPE_SECRET_KEY` y `STRIPE_WEBHOOK_SECRET`; sus valores sólo deben existir en el gestor de secretos del entorno. Nunca se incluyen claves en código, documentación, logs o respuestas HTTP.
 - Antes de habilitar pagos online a clientes, validar mediante un ensayo aislado el webhook firmado, autorizaciones, captura manual, reintentos, replays y eventos fuera de orden. La configuración de métodos de pago y cualquier cambio de producción requieren aprobación separada.
 - La entrega tolera que `payment_intent.succeeded` incremente la versión justo después de `capture()`: el webhook no toca el estado operacional y el cierre condiciona `on_the_way`/rider/asignación, no una versión antigua. **Sigue pendiente** una saga o conciliación para el caso de caída del proceso después de que Stripe capture y antes de persistir `delivered`, y para hacer atómico el ledger de efectivo con la entrega.
+
+## Sincronización del catálogo Partners → Customers
+
+`GET /api/v1/catalog/events` es un stream SSE público, separado del stream autenticado de pedidos. Solo comunica `catalog.updated` con una razón y, cuando el restaurante ya es público, identificadores públicos; nunca envía cartas completas, contactos, documentos, pedidos ni datos de empleados. El evento `ready` obliga a Customers a consultar de nuevo el catálogo al conectar/reconectar.
+
+Las mutaciones de carta/publicación, estado y horarios notifican después de guardar. MongoDB Change Streams sobre `restaurants` distribuye también las actualizaciones entre instancias de Render y detecta cambios realizados desde Admin. Si el relay falla temporalmente, siguen disponibles los eventos locales y la revalidación periódica de Customers. `GET /api/v1/catalog/restaurants` lee MongoDB y responde `Cache-Control: no-store`, sin snapshots de catálogo en Redis o memoria que puedan devolver productos o precios antiguos.
+
+Los datos operativos de Mr Rooster ya no se restablecen en cada arranque. Los valores del portfolio de la reparación de acceso se aplican con `$setOnInsert`, no sobre cartas existentes. Esto conserva los cambios actuales, pero no recupera ediciones que un arranque anterior ya hubiera sobrescrito; su recuperación requiere una copia histórica o volver a guardarlas en Partners.

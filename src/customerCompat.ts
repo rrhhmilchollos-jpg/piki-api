@@ -5,7 +5,7 @@ import { Order, Restaurant, CustomerAccount, RiderOrderMessage } from "./models.
 import { publishOrderIntakeEvents } from "./realtime.js";
 import { evaluateXativaCoverage } from "./coverage/xativaPolicy.js";
 import { quoteDeliveryRoute } from "./coverage/routing.js";
-import { CUSTOMER_CATALOG_RESTAURANT_FILTER, CUSTOMER_ORDERABLE_RESTAURANT_FILTER, customerCatalogRestaurantName, restaurantIsWithinOpeningHours } from "./customerCatalogPolicy.js";
+import { CUSTOMER_CATALOG_RESTAURANT_FILTER, CUSTOMER_ORDERABLE_RESTAURANT_FILTER, customerCatalogRestaurantName, menuItemIsAvailable, restaurantIsWithinOpeningHours } from "./customerCatalogPolicy.js";
 import { modifierGroupsForItem, quoteMenuItem, usesReferenceAddOns } from "./menuModifiers.js";
 import { cashOrderLimitError, isCashOrderWithinLimit } from "./paymentPolicy.js";
 import { createCheckoutSession } from "./stripe.js";
@@ -152,7 +152,7 @@ const deliveryPin = (orderCode: string) => {
 function restaurantView(row: any) {
   const useReferenceFallback = usesReferenceAddOns(row);
   if (row.availabilityStatus === "coming_soon") return { id: String(row._id), name: row.name, cuisine: row.cuisine, category: row.category, locality: row.locality, tagline: "Disponible muy pronto", availabilityStatus: "coming_soon", isActive: false, onboardingStatus: row.onboardingStatus, menu: [], image: row.image || "" };
-  return { id: String(row._id), name: customerCatalogRestaurantName(row), availabilityStatus: row.availabilityStatus || "available", isActive: row.isActive, onboardingStatus: row.onboardingStatus, cuisine: row.cuisine, category: row.category, tagline: row.tagline || "Descubre este establecimiento en PIKI.", eta: `${row.etaMinutes?.[0] || 20}–${row.etaMinutes?.[1] || 35} min`, fee: (row.deliveryFeeCents || 0) / 100, rating: row.rating || 0, reviews: row.reviews || 0, promoted: row.promoted, image: row.image || "", accent: row.accent || "#FFD72E", menu: (row.menu || []).map((item: any) => ({ id: item.id, name: item.name, description: item.description || "", price: item.price, allergens: Array.isArray(item.allergens) ? item.allergens : [], vegetarian: Boolean(item.vegetarian), popular: Boolean(item.popular), modifierGroups: modifierGroupsForItem(item, useReferenceFallback) })) };
+  return { id: String(row._id), name: customerCatalogRestaurantName(row), availabilityStatus: row.availabilityStatus || "available", isActive: row.isActive, onboardingStatus: row.onboardingStatus, cuisine: row.cuisine, category: row.category, tagline: row.tagline || "Descubre este establecimiento en PIKI.", eta: `${row.etaMinutes?.[0] || 20}–${row.etaMinutes?.[1] || 35} min`, fee: (row.deliveryFeeCents || 0) / 100, rating: row.rating || 0, reviews: row.reviews || 0, promoted: row.promoted, image: row.image || "", accent: row.accent || "#FFD72E", menu: (row.menu || []).filter(menuItemIsAvailable).map((item: any) => ({ id: item.id, name: item.name, description: item.description || "", price: item.price, allergens: Array.isArray(item.allergens) ? item.allergens : [], vegetarian: Boolean(item.vegetarian), popular: Boolean(item.popular), modifierGroups: modifierGroupsForItem(item, useReferenceFallback) })) };
 }
 
 export async function handleCustomerTrpc(req: Request, res: Response) {
@@ -164,6 +164,7 @@ export async function handleCustomerTrpc(req: Request, res: Response) {
   const procedure = decodeURIComponent(String(req.params.procedure || pathProcedure)).split("?")[0];
   const input = inputOf(req);
   try {
+    if (procedure.startsWith("catalog.")) res.setHeader("Cache-Control", "no-store, max-age=0");
     if (procedure === "catalog.list") {
       const filter: Record<string, unknown> = { ...CUSTOMER_CATALOG_RESTAURANT_FILTER };
       if (input?.category) filter.category = input.category;
@@ -335,6 +336,9 @@ export async function handleCustomerTrpc(req: Request, res: Response) {
       if (!restaurant) return fail(res, "Restaurante no encontrado", "NOT_FOUND");
       if (!restaurantIsWithinOpeningHours(restaurant.partnerProfile?.openingHours)) return fail(res, "Este establecimiento está cerrado ahora. Elige otro horario para realizar el pedido.", "PARTNER_CLOSED");
       const requested = Array.isArray(input?.items) ? input.items : [];
+      if (requested.some((line: any) => restaurant.menu.some((item: any) => item.id === line.id && !menuItemIsAvailable(item)))) {
+        return fail(res, "Un producto de tu cesta ya no está disponible. Actualiza la carta antes de continuar.", "PRODUCT_UNAVAILABLE");
+      }
       const useReferenceFallback = usesReferenceAddOns(restaurant);
       const items = requested.map((line: any) => {
         const item = restaurant.menu.find((candidate: any) => candidate.id === line.id);

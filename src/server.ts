@@ -50,6 +50,7 @@ import { dispatchInitialIdempotencyKey, dispatchRequeueIdempotencyKey, enqueueDi
 import { buildFleetEntityScope, buildTenantScope } from "./tenantScope.js";
 import { authenticationOptions, registrationOptions, verifyAuthentication, verifyRegistration } from "./passkeys.js";
 import { markPartnerBatchPaid, markRiderBatchPaid, publicPartnerCode, publicRiderCode, recordGovernanceEvent, syncPublicIds } from "./pikiGovernance.js";
+import { publishCatalogUpdate, serveCatalogEvents, startCatalogRelay, stopCatalogRelay } from "./catalogRealtime.js";
 
 export const app = express();
 app.set("trust proxy", 1);
@@ -64,14 +65,8 @@ const isAllowedCorsOrigin = (origin?: string) => !origin || allowedOrigins.has(o
 const corsOptions = { origin: (origin: string | undefined, callback: (error: Error | null, allowed?: boolean) => void) => callback(null, isAllowedCorsOrigin(origin)), credentials: true };
 const databaseName = process.env.MONGODB_DB || "piki";
 let databaseReady = false;
-const catalogCache = new Map<string, { expiresAt: number; body: { restaurants: unknown[] } }>();
 const geocodeCache = new Map<string, { expiresAt: number; body: any }>();
-const CATALOG_CACHE_MS = 30_000;
 const GEOCODE_CACHE_MS = 300_000;
-function invalidateCatalogCache() {
-  catalogCache.clear();
-  void sharedCacheDelete("piki:catalog:|");
-}
 const boundedFetch = (input: string | URL, init: RequestInit = {}) => fetch(input, { ...init, signal: AbortSignal.timeout(1_200) });
 const geocoderHeaders = { "User-Agent": "PIKI-Delivery/0.2 (+https://pikidelivery.com)" };
 
@@ -101,7 +96,7 @@ async function reversePhoton(latitude: number, longitude: number) {
   const label = [address.road, [address.postcode, address.locality].filter(Boolean).join(" ")].filter(Boolean).join(", ");
   return { label: label || `Ubicación GPS ${latitude.toFixed(5)}, ${longitude.toFixed(5)}`, latitude, longitude, locality: address.locality || null, address: properties };
 }
-mongoose.connection.on("connected", () => { databaseReady = true; startRealtimeRelay(); void syncPublicIds().catch((error) => console.error("Public ID sync failed", error)); });
+mongoose.connection.on("connected", () => { databaseReady = true; startRealtimeRelay(); startCatalogRelay(); void syncPublicIds().catch((error) => console.error("Public ID sync failed", error)); });
 mongoose.connection.on("disconnected", () => { databaseReady = false; console.warn("MongoDB disconnected; API entering not-ready state"); });
 mongoose.connection.on("error", (error) => { databaseReady = false; console.error("MongoDB connection error", error instanceof Error ? error.message : error); });
 
@@ -194,10 +189,6 @@ async function sharedCacheGet<T>(key: string): Promise<T | null> {
 async function sharedCacheSet(key: string, value: unknown, ttlSeconds: number): Promise<void> {
   if (!upstashRedisUrl || !upstashRedisToken) return;
   try { await fetch(`${upstashRedisUrl}/set/${encodeURIComponent(key)}/${encodeURIComponent(JSON.stringify(value))}/EX/${ttlSeconds}`, { method: "POST", headers: { Authorization: `Bearer ${upstashRedisToken}` }, signal: AbortSignal.timeout(250) }); } catch { /* local cache fallback */ }
-}
-async function sharedCacheDelete(key: string): Promise<void> {
-  if (!upstashRedisUrl || !upstashRedisToken) return;
-  try { await fetch(`${upstashRedisUrl}/del/${encodeURIComponent(key)}`, { method: "POST", headers: { Authorization: `Bearer ${upstashRedisToken}` }, signal: AbortSignal.timeout(250) }); } catch { /* local cache fallback */ }
 }
 const rateLimit = (limit: number, windowMs: number, keyPrefix: string) => async (req: express.Request, res: express.Response, next: express.NextFunction) => {
   const surfaceKey = String(req.header("x-piki-surface") || req.query.surface || "-").toLowerCase();
@@ -1056,14 +1047,13 @@ app.post("/api/v1/signatures/signaturit/events", rateLimit(100, 60_000, "signatu
   return res.status(200).json({ received: true });
 });
 
+app.get("/api/v1/catalog/events", serveCatalogEvents);
 app.get("/api/v1/catalog/restaurants", async (req, res) => {
+  // Menu/stock/store changes must never re-fetch a stale browser, CDN, Redis
+  // or per-instance snapshot after the catalog.updated event.
+  res.setHeader("Cache-Control", "no-store, max-age=0");
   const query = typeof req.query.q === "string" ? req.query.q.trim().slice(0, 120).replace(/[.*+?^${}()|[\]\\]/g, "\\$&") : "";
   const category = typeof req.query.category === "string" ? req.query.category.trim() : "";
-  const cacheKey = `${query}|${category}`;
-  const cached = catalogCache.get(cacheKey);
-  if (cached && cached.expiresAt > Date.now()) { res.setHeader("Cache-Control", "public, max-age=30, s-maxage=30, stale-while-revalidate=60, stale-if-error=120"); return res.json(cached.body); }
-  const shared = await sharedCacheGet<{ restaurants: unknown[] }>(`piki:catalog:${cacheKey}`);
-  if (shared) { catalogCache.set(cacheKey, { expiresAt: Date.now() + CATALOG_CACHE_MS, body: shared }); res.setHeader("Cache-Control", "public, max-age=30, s-maxage=30, stale-while-revalidate=60, stale-if-error=120"); return res.json(shared); }
   const clauses: Record<string, unknown>[] = [CUSTOMER_CATALOG_RESTAURANT_FILTER];
   if (category && category !== "Todos") clauses.push({ category });
   if (query) clauses.push({ $or: [{ name: { $regex: query, $options: "i" } }, { cuisine: { $regex: query, $options: "i" } }, { category: { $regex: query, $options: "i" } }] });
@@ -1079,9 +1069,6 @@ app.get("/api/v1/catalog/restaurants", async (req, res) => {
   };
   restaurants.sort((left: any, right: any) => (catalogPriority[left.slug] ?? 10) - (catalogPriority[right.slug] ?? 10));
   const body = { restaurants: restaurants.map((restaurant: any) => presentCustomerCatalogRestaurant({ ...restaurant, menu: canonicalRestaurantMenu(restaurant) })) };
-  catalogCache.set(cacheKey, { expiresAt: Date.now() + CATALOG_CACHE_MS, body });
-  void sharedCacheSet(`piki:catalog:${cacheKey}`, body, 30);
-  res.setHeader("Cache-Control", "public, max-age=30, s-maxage=30, stale-while-revalidate=60, stale-if-error=120");
   res.json(body);
 });
 
@@ -1510,6 +1497,7 @@ app.post("/api/v1/partners/menu/imports/:id/publish", requireRole("partner"), as
       published = await MenuImportDraft.findOneAndUpdate({ _id: id, restaurantId: objectId(restaurantId), status: "draft" }, { $set: { status: "published", publishedAt: new Date(), reviewedBy: objectId(String(req.auth?.employeeId || "")) } }, { new: true, session }).lean().exec();
       if (!published) throw new Error("MENU_IMPORT_NOT_FOUND_OR_CLOSED");
     });
+    await publishCatalogUpdate(restaurantId, "menu.published");
     return res.json({ published: true, restaurant, draft: menuImportResponse(published) });
   } catch (error) {
     const code = error instanceof Error ? error.message : "MENU_IMPORT_PUBLISH_FAILED";
@@ -1574,6 +1562,7 @@ app.patch("/api/v1/partners/store/status", requireRole("partner"), async (req, r
   if (!parsed.success) return res.status(400).json({ error: "INVALID_STORE_STATUS" });
   const restaurant = await Restaurant.findOneAndUpdate({ _id: restaurantId, onboardingStatus: "approved" }, { $set: { isActive: parsed.data.status === "open" } }, { new: true }).select("_id name isActive").lean().exec() as any;
   if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
+  await publishCatalogUpdate(restaurantId, "store.status_updated");
   return res.json({ restaurant: { id: String(restaurant._id), name: restaurant.name }, status: restaurant.isActive ? "open" : "paused", isOpen: Boolean(restaurant.isActive) });
 });
 app.get("/api/v1/partners/store/profile", requireRole("partner"), async (req, res) => {
@@ -1603,6 +1592,7 @@ app.patch("/api/v1/partners/store/hours", requireRole("partner"), async (req, re
   if (!parsed.success) return res.status(400).json({ error: "INVALID_OPENING_HOURS", details: parsed.error.flatten() });
   const restaurant = await Restaurant.findOneAndUpdate({ _id: restaurantId, onboardingStatus: "approved", ...tenantScope(req) }, { $set: { "partnerProfile.openingHours": parsed.data } }, { new: true }).select("_id name isActive partnerProfile.openingHours").lean().exec() as any;
   if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
+  await publishCatalogUpdate(restaurantId, "store.hours_updated");
   return res.json({ restaurantId: String(restaurant._id), name: restaurant.name, isOpen: Boolean(restaurant.isActive), openingHours: restaurant.partnerProfile?.openingHours || parsed.data });
 });
 app.get("/api/v1/partners/menu", requireRole("partner"), async (req, res) => {
@@ -1626,6 +1616,7 @@ app.put("/api/v1/partners/menu", requireRole("partner"), async (req, res) => {
   const items = current?.slug === ALIBABA_KEBAB_SLUG ? alibabaKebabMenu : parsed.data.items;
   const restaurant = await Restaurant.findByIdAndUpdate(restaurantId, { $set: { menu: items } }, { new: true }).select("name menu slug").lean().exec() as any;
   if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
+  await publishCatalogUpdate(restaurantId, "menu.updated");
   return res.json({ restaurant, menu: restaurant.menu || [] });
 });
 
@@ -1648,7 +1639,7 @@ app.put("/api/v1/admin/restaurants/:id/menu", requireOwner(), async (req, res) =
     { new: true },
   ).select("_id slug name menu").lean().exec() as any;
   if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND_OR_NOT_APPROVED" });
-  invalidateCatalogCache();
+  await publishCatalogUpdate(id, "menu.updated");
   return res.json({ updated: true, restaurant, menu: restaurant.menu || [] });
 });
 
@@ -4803,8 +4794,10 @@ async function repairConfiguredPartnerAccess() {
     ? await Promise.all(testPortfolio.map((location) => Restaurant.findOneAndUpdate(
       { slug: location.slug },
       {
-        $set: {
-          tenantId: account.tenantId || null,
+        // Access repair must not undo a Partner's saved catalog or pause state.
+        // Bootstrap defaults belong exclusively to newly inserted restaurants.
+        $setOnInsert: {
+          slug: location.slug, tagline: "Próximo partner PIKI en Xàtiva", phone: "", address: "Xàtiva",
           name: location.name,
           cuisine: location.cuisine,
           category: location.category,
@@ -4829,7 +4822,7 @@ async function repairConfiguredPartnerAccess() {
             "partnerProfile.commissionRateBps": 2300,
           } : {}),
         },
-        $setOnInsert: { slug: location.slug, tagline: "Próximo partner PIKI en Xàtiva", phone: "", address: "Xàtiva" },
+        $set: { tenantId: account.tenantId || null },
       },
       { upsert: true, new: true, setDefaultsOnInsert: true },
     ).select("_id slug name").lean().exec()))
@@ -4876,26 +4869,6 @@ async function repairConfiguredPartnerAccess() {
   ).exec();
   console.log(JSON.stringify({ event: "partner_access_repair", email, result: "repaired", restaurantId: String(restaurant._id), restaurantName: restaurant.name, assignedRestaurantCount: portfolioIds.length, ownerPreserved: isProtectedOwner }));
 }
-async function ensureMrRoosterOperational() {
-  const result = await Restaurant.updateOne(
-    { slug: "rooster-kebab-xativa" },
-    { $set: {
-      name: "Mr Rooster Xàtiva",
-      cuisine: "Kebab",
-      category: "Kebab",
-      locality: "Xàtiva",
-      availabilityStatus: "available",
-      upcomingMessage: "",
-      onboardingStatus: "approved",
-      isActive: true,
-      deliveryFeeCents: 299,
-      image: "https://files.manuscdn.com/user_upload_by_module/session_file/310519663931061405/PSnZzuCOslUOgNQN.jpg",
-      "partnerProfile.commissionRateBps": 2500,
-      menu: mrRoosterMenu,
-    } },
-  ).exec();
-  if (result.matchedCount > 0) console.log(JSON.stringify({ event: "mr_rooster_operational", slug: "rooster-kebab-xativa", modified: result.modifiedCount > 0, menuCount: mrRoosterMenu.length, commissionRateBps: 2500 }));
-}
 async function start() {
   const uri = process.env.MONGODB_URI;
   if (uri) {
@@ -4911,7 +4884,6 @@ async function start() {
     await repairConfiguredPartnerAccess();
     await purgeExpiredQaPartner();
     setInterval(() => { void purgeExpiredQaPartner().catch((error) => console.warn("QA partner purge failed", error instanceof Error ? error.message : String(error))); }, 60_000).unref();
-    await ensureMrRoosterOperational();
     await purgeTestDataIfEnabled();
     databaseReady = true;
     if (process.env.RUN_TENANT_MIGRATION === "true") {
@@ -4948,7 +4920,7 @@ async function start() {
   // `npm run start:dispatch-worker` as a separate service to consume the
   // persistent dispatch_outbox with atomic leases and retry/backoff.
   process.once("SIGTERM", () => {
-    stopNotificationWorker(); databaseReady = false;
+    stopNotificationWorker(); stopCatalogRelay(); databaseReady = false;
     server.close(() => { void mongoose.disconnect().finally(() => process.exit(0)); });
     setTimeout(() => process.exit(0), 25_000).unref();
   });

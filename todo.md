@@ -34,3 +34,9 @@
 ## Importante
 
 No se deben introducir contraseñas, URI de MongoDB ni claves de pagos en repositorios Git, archivos `.env` versionados, logs o chats.
+
+## Sincronización Partners → Customers (19 octubre 2026)
+
+- [ ] Los cambios de carta, precios, disponibilidad, horario y estado del local guardados/publicados por Partners deben llegar a Customers al momento, incluso sin iniciar sesión; no se deben exponer pedidos ni datos privados por el canal público.
+- [ ] La lectura del catálogo no debe devolver versiones antiguas desde caché HTTP, Redis o memoria después de un cambio.
+- [ ] Reiniciar/desplegar la API no debe reemplazar los menús, imágenes ni estado operativo editados de Mr Rooster por valores fijos de arranque.
