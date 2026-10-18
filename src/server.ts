@@ -343,9 +343,10 @@ const MENU_IMAGE_MIME_TYPES = ["image/webp", "image/jpeg", "image/png", "image/g
 const MENU_FILE_MIME_TYPES = ["application/pdf"] as const;
 const MENU_ASSET_MIME_TYPES = [...MENU_IMAGE_MIME_TYPES, ...MENU_FILE_MIME_TYPES] as const;
 const MENU_ASSET_KINDS = ["menu_image", "menu_file"] as const;
-const ALIBABA_KEBAB_SLUG = "alibaba-kebab-xativa";
 function canonicalRestaurantMenu(restaurant: any) {
-  return restaurant?.slug === ALIBABA_KEBAB_SLUG ? alibabaKebabMenu : (Array.isArray(restaurant?.menu) ? restaurant.menu : []);
+  // El menú público debe ser exactamente el último menú publicado por Partner.
+  // Nunca sustituirlo por un fixture fijo: eso ocultaba los cambios de Alibaba.
+  return Array.isArray(restaurant?.menu) ? restaurant.menu : [];
 }
 function pricedRestaurantMenu(restaurant: any) {
   return customerMenuForRestaurant({ ...restaurant, menu: canonicalRestaurantMenu(restaurant) });
@@ -1612,8 +1613,7 @@ app.put("/api/v1/partners/menu", requireRole("partner"), async (req, res) => {
   if (!restaurantId) return res.status(403).json({ error: access?.restaurantIds.length ? "PARTNER_RESTAURANT_ACCESS_DENIED" : "PARTNER_RESTAURANT_NOT_ASSIGNED" });
   const parsed = z.object({ items: z.array(partnerMenuItemSchema).max(500) }).safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_MENU", details: parsed.error.flatten() });
-  const current = await Restaurant.findById(restaurantId).select("slug").lean().exec() as any;
-  const items = current?.slug === ALIBABA_KEBAB_SLUG ? alibabaKebabMenu : parsed.data.items;
+  const items = parsed.data.items;
   const restaurant = await Restaurant.findByIdAndUpdate(restaurantId, { $set: { menu: items } }, { new: true }).select("name menu slug").lean().exec() as any;
   if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
   await publishCatalogUpdate(restaurantId, "menu.updated");
