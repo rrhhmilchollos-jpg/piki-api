@@ -31,7 +31,13 @@ const checkPassword = (value: string, encoded: string) => {
   const expected = Buffer.from(digest, "hex");
   return actual.length === expected.length && timingSafeEqual(actual, expected);
 };
-const publicUser = (user: any) => user ? ({ id: String(user._id), name: user.name, email: user.email, role: "user", createdAt: user.createdAt, lastSignedIn: user.lastSignedIn }) : null;
+const ensureReferralCode = async (user: any) => {
+  if (user?.referralCode) return String(user.referralCode).toUpperCase();
+  const code = `PIKI-${String(user._id).slice(-8).toUpperCase()}`;
+  await CustomerAccount.updateOne({ _id: user._id, $or: [{ referralCode: { $exists: false } }, { referralCode: null }, { referralCode: "" }] }, { $set: { referralCode: code } }).exec();
+  return code;
+};
+const publicUser = (user: any) => user ? ({ id: String(user._id), name: user.name, email: user.email, referralCode: user.referralCode || `PIKI-${String(user._id).slice(-8).toUpperCase()}`, role: "user", createdAt: user.createdAt, lastSignedIn: user.lastSignedIn }) : null;
 
 export function parseCustomerTrpcInput(value: unknown): any {
   if (!value || typeof value !== "object") return {};
@@ -176,7 +182,7 @@ export async function handleCustomerTrpc(req: Request, res: Response) {
       const row = await Restaurant.findOne({ _id: input?.id, ...CUSTOMER_CATALOG_RESTAURANT_FILTER }).lean().exec();
       return reply(res, row ? restaurantView(row) : null);
     }
-    if (procedure === "auth.me") return reply(res, await currentCustomer(req).then((user) => publicUser(user)));
+    if (procedure === "auth.me") { const user = await currentCustomer(req) as any; if (user) user.referralCode = await ensureReferralCode(user); return reply(res, publicUser(user)); }
     if (procedure === "customer.profile.get" || procedure === "customer.profile.update") {
       const user = await currentCustomer(req) as any;
       if (!user) return fail(res, "Inicia sesión para consultar tu perfil.", "AUTH_REQUIRED");
@@ -272,7 +278,7 @@ export async function handleCustomerTrpc(req: Request, res: Response) {
       const name = String(input?.name || "").trim(); const email = String(input?.email || "").trim().toLowerCase(); const password = String(input?.password || "");
       if (name.length < 2 || !email.includes("@") || password.length < 8) return fail(res, "Datos de cuenta no válidos");
       if (await CustomerAccount.exists({ email })) return fail(res, "Ya existe una cuenta con este email", "CONFLICT");
-      const user = await CustomerAccount.create({ name, email, passwordHash: hashPassword(password) }); await setSession(res, String(user._id)); return reply(res, { user: publicUser(user) });
+      const referralInput = String(input?.referralCode || "").trim().toUpperCase(); const user = await CustomerAccount.create({ name, email, referralCode: undefined, referredByCode: referralInput || null, passwordHash: hashPassword(password) }); await setSession(res, String(user._id)); return reply(res, { user: publicUser(user) });
     }
     if (procedure === "auth.login") {
       const email = String(input?.email || "").trim().toLowerCase(); const user = await CustomerAccount.findOne({ email }).exec();
