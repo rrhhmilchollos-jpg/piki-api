@@ -2430,7 +2430,13 @@ app.post("/api/v1/admin/document-requests", requireRole("admin"), async (req, re
   const allowedTypes = parsed.data.subjectType === "rider_application" || parsed.data.subjectType === "rider_lead" ? riderDocumentRequestTypes : partnerDocumentRequestTypes;
   const requestedTypes = parsed.data.requirements.map((item) => item.type);
   if (requestedTypes.some((type) => !allowedTypes.has(type)) || new Set(requestedTypes).size !== requestedTypes.length) return res.status(400).json({ error: "INVALID_DOCUMENT_REQUIREMENTS" });
-  const subject = await documentRequestSubject(parsed.data.subjectType, subjectId, parsed.data.subjectType.endsWith("_lead") ? await adminOnboardingScope(req) : tenantScope(req));
+  // Rider applications are onboarding records too. Public applications created
+  // before tenant binding may have tenantId=null, so using tenantScope here
+  // made the same record visible in the inbox but invisible when creating its
+  // document request. Keep the subject lookup aligned with all onboarding
+  // list/review endpoints while preserving tenant isolation for non-platform
+  // admins through adminOnboardingScope.
+  const subject = await documentRequestSubject(parsed.data.subjectType, subjectId, parsed.data.subjectType === "restaurant" ? tenantScope(req) : await adminOnboardingScope(req));
   if (!subject) return res.status(404).json({ error: "DOCUMENT_REQUEST_SUBJECT_NOT_FOUND", message: "No se ha encontrado el aspirante dentro de tu ámbito de administración. Actualiza la bandeja y selecciona de nuevo su solicitud." });
   if (!subject.recipientEmail || !z.string().email().safeParse(subject.recipientEmail).success) return res.status(409).json({ error: "SUBJECT_EMAIL_REQUIRED", message: "Añade un correo de contacto válido antes de solicitar documentación." });
   if (parsed.data.subjectType === "restaurant" && !subject.hasProfile) return res.status(409).json({ error: "PARTNER_PROFILE_REQUIRED", message: "Este comercio no tiene expediente de partner para recibir documentación." });
