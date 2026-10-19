@@ -2613,7 +2613,7 @@ app.patch("/api/v1/admin/riders/:id/lifecycle", requireRole("admin"), async (req
 app.delete("/api/v1/admin/riders/:id/test-account", requireOwner(), async (req, res) => {
   const id = objectId(String(req.params.id));
   if (!id) return res.status(400).json({ error: "INVALID_RIDER_ID" });
-  const rider = await Rider.findOne({ _id: id, isTestRider: true, email: "qa-rider@pikidelivery.test", ...tenantScope(req) }).lean().exec() as any;
+  const rider = await Rider.findOne({ _id: id, isTestRider: true, email: { $in: ["qa-rider@pikidelivery.test", "rrhh.milchollos+qa-rider@gmail.com"] }, ...tenantScope(req) }).lean().exec() as any;
   if (!rider) return res.status(404).json({ error: "QA_RIDER_NOT_FOUND" });
   const activeOrders = await Order.countDocuments({ riderId: id, status: { $in: [...activeOperationalOrderStatuses] } }).exec();
   if (activeOrders > 0) return res.status(409).json({ error: "QA_RIDER_HAS_ACTIVE_ORDERS", activeOrders });
