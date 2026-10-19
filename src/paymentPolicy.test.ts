@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { isDispatchablePayment } from "./dispatchEligibility.js";
-import { MAX_CASH_ORDER_CENTS, cashOrderLimitError, isCashOrderWithinLimit } from "./paymentPolicy.js";
+import { MAX_CASH_ORDER_CENTS, cashOrderLimitError, isCashOrderWithinLimit, isCashPaymentEnabledForRestaurant } from "./paymentPolicy.js";
 
 test("el límite de efectivo se aplica al total final, incluyendo los bordes 4.899/4.900", () => {
   assert.equal(MAX_CASH_ORDER_CENTS, 4_899);
@@ -20,4 +20,10 @@ test("dispatch bloquea efectivo legacy fuera de límite pero no afecta pago onli
   assert.equal(isDispatchablePayment("pending", "cash", 4_899), true);
   assert.equal(isDispatchablePayment("pending", "cash", 4_900), false);
   assert.equal(isDispatchablePayment("authorized", "stripe", 50_000), true);
+});
+
+test("efectivo requiere autorización expresa y Alibaba queda solo online", () => {
+  assert.equal(isCashPaymentEnabledForRestaurant({ slug: "mr-rooster-xativa", cashPaymentsEnabled: false }), false);
+  assert.equal(isCashPaymentEnabledForRestaurant({ slug: "mr-rooster-xativa", cashPaymentsEnabled: true }), true);
+  assert.equal(isCashPaymentEnabledForRestaurant({ slug: "alibaba-kebab-xativa", cashPaymentsEnabled: true }), false);
 });

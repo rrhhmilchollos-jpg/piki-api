@@ -1,3 +1,5 @@
+import { isCashPaymentEnabledForRestaurant } from "./paymentPolicy.js";
+
 export const COMING_SOON_SLUGS = ["eleven-burgers-xativa", "nakama-sushi-xativa", "rooster-kebab-xativa", "alibaba-kebab-xativa"] as const;
 export const CUSTOMER_HIDDEN_TEST_SLUGS = ["kfc-xativa-test", "partner-test", "kings-tacos-xativa"] as const;
 export const CUSTOMER_ORDERABLE_RESTAURANT_FILTER = {
@@ -25,11 +27,11 @@ export function restaurantIsWithinOpeningHours(openingHours: unknown, now = new 
   return withinOpeningSlot(current, value);
 }
 export function customerCatalogRestaurantName(restaurant: { name: string; slug?: string }) { return restaurant.name; }
-export function presentCustomerCatalogRestaurant<T extends { name: string; slug?: string; menu?: any[]; availabilityStatus?: string; isActive?: boolean; onboardingStatus?: string; partnerProfile?: { openingHours?: unknown } }>(restaurant: T) {
+export function presentCustomerCatalogRestaurant<T extends { name: string; slug?: string; menu?: any[]; availabilityStatus?: string; isActive?: boolean; onboardingStatus?: string; cashPaymentsEnabled?: boolean; partnerProfile?: { openingHours?: unknown } }>(restaurant: T) {
   const comingSoon = restaurant.availabilityStatus === "coming_soon";
   const withinHours = restaurantIsWithinOpeningHours(restaurant.partnerProfile?.openingHours);
   const orderable = restaurant.isActive === true && restaurant.onboardingStatus === "approved" && !comingSoon && withinHours;
-  return { ...restaurant, menu: customerMenuForRestaurant(restaurant), name: customerCatalogRestaurantName(restaurant), comingSoon, withinHours, orderable, availabilityLabel: comingSoon ? "Disponible muy pronto" : withinHours ? "" : "Cerrado ahora" };
+  return { ...restaurant, cashPaymentsEnabled: isCashPaymentEnabledForRestaurant(restaurant), menu: customerMenuForRestaurant(restaurant), name: customerCatalogRestaurantName(restaurant), comingSoon, withinHours, orderable, availabilityLabel: comingSoon ? "Disponible muy pronto" : withinHours ? "" : "Cerrado ahora" };
 }
 export const ALIBABA_KEBAB_SLUG = "alibaba-kebab-xativa";
 export const PARTNER_COMMISSION_RATES: Record<string, number> = {

@@ -1,6 +1,23 @@
 export const MAX_CASH_ORDER_CENTS = 4_899;
 
 export type CashPaymentMethod = "cash" | "stripe" | string | undefined | null;
+export type CashPaymentPartner = { slug?: string | null; name?: string | null; cashPaymentsEnabled?: boolean | null };
+
+/**
+ * Cash must be explicitly enabled by a PIKI superadmin per partner. It is not
+ * inferred from a legacy order or from a client-provided payment method.
+ * Alibaba Kebab Xàtiva is permanently online-only by the partner's request.
+ */
+export function isCashPaymentEnabledForRestaurant(restaurant: CashPaymentPartner): boolean {
+  return restaurant.cashPaymentsEnabled === true && String(restaurant.slug || "") !== "alibaba-kebab-xativa";
+}
+
+export function cashPaymentDisabledError(restaurant: CashPaymentPartner) {
+  return {
+    error: "CASH_PAYMENT_NOT_ENABLED_FOR_PARTNER",
+    message: `${restaurant.name || "Este establecimiento"} solo acepta pago online en PIKI. Selecciona tarjeta, Apple Pay o Google Pay.`,
+  } as const;
+}
 
 /** The cash cap applies to one final customer order, never to a rider handover. */
 export function isCashOrderWithinLimit(paymentMethod: CashPaymentMethod, totalCents: number): boolean {

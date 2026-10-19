@@ -7,7 +7,7 @@ import { evaluateXativaCoverage } from "./coverage/xativaPolicy.js";
 import { quoteDeliveryRoute } from "./coverage/routing.js";
 import { CUSTOMER_CATALOG_RESTAURANT_FILTER, CUSTOMER_ORDERABLE_RESTAURANT_FILTER, customerCatalogRestaurantName, menuItemIsAvailable, restaurantIsWithinOpeningHours } from "./customerCatalogPolicy.js";
 import { modifierGroupsForItem, quoteMenuItem, usesReferenceAddOns } from "./menuModifiers.js";
-import { cashOrderLimitError, isCashOrderWithinLimit } from "./paymentPolicy.js";
+import { cashOrderLimitError, cashPaymentDisabledError, isCashOrderWithinLimit, isCashPaymentEnabledForRestaurant } from "./paymentPolicy.js";
 import { createCheckoutSession } from "./stripe.js";
 import { dispatchInitialIdempotencyKey, enqueueDispatchOutbox } from "./dispatchOutbox.js";
 import { SupportTicket } from "./models.js";
@@ -360,6 +360,10 @@ export async function handleCustomerTrpc(req: Request, res: Response) {
       const normalized = items as Array<{itemId: string; name: string; quantity: number; unitPriceCents: number; selectedOptions: Array<{ groupId: string; groupName: string; optionId: string; optionName: string; unitPriceCents: number }>}>;
       const paymentMethod = customerPaymentMethod(input?.paymentMethod);
       if (!paymentMethod) return fail(res, "Selecciona tarjeta o efectivo para continuar.", "PAYMENT_METHOD_UNAVAILABLE");
+      if (paymentMethod === "cash" && !isCashPaymentEnabledForRestaurant(restaurant)) {
+        const error = cashPaymentDisabledError(restaurant);
+        return res.status(409).json(error);
+      }
       const latitude = Number(input?.deliveryLocation?.latitude); const longitude = Number(input?.deliveryLocation?.longitude);
       if (!Number.isFinite(latitude) || latitude < -90 || latitude > 90 || !Number.isFinite(longitude) || longitude < -180 || longitude > 180) return fail(res, "Selecciona una dirección válida de la lista antes de confirmar el pedido.", "DELIVERY_LOCATION_REQUIRED");
       const deliveryPoint: [number, number] = [longitude, latitude];

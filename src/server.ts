@@ -38,9 +38,9 @@ import { ALIBABA_KEBAB_COVER_IMAGE, alibabaKebabMenu } from "./alibabaKebabMenu.
 import { mrRoosterMenu } from "./mrRoosterMenu.js";
 import { configuredPartnerRestaurantUpsert } from "./partnerRepairPolicy.js";
 import { quoteMenuItem, usesReferenceAddOns } from "./menuModifiers.js";
-import { decideLatePickup, pointDistanceMeters } from "./pickupPolicy.js";
+import { pointDistanceMeters } from "./pickupPolicy.js";
 import { buildLegacyRiderSupportTicketFilter, buildRiderSupportTicketFilter } from "./supportTicketScope.js";
-import { cashOrderLimitError, isCashOrderWithinLimit } from "./paymentPolicy.js";
+import { cashOrderLimitError, cashPaymentDisabledError, isCashOrderWithinLimit, isCashPaymentEnabledForRestaurant } from "./paymentPolicy.js";
 import { calculateMarketplaceBreakdown, DEFAULT_PARTNER_COMMISSION_BPS } from "./marketplaceAccounting.js";
 import { postMarketplaceOrderLedger, preparePartnerPayoutBatch } from "./marketplaceLedger.js";
 import { extractAndParseMenu, readAssetBytes } from "./menuImport.js";
@@ -1060,7 +1060,7 @@ app.get("/api/v1/catalog/restaurants", async (req, res) => {
   const restaurants = await Restaurant.find(filter)
     // Explicit inclusion avoids MongoDB path-collision errors caused by
     // partnerProfile.documents having select:false nested fields.
-    .select("slug name cuisine category locality partnerGroupKey tagline etaMinutes deliveryFeeCents rating reviews promoted image accent phone address location menu isActive onboardingStatus availabilityStatus upcomingAt upcomingMessage partnerProfile.openingHours")
+    .select("slug name cuisine category locality partnerGroupKey tagline etaMinutes deliveryFeeCents cashPaymentsEnabled rating reviews promoted image accent phone address location menu isActive onboardingStatus availabilityStatus upcomingAt upcomingMessage partnerProfile.openingHours")
     .sort({ promoted: -1, rating: -1, reviews: -1 }).lean().exec();
   const catalogPriority: Record<string, number> = {
     "alibaba-kebab-xativa": 0,
@@ -1154,7 +1154,7 @@ app.get("/api/v1/coverage", async (req, res) => {
       const rows = await Restaurant.find(CUSTOMER_ORDERABLE_RESTAURANT_FILTER)
         // Inclusive projection avoids a MongoDB path collision with the
         // select:false document payload nested under partnerProfile.
-        .select("slug name cuisine category locality tagline etaMinutes deliveryFeeCents rating reviews promoted image accent phone address location menu availabilityStatus upcomingAt upcomingMessage")
+        .select("slug name cuisine category locality tagline etaMinutes deliveryFeeCents cashPaymentsEnabled rating reviews promoted image accent phone address location menu availabilityStatus upcomingAt upcomingMessage")
         .sort({ promoted: -1, rating: -1, reviews: -1 }).lean().exec();
       restaurants = rows.map((restaurant: any) => presentCustomerCatalogRestaurant({ ...restaurant, menu: canonicalRestaurantMenu(restaurant) }));
     } catch (error) {
@@ -1741,7 +1741,14 @@ app.patch("/api/v1/partners/kitchen/orders/:id/status", requireRole("partner"), 
     order.preparationMinutes = parsed.data.preparationMinutes ?? 4;
     order.partnerPrepDeadlineAt = new Date(Date.now() + order.preparationMinutes * 60_000);
   }
-  if (["ready_for_pickup", "cancelled"].includes(target)) order.partnerPrepDeadlineAt = null;
+  if (target === "ready_for_pickup") {
+    order.partnerPrepDeadlineAt = null;
+    order.pickupDeadlineAt = new Date(Date.now() + PICKUP_REASSIGN_AFTER_MS);
+  }
+  if (target === "cancelled") {
+    order.partnerPrepDeadlineAt = null;
+    order.pickupDeadlineAt = null;
+  }
   order.statusHistory.push({ status: target, actorRole: "partner", reason: "Actualización desde pantalla de cocina" } as any);
   await order.save();
   await publishOrderStatusEvents(order, target).catch((error) => console.warn("Realtime partner status event failed", error instanceof Error ? error.message : error));
@@ -1877,6 +1884,7 @@ const partnerSettingsSchema = z.object({
   address: z.string().trim().max(280).optional(),
   locality: z.string().trim().max(120).optional(),
   deliveryFeeCents: z.number().int().min(0).max(10000).optional(),
+  cashPaymentsEnabled: z.boolean().optional(),
   isActive: z.boolean().optional(),
   availabilityStatus: z.enum(["available", "coming_soon"]).optional(),
   promoted: z.boolean().optional(),
@@ -1886,7 +1894,7 @@ const partnerSettingsSchema = z.object({
 app.get("/api/v1/admin/restaurants/:id/settings", requireOwner(), async (req, res) => {
   const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
   if (!id) return res.status(400).json({ error: "INVALID_RESTAURANT_ID" });
-  const restaurant = await Restaurant.findOne({ _id: id, ...tenantScope(req) }).select("_id slug name cuisine category phone email address locality deliveryFeeCents isActive availabilityStatus promoted image location onboardingStatus partnerProfile.commissionRateBps").lean().exec() as any;
+  const restaurant = await Restaurant.findOne({ _id: id, ...tenantScope(req) }).select("_id slug name cuisine category phone email address locality deliveryFeeCents cashPaymentsEnabled isActive availabilityStatus promoted image location onboardingStatus partnerProfile.commissionRateBps").lean().exec() as any;
   if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
   return res.json({ restaurant: { ...restaurant, id: String(restaurant._id), partnerCode: restaurant.partnerCode || publicPartnerCode(restaurant._id), commissionRateBps: Number(restaurant.partnerProfile?.commissionRateBps ?? DEFAULT_PARTNER_COMMISSION_BPS), commissionPercent: Number(restaurant.partnerProfile?.commissionRateBps ?? DEFAULT_PARTNER_COMMISSION_BPS) / 100 } });
 });
@@ -1898,8 +1906,9 @@ app.patch("/api/v1/admin/restaurants/:id/settings", requireOwner(), async (req, 
   if (!parsed.success) return res.status(400).json({ error: "INVALID_PARTNER_SETTINGS", details: parsed.error.flatten() });
   const { commissionRateBps, ...settings } = parsed.data;
   const update = { ...settings, ...(commissionRateBps === undefined ? {} : { "partnerProfile.commissionRateBps": commissionRateBps }) };
-  const restaurant = await Restaurant.findOneAndUpdate({ _id: id, ...tenantScope(req) }, { $set: update }, { new: true }).select("_id slug name cuisine category phone email address locality deliveryFeeCents isActive availabilityStatus promoted image location onboardingStatus partnerProfile.commissionRateBps").lean().exec() as any;
+  const restaurant = await Restaurant.findOneAndUpdate({ _id: id, ...tenantScope(req) }, { $set: update }, { new: true }).select("_id slug name cuisine category phone email address locality deliveryFeeCents cashPaymentsEnabled isActive availabilityStatus promoted image location onboardingStatus partnerProfile.commissionRateBps").lean().exec() as any;
   if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
+  invalidateCatalogCache();
   await AccessAuthorization.create({ employeeId: objectId(String(req.auth!.employeeId!)), action: "settings_updated", previousStatus: "approved", nextStatus: "approved", previousRole: "partner", nextRole: "partner", accessLevel: "superadmin", actorEmployeeId: objectId(String(req.auth!.employeeId!)), reason: `Configuración protegida actualizada para ${restaurant.name}; comisión definida por PIKI superadmin.` });
   return res.json({ updated: true, restaurant: { ...restaurant, id: String(restaurant._id), partnerCode: restaurant.partnerCode || publicPartnerCode(restaurant._id), commissionRateBps: Number(restaurant.partnerProfile?.commissionRateBps ?? DEFAULT_PARTNER_COMMISSION_BPS), commissionPercent: Number(restaurant.partnerProfile?.commissionRateBps ?? DEFAULT_PARTNER_COMMISSION_BPS) / 100 } });
 });
@@ -2744,6 +2753,7 @@ app.post("/api/v1/orders", rateLimit(20, 60_000, "orders-create"), async (req, r
   if (!restaurantObjectId) return res.status(400).json({ error: "INVALID_RESTAURANT_ID" });
   const restaurant = await Restaurant.findOne({ _id: restaurantObjectId, isActive: true, onboardingStatus: "approved" }).lean().exec() as any;
   if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_AVAILABLE" });
+  if (parsed.data.paymentMethod === "cash" && !isCashPaymentEnabledForRestaurant(restaurant)) return res.status(409).json(cashPaymentDisabledError(restaurant));
   // El catálogo público y el checkout deben compartir exactamente la misma política de precio.
   // Alibaba aplica el 18% por producto; Kings Tacos y el resto no se alteran.
   const pricedMenu = pricedRestaurantMenu(restaurant);
@@ -2809,6 +2819,7 @@ app.post("/api/v1/internal/customer-orders/sync", async (req, res) => {
   const restaurantId = objectId(input.restaurantSlug);
   const restaurant = await Restaurant.findOne({ $or: [{ slug: input.restaurantSlug }, ...(restaurantId ? [{ _id: restaurantId }] : [])], isActive: true, onboardingStatus: "approved" }).lean().exec() as any;
   if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_AVAILABLE" });
+  if (input.paymentMethod === "cash" && !isCashPaymentEnabledForRestaurant(restaurant)) return res.status(409).json(cashPaymentDisabledError(restaurant));
   const existing = await Order.findOne({ publicCode: input.publicCode }).lean().exec() as any;
   const location = input.deliveryLocation ? { type: "Point", coordinates: [input.deliveryLocation.longitude, input.deliveryLocation.latitude] } : restaurant.location;
   if (!location?.coordinates?.length) return res.status(409).json({ error: "DELIVERY_LOCATION_REQUIRED" });
@@ -3324,7 +3335,7 @@ app.post("/api/v1/orders/:id/transitions", requireRole("admin", "partner", "ride
   }
   try { assertTransition(order.status, parsed.data.status, actorRole); } catch (error) { return res.status(409).json({ error: "INVALID_ORDER_TRANSITION", message: error instanceof Error ? error.message : "Transition not allowed" }); }
   if (parsed.data.status === "delivered" && order.paymentMethod === "cash") return res.status(409).json({ error: "DELIVERY_QR_REQUIRED", message: "Un pedido a contrarreembolso debe cerrarse con el QR del Customer para registrar el cobro en efectivo una sola vez." });
-  const update: Record<string, unknown> = { $set: { status: parsed.data.status, ...(actorRole === "partner" && parsed.data.status === "accepted" ? { partnerPrepDeadlineAt: new Date(Date.now() + PARTNER_PREPARATION_LIMIT_MINUTES * 60_000) } : {}), ...(actorRole === "partner" && ["ready_for_pickup", "cancelled"].includes(parsed.data.status) ? { partnerPrepDeadlineAt: null } : {}), ...(actorRole === "rider" && parsed.data.status === "picked_up" && order.assignmentState === "offered" ? { assignmentState: "assigned", assignmentExpiresAt: null, pickupDeadlineAt: null } : {}) }, $inc: { version: 1 }, $push: { statusHistory: { status: parsed.data.status, actorRole, reason: parsed.data.reason || "" } } };
+  const update: Record<string, unknown> = { $set: { status: parsed.data.status, ...(actorRole === "partner" && parsed.data.status === "accepted" ? { partnerPrepDeadlineAt: new Date(Date.now() + PARTNER_PREPARATION_LIMIT_MINUTES * 60_000) } : {}), ...(actorRole === "partner" && parsed.data.status === "ready_for_pickup" ? { partnerPrepDeadlineAt: null, pickupDeadlineAt: new Date(Date.now() + PICKUP_REASSIGN_AFTER_MS) } : {}), ...(actorRole === "partner" && parsed.data.status === "cancelled" ? { partnerPrepDeadlineAt: null, pickupDeadlineAt: null } : {}), ...(actorRole === "rider" && parsed.data.status === "picked_up" && order.assignmentState === "offered" ? { assignmentState: "assigned", assignmentExpiresAt: null, pickupDeadlineAt: null } : {}) }, $inc: { version: 1 }, $push: { statusHistory: { status: parsed.data.status, actorRole, reason: parsed.data.reason || "" } } };
   if (parsed.data.status === "delivered") update.$set = { status: "delivered", deliveredAt: new Date(), archivedAt: new Date() };
   if (parsed.data.status === "cancelled") update.$set = { status: "cancelled", cancelledAt: new Date(), archivedAt: new Date() };
   const updated = await Order.findOneAndUpdate({ _id: id, version: order.version, status: order.status }, update, { new: true }).lean().exec();
@@ -3405,17 +3416,16 @@ app.post("/api/v1/riders/:riderId/orders/:orderId/accept-offer", requireRole("ri
   if (!(await riderAccessForRequest(riderId, req))) return res.status(403).json({ error: "RIDER_ACCESS_DENIED" });
   const order = await Order.findOne({ _id: orderId, riderId, assignmentState: "offered" }).lean().exec() as any;
   if (!order) return res.status(404).json({ error: "RIDER_OFFER_NOT_FOUND" });
-  const pickupDeadlineAt = new Date(Date.now() + PICKUP_REASSIGN_AFTER_MS);
   const updated = await Order.findOneAndUpdate(
     { _id: orderId, riderId, assignmentState: "offered", version: order.version },
-    { $set: { assignmentState: "assigned", assignmentExpiresAt: null, pickupDeadlineAt, riderArrivedAt: null, riderArrivalDistanceMeters: null }, $inc: { version: 1 }, $push: { statusHistory: { status: order.status, actorRole: "rider", reason: `Rider acepta la oferta; llegada al Partner requerida antes de ${pickupDeadlineAt.toISOString()}.` } } },
+    { $set: { assignmentState: "assigned", assignmentExpiresAt: null, pickupDeadlineAt: null, riderArrivedAt: null, riderArrivalDistanceMeters: null }, $inc: { version: 1 }, $push: { statusHistory: { status: order.status, actorRole: "rider", reason: "Rider acepta la oferta; el plazo de retirada se iniciará cuando el Partner marque el pedido como listo." } } },
     { new: true },
   ).lean().exec() as any;
   if (!updated) return res.status(409).json({ error: "ORDER_CHANGED_RETRY" });
   await RiderAssignmentReservation.updateOne({ orderId, riderId, status: "reserved" }, { $set: { expiresAt: null } }).exec();
   await DispatchDecision.updateMany({ orderId, riderId, outcome: "offered" }, { $set: { outcome: "accepted", actorRole: "rider" } }).exec();
   await publishOrderStatusEvents(updated, updated.status);
-  return res.json({ message: "Pedido aceptado. Llegar al Partner en un máximo de 15 minutos.", pickupDeadlineAt, order: updated });
+  return res.json({ message: "Pedido aceptado. El Partner avisará cuando esté listo para retirar.", pickupDeadlineAt: null, order: updated });
 });
 
 app.post("/api/v1/riders/:riderId/orders/:orderId/confirm-arrival", requireRole("rider"), async (req, res) => {
@@ -3939,39 +3949,31 @@ const automaticDispatchSweepStats = {
   lastDurationMs: null as number | null,
   lastError: null as string | null,
 };
-const PICKUP_REASSIGN_AFTER_MS = Math.max(60_000, Number(process.env.PIKI_PICKUP_REASSIGN_AFTER_MINUTES || 15) * 60_000);
+const PICKUP_REASSIGN_AFTER_MS = 10 * 60_000;
 const PICKUP_ARRIVAL_RADIUS_METERS = Math.max(30, Number(process.env.PIKI_PICKUP_ARRIVAL_RADIUS_METERS || 80));
 const PICKUP_CONFIRMATION_RADIUS_METERS = Math.max(100, Number(process.env.PIKI_PICKUP_CONFIRMATION_RADIUS_METERS || 150));
 const DELIVERY_CONFIRMATION_RADIUS_METERS = Math.max(30, Number(process.env.PIKI_DELIVERY_CONFIRMATION_RADIUS_METERS || 80));
 async function reassignLatePickupOrders() {
   const now = new Date();
   let reassigned = 0;
-  const legacyAssigned = await Order.find({ assignmentState: "assigned", riderId: { $ne: null }, riderArrivedAt: null, pickupDeadlineAt: null, status: { $in: ["pending", "accepted", "preparing", "ready_for_pickup"] } }).select("_id updatedAt").limit(100).lean().exec() as any[];
+  await Order.updateMany({ assignmentState: "assigned", status: { $ne: "ready_for_pickup" }, pickupDeadlineAt: { $ne: null } }, { $set: { pickupDeadlineAt: null } }).exec();
+  const legacyAssigned = await Order.find({ assignmentState: "assigned", riderId: { $ne: null }, pickupDeadlineAt: null, status: "ready_for_pickup" }).select("_id updatedAt").limit(100).lean().exec() as any[];
   for (const order of legacyAssigned) {
     const deadline = new Date(new Date(order.updatedAt || now).getTime() + PICKUP_REASSIGN_AFTER_MS);
-    await Order.updateOne({ _id: order._id, assignmentState: "assigned", riderArrivedAt: null, pickupDeadlineAt: null }, { $set: { pickupDeadlineAt: deadline } }).exec();
+    await Order.updateOne({ _id: order._id, assignmentState: "assigned", pickupDeadlineAt: null }, { $set: { pickupDeadlineAt: deadline } }).exec();
   }
 
-  const lateOrders = await Order.find({ assignmentState: "assigned", riderId: { $ne: null }, riderArrivedAt: null, pickupDeadlineAt: { $ne: null, $lte: now }, status: { $in: ["pending", "accepted", "preparing", "ready_for_pickup"] } }).select("_id riderId restaurantId tenantId publicCode customerId status version assignmentState").limit(100).lean().exec() as any[];
+  const lateOrders = await Order.find({ assignmentState: "assigned", riderId: { $ne: null }, pickupDeadlineAt: { $ne: null, $lte: now }, status: "ready_for_pickup" }).select("_id riderId restaurantId tenantId publicCode customerId status version assignmentState").limit(100).lean().exec() as any[];
   for (const order of lateOrders) {
     const [rider, restaurant] = await Promise.all([
       Rider.findById(order.riderId).select("_id location lastLocationAt").lean().exec() as any,
       Restaurant.findById(order.restaurantId).select("_id location").lean().exec() as any,
     ]);
-    const decision = decideLatePickup({ riderLocation: rider?.location, partnerLocation: restaurant?.location, riderLastLocationAt: rider?.lastLocationAt, arrivalRadiusMeters: PICKUP_ARRIVAL_RADIUS_METERS, now });
-    if (decision.action === "mark_arrived") {
-      const arrived = await Order.findOneAndUpdate(
-        { _id: order._id, assignmentState: "assigned", riderId: order.riderId, riderArrivedAt: null, version: order.version },
-        { $set: { riderArrivedAt: now, riderArrivalDistanceMeters: decision.distanceMeters, pickupDeadlineAt: null }, $inc: { version: 1 }, $push: { statusHistory: { status: order.status, actorRole: "system", reason: `Llegada al Partner verificada automáticamente por GPS (${Math.round(decision.distanceMeters)} m).` } } },
-        { new: true },
-      ).lean().exec() as any;
-      if (arrived) await publishRiderArrivalEvent(arrived, rider, decision.distanceMeters, "gps_sweep");
-      continue;
-    }
+    const distanceMeters = pointDistanceMeters(rider?.location, restaurant?.location);
 
     const released = await Order.findOneAndUpdate(
-      { _id: order._id, assignmentState: "assigned", riderId: order.riderId, riderArrivedAt: null, version: order.version },
-      { $set: { riderId: null, assignmentState: "expired", assignmentExpiresAt: null, pickupDeadlineAt: null }, $inc: { dispatchAttempts: 1, version: 1 }, $push: { statusHistory: { status: order.status, actorRole: "system", reason: `Reasignación automática: rider sin llegada verificada al Partner tras ${Math.round(PICKUP_REASSIGN_AFTER_MS / 60_000)} minutos (${decision.distanceMeters == null ? "GPS no disponible" : `${Math.round(decision.distanceMeters)} m`}).` } } },
+      { _id: order._id, assignmentState: "assigned", riderId: order.riderId, version: order.version },
+      { $set: { riderId: null, assignmentState: "expired", assignmentExpiresAt: null, pickupDeadlineAt: null, riderArrivedAt: null, riderArrivalDistanceMeters: null }, $inc: { dispatchAttempts: 1, version: 1 }, $push: { statusHistory: { status: order.status, actorRole: "system", reason: `Reasignación automática: retirada no confirmada tras ${Math.round(PICKUP_REASSIGN_AFTER_MS / 60_000)} minutos desde que el Partner marcó «Listo» (${distanceMeters == null ? "GPS no disponible" : `${Math.round(distanceMeters)} m`}).` } } },
       { new: false },
     ).lean().exec() as any;
     if (!released?.riderId) continue;
@@ -4321,7 +4323,7 @@ app.post("/api/v1/dispatch/orders/:id/offer-response", requireRole("rider", "adm
     if (!rider) return res.status(403).json({ error: "RIDER_ACCESS_DENIED" });
   }
   if (parsed.data.accept) {
-    const updated = await Order.findOneAndUpdate({ _id: orderId, ...tenantScope(req), assignmentState: "offered", riderId: order.riderId, offerId: order.offerId || null, version: order.version }, { $set: { assignmentState: "assigned", pickupDeadlineAt: new Date(Date.now() + PICKUP_REASSIGN_AFTER_MS) }, $inc: { version: 1 } }, { new: true }).lean().exec() as any;
+    const updated = await Order.findOneAndUpdate({ _id: orderId, ...tenantScope(req), assignmentState: "offered", riderId: order.riderId, offerId: order.offerId || null, version: order.version }, { $set: { assignmentState: "assigned", pickupDeadlineAt: null }, $inc: { version: 1 } }, { new: true }).lean().exec() as any;
     if (!updated) return res.status(409).json({ error: "OFFER_CHANGED_RETRY" });
     await RiderAssignmentReservation.updateOne({ orderId: updated._id, riderId: updated.riderId, status: "reserved" }, { $set: { expiresAt: null } }).exec();
     await DispatchDecision.updateMany({ orderId: updated._id, riderId: updated.riderId, outcome: "offered" }, { $set: { outcome: "accepted", actorRole: "rider" } }).exec();
