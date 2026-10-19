@@ -4343,7 +4343,7 @@ app.get("/api/v1/riders/:id/offers", requireRole("rider"), async (req, res) => {
   const rider = await riderAccessForRequest(riderId, req);
   if (!rider) return res.status(403).json({ error: "RIDER_ACCESS_DENIED" });
   const offers = await Order.find({ riderId, assignmentState: { $in: ["offered", "assigned"] }, status: { $nin: ["delivered", "cancelled"] } })
-.select("_id publicCode displayCode displayCodeDate restaurantId customerId customerName riderId status paymentState paymentMethod partnerPaymentRequired partnerPaymentCents subtotalCents deliveryFeeCents serviceFeeCents totalCents assignmentState assignmentExpiresAt pickupDeadlineAt riderHeadingToPartnerAt riderArrivedAt riderArrivalDistanceMeters partnerPrepDeadlineAt deliveryAddress deliveryNote deliveryLocation items createdAt")
+.select("_id publicCode displayCode displayCodeDate restaurantId customerId customerName riderId status paymentState paymentMethod partnerPaymentRequired partnerPaymentCents subtotalCents deliveryFeeCents serviceFeeCents totalCents assignmentState assignmentExpiresAt pickupDeadlineAt riderHeadingToPartnerAt riderArrivedAt riderArrivalDistanceMeters partnerPrepDeadlineAt preparationMinutes deliveryAddress deliveryNote deliveryLocation items createdAt")
     .sort({ createdAt: -1 }).limit(10).lean().exec() as any[];
   const riderProfile = await Rider.findById(riderId).select("vehicle").lean().exec() as any;
   const restaurantIds = offers.map((offer) => offer.restaurantId).filter(Boolean);
@@ -4388,7 +4388,7 @@ app.get("/api/v1/riders/:id/offers", requireRole("rider"), async (req, res) => {
       riderArrivedAt: offer.riderArrivedAt || null,
       riderArrivalDistanceMeters: offer.riderArrivalDistanceMeters ?? null,
       partnerPrepDeadlineAt: offer.partnerPrepDeadlineAt || null,
-      preparationMinutes: offer.status === "ready_for_pickup" ? 0 : PARTNER_PREPARATION_LIMIT_MINUTES,
+      preparationMinutes: offer.status === "ready_for_pickup" ? 0 : offer.preparationMinutes ?? (offer.partnerPrepDeadlineAt ? Math.max(4, Math.min(10, Math.ceil((new Date(offer.partnerPrepDeadlineAt).getTime() - now) / 60000))) : 4),
       items: (offer.items || []).map((item: any) => ({
         name: item.name || "Producto",
         quantity: Number(item.quantity || 1),
