@@ -50,7 +50,7 @@ function alibabaOptions(prefix: string, values: readonly (readonly [string, stri
 function alibabaModifierGroups(item: Record<string, any>) {
   const name = String(item.name || "").toLocaleLowerCase("es-ES");
   const groups: any[] = [];
-  if (name.includes("menú") || name.includes("menu")) groups.push({ id: `${item.id}-bebida`, name: "Elige tus bebidas", description: "Incluidas en el menú", minSelections: 1, maxSelections: ALIBABA_OPTIONS.drinks.length, options: alibabaOptions("bebida", ALIBABA_OPTIONS.drinks) });
+  if (name.includes("menú") || name.includes("menu")) groups.push({ id: `${item.id}-bebida`, name: "Elige tu bebida", description: "Incluida en el menú", minSelections: 1, maxSelections: 1, options: alibabaOptions("bebida", ALIBABA_OPTIONS.drinks) });
   if (name.includes("doner") || name.includes("kebab") || name.includes("carne")) groups.push({ id: `${item.id}-salsa`, name: "Elige tus salsas", description: "Puedes escoger varias salsas", minSelections: 1, maxSelections: ALIBABA_OPTIONS.sauces.length, options: alibabaOptions("salsa", ALIBABA_OPTIONS.sauces) });
   if (name.includes("doner") || name.includes("kebab") || name.includes("carne") || name.includes("plato")) groups.push({ id: `${item.id}-extras`, name: "¿Quieres añadir extras?", description: "Extras opcionales para tu pedido", minSelections: 0, maxSelections: 3, options: alibabaOptions("extra", ALIBABA_OPTIONS.extras) });
   return groups;
