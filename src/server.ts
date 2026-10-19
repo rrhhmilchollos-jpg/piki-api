@@ -309,11 +309,6 @@ const checkoutTokenIsValid = (orderCode: string, raw: unknown) => typeof raw ===
 	  if (String(raw || "").trim().toUpperCase() === deliveryPin(orderCode)) return true;
 	  try { const url = new URL(String(raw)); return url.searchParams.get("order_id") === orderCode && url.searchParams.get("delivery_token") === deliveryQrSignature(orderCode); } catch { return false; }
 	};
-	const pickupQrSecret = String(process.env.PICKUP_QR_SECRET || deliveryQrSecret).trim();
-	const pickupQrSignature = (orderCode: string) => createHmac("sha256", pickupQrSecret || "development-only-pickup-qr-secret").update(`pickup:${orderCode}`).digest("hex").slice(0, 24);
-	const pickupPinAlphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-	const pickupQrPin = (orderCode: string) => { const digest = createHmac("sha256", pickupQrSecret || "development-only-pickup-qr-secret").update(`pickup-pin:${orderCode}`).digest(); return Array.from({ length: 4 }, (_, index) => pickupPinAlphabet[digest[index] % pickupPinAlphabet.length]).join(""); };
-	const pickupQrUrl = (orderCode: string) => `${(process.env.PARTNER_APP_URL || "https://partners.pikidelivery.com").replace(/\/$/, "")}/?order_id=${encodeURIComponent(orderCode)}&pickup_token=${pickupQrSignature(orderCode)}`;
 const riderLocationSchema = locationSchema.extend({ riderId: z.string().min(1) });
 const trackingSessionCreateSchema = z.object({ shiftId: z.string().regex(/^[a-f\d]{24}$/).optional(), platform: z.enum(["ios", "android", "web"]), appVersion: z.string().trim().min(1).max(80).default("unknown"), consentVersion: z.string().trim().min(1).max(80) });
 const trackingSampleSchema = z.object({ sampleId: z.string().trim().min(8).max(160), latitude: z.number().min(-90).max(90), longitude: z.number().min(-180).max(180), accuracyMeters: z.number().min(0).max(500), recordedAt: z.coerce.date() });
@@ -1672,8 +1667,6 @@ app.get("/api/v1/partners/kitchen/orders", requireRole("partner"), async (req, r
       ...order,
       restaurant: restaurant ? { name: restaurant.name, address: restaurant.address || "", phone: restaurant.phone || "", cuisine: restaurant.cuisine || "" } : null,
       customer: customerName ? { name: customerName, email: linkedCustomer?.email || "" } : null,
-      pickupQrUrl: order.status === "ready_for_pickup" ? pickupQrUrl(order.publicCode) : null,
-      pickupPin: order.status === "ready_for_pickup" ? pickupQrPin(order.publicCode) : null,
       partnerPrepDeadlineAt: order.partnerPrepDeadlineAt || null,
       partnerPrepOverdue: Boolean(order.partnerPrepDeadlineAt && new Date(order.partnerPrepDeadlineAt).getTime() < Date.now()),
       riderTracking: (() => {
@@ -3480,11 +3473,18 @@ app.post("/api/v1/riders/:riderId/orders/:orderId/confirm-pickup", requireRole("
   if (order.status === "picked_up" || order.status === "on_the_way") {
     return res.json({ message: "La recogida ya estaba confirmada. Ya puedes continuar hacia el cliente.", order });
   }
-  if (!order.riderArrivedAt) return res.status(409).json({ error: "PARTNER_ARRIVAL_REQUIRED", message: "Confirma primero tu llegada al Partner con GPS." });
-  if (!(order.status === "accepted" || order.status === "preparing" || order.status === "ready_for_pickup")) return res.status(409).json({ error: "PICKUP_NOT_AVAILABLE", message: "La recogida todavía no está disponible para este pedido." });
+  if (order.status !== "ready_for_pickup") return res.status(409).json({ error: "PARTNER_NOT_READY", message: "El Partner todavía no ha marcado el pedido como listo para recoger." });
+  const [rider, restaurant] = await Promise.all([
+    Rider.findById(riderId).select("_id location lastLocationAt").lean().exec(),
+    Restaurant.findById(order.restaurantId).select("_id location").lean().exec(),
+  ]) as [any, any];
+  if (!rider?.lastLocationAt || new Date(rider.lastLocationAt).getTime() < Date.now() - 90_000) return res.status(409).json({ error: "FRESH_LOCATION_REQUIRED", message: "Actualiza tu GPS antes de confirmar la recogida." });
+  const distanceMeters = pointDistanceMeters(rider.location, restaurant?.location);
+  if (distanceMeters == null) return res.status(409).json({ error: "PARTNER_LOCATION_REQUIRED", message: "No se puede verificar la ubicación del Partner." });
+  if (distanceMeters > PICKUP_CONFIRMATION_RADIUS_METERS) return res.status(409).json({ error: "PARTNER_TOO_FAR", message: `Aún estás a ${Math.round(distanceMeters)} m del Partner. La recogida se habilita dentro de una manzana.`, distanceMeters, confirmationRadiusMeters: PICKUP_CONFIRMATION_RADIUS_METERS });
   const updated = await Order.findOneAndUpdate(
-    { _id: orderId, riderId, assignmentState: "assigned", riderArrivedAt: { $ne: null }, status: { $in: ["accepted", "preparing", "ready_for_pickup"] }, version: order.version },
-    { $set: { status: "picked_up", pickupDeadlineAt: null }, $inc: { version: 1 }, $push: { statusHistory: { status: "picked_up", actorRole: "rider", reason: "Recogida confirmada directamente por Rider tras llegar al Partner" } } },
+    { _id: orderId, riderId, assignmentState: "assigned", status: "ready_for_pickup", version: order.version },
+    { $set: { status: "picked_up", riderArrivedAt: new Date(), riderArrivalDistanceMeters: distanceMeters, pickupDeadlineAt: null }, $inc: { version: 1 }, $push: { statusHistory: { status: "picked_up", actorRole: "rider", reason: `Recogida GPS directa dentro del radio operativo (${Math.round(distanceMeters)} m)` } } },
     { new: true },
   ).lean().exec() as any;
   if (!updated) return res.status(409).json({ error: "ORDER_CHANGED_RETRY" });
@@ -3937,6 +3937,7 @@ const automaticDispatchSweepStats = {
 };
 const PICKUP_REASSIGN_AFTER_MS = Math.max(60_000, Number(process.env.PIKI_PICKUP_REASSIGN_AFTER_MINUTES || 15) * 60_000);
 const PICKUP_ARRIVAL_RADIUS_METERS = Math.max(30, Number(process.env.PIKI_PICKUP_ARRIVAL_RADIUS_METERS || 80));
+const PICKUP_CONFIRMATION_RADIUS_METERS = Math.max(100, Number(process.env.PIKI_PICKUP_CONFIRMATION_RADIUS_METERS || 150));
 const DELIVERY_CONFIRMATION_RADIUS_METERS = Math.max(30, Number(process.env.PIKI_DELIVERY_CONFIRMATION_RADIUS_METERS || 80));
 async function reassignLatePickupOrders() {
   const now = new Date();
