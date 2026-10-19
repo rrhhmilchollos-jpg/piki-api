@@ -4354,7 +4354,7 @@ app.get("/api/v1/riders/:id/offers", requireRole("rider"), async (req, res) => {
   const customerIds = offers.map((offer) => offer.customerId).filter((value): value is mongoose.Types.ObjectId => Boolean(value) && mongoose.isValidObjectId(value));
   const [restaurants, customers] = await Promise.all([
     Restaurant.find({ _id: { $in: restaurantIds } }).select("name address phone cuisine etaMinutes deliveryFeeCents image location").lean().exec(),
-    CustomerAccount.find({ _id: { $in: customerIds } }).select("name phone").lean().exec(),
+    CustomerAccount.find({ _id: { $in: customerIds } }).select("name email phone").lean().exec(),
   ]);
   const restaurantById = new Map(restaurants.map((restaurant: any) => [String(restaurant._id), restaurant]));
   const customerById = new Map(customers.map((customer: any) => [String(customer._id), customer]));
@@ -4406,8 +4406,11 @@ app.get("/api/v1/riders/:id/offers", requireRole("rider"), async (req, res) => {
       phase: phase[offer.status] || "assigned",
       etaMinutes: offer.assignmentExpiresAt ? Math.max(0, Math.ceil((new Date(offer.assignmentExpiresAt).getTime() - now) / 60000)) : null,
       restaurant: restaurant ? { name: restaurant.name, address: restaurant.address || "", phone: restaurant.phone || "", cuisine: restaurant.cuisine || "", etaMinutes: restaurant.etaMinutes || [], imageUrl: restaurant.image || "", location: restaurant.location || null } : null,
-      customerName: customerPhase ? customer?.name || offer.customerName || "Cliente" : null,
+      // El nombre guardado por Customer puede ser un nombre completo o un
+      // alias. Se libera únicamente después de confirmar la recogida.
+      customerName: customerPhase ? customer?.name || offer.customerName || "Cliente final" : null,
       customerPhone: customerPhase ? customer?.phone || (offer as any).customerPhone || null : null,
+      customerEmail: customerPhase ? customer?.email || null : null,
       deliveryAddress: customerPhase ? offer.deliveryAddress || "" : null,
       deliveryNote: customerPhase ? offer.deliveryNote || null : null,
       deliveryLocation: customerPhase ? offer.deliveryLocation || null : null,
