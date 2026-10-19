@@ -26,8 +26,8 @@ export function presentCustomerCatalogRestaurant<T extends { name: string; slug?
 }
 export const ALIBABA_KEBAB_SLUG = "alibaba-kebab-xativa";
 export const PARTNER_COMMISSION_RATES: Record<string, number> = {
-  [ALIBABA_KEBAB_SLUG]: 0.18,
-  "rooster-kebab-xativa": 0.18,
+  [ALIBABA_KEBAB_SLUG]: 0.15,
+  "rooster-kebab-xativa": 0.25,
   "nakama-sushi-xativa": 0.18,
 };
 export const DEFAULT_CUSTOMER_COMMISSION_RATE = 0.18;
