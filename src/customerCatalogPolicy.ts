@@ -9,13 +9,18 @@ export const CUSTOMER_CATALOG_RESTAURANT_FILTER = {
 export function restaurantIsWithinOpeningHours(openingHours: unknown, now = new Date()): boolean {
   if (!openingHours || typeof openingHours !== "object") return true;
   const day = new Intl.DateTimeFormat("es-ES", { weekday: "long", timeZone: "Europe/Madrid" }).format(now).toLocaleLowerCase("es-ES");
-  const value = (openingHours as Record<string, unknown>)[day] as { open?: string; close?: string; closed?: boolean } | undefined;
-  if (!value || value.closed === true) return false;
-  const open = String(value.open || ""); const close = String(value.close || "");
-  if (!/^\d{2}:\d{2}$/.test(open) || !/^\d{2}:\d{2}$/.test(close)) return true;
+  const raw = (openingHours as Record<string, unknown>)[day] as Record<string, unknown> | undefined;
+  if (!raw || raw.closed === true) return false;
+  const windows = raw.morning && raw.evening ? [raw.morning, raw.evening] : [raw];
   const current = Number(new Intl.DateTimeFormat("es-ES", { hour: "2-digit", minute: "2-digit", hour12: false, timeZone: "Europe/Madrid" }).format(now).replace(":", ""));
-  const start = Number(open.replace(":", "")); const end = Number(close.replace(":", ""));
-  return end >= start ? current >= start && current <= end : current >= start || current <= end;
+  return windows.some((candidate) => {
+    const value = candidate as { open?: string; close?: string; closed?: boolean };
+    if (value.closed === true) return false;
+    const open = String(value.open || ""); const close = String(value.close || "");
+    if (!/^\d{2}:\d{2}$/.test(open) || !/^\d{2}:\d{2}$/.test(close)) return true;
+    const start = Number(open.replace(":", "")); const end = Number(close.replace(":", ""));
+    return end >= start ? current >= start && current <= end : current >= start || current <= end;
+  });
 }
 export function customerCatalogRestaurantName(restaurant: { name: string; slug?: string }) { return restaurant.name; }
 export function presentCustomerCatalogRestaurant<T extends { name: string; slug?: string; menu?: any[]; availabilityStatus?: string; isActive?: boolean; onboardingStatus?: string; partnerProfile?: { openingHours?: unknown } }>(restaurant: T) {
