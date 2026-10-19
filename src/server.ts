@@ -1719,7 +1719,7 @@ app.get("/api/v1/partners/kitchen/orders/archive", requireRole("partner"), async
 });
 
 app.patch("/api/v1/partners/kitchen/orders/:id/status", requireRole("partner"), async (req, res) => {
-  const parsed = z.object({ status: z.enum(["accepted", "preparing", "ready_for_pickup", "cancelled"]) }).safeParse(req.body);
+  const parsed = z.object({ status: z.enum(["accepted", "preparing", "ready_for_pickup", "cancelled"]), preparationMinutes: z.number().int().min(4).max(10).optional() }).safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_KITCHEN_STATUS" });
   const permission: PartnerPermission = parsed.data.status === "cancelled" ? "orders:cancel" : parsed.data.status === "accepted" ? "orders:write" : "orders:prepare";
   const { access, allowed: permissionGranted } = await partnerRequestAccess(req, permission);
@@ -1737,6 +1737,10 @@ app.patch("/api/v1/partners/kitchen/orders/:id/status", requireRole("partner"), 
   if (target === "accepted" && !( ["authorized", "paid"] as string[]).includes(order.paymentState) && order.paymentMethod !== "cash") return res.status(409).json({ error: "PAYMENT_NOT_CONFIRMED" });
   order.status = target as any;
   if (target === "accepted") order.partnerPrepDeadlineAt = new Date(Date.now() + PARTNER_PREPARATION_LIMIT_MINUTES * 60_000);
+  if (target === "preparing") {
+    order.preparationMinutes = parsed.data.preparationMinutes ?? 4;
+    order.partnerPrepDeadlineAt = new Date(Date.now() + order.preparationMinutes * 60_000);
+  }
   if (["ready_for_pickup", "cancelled"].includes(target)) order.partnerPrepDeadlineAt = null;
   order.statusHistory.push({ status: target, actorRole: "partner", reason: "Actualización desde pantalla de cocina" } as any);
   await order.save();
