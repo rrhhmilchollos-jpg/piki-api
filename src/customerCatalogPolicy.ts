@@ -6,21 +6,23 @@ export const CUSTOMER_ORDERABLE_RESTAURANT_FILTER = {
 export const CUSTOMER_CATALOG_RESTAURANT_FILTER = {
   $or: [CUSTOMER_ORDERABLE_RESTAURANT_FILTER, { slug: { $in: [...COMING_SOON_SLUGS] }, availabilityStatus: "coming_soon", onboardingStatus: { $ne: "rejected" } }],
 };
+function withinOpeningSlot(current: number, slot: unknown): boolean {
+  if (!slot || typeof slot !== "object") return false;
+  const value = slot as { open?: string; close?: string };
+  const open = String(value.open || ""); const close = String(value.close || "");
+  if (!/^\d{2}:\d{2}$/.test(open) || !/^\d{2}:\d{2}$/.test(close)) return false;
+  const start = Number(open.replace(":", "")); const end = Number(close.replace(":", ""));
+  return end >= start ? current >= start && current <= end : current >= start || current <= end;
+}
 export function restaurantIsWithinOpeningHours(openingHours: unknown, now = new Date()): boolean {
   if (!openingHours || typeof openingHours !== "object") return true;
   const day = new Intl.DateTimeFormat("es-ES", { weekday: "long", timeZone: "Europe/Madrid" }).format(now).toLocaleLowerCase("es-ES");
-  const raw = (openingHours as Record<string, unknown>)[day] as Record<string, unknown> | undefined;
-  if (!raw || raw.closed === true) return false;
-  const windows = raw.morning && raw.evening ? [raw.morning, raw.evening] : [raw];
+  const value = (openingHours as Record<string, unknown>)[day] as { open?: string; close?: string; closed?: boolean; morning?: unknown; afternoon?: unknown } | undefined;
+  if (!value || value.closed === true) return false;
   const current = Number(new Intl.DateTimeFormat("es-ES", { hour: "2-digit", minute: "2-digit", hour12: false, timeZone: "Europe/Madrid" }).format(now).replace(":", ""));
-  return windows.some((candidate) => {
-    const value = candidate as { open?: string; close?: string; closed?: boolean };
-    if (value.closed === true) return false;
-    const open = String(value.open || ""); const close = String(value.close || "");
-    if (!/^\d{2}:\d{2}$/.test(open) || !/^\d{2}:\d{2}$/.test(close)) return true;
-    const start = Number(open.replace(":", "")); const end = Number(close.replace(":", ""));
-    return end >= start ? current >= start && current <= end : current >= start || current <= end;
-  });
+  if (value.morning || value.afternoon) return withinOpeningSlot(current, value.morning) || withinOpeningSlot(current, value.afternoon);
+  if (!value.open || !value.close) return true;
+  return withinOpeningSlot(current, value);
 }
 export function customerCatalogRestaurantName(restaurant: { name: string; slug?: string }) { return restaurant.name; }
 export function presentCustomerCatalogRestaurant<T extends { name: string; slug?: string; menu?: any[]; availabilityStatus?: string; isActive?: boolean; onboardingStatus?: string; partnerProfile?: { openingHours?: unknown } }>(restaurant: T) {
@@ -31,8 +33,8 @@ export function presentCustomerCatalogRestaurant<T extends { name: string; slug?
 }
 export const ALIBABA_KEBAB_SLUG = "alibaba-kebab-xativa";
 export const PARTNER_COMMISSION_RATES: Record<string, number> = {
-  [ALIBABA_KEBAB_SLUG]: 0.15,
-  "rooster-kebab-xativa": 0.25,
+  [ALIBABA_KEBAB_SLUG]: 0.18,
+  "rooster-kebab-xativa": 0.18,
   "nakama-sushi-xativa": 0.18,
 };
 export const DEFAULT_CUSTOMER_COMMISSION_RATE = 0.18;
@@ -51,7 +53,7 @@ function alibabaModifierGroups(item: Record<string, any>) {
   const name = String(item.name || "").toLocaleLowerCase("es-ES");
   const groups: any[] = [];
   if (name.includes("menú") || name.includes("menu")) groups.push({ id: `${item.id}-bebida`, name: "Elige tu bebida", description: "Incluida en el menú", minSelections: 1, maxSelections: 1, options: alibabaOptions("bebida", ALIBABA_OPTIONS.drinks) });
-  if (name.includes("doner") || name.includes("kebab") || name.includes("carne")) groups.push({ id: `${item.id}-salsa`, name: "Elige tus salsas", description: "Puedes escoger varias salsas", minSelections: 1, maxSelections: ALIBABA_OPTIONS.sauces.length, options: alibabaOptions("salsa", ALIBABA_OPTIONS.sauces) });
+  if (name.includes("doner") || name.includes("kebab") || name.includes("carne")) groups.push({ id: `${item.id}-salsa`, name: "Elige tu salsa", description: "Puedes escoger una salsa", minSelections: 0, maxSelections: 1, options: alibabaOptions("salsa", ALIBABA_OPTIONS.sauces) });
   if (name.includes("doner") || name.includes("kebab") || name.includes("carne") || name.includes("plato")) groups.push({ id: `${item.id}-extras`, name: "¿Quieres añadir extras?", description: "Extras opcionales para tu pedido", minSelections: 0, maxSelections: 3, options: alibabaOptions("extra", ALIBABA_OPTIONS.extras) });
   return groups;
 }
@@ -91,11 +93,8 @@ function applyPartnerMenuPricing<T extends Record<string, any>>(item: T, rate: n
   // + button opens the real option selector and the server can quote it.
   return { ...priced, modifiers, modifierGroups: modifiers };
 }
-export function menuItemIsAvailable(item: { available?: boolean } | null | undefined): boolean {
-  return Boolean(item) && item?.available !== false;
-}
 export function customerMenuForRestaurant<T extends { slug?: string; menu?: any[] }>(restaurant: T): any[] {
-  const menu = Array.isArray(restaurant.menu) ? restaurant.menu.filter(menuItemIsAvailable) : [];
+  const menu = Array.isArray(restaurant.menu) ? restaurant.menu : [];
   const rate = customerCommissionRate(restaurant as T & { partnerProfile?: { commissionRateBps?: number } });
   return rate > 0 ? menu.map((item) => applyPartnerMenuPricing(item, rate, restaurant.slug || "")) : menu;
 }

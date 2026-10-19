@@ -50,7 +50,6 @@ import { dispatchInitialIdempotencyKey, dispatchRequeueIdempotencyKey, enqueueDi
 import { buildFleetEntityScope, buildTenantScope } from "./tenantScope.js";
 import { authenticationOptions, registrationOptions, verifyAuthentication, verifyRegistration } from "./passkeys.js";
 import { markPartnerBatchPaid, markRiderBatchPaid, publicPartnerCode, publicRiderCode, recordGovernanceEvent, syncPublicIds } from "./pikiGovernance.js";
-import { publishCatalogUpdate, serveCatalogEvents, startCatalogRelay, stopCatalogRelay } from "./catalogRealtime.js";
 
 export const app = express();
 app.set("trust proxy", 1);
@@ -65,8 +64,14 @@ const isAllowedCorsOrigin = (origin?: string) => !origin || allowedOrigins.has(o
 const corsOptions = { origin: (origin: string | undefined, callback: (error: Error | null, allowed?: boolean) => void) => callback(null, isAllowedCorsOrigin(origin)), credentials: true };
 const databaseName = process.env.MONGODB_DB || "piki";
 let databaseReady = false;
+const catalogCache = new Map<string, { expiresAt: number; body: { restaurants: unknown[] } }>();
 const geocodeCache = new Map<string, { expiresAt: number; body: any }>();
+const CATALOG_CACHE_MS = 30_000;
 const GEOCODE_CACHE_MS = 300_000;
+function invalidateCatalogCache() {
+  catalogCache.clear();
+  void sharedCacheDelete("piki:catalog:|");
+}
 const boundedFetch = (input: string | URL, init: RequestInit = {}) => fetch(input, { ...init, signal: AbortSignal.timeout(1_200) });
 const geocoderHeaders = { "User-Agent": "PIKI-Delivery/0.2 (+https://pikidelivery.com)" };
 
@@ -96,7 +101,7 @@ async function reversePhoton(latitude: number, longitude: number) {
   const label = [address.road, [address.postcode, address.locality].filter(Boolean).join(" ")].filter(Boolean).join(", ");
   return { label: label || `Ubicación GPS ${latitude.toFixed(5)}, ${longitude.toFixed(5)}`, latitude, longitude, locality: address.locality || null, address: properties };
 }
-mongoose.connection.on("connected", () => { databaseReady = true; startRealtimeRelay(); startCatalogRelay(); void syncPublicIds().catch((error) => console.error("Public ID sync failed", error)); });
+mongoose.connection.on("connected", () => { databaseReady = true; startRealtimeRelay(); void syncPublicIds().catch((error) => console.error("Public ID sync failed", error)); });
 mongoose.connection.on("disconnected", () => { databaseReady = false; console.warn("MongoDB disconnected; API entering not-ready state"); });
 mongoose.connection.on("error", (error) => { databaseReady = false; console.error("MongoDB connection error", error instanceof Error ? error.message : error); });
 
@@ -189,6 +194,10 @@ async function sharedCacheGet<T>(key: string): Promise<T | null> {
 async function sharedCacheSet(key: string, value: unknown, ttlSeconds: number): Promise<void> {
   if (!upstashRedisUrl || !upstashRedisToken) return;
   try { await fetch(`${upstashRedisUrl}/set/${encodeURIComponent(key)}/${encodeURIComponent(JSON.stringify(value))}/EX/${ttlSeconds}`, { method: "POST", headers: { Authorization: `Bearer ${upstashRedisToken}` }, signal: AbortSignal.timeout(250) }); } catch { /* local cache fallback */ }
+}
+async function sharedCacheDelete(key: string): Promise<void> {
+  if (!upstashRedisUrl || !upstashRedisToken) return;
+  try { await fetch(`${upstashRedisUrl}/del/${encodeURIComponent(key)}`, { method: "POST", headers: { Authorization: `Bearer ${upstashRedisToken}` }, signal: AbortSignal.timeout(250) }); } catch { /* local cache fallback */ }
 }
 const rateLimit = (limit: number, windowMs: number, keyPrefix: string) => async (req: express.Request, res: express.Response, next: express.NextFunction) => {
   const surfaceKey = String(req.header("x-piki-surface") || req.query.surface || "-").toLowerCase();
@@ -287,7 +296,7 @@ async function fleetCanAccessRider(req: express.Request, riderId: mongoose.Types
 const locationSchema = z.object({ latitude: z.number().min(-90).max(90), longitude: z.number().min(-180).max(180), accuracy: z.number().min(0).max(500).optional() });
 const customerModifierSelectionSchema = z.object({ groupId: z.string().min(1).max(80), optionIds: z.array(z.string().min(1).max(80)).max(12) });
 const orderItemSchema = z.object({ itemId: z.string().min(1), quantity: z.number().int().min(1).max(20), selections: z.array(customerModifierSelectionSchema).max(12).optional() });
-const createOrderSchema = z.object({ restaurantId: z.string().min(1), deliveryAddress: z.string().min(5).max(280), deliveryNote: z.string().trim().max(500).default(""), scheduledFor: z.coerce.date().nullable().optional(), deliveryLocation: locationSchema, items: z.array(orderItemSchema).min(1).max(50), paymentMethod: z.string().optional().default("cash") });
+const createOrderSchema = z.object({ restaurantId: z.string().min(1), deliveryAddress: z.string().min(5).max(280), deliveryNote: z.string().trim().max(500).default(""), deliveryLocation: locationSchema, items: z.array(orderItemSchema).min(1).max(50), paymentMethod: z.string().optional().default("cash") });
 const deliveryQrSecret = String(process.env.DELIVERY_QR_SECRET || "").trim();
 if (process.env.NODE_ENV === "production" && !deliveryQrSecret) throw new Error("DELIVERY_QR_SECRET is required in production");
 const deliveryQrSignature = (orderCode: string) => createHmac("sha256", deliveryQrSecret || "development-only-delivery-qr-secret").update(`delivery:${orderCode}`).digest("hex").slice(0, 24);
@@ -343,10 +352,9 @@ const MENU_IMAGE_MIME_TYPES = ["image/webp", "image/jpeg", "image/png", "image/g
 const MENU_FILE_MIME_TYPES = ["application/pdf"] as const;
 const MENU_ASSET_MIME_TYPES = [...MENU_IMAGE_MIME_TYPES, ...MENU_FILE_MIME_TYPES] as const;
 const MENU_ASSET_KINDS = ["menu_image", "menu_file"] as const;
+const ALIBABA_KEBAB_SLUG = "alibaba-kebab-xativa";
 function canonicalRestaurantMenu(restaurant: any) {
-  // El menú público debe ser exactamente el último menú publicado por Partner.
-  // Nunca sustituirlo por un fixture fijo: eso ocultaba los cambios de Alibaba.
-  return Array.isArray(restaurant?.menu) ? restaurant.menu : [];
+  return restaurant?.slug === ALIBABA_KEBAB_SLUG ? alibabaKebabMenu : (Array.isArray(restaurant?.menu) ? restaurant.menu : []);
 }
 function pricedRestaurantMenu(restaurant: any) {
   return customerMenuForRestaurant({ ...restaurant, menu: canonicalRestaurantMenu(restaurant) });
@@ -1048,13 +1056,14 @@ app.post("/api/v1/signatures/signaturit/events", rateLimit(100, 60_000, "signatu
   return res.status(200).json({ received: true });
 });
 
-app.get("/api/v1/catalog/events", serveCatalogEvents);
 app.get("/api/v1/catalog/restaurants", async (req, res) => {
-  // Menu/stock/store changes must never re-fetch a stale browser, CDN, Redis
-  // or per-instance snapshot after the catalog.updated event.
-  res.setHeader("Cache-Control", "no-store, max-age=0");
   const query = typeof req.query.q === "string" ? req.query.q.trim().slice(0, 120).replace(/[.*+?^${}()|[\]\\]/g, "\\$&") : "";
   const category = typeof req.query.category === "string" ? req.query.category.trim() : "";
+  const cacheKey = `${query}|${category}`;
+  const cached = catalogCache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) { res.setHeader("Cache-Control", "public, max-age=30, s-maxage=30, stale-while-revalidate=60, stale-if-error=120"); return res.json(cached.body); }
+  const shared = await sharedCacheGet<{ restaurants: unknown[] }>(`piki:catalog:${cacheKey}`);
+  if (shared) { catalogCache.set(cacheKey, { expiresAt: Date.now() + CATALOG_CACHE_MS, body: shared }); res.setHeader("Cache-Control", "public, max-age=30, s-maxage=30, stale-while-revalidate=60, stale-if-error=120"); return res.json(shared); }
   const clauses: Record<string, unknown>[] = [CUSTOMER_CATALOG_RESTAURANT_FILTER];
   if (category && category !== "Todos") clauses.push({ category });
   if (query) clauses.push({ $or: [{ name: { $regex: query, $options: "i" } }, { cuisine: { $regex: query, $options: "i" } }, { category: { $regex: query, $options: "i" } }] });
@@ -1070,6 +1079,9 @@ app.get("/api/v1/catalog/restaurants", async (req, res) => {
   };
   restaurants.sort((left: any, right: any) => (catalogPriority[left.slug] ?? 10) - (catalogPriority[right.slug] ?? 10));
   const body = { restaurants: restaurants.map((restaurant: any) => presentCustomerCatalogRestaurant({ ...restaurant, menu: canonicalRestaurantMenu(restaurant) })) };
+  catalogCache.set(cacheKey, { expiresAt: Date.now() + CATALOG_CACHE_MS, body });
+  void sharedCacheSet(`piki:catalog:${cacheKey}`, body, 30);
+  res.setHeader("Cache-Control", "public, max-age=30, s-maxage=30, stale-while-revalidate=60, stale-if-error=120");
   res.json(body);
 });
 
@@ -1221,9 +1233,12 @@ app.patch("/api/v1/admin/partner-leads/:id", requireRole("admin", "commercial", 
 });
 
 const partnerDocumentSchema = z.object({ type: z.enum(["tax_id", "bank_certificate", "insurance", "activity_license", "food_sanitary_authorization", "identity", "other"]), fileName: z.string().min(1).max(180), mimeType: z.enum(DOCUMENT_UPLOAD_MIME_TYPES), sizeBytes: z.number().int().positive().max(2_500_000), sha256: z.string().regex(/^[a-f0-9]{64}$/), contentBase64: z.string().min(20).max(3_500_000) });
-const hoursWindowSchema = z.object({ open: z.string().regex(/^\d{2}:\d{2}$/), close: z.string().regex(/^\d{2}:\d{2}$/), closed: z.boolean() });
-const dayOpeningHoursSchema = z.union([hoursWindowSchema, z.object({ morning: hoursWindowSchema, evening: hoursWindowSchema, closed: z.boolean() })]);
-const openingHoursSchema = z.record(z.string().min(2).max(15), dayOpeningHoursSchema);
+const openingHourSlotSchema = z.object({ open: z.string().regex(/^\d{2}:\d{2}$/), close: z.string().regex(/^\d{2}:\d{2}$/) });
+const openingDaySchema = z.union([
+  z.object({ morning: openingHourSlotSchema, afternoon: openingHourSlotSchema, closed: z.boolean() }),
+  z.object({ open: z.string().regex(/^\d{2}:\d{2}$/), close: z.string().regex(/^\d{2}:\d{2}$/), closed: z.boolean() }),
+]);
+const openingHoursSchema = z.record(z.string().min(2).max(15), openingDaySchema);
 const partnerSchema = z.object({ name: z.string().min(2).max(160), email: z.string().email(), password: z.string().min(12).max(200).regex(/[A-Z]/).regex(/[a-z]/).regex(/[0-9]/), phone: z.string().min(6).max(40), address: z.string().min(5).max(280), legalName: z.string().min(2).max(180), taxId: z.string().regex(/^[A-Za-z0-9-]{5,20}$/), legalForm: z.enum(["autonomo", "sl", "sa", "cooperativa", "otra"]), representativeName: z.string().min(2).max(160), representativeRole: z.string().min(2).max(100), representativeDocument: z.string().min(5).max(30), fiscalAddress: z.string().min(5).max(280), operatingAddress: z.string().min(5).max(280), postalCode: z.string().regex(/^\d{5}$/), city: z.string().min(2).max(100), province: z.string().min(2).max(100), iban: z.string().regex(/^[A-Z]{2}\d{2}[A-Z0-9]{10,30}$/), bankAccountHolder: z.string().min(2).max(180), cuisine: z.string().min(2).max(100), vatRate: z.union([z.literal(4), z.literal(10), z.literal(21)]), commissionAccepted: z.literal(true), termsAcceptedAt: z.coerce.date(), contractAccepted: z.literal(true), privacyAccepted: z.literal(true), dataProcessingAccepted: z.literal(true), pdaUnits: z.number().int().min(1).max(50), pdaUnitCostCents: z.literal(30000), pdaCostAccepted: z.literal(true), pdaCostAcceptedAt: z.coerce.date(), privacyAcceptedAt: z.coerce.date(), dataProcessingAcceptedAt: z.coerce.date(), openingHours: openingHoursSchema, documents: z.array(partnerDocumentSchema).length(5) });
 app.get("/api/v1/public/partners/:id/stripe/onboarding-link", async (req, res) => {
   const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
@@ -1490,23 +1505,16 @@ app.post("/api/v1/partners/menu/imports/:id/publish", requireRole("partner"), as
   const draft = await MenuImportDraft.findOne({ _id: id, restaurantId: objectId(restaurantId), status: "draft" }).lean().exec() as any;
   if (!draft) return res.status(404).json({ error: "MENU_IMPORT_NOT_FOUND_OR_CLOSED" });
   if (!Array.isArray(draft.items) || !draft.items.length) return res.status(409).json({ error: "MENU_IMPORT_EMPTY", message: "Añade al menos un producto antes de publicar." });
-  const currentRestaurant = await Restaurant.findOne({ _id: objectId(restaurantId), ...tenantScope(req) }).select("menu").lean().exec() as any;
-  const currentCount = Array.isArray(currentRestaurant?.menu) ? currentRestaurant.menu.length : 0;
-  const importedCount = draft.items.length;
-  if (currentCount >= 40 && importedCount < Math.floor(currentCount * 0.5) && req.body?.confirmFullReplacement !== true) {
-    return res.status(409).json({ error: "MENU_REPLACEMENT_REQUIRES_CONFIRMATION", currentCount, receivedCount: importedCount, hint: "Revisa el borrador: la importación ha detectado menos de la mitad de la carta actual." });
-  }
   const session = await mongoose.startSession();
   try {
     let restaurant: any = null;
     let published: any = null;
     await session.withTransaction(async () => {
-      restaurant = await Restaurant.findOneAndUpdate({ _id: objectId(restaurantId), onboardingStatus: "approved", ...tenantScope(req) }, { $set: { menu: draft.items } }, { new: true, session }).select("name menu").lean().exec() as any;
+      restaurant = await Restaurant.findOneAndUpdate({ _id: objectId(restaurantId), onboardingStatus: "approved" }, { $set: { menu: draft.items } }, { new: true, session }).select("name menu").lean().exec() as any;
       if (!restaurant) throw new Error("RESTAURANT_NOT_APPROVED");
       published = await MenuImportDraft.findOneAndUpdate({ _id: id, restaurantId: objectId(restaurantId), status: "draft" }, { $set: { status: "published", publishedAt: new Date(), reviewedBy: objectId(String(req.auth?.employeeId || "")) } }, { new: true, session }).lean().exec();
       if (!published) throw new Error("MENU_IMPORT_NOT_FOUND_OR_CLOSED");
     });
-    await publishCatalogUpdate(restaurantId, "menu.published");
     return res.json({ published: true, restaurant, draft: menuImportResponse(published) });
   } catch (error) {
     const code = error instanceof Error ? error.message : "MENU_IMPORT_PUBLISH_FAILED";
@@ -1571,7 +1579,6 @@ app.patch("/api/v1/partners/store/status", requireRole("partner"), async (req, r
   if (!parsed.success) return res.status(400).json({ error: "INVALID_STORE_STATUS" });
   const restaurant = await Restaurant.findOneAndUpdate({ _id: restaurantId, onboardingStatus: "approved" }, { $set: { isActive: parsed.data.status === "open" } }, { new: true }).select("_id name isActive").lean().exec() as any;
   if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
-  await publishCatalogUpdate(restaurantId, "store.status_updated");
   return res.json({ restaurant: { id: String(restaurant._id), name: restaurant.name }, status: restaurant.isActive ? "open" : "paused", isOpen: Boolean(restaurant.isActive) });
 });
 app.get("/api/v1/partners/store/profile", requireRole("partner"), async (req, res) => {
@@ -1601,7 +1608,6 @@ app.patch("/api/v1/partners/store/hours", requireRole("partner"), async (req, re
   if (!parsed.success) return res.status(400).json({ error: "INVALID_OPENING_HOURS", details: parsed.error.flatten() });
   const restaurant = await Restaurant.findOneAndUpdate({ _id: restaurantId, onboardingStatus: "approved", ...tenantScope(req) }, { $set: { "partnerProfile.openingHours": parsed.data } }, { new: true }).select("_id name isActive partnerProfile.openingHours").lean().exec() as any;
   if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
-  await publishCatalogUpdate(restaurantId, "store.hours_updated");
   return res.json({ restaurantId: String(restaurant._id), name: restaurant.name, isOpen: Boolean(restaurant.isActive), openingHours: restaurant.partnerProfile?.openingHours || parsed.data });
 });
 app.get("/api/v1/partners/menu", requireRole("partner"), async (req, res) => {
@@ -1609,7 +1615,7 @@ app.get("/api/v1/partners/menu", requireRole("partner"), async (req, res) => {
   if (!allowed) return res.status(403).json({ error: "PARTNER_PERMISSION_DENIED", permission: "menu:read" });
   const restaurantId = await employeeRestaurant(req, access);
   if (!restaurantId) return res.status(403).json({ error: access?.restaurantIds.length ? "PARTNER_RESTAURANT_ACCESS_DENIED" : "PARTNER_RESTAURANT_NOT_ASSIGNED" });
-  const restaurant = await Restaurant.findOne({ _id: restaurantId, ...tenantScope(req) }).select("name slug internalDemo menu tenantId").lean().exec() as any;
+  const restaurant = await Restaurant.findById(restaurantId).select("name slug internalDemo menu").lean().exec() as any;
   if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
   const menu = canonicalRestaurantMenu(restaurant);
   return res.json({ restaurant: { ...restaurant, menu }, menu });
@@ -1621,18 +1627,10 @@ app.put("/api/v1/partners/menu", requireRole("partner"), async (req, res) => {
   if (!restaurantId) return res.status(403).json({ error: access?.restaurantIds.length ? "PARTNER_RESTAURANT_ACCESS_DENIED" : "PARTNER_RESTAURANT_NOT_ASSIGNED" });
   const parsed = z.object({ items: z.array(partnerMenuItemSchema).max(500) }).safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_MENU", details: parsed.error.flatten() });
-  const items = parsed.data.items;
-  const ids = items.map((item) => item.id);
-  if (new Set(ids).size !== ids.length) return res.status(400).json({ error: "INVALID_MENU_DUPLICATE_ITEM_IDS" });
-  const current = await Restaurant.findOne({ _id: restaurantId, ...tenantScope(req) }).select("name menu slug tenantId").lean().exec() as any;
-  if (!current) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
-  const currentCount = Array.isArray(current.menu) ? current.menu.length : 0;
-  if (currentCount >= 40 && items.length < Math.floor(currentCount * 0.5) && req.body?.confirmFullReplacement !== true) {
-    return res.status(409).json({ error: "MENU_REPLACEMENT_REQUIRES_CONFIRMATION", currentCount, receivedCount: items.length, hint: "Envía confirmFullReplacement=true sólo cuando quieras sustituir deliberadamente toda la carta." });
-  }
-  const restaurant = await Restaurant.findOneAndUpdate({ _id: restaurantId, ...tenantScope(req) }, { $set: { menu: items } }, { new: true }).select("name menu slug tenantId").lean().exec() as any;
+  const current = await Restaurant.findById(restaurantId).select("slug").lean().exec() as any;
+  const items = current?.slug === ALIBABA_KEBAB_SLUG ? alibabaKebabMenu : parsed.data.items;
+  const restaurant = await Restaurant.findByIdAndUpdate(restaurantId, { $set: { menu: items } }, { new: true }).select("name menu slug").lean().exec() as any;
   if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
-  await publishCatalogUpdate(restaurantId, "menu.updated");
   return res.json({ restaurant, menu: restaurant.menu || [] });
 });
 
@@ -1655,7 +1653,7 @@ app.put("/api/v1/admin/restaurants/:id/menu", requireOwner(), async (req, res) =
     { new: true },
   ).select("_id slug name menu").lean().exec() as any;
   if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND_OR_NOT_APPROVED" });
-  await publishCatalogUpdate(id, "menu.updated");
+  invalidateCatalogCache();
   return res.json({ updated: true, restaurant, menu: restaurant.menu || [] });
 });
 
@@ -2437,13 +2435,7 @@ app.post("/api/v1/admin/document-requests", requireRole("admin"), async (req, re
   const allowedTypes = parsed.data.subjectType === "rider_application" || parsed.data.subjectType === "rider_lead" ? riderDocumentRequestTypes : partnerDocumentRequestTypes;
   const requestedTypes = parsed.data.requirements.map((item) => item.type);
   if (requestedTypes.some((type) => !allowedTypes.has(type)) || new Set(requestedTypes).size !== requestedTypes.length) return res.status(400).json({ error: "INVALID_DOCUMENT_REQUIREMENTS" });
-  // Rider applications are onboarding records too. Public applications created
-  // before tenant binding may have tenantId=null, so using tenantScope here
-  // made the same record visible in the inbox but invisible when creating its
-  // document request. Keep the subject lookup aligned with all onboarding
-  // list/review endpoints while preserving tenant isolation for non-platform
-  // admins through adminOnboardingScope.
-  const subject = await documentRequestSubject(parsed.data.subjectType, subjectId, parsed.data.subjectType === "restaurant" ? tenantScope(req) : await adminOnboardingScope(req));
+  const subject = await documentRequestSubject(parsed.data.subjectType, subjectId, parsed.data.subjectType.endsWith("_lead") ? await adminOnboardingScope(req) : tenantScope(req));
   if (!subject) return res.status(404).json({ error: "DOCUMENT_REQUEST_SUBJECT_NOT_FOUND", message: "No se ha encontrado el aspirante dentro de tu ámbito de administración. Actualiza la bandeja y selecciona de nuevo su solicitud." });
   if (!subject.recipientEmail || !z.string().email().safeParse(subject.recipientEmail).success) return res.status(409).json({ error: "SUBJECT_EMAIL_REQUIRED", message: "Añade un correo de contacto válido antes de solicitar documentación." });
   if (parsed.data.subjectType === "restaurant" && !subject.hasProfile) return res.status(409).json({ error: "PARTNER_PROFILE_REQUIRED", message: "Este comercio no tiene expediente de partner para recibir documentación." });
@@ -2817,7 +2809,7 @@ app.post("/api/v1/orders", rateLimit(20, 60_000, "orders-create"), async (req, r
     marketplace: { commissionRateBps: marketplace.commissionRateBps, commissionCents: marketplace.platformCommissionCents, partnerPayoutCents: marketplace.partnerPayoutCents, riderEarningsCents: marketplace.riderEarningsCents, platformNetBeforeProcessingCents: marketplace.platformNetBeforeProcessingCents }, coverage, route, partnerPreparationLimitMinutes: PARTNER_PREPARATION_LIMIT_MINUTES, customerDeliveryTargetMinutes: CUSTOMER_DELIVERY_TARGET_MINUTES, etaMinutes: calculateEtaRange([PARTNER_PREPARATION_LIMIT_MINUTES, PARTNER_PREPARATION_LIMIT_MINUTES], [5, 15]) } });
 });
 
-const customerOrderSyncSchema = z.object({ publicCode: z.string().trim().min(6).max(64), restaurantSlug: z.string().trim().min(1).max(120), customerId: z.string().nullable().optional(), customerName: z.string().trim().max(160).nullable().optional(), deliveryAddress: z.string().trim().min(5).max(1000), deliveryNote: z.string().trim().max(500).default(""), scheduledFor: z.coerce.date().nullable().optional(), deliveryLocation: z.object({ latitude: z.number().finite(), longitude: z.number().finite() }).nullable().optional(), items: z.array(z.object({ itemId: z.string().min(1), name: z.string().min(1), quantity: z.number().int().min(1).max(20), unitPriceCents: z.number().int().min(0), totalCents: z.number().int().min(0).optional() })).min(1), subtotalCents: z.number().int().min(0), deliveryFeeCents: z.number().int().min(0), serviceFeeCents: z.number().int().min(0), totalCents: z.number().int().min(0), paymentMethod: z.enum(["stripe", "cash"]).default("stripe"), paymentState: z.enum(["pending", "authorized", "paid", "failed", "refunded"]).default("pending"), stripeCheckoutSessionId: z.string().nullable().optional(), stripePaymentIntentId: z.string().nullable().optional() });
+const customerOrderSyncSchema = z.object({ publicCode: z.string().trim().min(6).max(64), restaurantSlug: z.string().trim().min(1).max(120), customerId: z.string().nullable().optional(), customerName: z.string().trim().max(160).nullable().optional(), deliveryAddress: z.string().trim().min(5).max(1000), deliveryNote: z.string().trim().max(500).default(""), deliveryLocation: z.object({ latitude: z.number().finite(), longitude: z.number().finite() }).nullable().optional(), items: z.array(z.object({ itemId: z.string().min(1), name: z.string().min(1), quantity: z.number().int().min(1).max(20), unitPriceCents: z.number().int().min(0), totalCents: z.number().int().min(0).optional() })).min(1), subtotalCents: z.number().int().min(0), deliveryFeeCents: z.number().int().min(0), serviceFeeCents: z.number().int().min(0), totalCents: z.number().int().min(0), paymentMethod: z.enum(["stripe", "cash"]).default("stripe"), paymentState: z.enum(["pending", "authorized", "paid", "failed", "refunded"]).default("pending"), stripeCheckoutSessionId: z.string().nullable().optional(), stripePaymentIntentId: z.string().nullable().optional() });
 app.post("/api/v1/internal/customer-orders/sync", async (req, res) => {
   const expected = process.env.PIKI_CUSTOMER_SYNC_SECRET;
   if (!expected || req.header("x-piki-customer-sync-secret") !== expected) return res.status(401).json({ error: "INVALID_SYNC_AUTH" });
@@ -2850,10 +2842,10 @@ app.post("/api/v1/internal/customer-orders/sync", async (req, res) => {
   const canonicalSubtotalCents = canonicalItems.reduce((sum, item) => sum + item.unitPriceCents * item.quantity, 0);
   const canonicalTotalCents = canonicalSubtotalCents + input.deliveryFeeCents + input.serviceFeeCents;
   if (!isCashOrderWithinLimit(input.paymentMethod, canonicalTotalCents)) return res.status(422).json(cashOrderLimitError(canonicalTotalCents));
-  const order = await Order.findOneAndUpdate({ publicCode: input.publicCode }, { $set: { tenantId: restaurant.tenantId || null, restaurantId: restaurant._id, customerId: input.customerId || null, ...(input.customerName !== undefined ? { customerName: input.customerName || "" } : {}), items: canonicalItems, deliveryAddress: input.deliveryAddress, deliveryNote: input.deliveryNote, scheduledFor: input.scheduledFor || null, deliveryLocation: location, subtotalCents: canonicalSubtotalCents, deliveryFeeCents: input.deliveryFeeCents, serviceFeeCents: input.serviceFeeCents, totalCents: canonicalTotalCents, marketplaceCommissionRateBps: marketplace.commissionRateBps, marketplaceCommissionCents: marketplace.platformCommissionCents, partnerPayoutCents: marketplace.partnerPayoutCents, riderEarningsCents: marketplace.riderEarningsCents, platformNetBeforeProcessingCents: marketplace.platformNetBeforeProcessingCents, payoutStatus: "pending", paymentMethod: input.paymentMethod, paymentState: input.paymentState, ...(input.stripeCheckoutSessionId !== undefined ? { stripeCheckoutSessionId: input.stripeCheckoutSessionId } : {}), ...(input.stripePaymentIntentId !== undefined ? { stripePaymentIntentId: input.stripePaymentIntentId } : {}), ...(["authorized", "paid"].includes(input.paymentState) && !["authorized", "paid"].includes(existing?.paymentState || "") ? { status: "pending", assignmentState: "unassigned" } : {}) }, $setOnInsert: { publicCode: input.publicCode, status: "pending", assignmentState: "unassigned", statusHistory: [{ status: "pending", actorRole: "system", reason: "Pedido sincronizado desde PIKI Customer" }] } }, { upsert: true, new: true, setDefaultsOnInsert: true }).lean().exec() as any;
+  const order = await Order.findOneAndUpdate({ publicCode: input.publicCode }, { $set: { tenantId: restaurant.tenantId || null, restaurantId: restaurant._id, customerId: input.customerId || null, ...(input.customerName !== undefined ? { customerName: input.customerName || "" } : {}), items: canonicalItems, deliveryAddress: input.deliveryAddress, deliveryNote: input.deliveryNote, deliveryLocation: location, subtotalCents: canonicalSubtotalCents, deliveryFeeCents: input.deliveryFeeCents, serviceFeeCents: input.serviceFeeCents, totalCents: canonicalTotalCents, marketplaceCommissionRateBps: marketplace.commissionRateBps, marketplaceCommissionCents: marketplace.platformCommissionCents, partnerPayoutCents: marketplace.partnerPayoutCents, riderEarningsCents: marketplace.riderEarningsCents, platformNetBeforeProcessingCents: marketplace.platformNetBeforeProcessingCents, payoutStatus: "pending", paymentMethod: input.paymentMethod, paymentState: input.paymentState, ...(input.stripeCheckoutSessionId !== undefined ? { stripeCheckoutSessionId: input.stripeCheckoutSessionId } : {}), ...(input.stripePaymentIntentId !== undefined ? { stripePaymentIntentId: input.stripePaymentIntentId } : {}), ...(["authorized", "paid"].includes(input.paymentState) && !["authorized", "paid"].includes(existing?.paymentState || "") ? { status: "pending", assignmentState: "unassigned" } : {}) }, $setOnInsert: { publicCode: input.publicCode, status: "pending", assignmentState: "unassigned", statusHistory: [{ status: "pending", actorRole: "system", reason: "Pedido sincronizado desde PIKI Customer" }] } }, { upsert: true, new: true, setDefaultsOnInsert: true }).lean().exec() as any;
   const newlyPaid = ["authorized", "paid"].includes(input.paymentState) && !["authorized", "paid"].includes(existing?.paymentState || "");
   const newCashOrder = input.paymentMethod === "cash" && !existing;
-  if ((newlyPaid || newCashOrder) && (!order.scheduledFor || new Date(order.scheduledFor).getTime() <= Date.now())) {
+  if (newlyPaid || newCashOrder) {
     const dispatch = enqueueOrderForDispatch(order._id as mongoose.Types.ObjectId).catch((error) => console.warn("Dispatch outbox enqueue failed", error instanceof Error ? error.message : error));
     const settlement = newCashOrder
       ? { settlement: "cash_due" as const, message: "Contrarreembolso recibido desde PIKI Customer: el Rider cobrará al entregar." }
@@ -2904,18 +2896,6 @@ app.get("/api/v1/internal/customer-orders/:publicCode/tracking", async (req, res
   const updatedAt = rider?.lastLocationAt ? new Date(rider.lastLocationAt).getTime() : 0;
   const fresh = active && Array.isArray(coordinates) && coordinates.length >= 2 && updatedAt >= Date.now() - 120_000;
   return res.json({ publicCode: order.publicCode, status: order.status, assignmentState: order.assignmentState, paymentMethod: order.paymentMethod, paymentState: order.paymentState, cashDueAtDelivery: order.paymentMethod === "cash" && order.paymentState !== "paid", riderId: rider?._id ? String(rider._id) : null, riderName: rider?.name || null, riderPhotoUrl: rider?.photoUrl || null, vehicle: rider?.vehicle || null, chatAvailable: active, locationAvailable: fresh, latitude: fresh ? Number(coordinates[1]) : null, longitude: fresh ? Number(coordinates[0]) : null, updatedAt: fresh ? updatedAt : null });
-});
-app.post("/api/v1/internal/customer-orders/:publicCode/pickup", async (req, res) => {
-  if (!requireCustomerSyncSecret(req, res)) return;
-  const order = await Order.findOne({ publicCode: String(req.params.publicCode) }).lean().exec() as any;
-  if (!order) return res.status(404).json({ error: "ORDER_NOT_FOUND" });
-  if (order.status !== "ready_for_pickup" || order.assignmentState !== "assigned" || !order.riderArrivedAt) return res.status(409).json({ error: "PICKUP_NOT_READY", message: "El Partner aún no ha marcado el pedido como listo o el Rider no ha llegado al local." });
-  const pickupCode = String(req.body?.pickupCode || "").trim();
-  if (!pickupCode || !pickupQrIsValid(order.publicCode, pickupCode)) return res.status(422).json({ error: "PICKUP_QR_INVALID", message: "El PIN o QR de recogida no es válido." });
-  const updated = await Order.findOneAndUpdate({ _id: order._id, status: "ready_for_pickup", assignmentState: "assigned", riderArrivedAt: { $ne: null }, version: order.version }, { $set: { status: "picked_up", pickupDeadlineAt: null }, $inc: { version: 1 }, $push: { statusHistory: { status: "picked_up", actorRole: "rider", reason: "Recogida confirmada por Rider mediante Customer sincronizado" } } }, { new: true }).lean().exec();
-  if (!updated) return res.status(409).json({ error: "PICKUP_ALREADY_CONFIRMED" });
-  await publishOrderStatusEvents(updated, "picked_up").catch((error) => console.warn("Pickup event failed", error instanceof Error ? error.message : error));
-  return res.json({ ok: true, message: "Recogida confirmada", order: updated });
 });
 app.post("/api/v1/internal/customer-orders/:publicCode/messages", async (req, res) => {
   if (!requireCustomerSyncSecret(req, res)) return;
@@ -3500,6 +3480,12 @@ app.post("/api/v1/riders/:riderId/orders/:orderId/confirm-pickup", requireRole("
   if (!riderAccess) return res.status(403).json({ error: "RIDER_ACCESS_DENIED" });
   const order = await Order.findOne({ _id: orderId, riderId, assignmentState: "assigned" }).lean().exec() as any;
   if (!order) return res.status(404).json({ error: "ACTIVE_RIDER_ORDER_NOT_FOUND" });
+  // A retry after a successful write must be harmless. This is common on a
+  // mobile connection when the rider loses the response while the order has
+  // already moved to the customer phase.
+  if (order.status === "picked_up" || order.status === "on_the_way") {
+    return res.json({ message: "La recogida ya estaba confirmada. Ya puedes continuar hacia el cliente.", order });
+  }
   if (!order.riderArrivedAt) return res.status(409).json({ error: "PARTNER_ARRIVAL_REQUIRED", message: "Confirma primero tu llegada al Partner con GPS." });
   if (order.status !== "ready_for_pickup") return res.status(409).json({ error: "PARTNER_NOT_READY", message: "El Partner todavía no ha marcado el pedido como listo para recoger." });
   const pickupCode = String(req.body?.pickupQr || req.body?.pickupPin || "").trim();
@@ -4029,7 +4015,6 @@ async function assignOrderAutomatically(orderId: mongoose.Types.ObjectId, prefer
     if (!order) return { state: "not_found" as const };
     const tenantFilter: Record<string, unknown> = order.tenantId ? { tenantId: order.tenantId } : {};
     if (!isDispatchablePayment(order.paymentState, order.paymentMethod, Number(order.totalCents)) || !isDispatchableOrderStatus(order.status)) return { state: "not_dispatchable" as const };
-    if (order.scheduledFor && new Date(order.scheduledFor).getTime() > Date.now()) return { state: "scheduled" as const, scheduledFor: order.scheduledFor };
     if (order.riderId || order.assignmentState === "assigned" || order.assignmentState === "offered") return { state: "already_assigned" as const, riderId: order.riderId };
     const restaurant = await Restaurant.findOne({ _id: order.restaurantId, ...tenantFilter }).lean().exec() as any;
     if (!restaurant?.location?.coordinates || !order.deliveryLocation?.coordinates) return { state: "missing_geolocation" as const };
@@ -4823,10 +4808,8 @@ async function repairConfiguredPartnerAccess() {
     ? await Promise.all(testPortfolio.map((location) => Restaurant.findOneAndUpdate(
       { slug: location.slug },
       {
-        // Access repair must not undo a Partner's saved catalog or pause state.
-        // Bootstrap defaults belong exclusively to newly inserted restaurants.
-        $setOnInsert: {
-          slug: location.slug, tagline: "Próximo partner PIKI en Xàtiva", phone: "", address: "Xàtiva",
+        $set: {
+          tenantId: account.tenantId || null,
           name: location.name,
           cuisine: location.cuisine,
           category: location.category,
@@ -4851,7 +4834,7 @@ async function repairConfiguredPartnerAccess() {
             "partnerProfile.commissionRateBps": 2300,
           } : {}),
         },
-        $set: { tenantId: account.tenantId || null },
+        $setOnInsert: { slug: location.slug, tagline: "Próximo partner PIKI en Xàtiva", phone: "", address: "Xàtiva" },
       },
       { upsert: true, new: true, setDefaultsOnInsert: true },
     ).select("_id slug name").lean().exec()))
@@ -4898,6 +4881,26 @@ async function repairConfiguredPartnerAccess() {
   ).exec();
   console.log(JSON.stringify({ event: "partner_access_repair", email, result: "repaired", restaurantId: String(restaurant._id), restaurantName: restaurant.name, assignedRestaurantCount: portfolioIds.length, ownerPreserved: isProtectedOwner }));
 }
+async function ensureMrRoosterOperational() {
+  const result = await Restaurant.updateOne(
+    { slug: "rooster-kebab-xativa" },
+    { $set: {
+      name: "Mr Rooster Xàtiva",
+      cuisine: "Kebab",
+      category: "Kebab",
+      locality: "Xàtiva",
+      availabilityStatus: "available",
+      upcomingMessage: "",
+      onboardingStatus: "approved",
+      isActive: true,
+      deliveryFeeCents: 299,
+      image: "https://files.manuscdn.com/user_upload_by_module/session_file/310519663931061405/PSnZzuCOslUOgNQN.jpg",
+      "partnerProfile.commissionRateBps": 2500,
+      menu: mrRoosterMenu,
+    } },
+  ).exec();
+  if (result.matchedCount > 0) console.log(JSON.stringify({ event: "mr_rooster_operational", slug: "rooster-kebab-xativa", modified: result.modifiedCount > 0, menuCount: mrRoosterMenu.length, commissionRateBps: 2500 }));
+}
 async function start() {
   const uri = process.env.MONGODB_URI;
   if (uri) {
@@ -4913,6 +4916,7 @@ async function start() {
     await repairConfiguredPartnerAccess();
     await purgeExpiredQaPartner();
     setInterval(() => { void purgeExpiredQaPartner().catch((error) => console.warn("QA partner purge failed", error instanceof Error ? error.message : String(error))); }, 60_000).unref();
+    await ensureMrRoosterOperational();
     await purgeTestDataIfEnabled();
     databaseReady = true;
     if (process.env.RUN_TENANT_MIGRATION === "true") {
@@ -4949,7 +4953,7 @@ async function start() {
   // `npm run start:dispatch-worker` as a separate service to consume the
   // persistent dispatch_outbox with atomic leases and retry/backoff.
   process.once("SIGTERM", () => {
-    stopNotificationWorker(); stopCatalogRelay(); databaseReady = false;
+    stopNotificationWorker(); databaseReady = false;
     server.close(() => { void mongoose.disconnect().finally(() => process.exit(0)); });
     setTimeout(() => process.exit(0), 25_000).unref();
   });
