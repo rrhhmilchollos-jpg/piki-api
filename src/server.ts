@@ -2905,6 +2905,18 @@ app.get("/api/v1/internal/customer-orders/:publicCode/tracking", async (req, res
   const fresh = active && Array.isArray(coordinates) && coordinates.length >= 2 && updatedAt >= Date.now() - 120_000;
   return res.json({ publicCode: order.publicCode, status: order.status, assignmentState: order.assignmentState, paymentMethod: order.paymentMethod, paymentState: order.paymentState, cashDueAtDelivery: order.paymentMethod === "cash" && order.paymentState !== "paid", riderId: rider?._id ? String(rider._id) : null, riderName: rider?.name || null, riderPhotoUrl: rider?.photoUrl || null, vehicle: rider?.vehicle || null, chatAvailable: active, locationAvailable: fresh, latitude: fresh ? Number(coordinates[1]) : null, longitude: fresh ? Number(coordinates[0]) : null, updatedAt: fresh ? updatedAt : null });
 });
+app.post("/api/v1/internal/customer-orders/:publicCode/pickup", async (req, res) => {
+  if (!requireCustomerSyncSecret(req, res)) return;
+  const order = await Order.findOne({ publicCode: String(req.params.publicCode) }).lean().exec() as any;
+  if (!order) return res.status(404).json({ error: "ORDER_NOT_FOUND" });
+  if (order.status !== "ready_for_pickup" || order.assignmentState !== "assigned" || !order.riderArrivedAt) return res.status(409).json({ error: "PICKUP_NOT_READY", message: "El Partner aún no ha marcado el pedido como listo o el Rider no ha llegado al local." });
+  const pickupCode = String(req.body?.pickupCode || "").trim();
+  if (!pickupCode || !pickupQrIsValid(order.publicCode, pickupCode)) return res.status(422).json({ error: "PICKUP_QR_INVALID", message: "El PIN o QR de recogida no es válido." });
+  const updated = await Order.findOneAndUpdate({ _id: order._id, status: "ready_for_pickup", assignmentState: "assigned", riderArrivedAt: { $ne: null }, version: order.version }, { $set: { status: "picked_up", pickupDeadlineAt: null }, $inc: { version: 1 }, $push: { statusHistory: { status: "picked_up", actorRole: "rider", reason: "Recogida confirmada por Rider mediante Customer sincronizado" } } }, { new: true }).lean().exec();
+  if (!updated) return res.status(409).json({ error: "PICKUP_ALREADY_CONFIRMED" });
+  await publishOrderStatusEvents(updated, "picked_up").catch((error) => console.warn("Pickup event failed", error instanceof Error ? error.message : error));
+  return res.json({ ok: true, message: "Recogida confirmada", order: updated });
+});
 app.post("/api/v1/internal/customer-orders/:publicCode/messages", async (req, res) => {
   if (!requireCustomerSyncSecret(req, res)) return;
   const order = await Order.findOne({ publicCode: String(req.params.publicCode) }).lean().exec() as any;
