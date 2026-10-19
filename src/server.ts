@@ -2610,6 +2610,33 @@ app.patch("/api/v1/admin/riders/:id/lifecycle", requireRole("admin"), async (req
   return res.json({ rider });
 });
 
+app.delete("/api/v1/admin/riders/:id/test-account", requireOwner(), async (req, res) => {
+  const id = objectId(String(req.params.id));
+  if (!id) return res.status(400).json({ error: "INVALID_RIDER_ID" });
+  const rider = await Rider.findOne({ _id: id, isTestRider: true, email: "qa-rider@pikidelivery.test", ...tenantScope(req) }).lean().exec() as any;
+  if (!rider) return res.status(404).json({ error: "QA_RIDER_NOT_FOUND" });
+  const activeOrders = await Order.countDocuments({ riderId: id, status: { $in: [...activeOperationalOrderStatuses] } }).exec();
+  if (activeOrders > 0) return res.status(409).json({ error: "QA_RIDER_HAS_ACTIVE_ORDERS", activeOrders });
+  const riderFilter = { riderId: id };
+  const orderFilter = { riderId: id };
+  const deleted: Record<string, number> = {};
+  for (const [name, operation] of [
+    ["locationSamples", LocationSample.deleteMany(riderFilter)],
+    ["trackingSessions", TrackingSession.deleteMany(riderFilter)],
+    ["riderSlots", RiderSlot.deleteMany(riderFilter)],
+    ["reservations", RiderAssignmentReservation.deleteMany(riderFilter)],
+    ["dispatchDecisions", DispatchDecision.deleteMany({ riderId: id })],
+    ["messages", RiderOrderMessage.deleteMany(orderFilter)],
+    ["incidents", RiderIncident.deleteMany(riderFilter)],
+    ["notifications", Notification.deleteMany({ recipientId: id })],
+    ["pushSubscriptions", PushSubscription.deleteMany({ ownerId: id })],
+    ["supportTickets", SupportTicket.deleteMany({ riderId: id })],
+    ["rider", Rider.deleteOne({ _id: id })],
+  ] as const) deleted[name] = (await operation).deletedCount || 0;
+  await GovernanceAuditEvent.create({ action: "qa_rider_physically_deleted", actorId: req.auth?.employeeId, entityType: "rider", entityId: String(id), metadata: { email: rider.email, riderCode: rider.riderCode, deleted } });
+  return res.json({ deleted: true, riderCode: rider.riderCode, email: rider.email, deletedCounts: deleted });
+});
+
 const riderZoneSchema = z.object({ zoneSlug: z.string().regex(/^[a-z0-9-]+$/).nullable() });
 app.patch("/api/v1/riders/:id/zone", requireRole("admin", "fleet"), async (req, res) => {
   const riderId = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
