@@ -17,10 +17,10 @@ function withinOpeningSlot(current: number, slot: unknown): boolean {
 export function restaurantIsWithinOpeningHours(openingHours: unknown, now = new Date()): boolean {
   if (!openingHours || typeof openingHours !== "object") return true;
   const day = new Intl.DateTimeFormat("es-ES", { weekday: "long", timeZone: "Europe/Madrid" }).format(now).toLocaleLowerCase("es-ES");
-  const value = (openingHours as Record<string, unknown>)[day] as { open?: string; close?: string; closed?: boolean; morning?: unknown; afternoon?: unknown } | undefined;
+  const value = (openingHours as Record<string, unknown>)[day] as { open?: string; close?: string; closed?: boolean; morning?: unknown; afternoon?: unknown; evening?: unknown } | undefined;
   if (!value || value.closed === true) return false;
   const current = Number(new Intl.DateTimeFormat("es-ES", { hour: "2-digit", minute: "2-digit", hour12: false, timeZone: "Europe/Madrid" }).format(now).replace(":", ""));
-  if (value.morning || value.afternoon) return withinOpeningSlot(current, value.morning) || withinOpeningSlot(current, value.afternoon);
+  if (value.morning || value.afternoon || value.evening) return withinOpeningSlot(current, value.morning) || withinOpeningSlot(current, value.afternoon || value.evening);
   if (!value.open || !value.close) return true;
   return withinOpeningSlot(current, value);
 }
@@ -93,8 +93,11 @@ function applyPartnerMenuPricing<T extends Record<string, any>>(item: T, rate: n
   // + button opens the real option selector and the server can quote it.
   return { ...priced, modifiers, modifierGroups: modifiers };
 }
+export function menuItemIsAvailable(item: { available?: boolean } | null | undefined): boolean {
+  return Boolean(item) && item?.available !== false;
+}
 export function customerMenuForRestaurant<T extends { slug?: string; menu?: any[] }>(restaurant: T): any[] {
-  const menu = Array.isArray(restaurant.menu) ? restaurant.menu : [];
+  const menu = Array.isArray(restaurant.menu) ? restaurant.menu.filter(menuItemIsAvailable) : [];
   const rate = customerCommissionRate(restaurant as T & { partnerProfile?: { commissionRateBps?: number } });
   return rate > 0 ? menu.map((item) => applyPartnerMenuPricing(item, rate, restaurant.slug || "")) : menu;
 }
