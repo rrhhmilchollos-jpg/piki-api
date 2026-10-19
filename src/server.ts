@@ -1488,12 +1488,18 @@ app.post("/api/v1/partners/menu/imports/:id/publish", requireRole("partner"), as
   const draft = await MenuImportDraft.findOne({ _id: id, restaurantId: objectId(restaurantId), status: "draft" }).lean().exec() as any;
   if (!draft) return res.status(404).json({ error: "MENU_IMPORT_NOT_FOUND_OR_CLOSED" });
   if (!Array.isArray(draft.items) || !draft.items.length) return res.status(409).json({ error: "MENU_IMPORT_EMPTY", message: "Añade al menos un producto antes de publicar." });
+  const currentRestaurant = await Restaurant.findOne({ _id: objectId(restaurantId), ...tenantScope(req) }).select("menu").lean().exec() as any;
+  const currentCount = Array.isArray(currentRestaurant?.menu) ? currentRestaurant.menu.length : 0;
+  const importedCount = draft.items.length;
+  if (currentCount >= 40 && importedCount < Math.floor(currentCount * 0.5) && req.body?.confirmFullReplacement !== true) {
+    return res.status(409).json({ error: "MENU_REPLACEMENT_REQUIRES_CONFIRMATION", currentCount, receivedCount: importedCount, hint: "Revisa el borrador: la importación ha detectado menos de la mitad de la carta actual." });
+  }
   const session = await mongoose.startSession();
   try {
     let restaurant: any = null;
     let published: any = null;
     await session.withTransaction(async () => {
-      restaurant = await Restaurant.findOneAndUpdate({ _id: objectId(restaurantId), onboardingStatus: "approved" }, { $set: { menu: draft.items } }, { new: true, session }).select("name menu").lean().exec() as any;
+      restaurant = await Restaurant.findOneAndUpdate({ _id: objectId(restaurantId), onboardingStatus: "approved", ...tenantScope(req) }, { $set: { menu: draft.items } }, { new: true, session }).select("name menu").lean().exec() as any;
       if (!restaurant) throw new Error("RESTAURANT_NOT_APPROVED");
       published = await MenuImportDraft.findOneAndUpdate({ _id: id, restaurantId: objectId(restaurantId), status: "draft" }, { $set: { status: "published", publishedAt: new Date(), reviewedBy: objectId(String(req.auth?.employeeId || "")) } }, { new: true, session }).lean().exec();
       if (!published) throw new Error("MENU_IMPORT_NOT_FOUND_OR_CLOSED");
@@ -1601,7 +1607,7 @@ app.get("/api/v1/partners/menu", requireRole("partner"), async (req, res) => {
   if (!allowed) return res.status(403).json({ error: "PARTNER_PERMISSION_DENIED", permission: "menu:read" });
   const restaurantId = await employeeRestaurant(req, access);
   if (!restaurantId) return res.status(403).json({ error: access?.restaurantIds.length ? "PARTNER_RESTAURANT_ACCESS_DENIED" : "PARTNER_RESTAURANT_NOT_ASSIGNED" });
-  const restaurant = await Restaurant.findById(restaurantId).select("name slug internalDemo menu").lean().exec() as any;
+  const restaurant = await Restaurant.findOne({ _id: restaurantId, ...tenantScope(req) }).select("name slug internalDemo menu tenantId").lean().exec() as any;
   if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
   const menu = canonicalRestaurantMenu(restaurant);
   return res.json({ restaurant: { ...restaurant, menu }, menu });
@@ -1614,7 +1620,15 @@ app.put("/api/v1/partners/menu", requireRole("partner"), async (req, res) => {
   const parsed = z.object({ items: z.array(partnerMenuItemSchema).max(500) }).safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_MENU", details: parsed.error.flatten() });
   const items = parsed.data.items;
-  const restaurant = await Restaurant.findByIdAndUpdate(restaurantId, { $set: { menu: items } }, { new: true }).select("name menu slug").lean().exec() as any;
+  const ids = items.map((item) => item.id);
+  if (new Set(ids).size !== ids.length) return res.status(400).json({ error: "INVALID_MENU_DUPLICATE_ITEM_IDS" });
+  const current = await Restaurant.findOne({ _id: restaurantId, ...tenantScope(req) }).select("name menu slug tenantId").lean().exec() as any;
+  if (!current) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
+  const currentCount = Array.isArray(current.menu) ? current.menu.length : 0;
+  if (currentCount >= 40 && items.length < Math.floor(currentCount * 0.5) && req.body?.confirmFullReplacement !== true) {
+    return res.status(409).json({ error: "MENU_REPLACEMENT_REQUIRES_CONFIRMATION", currentCount, receivedCount: items.length, hint: "Envía confirmFullReplacement=true sólo cuando quieras sustituir deliberadamente toda la carta." });
+  }
+  const restaurant = await Restaurant.findOneAndUpdate({ _id: restaurantId, ...tenantScope(req) }, { $set: { menu: items } }, { new: true }).select("name menu slug tenantId").lean().exec() as any;
   if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
   await publishCatalogUpdate(restaurantId, "menu.updated");
   return res.json({ restaurant, menu: restaurant.menu || [] });
