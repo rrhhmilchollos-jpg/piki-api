@@ -27,11 +27,23 @@ export function restaurantIsWithinOpeningHours(openingHours: unknown, now = new 
   return withinOpeningSlot(current, value);
 }
 export function customerCatalogRestaurantName(restaurant: { name: string; slug?: string }) { return restaurant.name; }
-export function presentCustomerCatalogRestaurant<T extends { name: string; slug?: string; menu?: any[]; availabilityStatus?: string; isActive?: boolean; onboardingStatus?: string; cashPaymentsEnabled?: boolean; partnerProfile?: { openingHours?: unknown } }>(restaurant: T) {
+export function presentCustomerCatalogRestaurant<T extends { name: string; slug?: string; menu?: any[]; availabilityStatus?: string; upcomingMessage?: string; isActive?: boolean; onboardingStatus?: string; cashPaymentsEnabled?: boolean; partnerProfile?: { openingHours?: unknown } }>(restaurant: T) {
   const comingSoon = restaurant.availabilityStatus === "coming_soon";
   const withinHours = restaurantIsWithinOpeningHours(restaurant.partnerProfile?.openingHours);
   const orderable = restaurant.isActive === true && restaurant.onboardingStatus === "approved" && !comingSoon && withinHours;
-  return { ...restaurant, cashPaymentsEnabled: isCashPaymentEnabledForRestaurant(restaurant), menu: customerMenuForRestaurant(restaurant), name: customerCatalogRestaurantName(restaurant), comingSoon, withinHours, orderable, availabilityLabel: comingSoon ? "Disponible muy pronto" : withinHours ? "" : "Cerrado ahora" };
+  // Do not leak a stale persisted announcement after a restaurant becomes live.
+  // The public catalog must derive this label from the operational status.
+  return {
+    ...restaurant,
+    upcomingMessage: comingSoon ? (restaurant.upcomingMessage || "Disponible muy pronto") : "",
+    cashPaymentsEnabled: isCashPaymentEnabledForRestaurant(restaurant),
+    menu: customerMenuForRestaurant(restaurant),
+    name: customerCatalogRestaurantName(restaurant),
+    comingSoon,
+    withinHours,
+    orderable,
+    availabilityLabel: comingSoon ? "Disponible muy pronto" : withinHours ? "" : "Cerrado ahora",
+  };
 }
 export const ALIBABA_KEBAB_SLUG = "alibaba-kebab-xativa";
 export const PARTNER_COMMISSION_RATES: Record<string, number> = {

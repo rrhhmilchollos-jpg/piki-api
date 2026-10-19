@@ -91,9 +91,11 @@ export async function createCheckoutSession(input: {
     customer_email: input.customerEmail,
     client_reference_id: input.publicCode,
     metadata,
-    // Do not send payment_method_types here. Manual-capture rollout must be
-    // validated with compatible card payments before any other method is
-    // considered; this code does not announce an additional method as enabled.
+    // Keep the hosted checkout limited to the two methods approved for PIKI.
+    // Bizum is handled by Stripe; no phone number is stored or displayed here.
+    // The installed Stripe SDK predates Bizum's type declaration; the API
+    // accepts it and Stripe's current Checkout docs list it explicitly.
+    payment_method_types: ["card", "bizum" as unknown as Stripe.Checkout.SessionCreateParams.PaymentMethodType],
     payment_intent_data: { metadata, capture_method: "manual" },
     success_url: `${input.origin}/?checkout=success&order_id=${encodeURIComponent(input.publicCode)}`,
     cancel_url: `${input.origin}/?checkout=cancelled&order_id=${encodeURIComponent(input.publicCode)}`,

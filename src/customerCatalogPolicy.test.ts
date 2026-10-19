@@ -16,9 +16,10 @@ test('los partners próximos son visibles pero no son operables ni indexables co
 });
 
 test('un restaurante aprobado, activo y disponible se presenta como operable', () => {
-  const view = presentCustomerCatalogRestaurant({ name: 'Restaurante local', slug: 'restaurante-local', availabilityStatus: 'available', isActive: true, onboardingStatus: 'approved' });
+  const view = presentCustomerCatalogRestaurant({ name: 'Restaurante local', slug: 'restaurante-local', availabilityStatus: 'available', upcomingMessage: 'Disponible muy pronto', isActive: true, onboardingStatus: 'approved' });
   assert.equal(view.orderable, true);
   assert.equal(view.comingSoon, false);
+  assert.equal(view.upcomingMessage, '');
 });
 
 test('un horario partido permite pedidos en mañana y tarde-noche y los bloquea entre franjas', () => {
