@@ -305,21 +305,15 @@ const deliveryQrUrl = (orderCode: string) => `${(process.env.CUSTOMER_APP_URL ||
 const checkoutTokenSecret = String(process.env.CHECKOUT_TOKEN_SECRET || deliveryQrSecret).trim();
 const checkoutToken = (orderCode: string) => createHmac("sha256", checkoutTokenSecret || "development-only-checkout-secret").update(`checkout:${orderCode}`).digest("base64url");
 const checkoutTokenIsValid = (orderCode: string, raw: unknown) => typeof raw === "string" && raw.length >= 20 && raw === checkoutToken(orderCode);
-const deliveryQrIsValid = (orderCode: string, raw: unknown) => {
-  if (String(raw || "").trim().toUpperCase() === deliveryPin(orderCode)) return true;
-  try { const url = new URL(String(raw)); return url.searchParams.get("order_id") === orderCode && url.searchParams.get("delivery_token") === deliveryQrSignature(orderCode); } catch { return false; }
-};
-const pickupQrSecret = String(process.env.PICKUP_QR_SECRET || deliveryQrSecret).trim();
-const pickupQrSignature = (orderCode: string) => createHmac("sha256", pickupQrSecret || "development-only-pickup-qr-secret").update(`pickup:${orderCode}`).digest("hex").slice(0, 24);
-const pickupPinAlphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-const pickupQrPin = (orderCode: string) => { const digest = createHmac("sha256", pickupQrSecret || "development-only-pickup-qr-secret").update(`pickup-pin:${orderCode}`).digest(); return Array.from({ length: 4 }, (_, index) => pickupPinAlphabet[digest[index] % pickupPinAlphabet.length]).join(""); };
-const pickupQrUrl = (orderCode: string) => `${(process.env.PARTNER_APP_URL || "https://partners.pikidelivery.com").replace(/\/$/, "")}/?order_id=${encodeURIComponent(orderCode)}&pickup_token=${pickupQrSignature(orderCode)}`;
-const pickupQrIsValid = (orderCode: string, raw: unknown) => {
-  const value = String(raw || "").trim();
-  if (!value) return false;
-  if (value.toUpperCase() === pickupQrPin(orderCode)) return true;
-  try { const url = new URL(value); return url.searchParams.get("order_id") === orderCode && url.searchParams.get("pickup_token") === pickupQrSignature(orderCode); } catch { return false; }
-};
+	const deliveryQrIsValid = (orderCode: string, raw: unknown) => {
+	  if (String(raw || "").trim().toUpperCase() === deliveryPin(orderCode)) return true;
+	  try { const url = new URL(String(raw)); return url.searchParams.get("order_id") === orderCode && url.searchParams.get("delivery_token") === deliveryQrSignature(orderCode); } catch { return false; }
+	};
+	const pickupQrSecret = String(process.env.PICKUP_QR_SECRET || deliveryQrSecret).trim();
+	const pickupQrSignature = (orderCode: string) => createHmac("sha256", pickupQrSecret || "development-only-pickup-qr-secret").update(`pickup:${orderCode}`).digest("hex").slice(0, 24);
+	const pickupPinAlphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+	const pickupQrPin = (orderCode: string) => { const digest = createHmac("sha256", pickupQrSecret || "development-only-pickup-qr-secret").update(`pickup-pin:${orderCode}`).digest(); return Array.from({ length: 4 }, (_, index) => pickupPinAlphabet[digest[index] % pickupPinAlphabet.length]).join(""); };
+	const pickupQrUrl = (orderCode: string) => `${(process.env.PARTNER_APP_URL || "https://partners.pikidelivery.com").replace(/\/$/, "")}/?order_id=${encodeURIComponent(orderCode)}&pickup_token=${pickupQrSignature(orderCode)}`;
 const riderLocationSchema = locationSchema.extend({ riderId: z.string().min(1) });
 const trackingSessionCreateSchema = z.object({ shiftId: z.string().regex(/^[a-f\d]{24}$/).optional(), platform: z.enum(["ios", "android", "web"]), appVersion: z.string().trim().min(1).max(80).default("unknown"), consentVersion: z.string().trim().min(1).max(80) });
 const trackingSampleSchema = z.object({ sampleId: z.string().trim().min(8).max(160), latitude: z.number().min(-90).max(90), longitude: z.number().min(-180).max(180), accuracyMeters: z.number().min(0).max(500), recordedAt: z.coerce.date() });
@@ -3487,13 +3481,10 @@ app.post("/api/v1/riders/:riderId/orders/:orderId/confirm-pickup", requireRole("
     return res.json({ message: "La recogida ya estaba confirmada. Ya puedes continuar hacia el cliente.", order });
   }
   if (!order.riderArrivedAt) return res.status(409).json({ error: "PARTNER_ARRIVAL_REQUIRED", message: "Confirma primero tu llegada al Partner con GPS." });
-  if (order.status !== "ready_for_pickup") return res.status(409).json({ error: "PARTNER_NOT_READY", message: "El Partner todavía no ha marcado el pedido como listo para recoger." });
-  const pickupCode = String(req.body?.pickupQr || req.body?.pickupPin || "").trim();
-  if (!pickupCode) return res.status(422).json({ error: "PICKUP_QR_REQUIRED", message: "Escanea el QR o introduce el PIN que proporciona el Partner antes de confirmar la recogida." });
-  if (!pickupQrIsValid(order.publicCode, pickupCode)) return res.status(422).json({ error: "PICKUP_QR_INVALID", message: "El QR o PIN de recogida no es válido." });
+  if (!(order.status === "accepted" || order.status === "preparing" || order.status === "ready_for_pickup")) return res.status(409).json({ error: "PICKUP_NOT_AVAILABLE", message: "La recogida todavía no está disponible para este pedido." });
   const updated = await Order.findOneAndUpdate(
-    { _id: orderId, riderId, assignmentState: "assigned", riderArrivedAt: { $ne: null }, status: "ready_for_pickup", version: order.version },
-    { $set: { status: "picked_up", pickupDeadlineAt: null }, $inc: { version: 1 }, $push: { statusHistory: { status: "picked_up", actorRole: "rider", reason: "Recogida confirmada por Rider con QR/PIN" } } },
+    { _id: orderId, riderId, assignmentState: "assigned", riderArrivedAt: { $ne: null }, status: { $in: ["accepted", "preparing", "ready_for_pickup"] }, version: order.version },
+    { $set: { status: "picked_up", pickupDeadlineAt: null }, $inc: { version: 1 }, $push: { statusHistory: { status: "picked_up", actorRole: "rider", reason: "Recogida confirmada directamente por Rider tras llegar al Partner" } } },
     { new: true },
   ).lean().exec() as any;
   if (!updated) return res.status(409).json({ error: "ORDER_CHANGED_RETRY" });
