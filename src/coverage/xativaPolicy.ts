@@ -1,17 +1,22 @@
 import { xativaMunicipalityGeometry } from "./xativaBoundary.js";
 
+export const XATIVA_PHASE_2_LOCALITIES = ["Novetlè", "La Llosa de Ranes", "Cerdà", "La Granja", "Llanera", "El Genovés", "Anahuir", "Ayacor"] as const;
+
 export const XATIVA_COVERAGE_POLICY = {
-  slug: "xativa-v1",
+  slug: "xativa-casco-urbano-fase-1",
   city: "Xàtiva",
-  version: 1,
+  version: 2,
   center: [-0.521111, 38.990276] as [number, number],
-  maxStraightLineDistanceKm: 10,
+  // Fase 1: radio operativo del casco urbano. Los pueblos colindantes quedan
+  // preparados para una fase posterior, pero no se consideran cubiertos.
+  maxStraightLineDistanceKm: 3,
   deliveryBaseFeeCents: 299,
-  outsideMunicipalitySurchargeCents: 100,
+  outsideMunicipalitySurchargeCents: 0,
   serviceFeeCents: 79,
   routeVehicleThresholdKm: 3,
   routeVehicleClasses: ["motorcycle", "car"] as const,
   municipalityBoundarySource: "OpenStreetMap relation via Nominatim, retrieved 2026-09-26",
+  phase2Enabled: false,
 } as const;
 
 export type VehicleClass = "bike" | "electric_bike" | "electric_scooter" | "motorcycle" | "scooter" | "car";
@@ -73,9 +78,9 @@ function insideMunicipality(point: [number, number]) {
 
 export function evaluateXativaCoverage(point: [number, number]): CoverageDecision {
   const straightLineDistanceKm = distanceKm(XATIVA_COVERAGE_POLICY.center, point);
-  const covered = straightLineDistanceKm <= XATIVA_COVERAGE_POLICY.maxStraightLineDistanceKm;
   const withinMunicipality = insideMunicipality(point);
-  const outsideMunicipalitySurchargeCents = covered && !withinMunicipality ? XATIVA_COVERAGE_POLICY.outsideMunicipalitySurchargeCents : 0;
+  const covered = withinMunicipality && straightLineDistanceKm <= XATIVA_COVERAGE_POLICY.maxStraightLineDistanceKm;
+  const outsideMunicipalitySurchargeCents = 0;
   const deliveryFeeCents = covered ? XATIVA_COVERAGE_POLICY.deliveryBaseFeeCents + outsideMunicipalitySurchargeCents : null;
   return {
     policySlug: XATIVA_COVERAGE_POLICY.slug,

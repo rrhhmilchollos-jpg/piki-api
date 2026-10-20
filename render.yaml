@@ -32,3 +32,13 @@ services:
         sync: false
       - key: GOOGLE_MAPS_API_KEY
         sync: false
+      - key: PIKI_HOURLY_GUARANTEE_ENABLED
+        value: "false"
+      - key: PIKI_RIDER_REFERRALS_ENABLED
+        value: "false"
+      - key: PIKI_RIDER_INCENTIVES_MONTHLY_CAP_CENTS
+        value: "0"
+      - key: PIKI_RIDER_COMPENSATION_MODE
+        value: founder_partner
+      - key: PIKI_RIDER_PAYOUT_CENTS
+        value: "0"

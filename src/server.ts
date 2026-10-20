@@ -56,6 +56,11 @@ app.set("trust proxy", 1);
 const port = Number(process.env.PORT || 3000);
 const PARTNER_PREPARATION_LIMIT_MINUTES = 15;
 const CUSTOMER_DELIVERY_TARGET_MINUTES = 30;
+function configuredRiderPayoutCents() {
+  if (String(process.env.PIKI_RIDER_COMPENSATION_MODE || "").trim().toLowerCase() === "founder_partner") return 0;
+  const configured = Number(process.env.PIKI_RIDER_PAYOUT_CENTS ?? 350);
+  return Number.isFinite(configured) ? Math.max(0, Math.round(configured)) : 350;
+}
 const defaultOrigins = ["http://localhost:3000", "http://localhost:5173", "https://localhost", "https://pikidelivery.com", "https://www.pikidelivery.com", "https://app.pikidelivery.com", "https://partners.pikidelivery.com", "https://admin.pikidelivery.com", "https://support.pikidelivery.com", "https://piki-admin-live.vercel.app", "https://piki-support.vercel.app", "https://rider.pikidelivery.com", "https://riders.pikidelivery.com", "https://fleet.pikidelivery.com", "https://piki-customer.onrender.com", "https://piki-riders.onrender.com", "https://piki-admin.onrender.com", "https://edpexgfa.manus.space"];
 const configuredOrigins = (process.env.CORS_ORIGINS || "").split(",").map((origin) => origin.trim()).filter(Boolean);
 const allowedOrigins = new Set([...defaultOrigins, ...configuredOrigins]);
@@ -2815,7 +2820,7 @@ app.post("/api/v1/orders", rateLimit(20, 60_000, "orders-create"), async (req, r
     deliveryFeeCents,
     serviceFeeCents,
     commissionRateBps: Number(restaurant.partnerProfile?.commissionRateBps ?? DEFAULT_PARTNER_COMMISSION_BPS),
-    riderEarningsCents: Math.max(0, Number(process.env.PIKI_RIDER_PAYOUT_CENTS || 350)),
+    riderEarningsCents: configuredRiderPayoutCents(),
   });
   if (marketplace.customerTotalCents !== totalCents) return res.status(500).json({ error: "MARKETPLACE_TOTAL_MISMATCH" });
   if (!isCashOrderWithinLimit(parsed.data.paymentMethod, totalCents)) return res.status(422).json(cashOrderLimitError(totalCents));
@@ -2856,7 +2861,7 @@ app.post("/api/v1/internal/customer-orders/sync", async (req, res) => {
     deliveryFeeCents: input.deliveryFeeCents,
     serviceFeeCents: input.serviceFeeCents,
     commissionRateBps: Number(restaurant.partnerProfile?.commissionRateBps ?? DEFAULT_PARTNER_COMMISSION_BPS),
-    riderEarningsCents: Math.max(0, Number(process.env.PIKI_RIDER_PAYOUT_CENTS || 350)),
+    riderEarningsCents: configuredRiderPayoutCents(),
   });
   if (marketplace.customerTotalCents !== input.totalCents) return res.status(409).json({ error: "MARKETPLACE_TOTAL_MISMATCH" });
   // Customer is the source of truth: never rebuild lines from a second menu copy.

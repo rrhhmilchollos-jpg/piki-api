@@ -26,6 +26,7 @@ export type DispatchInput = {
   maxGpsAgeSeconds?: number;
   maxCustomerEtaMinutes?: number;
   maxConcurrentOrders?: 1 | 2;
+  orderVolume?: "standard" | "bulky";
 };
 
 export type DispatchWeights = {
@@ -100,6 +101,9 @@ export function scoreDispatchCandidate(candidate: DispatchCandidate, input: Disp
   // Route distance is persisted at order creation and controls vehicle eligibility.
   // Haversine remains only as an ETA fallback when the provider was unavailable.
   const customerDistanceKm = input.routeDistanceKm ?? distanceKm(input.restaurantLocation, input.customerLocation);
+  // En el lanzamiento, los coches quedan reservados para perímetro/recorridos
+  // largos o pedidos voluminosos; el patinete lidera el reparto urbano corto.
+  if (candidate.vehicle === "car" && customerDistanceKm <= 3 && input.orderVolume !== "bulky") return null;
   const pickupEtaMinutes = travelMinutes(pickupDistanceKm, candidate.vehicle);
   const customerEtaMinutes = input.routeDurationMinutes != null && Number.isFinite(input.routeDurationMinutes) ? Math.max(1, Math.ceil(input.routeDurationMinutes)) : travelMinutes(customerDistanceKm, candidate.vehicle);
   const totalEtaMinutes = input.preparationMinutes + Math.max(input.preparationMinutes, pickupEtaMinutes) + customerEtaMinutes;
@@ -118,6 +122,9 @@ export function scoreDispatchCandidate(candidate: DispatchCandidate, input: Disp
   const priority = bounded(candidate.servicePriority ?? 0.5, 0.5);
   const preparationWait = Math.max(0, pickupEtaMinutes - input.preparationMinutes);
   const lateRisk = Math.max(0, totalEtaMinutes - 60);
+  const urbanVehiclePenalty = customerDistanceKm <= 3
+    ? ({ electric_scooter: 0, electric_bike: 0.5, bike: 1, scooter: 0.25, motorcycle: 4, car: 8 } as const)[candidate.vehicle]
+    : 0;
 
   // Lower is better. Every term is normalized or intentionally bounded and logged.
   const score =
@@ -129,7 +136,7 @@ export function scoreDispatchCandidate(candidate: DispatchCandidate, input: Disp
     dispatchWeights.zoneMismatch * (1 - zoneFit) * 20 +
     dispatchWeights.reliability * (1 - reliability) * 20 +
     dispatchWeights.rating * (1 - rating) * 20 +
-    dispatchWeights.priority * (1 - priority) * 20;
+    dispatchWeights.priority * (1 - priority) * 20 + urbanVehiclePenalty;
 
   return {
     riderId: candidate.id,
@@ -148,6 +155,7 @@ export function scoreDispatchCandidate(candidate: DispatchCandidate, input: Disp
       input.routeDistanceKm == null ? "ruta sin proveedor: restricción conservadora aplicada" : `ruta al cliente ${input.routeDistanceKm.toFixed(2)} km`,
       ...(input.routeDurationMinutes != null ? [`duración Google Maps/OSRM ${Math.ceil(input.routeDurationMinutes)} min`] : []),
       ...(requiredVehicleClasses.length ? [`vehículo requerido: ${requiredVehicleClasses.join(" o ")}`] : []),
+      ...(customerDistanceKm <= 3 ? [`prioridad urbana de vehículo: ${candidate.vehicle === "electric_scooter" ? "patinete eléctrico" : candidate.vehicle}`] : []),
       `espera de preparación ${preparationWait} min`,
       `carga activa ${activeOrderCount}/${maxConcurrentOrders}`,
       `valoración Rider ${(rating * 5).toFixed(2)}/5`,
@@ -161,5 +169,5 @@ export function rankDispatchCandidates(candidates: DispatchCandidate[], input: D
   return candidates
     .map((candidate) => scoreDispatchCandidate(candidate, input))
     .filter((decision): decision is DispatchDecision => Boolean(decision))
-    .sort((a, b) => a.pickupDistanceKm - b.pickupDistanceKm || a.score - b.score);
+    .sort((a, b) => a.score - b.score || a.pickupDistanceKm - b.pickupDistanceKm);
 }
