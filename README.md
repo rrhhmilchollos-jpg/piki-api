@@ -56,7 +56,7 @@ npm run seed
 | `GET` | `/api/v1/fleets/overview` | Resume flotas y pedidos operativos. |
 | `POST` | `/api/v1/orders` | Valida catálogo, recalcula importes y crea un pedido pendiente de pago. |
 | `POST` | `/api/v1/payments/checkout` | Crea una Checkout Session de Stripe usando los importes guardados en MongoDB. |
-| `POST` | `/api/webhooks/stripe` | Endpoint canónico Stripe: verifica `Stripe-Signature`, deduplica, autoriza el pago y solo lo captura al validar la entrega. |
+| `POST` | `/api/webhooks/stripe` | Endpoint canónico Stripe: verifica `Stripe-Signature`, deduplica y confirma pagos con captura automática. |
 | `POST` | `/api/v1/payments/webhook` | Alias compatible del endpoint canónico Stripe. |
 | `GET` | `/api/v1/realtime/events` | Stream SSE autenticado y reanudable de eventos operativos por superficie. |
 | `GET` | `/api/v1/fleets/pending-partner-orders` | Cola Fleet de pedidos pagados que esperan aceptación del Partner. |
@@ -72,7 +72,7 @@ STRIPE_WEBHOOK_SECRET=whsec_...
 
 En la cuenta **Stripe test**, configura el endpoint de staging exacto **`https://piki-api-staging.onrender.com/api/webhooks/stripe`**. Suscríbelo, como mínimo, a `payment_intent.amount_capturable_updated`, `payment_intent.succeeded`, `payment_intent.payment_failed`, `checkout.session.async_payment_failed`, `checkout.session.expired` y `charge.refunded`. La ruta histórica `/api/v1/payments/webhook` sigue disponible como alias compatible, pero el endpoint canónico es `/api/webhooks/stripe`.
 
-Stripe requiere el cuerpo crudo para verificar la firma; por eso la ruta se registra antes de `express.json()`. Los eventos se deduplican en la colección `stripe_events` usando `event.id`, con estados `processing`/`processed`/`failed`: sólo quedan `processed` después de actualizar el pedido y persistir el outbox de tiempo real. El cliente no debe marcar un pedido como pagado a partir de `success_url`: la confirmación válida es el webhook firmado.
+Stripe requiere el cuerpo crudo para verificar la firma; por eso la ruta se registra antes de `express.json()`. Los eventos se deduplican en la colección `stripe_events` usando `event.id`, con estados `processing`/`processed`/`failed`: sólo quedan `processed` después de actualizar el pedido y persistir el outbox de tiempo real. El cliente no debe marcar un pedido como pagado a partir de `success_url`: la confirmación válida es el webhook firmado. En Bizum y tarjeta se usa captura automática; el pedido sólo se considera pagado después del webhook firmado.
 
 ## Flujo de pedido pagado en tiempo real
 
@@ -96,14 +96,14 @@ La siguiente iteración introduce autenticación por rol, una máquina de estado
 
 El API intenta calcular cada ruta restaurante → cliente con Google Maps Directions usando `GOOGLE_MAPS_API_KEY`. Si Google no responde, utiliza OSRM; si ambos fallan, marca `routingDegraded=true` y aplica la restricción conservadora de vehículos. La duración persistida se usa en el ranking de Riders.
 
-Stripe usa `capture_method=manual`: `payment_intent.amount_capturable_updated` deja el pedido en `authorized`, lo que permite el despacho sin considerar el dinero liquidado. La captura se ejecuta idempotentemente después de QR/PIN válido en `confirm-delivery`; solo entonces el pedido pasa a `paymentState=paid`. Para el rollout manual se recomienda validar primero tarjeta compatible; **Bizum no se anuncia como habilitado por esta API**. No se ha cambiado la configuración de métodos de pago en producción. Los pedidos `cash` no pasan por Stripe.
+Stripe usa captura automática para tarjeta y Bizum. El Checkout limita los métodos a `card` y `bizum`, todos los importes se expresan en EUR y la sesión usa una clave de idempotencia por pedido. Bizum permanece sujeto a la aprobación de la capacidad `bizum_payments` en Stripe; mientras esté `pending`, los clientes siguen usando tarjeta. Los pedidos `cash` no pasan por Stripe.
 
 ### Límites de seguridad de Stripe
 
 - Esta documentación describe **test/staging**; no configura ni afirma una prueba E2E, cobro, webhook o KYC/payout real en producción.
 - Los nombres indicadores permitidos son `STRIPE_SECRET_KEY` y `STRIPE_WEBHOOK_SECRET`; sus valores sólo deben existir en el gestor de secretos del entorno. Nunca se incluyen claves en código, documentación, logs o respuestas HTTP.
-- Antes de habilitar pagos online a clientes, validar mediante un ensayo aislado el webhook firmado, autorizaciones, captura manual, reintentos, replays y eventos fuera de orden. La configuración de métodos de pago y cualquier cambio de producción requieren aprobación separada.
-- La entrega tolera que `payment_intent.succeeded` incremente la versión justo después de `capture()`: el webhook no toca el estado operacional y el cierre condiciona `on_the_way`/rider/asignación, no una versión antigua. **Sigue pendiente** una saga o conciliación para el caso de caída del proceso después de que Stripe capture y antes de persistir `delivered`, y para hacer atómico el ledger de efectivo con la entrega.
+- Antes de habilitar pagos online a clientes, validar mediante un ensayo aislado el webhook firmado, autorizaciones, captura automática, reintentos, replays y eventos fuera de orden. La configuración de métodos de pago y cualquier cambio de producción requieren aprobación separada.
+- La entrega tolera que `payment_intent.succeeded` llegue después de que Stripe confirme la sesión: el webhook no toca el estado operacional y el cierre condiciona `on_the_way`/rider/asignación. Sigue pendiente una saga o conciliación para el caso de caída del proceso después de la confirmación de Stripe y antes de persistir el estado final, y para hacer atómico el ledger de efectivo con la entrega.
 
 ## Sincronización del catálogo Partners → Customers
 
