@@ -8,6 +8,10 @@ La API implementa comprobaciones de salud, catálogo de restaurantes, alta de pa
 
 La conexión de Atlas no se guarda en el repositorio. La variable `MONGODB_URI` debe configurarse en el entorno de Render antes de desplegar. Se puede sembrar el catálogo inicial únicamente en un entorno de prueba con `SEED_DEMO_DATA=true`.
 
+### Google Business Profile para partners
+
+La sincronización de horarios usa OAuth de Google Business Profile. En Render deben configurarse `GOOGLE_BUSINESS_CLIENT_ID`, `GOOGLE_BUSINESS_CLIENT_SECRET`, `GOOGLE_BUSINESS_REDIRECT_URI` y `GOOGLE_BUSINESS_TOKEN_ENCRYPTION_KEY`. El callback de producción es `https://api.pikidelivery.com/api/v1/partners/google-business/callback`. El partner conecta su cuenta, selecciona la ubicación real y puede importar horarios desde Google o publicar los horarios de PIKI. Los tokens se guardan cifrados y nunca se exponen en respuestas HTTP.
+
 ## Migración formal a tenants
 
 La API incorpora `tenants`, `tenant_memberships` y `tenantId` indexado en las entidades operativas. La migración es idempotente y crea el tenant raíz `piki-platform` para los datos existentes.
