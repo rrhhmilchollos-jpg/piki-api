@@ -68,6 +68,7 @@ La API no activa pagos por defecto. Para un entorno de pruebas se deben configur
 ```text
 STRIPE_SECRET_KEY=sk_test_...
 STRIPE_WEBHOOK_SECRET=whsec_...
+STRIPE_BIZUM_ENABLED=false
 ```
 
 En la cuenta **Stripe test**, configura el endpoint de staging exacto **`https://piki-api-staging.onrender.com/api/webhooks/stripe`**. Suscríbelo, como mínimo, a `checkout.session.completed`, `checkout.session.async_payment_failed`, `checkout.session.expired`, `payment_intent.succeeded`, `payment_intent.payment_failed` y `charge.refunded`. La ruta histórica `/api/v1/payments/webhook` sigue disponible como alias compatible, pero el endpoint canónico es `/api/webhooks/stripe`.
@@ -96,7 +97,7 @@ La siguiente iteración introduce autenticación por rol, una máquina de estado
 
 El API intenta calcular cada ruta restaurante → cliente con Google Maps Directions usando `GOOGLE_MAPS_API_KEY`. Si Google no responde, utiliza OSRM; si ambos fallan, marca `routingDegraded=true` y aplica la restricción conservadora de vehículos. La duración persistida se usa en el ranking de Riders.
 
-Stripe usa captura automática para tarjeta y Bizum. El Checkout limita los métodos a `card` y `bizum`, todos los importes se expresan en EUR y la sesión usa una clave de idempotencia por pedido. Bizum permanece sujeto a la aprobación de la capacidad `bizum_payments` en Stripe; mientras esté `pending`, los clientes siguen usando tarjeta. Los pedidos `cash` no pasan por Stripe.
+Stripe usa captura automática para tarjeta y Bizum. Con `STRIPE_BIZUM_ENABLED=true`, el Checkout limita los métodos a `card` y `bizum`; con `false`, ofrece únicamente tarjeta para que el Checkout no intente usar una capacidad aún pendiente. Todos los importes se expresan en EUR y la sesión usa una clave de idempotencia por pedido. Bizum permanece sujeto a la aprobación de la capacidad `bizum_payments` en Stripe. Los pedidos `cash` no pasan por Stripe.
 
 ### Límites de seguridad de Stripe
 

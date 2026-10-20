@@ -15,6 +15,7 @@ import {
 
 const stripeSecretKey = process.env.STRIPE_SECRET_KEY;
 export const stripe = stripeSecretKey ? new Stripe(stripeSecretKey) : null;
+const stripeBizumEnabled = process.env.STRIPE_BIZUM_ENABLED === "true";
 const PROCESSING_LEASE_MS = 5 * 60_000;
 
 export function stripeConfigured() {
@@ -95,7 +96,9 @@ export async function createCheckoutSession(input: {
     // Bizum is handled by Stripe; no phone number is stored or displayed here.
     // The installed Stripe SDK predates Bizum's type declaration; the API
     // accepts it and Stripe's current Checkout docs list it explicitly.
-    payment_method_types: ["card", "bizum" as unknown as Stripe.Checkout.SessionCreateParams.PaymentMethodType],
+    payment_method_types: stripeBizumEnabled
+      ? ["card", "bizum" as unknown as Stripe.Checkout.SessionCreateParams.PaymentMethodType]
+      : ["card"],
     // Bizum does not support manual capture. Payment confirmation and the
     // order webhook now use the normal automatic-capture flow for both card
     // and Bizum payments.
