@@ -31,7 +31,7 @@ import { corporateEmailConfiguration, escapeCorporateHtml, sendCorporateEmail, s
 import { activeOperationalOrderStatuses, dispatchableOrderStatuses, dispatchablePaymentFilter, isDispatchableOrderStatus, isDispatchablePayment } from "./dispatchEligibility.js";
 import { canReceivePartnerLocations, partnerCan, partnerPermissions, partnerRolesForEmployee, permissionsForPartnerRoles, type PartnerPermission } from "./partnerAccess.js";
 import { awardRiderRecruitmentMilestones, claimRiderReferralCode, completeRiderShiftIncentiveTracking, incentiveProgramStatus, loadRiderIncentiveSnapshot, trackRiderLocationForIncentive, trackRiderShiftStart } from "./riderIncentives.js";
-import { buildApprovedRiderOperationalProfile } from "./riderApproval.js";
+import { buildApprovedRiderOperationalProfile, buildRiderEmployeeProvisioningFields, riderEmployeeProvisioningConflict } from "./riderApproval.js";
 import { COMING_SOON_SLUGS, CUSTOMER_CATALOG_RESTAURANT_FILTER, CUSTOMER_ORDERABLE_RESTAURANT_FILTER, GOLDEN_FOUNDER_SLUGS, customerCommissionRate, customerMenuForRestaurant, presentCustomerCatalogRestaurant } from "./customerCatalogPolicy.js";
 import { PARTNER_DEMO_MENU_VERSION, partnerDemoMenu } from "./partnerDemoMenu.js";
 import { KINGS_TACOS_COVER_IMAGE, kingsTacosMenu } from "./kingsTacosMenu.js";
@@ -2365,7 +2365,7 @@ app.patch("/api/v1/rider-applications/:id/status", requireRole("admin"), async (
   const parsed = z.object({ status: z.enum(["pending", "contacted", "approved", "rejected"]), notes: z.string().max(1000).optional(), assignedFleetId: z.string().regex(/^[a-f\d]{24}$/).nullable().optional() }).safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_APPLICATION_STATUS", details: parsed.error.flatten() });
   const scope = await adminOnboardingScope(req);
-  const existing = await RiderApplication.findOne({ _id: id, ...scope }).select("documents status tenantId").lean().exec() as any;
+  const existing = await RiderApplication.findOne({ _id: id, ...scope }).select("documents status tenantId assignedFleetId").lean().exec() as any;
   if (!existing) return res.status(404).json({ error: "APPLICATION_NOT_FOUND" });
   if (parsed.data.status === "approved") {
     const documents = existing.documents || [];
@@ -2373,18 +2373,153 @@ app.patch("/api/v1/rider-applications/:id/status", requireRole("admin"), async (
     const identityApproved = documents.some((document: any) => ["identity", "residence_permit"].includes(document.type) && document.status === "approved");
     if (!allDocumentsApproved || !identityApproved) return res.status(409).json({ error: "RIDER_DOCUMENT_REVIEW_REQUIRED", message: "Valida todos los documentos, incluida la identidad, antes de aprobar el alta." });
   }
-  const update: Record<string, unknown> = { status: parsed.data.status, notes: parsed.data.notes, reviewedBy: objectId(req.auth!.employeeId!), reviewedAt: new Date() };
-  if (parsed.data.status === "approved") update.identityVerificationStatus = "verified";
-  if (parsed.data.assignedFleetId !== undefined) update.assignedFleetId = parsed.data.assignedFleetId ? objectId(parsed.data.assignedFleetId) : null;
-  const application = await RiderApplication.findOneAndUpdate({ _id: id, ...scope }, { $set: update }, { new: true }).lean().exec() as any;
-  if (!application) return res.status(404).json({ error: "APPLICATION_NOT_FOUND" });
+  const actorEmployeeId = objectId(String(req.auth?.employeeId || ""));
+  const reviewedAt = new Date();
+  let application: any;
   let approvedRiderId = "";
-  if (parsed.data.status === "approved") {
-    const applicationTenantScope = application.tenantId ? { tenantId: application.tenantId } : { tenantId: null };
-    const existingRider = await Rider.findOne({ email: application.email }).select("_id tenantId riderCode").lean().exec() as any;
-    if (existingRider && String(existingRider.tenantId || "") !== String(application.tenantId || "")) return res.status(409).json({ error: "RIDER_EMAIL_OWNED_BY_ANOTHER_TENANT" });
-    const approvedRider = await Rider.findOneAndUpdate({ email: application.email, ...applicationTenantScope }, { $set: { tenantId: application.tenantId || null, ...buildApprovedRiderOperationalProfile(application), fleetId: application.assignedFleetId || null, status: "offline" }, $setOnInsert: { riderCode: existingRider?.riderCode || await nextRiderCode() } }, { upsert: true, new: true }).select("_id").lean().exec() as any;
-    approvedRiderId = approvedRider ? String(approvedRider._id) : "";
+  let employeeId = "";
+  let employeeCreated = false;
+
+  if (parsed.data.status !== "approved") {
+    const update: Record<string, unknown> = { status: parsed.data.status, notes: parsed.data.notes, reviewedBy: actorEmployeeId, reviewedAt };
+    if (parsed.data.assignedFleetId !== undefined) update.assignedFleetId = parsed.data.assignedFleetId ? objectId(parsed.data.assignedFleetId) : null;
+    application = await RiderApplication.findOneAndUpdate({ _id: id, ...scope }, { $set: update }, { new: true }).lean().exec() as any;
+    if (!application) return res.status(404).json({ error: "APPLICATION_NOT_FOUND" });
+  } else {
+    const session = await mongoose.startSession();
+    try {
+      await session.withTransaction(async () => {
+        // Reload under the transaction: retrying a concurrent approval must not
+        // bypass a newly inserted account or a later document review decision.
+        const current = await RiderApplication.findOne({ _id: id, ...scope }).session(session).lean().exec() as any;
+        if (!current) throw Object.assign(new Error("APPLICATION_NOT_FOUND"), { statusCode: 404 });
+        const documents = current.documents || [];
+        const allDocumentsApproved = documents.length > 0 && documents.every((document: any) => document.status === "approved");
+        const identityApproved = documents.some((document: any) => ["identity", "residence_permit"].includes(document.type) && document.status === "approved");
+        if (!allDocumentsApproved || !identityApproved) throw Object.assign(new Error("RIDER_DOCUMENT_REVIEW_REQUIRED"), { statusCode: 409 });
+        if (!current.tenantId) throw Object.assign(new Error("RIDER_APPLICATION_TENANT_REQUIRED"), { statusCode: 409 });
+
+        const applicationTenantScope = { tenantId: current.tenantId };
+        const assignedFleetId = parsed.data.assignedFleetId === undefined
+          ? current.assignedFleetId || null
+          : parsed.data.assignedFleetId ? objectId(parsed.data.assignedFleetId) : null;
+        if (assignedFleetId) {
+          const fleet = await Fleet.findOne({ _id: assignedFleetId, isActive: true, ...applicationTenantScope }).session(session).select("_id").lean().exec();
+          if (!fleet) throw Object.assign(new Error("ASSIGNED_FLEET_NOT_FOUND_OR_INACTIVE"), { statusCode: 409 });
+        }
+
+        const email = String(current.email || "").trim().toLowerCase();
+        const existingEmployee = await EmployeeAccount.findOne({ email }).session(session).select("_id tenantId jobRole apiRole primaryRole roles ownerProtected").lean().exec() as any;
+        const employeeConflict = riderEmployeeProvisioningConflict(existingEmployee, current.tenantId || null);
+        if (employeeConflict) throw Object.assign(new Error(employeeConflict), { statusCode: 409 });
+        const existingRider = await Rider.findOne({ email }).session(session).select("_id tenantId riderCode").lean().exec() as any;
+        if (existingRider && String(existingRider.tenantId || "") !== String(current.tenantId || "")) throw Object.assign(new Error("RIDER_EMAIL_OWNED_BY_ANOTHER_TENANT"), { statusCode: 409 });
+
+        const update: Record<string, unknown> = {
+          status: "approved",
+          notes: parsed.data.notes,
+          reviewedBy: actorEmployeeId,
+          reviewedAt,
+          identityVerificationStatus: "verified",
+          assignedFleetId,
+        };
+        application = await RiderApplication.findOneAndUpdate({ _id: id, ...scope }, { $set: update }, { new: true }).session(session).lean().exec() as any;
+        if (!application) throw Object.assign(new Error("APPLICATION_NOT_FOUND"), { statusCode: 404 });
+
+        const approvedRider = await Rider.findOneAndUpdate(
+          { email, ...applicationTenantScope },
+          {
+            $set: { tenantId: current.tenantId || null, ...buildApprovedRiderOperationalProfile(current), fleetId: assignedFleetId, status: "offline" },
+            $setOnInsert: { riderCode: existingRider?.riderCode || await nextRiderCode() },
+          },
+          { upsert: true, new: true, setDefaultsOnInsert: true },
+        ).session(session).select("_id").lean().exec() as any;
+        approvedRiderId = approvedRider ? String(approvedRider._id) : "";
+
+        const employeeFields = buildRiderEmployeeProvisioningFields({
+          name: current.name,
+          email,
+          tenantId: current.tenantId || null,
+          fleetId: assignedFleetId,
+          authorizedBy: actorEmployeeId,
+          authorizedAt: reviewedAt,
+        });
+        if (existingEmployee) {
+          await EmployeeAccount.updateOne({ _id: existingEmployee._id, ...applicationTenantScope }, { $set: employeeFields }).session(session).exec();
+          employeeId = String(existingEmployee._id);
+        } else {
+          const newEmployeeId = new mongoose.Types.ObjectId();
+          // This opaque, discarded value only fulfils the required password-hash
+          // field until the one-time activation link sets a chosen password.
+          // A plaintext temporary password is never stored, logged or returned.
+          const [employee] = await EmployeeAccount.create([{
+            _id: newEmployeeId,
+            employeeCode: employeeCodeFor(newEmployeeId),
+            ...employeeFields,
+            passwordHash: hashPassword(randomBytes(32).toString("base64url")),
+          }], { session });
+          employeeId = String(employee._id);
+          employeeCreated = true;
+          if (actorEmployeeId) {
+            await AccessAuthorization.create([{
+              tenantId: current.tenantId || null,
+              employeeId: employee._id,
+              action: "created",
+              previousStatus: null,
+              nextStatus: "approved",
+              previousRole: null,
+              nextRole: "rider",
+              accessLevel: "subadmin",
+              actorEmployeeId,
+              reason: "Cuenta Rider creada al aprobar un RiderApplication validado.",
+            }], { session });
+          }
+        }
+      });
+    } catch (error) {
+      const known = error as { message?: string; statusCode?: number; code?: number };
+      if (known.statusCode) return res.status(known.statusCode).json({ error: known.message });
+      // The unique e-mail index is the final guard if another approver creates
+      // an account after our transactional read. Do not retry by duplicating it.
+      if (known.code === 11000) return res.status(409).json({ error: "EMPLOYEE_EMAIL_ALREADY_EXISTS" });
+      throw error;
+    } finally {
+      await session.endSession();
+    }
+
+    // The activation flow sends a one-time reset link, never a password. It is
+    // attempted only for a newly created account and only if delivery is
+    // configured; retries can use the existing admin send-activation endpoint.
+    if (employeeCreated && corporateEmailConfiguration().configured) {
+      const employee = await EmployeeAccount.findById(employeeId).select("_id name email jobRole apiRole roles primaryRole").lean().exec() as any;
+      const surface = preferredCredentialSurface(employee);
+      if (employee && surface) {
+        const { delivery } = await sendEmployeePasswordLink(employee, surface, "activation");
+        if (delivery.sent && actorEmployeeId) {
+          await AccessAuthorization.create({
+            tenantId: application.tenantId || null,
+            employeeId: employee._id,
+            action: "credentials_sent",
+            previousStatus: "approved",
+            nextStatus: "approved",
+            previousRole: "rider",
+            nextRole: "rider",
+            accessLevel: "subadmin",
+            actorEmployeeId,
+            reason: `Enlace de activación enviado para ${employeeCredentialLabels[surface]}.`,
+          });
+        }
+        if (!delivery.sent) console.warn("Rider activation email was not delivered", { employeeId, error: delivery.error });
+      }
+    }
+    await recordGovernanceEvent({
+      actor: { employeeId: actorEmployeeId, role: req.auth?.role, tenantId: application.tenantId || null },
+      action: "rider_application_employee_provisioned",
+      targetType: "employee",
+      targetId: employeeId || null,
+      after: { applicationId: String(application._id), riderId: approvedRiderId, fleetId: application.assignedFleetId ? String(application.assignedFleetId) : null, employeeCreated },
+      reason: "RiderApplication aprobado tras validar la documentación; acceso Rider aprovisionado.",
+    });
   }
   if (existing.status !== parsed.data.status && ["approved", "rejected"].includes(parsed.data.status)) {
     const type = `onboarding.rider_application.${parsed.data.status}`;
