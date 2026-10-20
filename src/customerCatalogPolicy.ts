@@ -43,15 +43,18 @@ export function presentCustomerCatalogRestaurant<T extends { name: string; slug?
     withinHours,
     orderable,
     availabilityLabel: comingSoon ? "Disponible muy pronto" : withinHours ? "" : "Cerrado ahora",
+    goldenFounder: GOLDEN_FOUNDER_SLUGS.includes(restaurant.slug as typeof GOLDEN_FOUNDER_SLUGS[number]),
+    goldenFounderLabel: GOLDEN_FOUNDER_SLUGS.includes(restaurant.slug as typeof GOLDEN_FOUNDER_SLUGS[number]) ? "Partner Golden Fundador" : "",
+    commissionRateBps: Math.round(customerCommissionRate(restaurant as T & { partnerProfile?: { commissionRateBps?: number } }) * 10_000),
   };
 }
 export const ALIBABA_KEBAB_SLUG = "alibaba-kebab-xativa";
+export const GOLDEN_FOUNDER_SLUGS = [ALIBABA_KEBAB_SLUG, "rooster-kebab-xativa"] as const;
 export const PARTNER_COMMISSION_RATES: Record<string, number> = {
-  [ALIBABA_KEBAB_SLUG]: 0.18,
-  "rooster-kebab-xativa": 0.18,
-  "nakama-sushi-xativa": 0.18,
+  [ALIBABA_KEBAB_SLUG]: 0.15,
+  "rooster-kebab-xativa": 0.25,
 };
-export const DEFAULT_CUSTOMER_COMMISSION_RATE = 0.18;
+export const DEFAULT_CUSTOMER_COMMISSION_RATE = 0.20;
 const ALIBABA_OPTIONS = {
   drinks: [
     ["coca-cola", "Coca-Cola Original", 0], ["coca-cola-zero", "Coca-Cola Zero", 0],
@@ -72,9 +75,6 @@ function alibabaModifierGroups(item: Record<string, any>) {
   return groups;
 }
 export function customerCommissionRate(restaurant: { slug?: string; partnerProfile?: { commissionRateBps?: number } }): number {
-  if (Number.isInteger(restaurant.partnerProfile?.commissionRateBps)) {
-    return Math.max(0, Math.min(1, Number(restaurant.partnerProfile!.commissionRateBps) / 10_000));
-  }
   return PARTNER_COMMISSION_RATES[restaurant.slug || ""] ?? DEFAULT_CUSTOMER_COMMISSION_RATE;
 }
 function applyPartnerMenuPricing<T extends Record<string, any>>(item: T, rate: number, restaurantSlug = ""): T {
