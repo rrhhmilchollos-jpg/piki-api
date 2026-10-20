@@ -3530,13 +3530,13 @@ app.post("/api/v1/riders/:riderId/orders/:orderId/confirm-pickup", requireRole("
   if (distanceMeters > PICKUP_CONFIRMATION_RADIUS_METERS) return res.status(409).json({ error: "PARTNER_TOO_FAR", message: `Aún estás a ${Math.round(distanceMeters)} m del Partner. La recogida se habilita dentro de una manzana.`, distanceMeters, confirmationRadiusMeters: PICKUP_CONFIRMATION_RADIUS_METERS });
   const updated = await Order.findOneAndUpdate(
     { _id: orderId, riderId, assignmentState: "assigned", status: "ready_for_pickup", version: order.version },
-    { $set: { status: "picked_up", riderArrivedAt: new Date(), riderArrivalDistanceMeters: distanceMeters, pickupDeadlineAt: null }, $inc: { version: 1 }, $push: { statusHistory: { status: "picked_up", actorRole: "rider", reason: `Recogida GPS directa dentro del radio operativo (${Math.round(distanceMeters)} m)` } } },
+    { $set: { status: "on_the_way", riderArrivedAt: new Date(), riderArrivalDistanceMeters: distanceMeters, pickupDeadlineAt: null }, $inc: { version: 1 }, $push: { statusHistory: { status: "on_the_way", actorRole: "rider", reason: `Recogida confirmada y ruta al cliente iniciada dentro del radio operativo (${Math.round(distanceMeters)} m)` } } },
     { new: true },
   ).lean().exec() as any;
   if (!updated) return res.status(409).json({ error: "ORDER_CHANGED_RETRY" });
-  scheduleCustomerOrderPush(updated, "picked_up");
-  await publishOrderStatusEvents(updated, "picked_up");
-  return res.json({ message: "Recogida confirmada. Ya puedes iniciar la ruta hacia el cliente.", order: updated });
+  scheduleCustomerOrderPush(updated, "on_the_way");
+  await publishOrderStatusEvents(updated, "on_the_way");
+  return res.json({ message: "Recogida confirmada. Ruta al cliente iniciada automáticamente.", order: updated });
 });
 app.post("/api/v1/riders/:riderId/orders/:orderId/confirm-delivery", requireRole("rider"), async (req, res) => {
   const riderId = objectId(Array.isArray(req.params.riderId) ? req.params.riderId[0] : req.params.riderId);
@@ -3549,10 +3549,13 @@ app.post("/api/v1/riders/:riderId/orders/:orderId/confirm-delivery", requireRole
   if (order.status !== "on_the_way") return res.status(409).json({ error: "ORDER_NOT_ON_THE_WAY", message: "Primero confirma que has recogido el pedido e iniciado la ruta." });
   const rider = await Rider.findById(riderId).select("location lastLocationAt").lean().exec() as any;
   if (!rider?.lastLocationAt || new Date(rider.lastLocationAt).getTime() < Date.now() - 90_000) return res.status(409).json({ error: "FRESH_LOCATION_REQUIRED", message: "Actualiza tu GPS antes de confirmar la entrega." });
+  // El PIN/QR firmado por el Customer es la prueba de entrega. Validarlo
+  // antes del radio evita bloquear una entrega legítima por un pin de mapa
+  // desplazado o por el error normal del GPS urbano.
+  if (!deliveryQrIsValid(order.publicCode, req.body?.deliveryQr)) return res.status(422).json({ error: "DELIVERY_QR_INVALID", message: "Escanea el QR o introduce el PIN que proporciona el Customer antes de confirmar la entrega." });
   const deliveryDistanceMeters = pointDistanceMeters(rider.location, order.deliveryLocation);
   if (deliveryDistanceMeters == null) return res.status(409).json({ error: "DELIVERY_LOCATION_REQUIRED", message: "No se puede verificar la entrega: falta una ubicación GPS válida del cliente." });
-  if (deliveryDistanceMeters > DELIVERY_CONFIRMATION_RADIUS_METERS) return res.status(409).json({ error: "CUSTOMER_TOO_FAR", message: `Aún estás a ${Math.round(deliveryDistanceMeters)} m de la dirección del cliente. Acércate para confirmar la entrega.`, distanceMeters: deliveryDistanceMeters, confirmationRadiusMeters: DELIVERY_CONFIRMATION_RADIUS_METERS });
-  if (!deliveryQrIsValid(order.publicCode, req.body?.deliveryQr)) return res.status(422).json({ error: "DELIVERY_QR_INVALID", message: "Escanea el QR o introduce el PIN que proporciona el Customer antes de confirmar la entrega." });
+  const outsideGpsRadius = deliveryDistanceMeters > DELIVERY_CONFIRMATION_RADIUS_METERS;
   if (order.paymentMethod === "stripe") {
     if (!order.stripePaymentIntentId || order.paymentState !== "authorized") return res.status(409).json({ error: "PAYMENT_NOT_AUTHORIZED", message: "El pago online todavía no está autorizado para capturarse." });
     try { await captureStripePaymentIntent(order.stripePaymentIntentId); }
@@ -3575,7 +3578,7 @@ app.post("/api/v1/riders/:riderId/orders/:orderId/confirm-delivery", requireRole
   await releaseRiderOrderSlot(orderId, riderId);
   if (!order.isTestOrder) await awardRiderRecruitmentMilestones(riderId).catch((error) => console.error("Rider referral milestone evaluation failed", error instanceof Error ? error.message : error));
   scheduleCustomerOrderPush(deliveredOrder, "delivered");
-  return res.json({ message: order.paymentMethod === "cash" ? "Entrega confirmada y efectivo registrado en cartera." : "Entrega confirmada.", chatPurged: true, order: { id: deliveredOrder._id, publicCode: deliveredOrder.publicCode, status: deliveredOrder.status, deliveredAt: deliveredOrder.deliveredAt, paymentMethod: deliveredOrder.paymentMethod, cashCollected: Boolean(deliveredOrder.cashCollectedAt) } });
+  return res.json({ message: order.paymentMethod === "cash" ? "Entrega confirmada y efectivo registrado en cartera." : "Entrega confirmada.", chatPurged: true, gpsDistanceMeters: deliveryDistanceMeters, gpsOutsideConfiguredRadius: outsideGpsRadius, order: { id: deliveredOrder._id, publicCode: deliveredOrder.publicCode, status: deliveredOrder.status, deliveredAt: deliveredOrder.deliveredAt, paymentMethod: deliveredOrder.paymentMethod, cashCollected: Boolean(deliveredOrder.cashCollectedAt) } });
 });
 
 app.get("/api/v1/riders/:id/cash-wallet", requireRole("admin", "rider", "fleet"), async (req, res) => {
