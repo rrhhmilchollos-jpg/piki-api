@@ -1057,7 +1057,9 @@ app.post("/api/v1/signatures/signaturit/events", rateLimit(100, 60_000, "signatu
 app.get("/api/v1/catalog/restaurants", async (req, res) => {
   const query = typeof req.query.q === "string" ? req.query.q.trim().slice(0, 120).replace(/[.*+?^${}()|[\]\\]/g, "\\$&") : "";
   const category = typeof req.query.category === "string" ? req.query.category.trim() : "";
-  const cacheKey = `${query}|${category}`;
+  const postalCode = typeof req.query.postalCode === "string" && /^\d{5}$/.test(req.query.postalCode.trim()) ? req.query.postalCode.trim() : "";
+  const locality = typeof req.query.locality === "string" ? req.query.locality.trim().slice(0, 120) : "";
+  const cacheKey = `${query}|${category}|${postalCode}|${locality.toLocaleLowerCase()}`;
   const cached = catalogCache.get(cacheKey);
   if (cached && cached.expiresAt > Date.now()) { res.setHeader("Cache-Control", "public, max-age=30, s-maxage=30, stale-while-revalidate=60, stale-if-error=120"); return res.json(cached.body); }
   const shared = await sharedCacheGet<{ restaurants: unknown[] }>(`piki:catalog:${cacheKey}`);
@@ -1065,18 +1067,23 @@ app.get("/api/v1/catalog/restaurants", async (req, res) => {
   const clauses: Record<string, unknown>[] = [CUSTOMER_CATALOG_RESTAURANT_FILTER];
   if (category && category !== "Todos") clauses.push({ category });
   if (query) clauses.push({ $or: [{ name: { $regex: query, $options: "i" } }, { cuisine: { $regex: query, $options: "i" } }, { category: { $regex: query, $options: "i" } }] });
+  if (postalCode) clauses.push({ $or: [{ "partnerProfile.postalCode": postalCode }, { address: { $regex: `(?:^|\\D)${postalCode}(?:$|\\D)`, $options: "i" } }] });
+  if (locality && !postalCode) { const escapedLocality = locality.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); clauses.push({ $or: [{ locality: { $regex: `^${escapedLocality}$`, $options: "i" } }, { "partnerProfile.city": { $regex: `^${escapedLocality}$`, $options: "i" } }] }); }
   const filter: Record<string, unknown> = clauses.length === 1 ? clauses[0] : { $and: clauses };
   const restaurants = await Restaurant.find(filter)
     // Explicit inclusion avoids MongoDB path-collision errors caused by
     // partnerProfile.documents having select:false nested fields.
-    .select("slug name cuisine category locality partnerGroupKey tagline etaMinutes deliveryFeeCents cashPaymentsEnabled rating reviews promoted image accent phone address location menu isActive onboardingStatus availabilityStatus upcomingAt upcomingMessage partnerProfile.openingHours")
+    .select("slug name cuisine category locality partnerGroupKey tagline etaMinutes deliveryFeeCents cashPaymentsEnabled rating reviews promoted image accent phone address location menu isActive onboardingStatus availabilityStatus upcomingAt upcomingMessage partnerProfile.openingHours partnerProfile.postalCode partnerProfile.city partnerProfile.province")
     .sort({ promoted: -1, rating: -1, reviews: -1 }).lean().exec();
   const catalogPriority: Record<string, number> = {
     "alibaba-kebab-xativa": 0,
     "kings-tacos-xativa": 1,
   };
   restaurants.sort((left: any, right: any) => (catalogPriority[left.slug] ?? 10) - (catalogPriority[right.slug] ?? 10));
-  const body = { restaurants: restaurants.map((restaurant: any) => presentCustomerCatalogRestaurant({ ...restaurant, menu: canonicalRestaurantMenu(restaurant) })) };
+  const body = { restaurants: restaurants.map((restaurant: any) => {
+    const postalCodeFromAddress = String(restaurant.address || "").match(/\b\d{5}\b/)?.[0] || null;
+    return presentCustomerCatalogRestaurant({ ...restaurant, postalCode: restaurant.partnerProfile?.postalCode || postalCodeFromAddress, locality: restaurant.locality || restaurant.partnerProfile?.city || null, menu: canonicalRestaurantMenu(restaurant) });
+  }) };
   catalogCache.set(cacheKey, { expiresAt: Date.now() + CATALOG_CACHE_MS, body });
   void sharedCacheSet(`piki:catalog:${cacheKey}`, body, 30);
   res.setHeader("Cache-Control", "public, max-age=30, s-maxage=30, stale-while-revalidate=60, stale-if-error=120");
