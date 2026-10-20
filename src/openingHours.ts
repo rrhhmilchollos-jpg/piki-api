@@ -37,3 +37,4 @@ export const openingDaySchema = z.union([
 ]);
 
 export const openingHoursSchema = z.record(z.string().min(2).max(15), openingDaySchema);
+export type OpeningHours = z.infer<typeof openingHoursSchema>;

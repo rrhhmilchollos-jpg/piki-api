@@ -52,6 +52,8 @@ import { buildFleetEntityScope, buildTenantScope } from "./tenantScope.js";
 import { authenticationOptions, registrationOptions, verifyAuthentication, verifyRegistration } from "./passkeys.js";
 import { markPartnerBatchPaid, markRiderBatchPaid, publicPartnerCode, publicRiderCode, recordGovernanceEvent, syncPublicIds } from "./pikiGovernance.js";
 import { openingHoursSchema } from "./openingHours.js";
+import { GoogleBusinessConnection, GoogleOauthState, MunicipalExpansion } from "./expansionModels.js";
+import { decryptGoogleSecret, exchangeGoogleCode, fromGoogleRegularHours, googleAuthorizationUrl, googleBusinessConfigured, googleBusinessScopes, listGoogleAccounts, listGoogleLocations, readGoogleLocation, toGoogleRegularHours, updateGoogleLocationHours, encryptGoogleSecret } from "./googleBusinessProfile.js";
 
 export const app = express();
 app.set("trust proxy", 1);
@@ -1599,6 +1601,59 @@ app.patch("/api/v1/partners/store/hours", requireRole("partner"), async (req, re
   const restaurant = await Restaurant.findOneAndUpdate({ _id: restaurantId, onboardingStatus: "approved", ...tenantScope(req) }, { $set: { "partnerProfile.openingHours": parsed.data } }, { new: true }).select("_id name isActive partnerProfile.openingHours").lean().exec() as any;
   if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
   return res.json({ restaurantId: String(restaurant._id), name: restaurant.name, isOpen: Boolean(restaurant.isActive), openingHours: restaurant.partnerProfile?.openingHours || parsed.data });
+});
+app.get("/api/v1/partners/google-business/status", requireRole("partner"), async (req, res) => {
+  const { access, allowed } = await partnerRequestAccess(req, "store:write");
+  if (!allowed) return res.status(403).json({ error: "PARTNER_PERMISSION_DENIED", permission: "store:write" });
+  const restaurantId = await employeeRestaurant(req, access); if (!restaurantId) return res.status(403).json({ error: "PARTNER_RESTAURANT_NOT_ASSIGNED" });
+  const connection = await GoogleBusinessConnection.findOne({ restaurantId: objectId(restaurantId), ...tenantScope(req) }).select("restaurantId googleAccountName googleLocationName googleLocationTitle status scopes lastSyncAt lastSyncStatus lastSyncError lastGoogleUpdatedAt").lean().exec() as any;
+  return res.json({ configured: googleBusinessConfigured(), scopes: googleBusinessScopes(), connected: Boolean(connection), connection: connection ? { ...connection, restaurantId: String(connection.restaurantId) } : null });
+});
+app.get("/api/v1/partners/google-business/connect", requireRole("partner"), async (req, res) => {
+  const { access, allowed } = await partnerRequestAccess(req, "store:write");
+  if (!allowed) return res.status(403).json({ error: "PARTNER_PERMISSION_DENIED", permission: "store:write" });
+  if (!googleBusinessConfigured()) return res.status(503).json({ error: "GOOGLE_BUSINESS_NOT_CONFIGURED", message: "Faltan las credenciales OAuth de Google Business Profile." });
+  const restaurantId = await employeeRestaurant(req, access); if (!restaurantId || !access?.employee?._id) return res.status(403).json({ error: "PARTNER_RESTAURANT_NOT_ASSIGNED" });
+  const rawState = randomBytes(32).toString("base64url");
+  await GoogleOauthState.create({ stateHash: createHash("sha256").update(rawState).digest("hex"), restaurantId: objectId(restaurantId), employeeId: access.employee._id, tenantId: (req.auth as any)?.tenantId || null, expiresAt: new Date(Date.now() + 10 * 60_000) });
+  return res.json({ authorizationUrl: googleAuthorizationUrl(rawState) });
+});
+app.get("/api/v1/partners/google-business/locations", requireRole("partner"), async (req, res) => {
+  const { access, allowed } = await partnerRequestAccess(req, "store:write"); if (!allowed) return res.status(403).json({ error: "PARTNER_PERMISSION_DENIED", permission: "store:write" });
+  const restaurantId = await employeeRestaurant(req, access); if (!restaurantId) return res.status(403).json({ error: "PARTNER_RESTAURANT_NOT_ASSIGNED" });
+  const connection = await GoogleBusinessConnection.findOne({ restaurantId: objectId(restaurantId), ...tenantScope(req) }).select("+accessTokenEncrypted +refreshTokenEncrypted googleAccountName googleLocationName").exec() as any; if (!connection) return res.status(409).json({ error: "GOOGLE_NOT_CONNECTED" });
+  try { const accounts = await listGoogleAccounts(connection); const locations = (await Promise.all(accounts.map(async (account: any) => (await listGoogleLocations(connection, String(account.name))).map((location: any) => ({ ...location, accountName: account.name }))))).flat(); return res.json({ accounts, locations }); } catch (error) { return res.status(502).json({ error: "GOOGLE_LOCATIONS_FAILED", message: error instanceof Error ? error.message : "GOOGLE_LOCATIONS_FAILED" }); }
+});
+app.patch("/api/v1/partners/google-business/location", requireRole("partner"), async (req, res) => {
+  const { access, allowed } = await partnerRequestAccess(req, "store:write"); if (!allowed) return res.status(403).json({ error: "PARTNER_PERMISSION_DENIED", permission: "store:write" });
+  const restaurantId = await employeeRestaurant(req, access); const parsed = z.object({ accountName: z.string().regex(/^accounts\/[^/]+$/), locationName: z.string().regex(/^locations\/[^/]+$/), title: z.string().trim().max(200).optional() }).safeParse(req.body); if (!restaurantId || !parsed.success) return res.status(400).json({ error: "INVALID_GOOGLE_LOCATION" });
+  const connection = await GoogleBusinessConnection.findOne({ restaurantId: objectId(restaurantId), ...tenantScope(req) }).exec() as any; if (!connection) return res.status(409).json({ error: "GOOGLE_NOT_CONNECTED" });
+  connection.googleAccountName = parsed.data.accountName; connection.googleLocationName = parsed.data.locationName; connection.googleLocationTitle = parsed.data.title || null; await connection.save(); return res.json({ selected: true, googleAccountName: connection.googleAccountName, googleLocationName: connection.googleLocationName, googleLocationTitle: connection.googleLocationTitle });
+});
+app.get("/api/v1/partners/google-business/callback", async (req, res) => {
+  const code = typeof req.query.code === "string" ? req.query.code : ""; const rawState = typeof req.query.state === "string" ? req.query.state : "";
+  if (!code || !rawState) return res.status(400).send("Faltan los parámetros OAuth de Google.");
+  const state = await GoogleOauthState.findOneAndUpdate({ stateHash: createHash("sha256").update(rawState).digest("hex"), expiresAt: { $gt: new Date() }, usedAt: null }, { $set: { usedAt: new Date() } }, { new: true }).lean().exec() as any;
+  if (!state) return res.status(400).send("La autorización de Google ha caducado o ya fue utilizada.");
+  try {
+    const token = await exchangeGoogleCode(code);
+    await GoogleBusinessConnection.findOneAndUpdate({ restaurantId: state.restaurantId }, { $set: { tenantId: state.tenantId, accessTokenEncrypted: encryptGoogleSecret(token.accessToken), ...(token.refreshToken ? { refreshTokenEncrypted: encryptGoogleSecret(token.refreshToken) } : {}), tokenExpiryAt: token.expiresAt, scopes: token.scope.split(" "), status: "connected", lastSyncStatus: "never", lastSyncError: "" } }, { upsert: true, new: true });
+    const target = String(process.env.PARTNER_GOOGLE_SUCCESS_URL || "https://partners.pikidelivery.com/?google=connected"); return res.redirect(target);
+  } catch (error) { console.error("Google Business OAuth callback failed", error instanceof Error ? error.message : error); return res.redirect(`${process.env.PARTNER_GOOGLE_ERROR_URL || "https://partners.pikidelivery.com/?google=error"}&reason=oauth_failed`); }
+});
+app.post("/api/v1/partners/google-business/sync", requireRole("partner"), async (req, res) => {
+  const { access, allowed } = await partnerRequestAccess(req, "store:write"); if (!allowed) return res.status(403).json({ error: "PARTNER_PERMISSION_DENIED", permission: "store:write" });
+  const restaurantId = await employeeRestaurant(req, access); if (!restaurantId) return res.status(403).json({ error: "PARTNER_RESTAURANT_NOT_ASSIGNED" });
+  const connection = await GoogleBusinessConnection.findOne({ restaurantId: objectId(restaurantId), ...tenantScope(req) }).select("+accessTokenEncrypted +refreshTokenEncrypted").exec() as any; if (!connection?.googleLocationName) return res.status(409).json({ error: "GOOGLE_LOCATION_NOT_SELECTED", message: "Selecciona primero la ubicación de Google Business Profile." });
+  try { const googleLocation = await readGoogleLocation(connection, connection.googleLocationName); const hours = fromGoogleRegularHours(googleLocation.regularHours); await Restaurant.updateOne({ _id: objectId(restaurantId), ...tenantScope(req) }, { $set: { "partnerProfile.openingHours": hours } }); connection.lastSyncAt = new Date(); connection.lastSyncStatus = "success"; connection.lastSyncError = ""; connection.lastGoogleUpdatedAt = new Date(); await connection.save(); return res.json({ synced: true, direction: "google_to_piki", openingHours: hours }); }
+  catch (error) { connection.lastSyncAt = new Date(); connection.lastSyncStatus = "error"; connection.lastSyncError = error instanceof Error ? error.message : "GOOGLE_SYNC_FAILED"; connection.status = connection.lastSyncError === "GOOGLE_REAUTH_REQUIRED" ? "needs_reauth" : "error"; await connection.save(); return res.status(502).json({ error: "GOOGLE_SYNC_FAILED", message: connection.lastSyncError }); }
+});
+app.patch("/api/v1/partners/google-business/publish-hours", requireRole("partner"), async (req, res) => {
+  const { access, allowed } = await partnerRequestAccess(req, "store:write"); if (!allowed) return res.status(403).json({ error: "PARTNER_PERMISSION_DENIED", permission: "store:write" });
+  const restaurantId = await employeeRestaurant(req, access); if (!restaurantId) return res.status(403).json({ error: "PARTNER_RESTAURANT_NOT_ASSIGNED" });
+  const parsed = openingHoursSchema.safeParse(req.body?.openingHours ?? req.body); if (!parsed.success) return res.status(400).json({ error: "INVALID_OPENING_HOURS", details: parsed.error.flatten() });
+  const connection = await GoogleBusinessConnection.findOne({ restaurantId: objectId(restaurantId), ...tenantScope(req) }).select("+accessTokenEncrypted +refreshTokenEncrypted").exec() as any; if (!connection?.googleLocationName) return res.status(409).json({ error: "GOOGLE_LOCATION_NOT_SELECTED" });
+  try { const result = await updateGoogleLocationHours(connection, connection.googleLocationName, toGoogleRegularHours(parsed.data)); await Restaurant.updateOne({ _id: objectId(restaurantId), ...tenantScope(req) }, { $set: { "partnerProfile.openingHours": parsed.data } }); connection.lastSyncAt = new Date(); connection.lastSyncStatus = "success"; connection.lastSyncError = ""; await connection.save(); return res.json({ synced: true, direction: "piki_to_google", result }); } catch (error) { return res.status(502).json({ error: "GOOGLE_PUBLISH_FAILED", message: error instanceof Error ? error.message : "GOOGLE_PUBLISH_FAILED" }); }
 });
 app.get("/api/v1/partners/menu", requireRole("partner"), async (req, res) => {
   const { access, allowed } = await partnerRequestAccess(req, "menu:read");
@@ -4479,6 +4534,24 @@ app.get("/api/v1/riders/:id/mobility-advice", requireRole("rider"), async (req, 
   const currentZone = currentZoneRaw ? zoneDemand.find((zone) => zone.slug === currentZoneRaw.slug) || null : null;
   const advice = computeMobilityAdvice({ currentZone, zones: zoneDemand, lowActivityMinutes: Number(req.query.lowActivityMinutes || 15) });
   return res.json({ advice, checkedAt: new Date().toISOString(), windowMinutes: 45 });
+});
+const MUNICIPAL_EXPANSION_CATALOG = [
+  { municipalityKey: "xativa", municipalityName: "Xàtiva", phase: 1, phaseLabel: "Fase actual · casco urbano", status: "active", notes: "Zona de lanzamiento inicial." },
+  ...["Novetlè", "La Llosa de Ranes", "Cerdà", "La Granja de la Costera", "Llanera de Ranes", "El Genovés", "Anahuir", "Ayacor"].map((municipalityName) => ({ municipalityKey: municipalityName.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().replace(/[^a-z0-9]+/g, "-"), municipalityName, phase: 1, phaseLabel: "Fase 1 · corona Costera y Vall d'Albaida", status: "planned", notes: "Preparada; requiere geocerca y flota local antes de activar." })),
+  ...["Canals", "L'Alcúdia de Crespins"].map((municipalityName) => ({ municipalityKey: municipalityName.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().replace(/[^a-z0-9]+/g, "-"), municipalityName, phase: 1, phaseLabel: "Fase 1 · ampliación en bloque", status: "planned", notes: "Activación posterior a la corona inicial." })),
+  ...["Alzira", "Gandía"].map((municipalityName) => ({ municipalityKey: municipalityName.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().replace(/[^a-z0-9]+/g, "-"), municipalityName, phase: 2, phaseLabel: "Fase 2 · Ribera Alta y Safor", status: "planned", notes: "Nueva célula logística con City Manager." })),
+  ...["Torrent", "Sagunt", "Castellón", "Alicante"].map((municipalityName) => ({ municipalityKey: municipalityName.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().replace(/[^a-z0-9]+/g, "-"), municipalityName, phase: 3, phaseLabel: "Fase 3 · grandes núcleos", status: "planned", notes: "Expansión regional posterior." })),
+];
+app.get("/api/v1/admin/expansion/municipalities", requireRole("admin", "commercial", "gerente_comercial_zona"), async (req, res) => {
+  const scope = tenantScope(req); const existing = await MunicipalExpansion.find(scope).sort({ phase: 1, municipalityName: 1 }).lean().exec() as any[]; const byKey = new Map(existing.map((item) => [item.municipalityKey, item]));
+  const municipalities = MUNICIPAL_EXPANSION_CATALOG.map((item) => byKey.get(item.municipalityKey) || { ...item, tenantId: (req.auth as any)?.tenantId || null }); return res.json({ municipalities, mileagePercentage: null, pricingRule: "Sin porcentaje por kilometraje" });
+});
+app.post("/api/v1/admin/expansion/municipalities/seed", requireRole("admin"), async (req, res) => {
+  const tenantId = (req.auth as any)?.tenantId || null; const operations = MUNICIPAL_EXPANSION_CATALOG.map((item) => ({ updateOne: { filter: { ...tenantScope(req), municipalityKey: item.municipalityKey }, update: { $setOnInsert: { ...item, tenantId } }, upsert: true } })); await MunicipalExpansion.bulkWrite(operations); return res.json({ seeded: operations.length });
+});
+app.patch("/api/v1/admin/expansion/municipalities/:key", requireRole("admin"), async (req, res) => {
+  const key = String(req.params.key); const parsed = z.object({ status: z.enum(["planned", "ready", "active", "paused"]), zoneSlug: z.string().regex(/^[a-z0-9-]+$/).nullable().optional(), notes: z.string().trim().max(1000).optional() }).safeParse(req.body); if (!parsed.success) return res.status(400).json({ error: "INVALID_EXPANSION_STATUS" });
+  const item = await MunicipalExpansion.findOneAndUpdate({ ...tenantScope(req), municipalityKey: key }, { $set: { ...parsed.data, ...(parsed.data.status === "active" ? { activatedAt: new Date(), activatedBy: req.auth?.employeeId || null } : {}) } }, { new: true }).lean().exec(); if (!item) return res.status(404).json({ error: "MUNICIPALITY_NOT_FOUND" }); return res.json({ municipality: item });
 });
 app.post("/api/v1/zones", requireRole("admin"), async (req, res) => {
   const parsed = zoneSchema.safeParse(req.body); if (!parsed.success) return res.status(400).json({ error: "INVALID_ZONE", details: parsed.error.flatten() });
