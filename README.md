@@ -70,7 +70,7 @@ STRIPE_SECRET_KEY=sk_test_...
 STRIPE_WEBHOOK_SECRET=whsec_...
 ```
 
-En la cuenta **Stripe test**, configura el endpoint de staging exacto **`https://piki-api-staging.onrender.com/api/webhooks/stripe`**. Suscríbelo, como mínimo, a `payment_intent.amount_capturable_updated`, `payment_intent.succeeded`, `payment_intent.payment_failed`, `checkout.session.async_payment_failed`, `checkout.session.expired` y `charge.refunded`. La ruta histórica `/api/v1/payments/webhook` sigue disponible como alias compatible, pero el endpoint canónico es `/api/webhooks/stripe`.
+En la cuenta **Stripe test**, configura el endpoint de staging exacto **`https://piki-api-staging.onrender.com/api/webhooks/stripe`**. Suscríbelo, como mínimo, a `checkout.session.completed`, `checkout.session.async_payment_failed`, `checkout.session.expired`, `payment_intent.succeeded`, `payment_intent.payment_failed` y `charge.refunded`. La ruta histórica `/api/v1/payments/webhook` sigue disponible como alias compatible, pero el endpoint canónico es `/api/webhooks/stripe`.
 
 Stripe requiere el cuerpo crudo para verificar la firma; por eso la ruta se registra antes de `express.json()`. Los eventos se deduplican en la colección `stripe_events` usando `event.id`, con estados `processing`/`processed`/`failed`: sólo quedan `processed` después de actualizar el pedido y persistir el outbox de tiempo real. El cliente no debe marcar un pedido como pagado a partir de `success_url`: la confirmación válida es el webhook firmado. En Bizum y tarjeta se usa captura automática; el pedido sólo se considera pagado después del webhook firmado.
 
