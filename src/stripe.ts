@@ -96,7 +96,10 @@ export async function createCheckoutSession(input: {
     // The installed Stripe SDK predates Bizum's type declaration; the API
     // accepts it and Stripe's current Checkout docs list it explicitly.
     payment_method_types: ["card", "bizum" as unknown as Stripe.Checkout.SessionCreateParams.PaymentMethodType],
-    payment_intent_data: { metadata, capture_method: "manual" },
+    // Bizum does not support manual capture. Payment confirmation and the
+    // order webhook now use the normal automatic-capture flow for both card
+    // and Bizum payments.
+    payment_intent_data: { metadata },
     success_url: `${input.origin}/?checkout=success&order_id=${encodeURIComponent(input.publicCode)}`,
     cancel_url: `${input.origin}/?checkout=cancelled&order_id=${encodeURIComponent(input.publicCode)}`,
   }, { idempotencyKey: `piki-checkout-${input.publicCode}` });
