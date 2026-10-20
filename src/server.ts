@@ -9,6 +9,7 @@ import express from "express";
 import mongoose from "mongoose";
 import { z } from "zod";
 import { CashLedgerEntry, CustomerAccount, DispatchDecision, DocumentRequest, EmployeeAccount, AccessAuthorization, Fleet, Order, Restaurant, PartnerAsset, PartnerLocalityGroup, MenuImportDraft, Rider, RiderApplication, PartnerLead, RiderLead, RiderIncident, RiderOrderMessage, RiderSlot, SignatureRequest, Zone, PushSubscription, RealtimeEvent, Notification, Tenant, TenantMembership, RiderAssignmentReservation, SupportTicket, OnboardingRequest, TrackingSession, RiderPayoutBatch, PartnerPayoutBatch, GovernanceAuditEvent, LocationSample, ensureIndexes } from "./models.js";
+import { RiderShiftIncentiveMetric } from "./riderIncentivesModels.js";
 import { normalizeLeadEmail, partnerLeadSubmissionSchema, riderLeadSubmissionSchema, webLeadReviewSchema, webLeadStatusSchema } from "./webLeads.js";
 import { assertTransition, calculateEtaRange, transitionSchema, validateCoordinates } from "./algorithms/index.js";
 import { configuredAuthRoles, requireOwner, requireRole, resolveRole } from "./auth.js";
@@ -4689,7 +4690,39 @@ app.get("/api/v1/admin/operations/health", requireRole("admin", "fleet"), async 
   }, { total: 0, online: 0, offline: 0, freshGps: 0, staleGps: 0, missingGps: 0 });
   return res.json({ service: "piki-api", generatedAt: new Date().toISOString(), riders: summary, dispatch: { queue: dispatchQueue, activeOffers, activeOrders }, automaticDispatchSweep: { ...automaticDispatchSweepStats, intervalSeconds: 5, healthy: automaticDispatchSweepStats.runs > 0 && automaticDispatchSweepStats.errors === 0 && Boolean(automaticDispatchSweepStats.lastCompletedAt) }, thresholds: { freshGpsSeconds: 90, staleGpsMinutes: 10, pickupReassignMinutes: Math.round(PICKUP_REASSIGN_AFTER_MS / 60_000), pickupArrivalRadiusMeters: PICKUP_ARRIVAL_RADIUS_METERS, deliveryConfirmationRadiusMeters: DELIVERY_CONFIRMATION_RADIUS_METERS, partnerPreparationMinutes: PARTNER_PREPARATION_LIMIT_MINUTES, customerDeliveryTargetMinutes: CUSTOMER_DELIVERY_TARGET_MINUTES } });
 });
-
+app.get("/api/v1/admin/riders/hours", requireRole("admin", "finance"), async (req, res) => {
+  const requestedStart = typeof req.query.start === "string" ? req.query.start : "";
+  const requestedEnd = typeof req.query.end === "string" ? req.query.end : "";
+  const start = requestedStart && /^\d{4}-\d{2}-\d{2}$/.test(requestedStart)
+    ? new Date(`${requestedStart}T00:00:00.000Z`)
+    : new Date(Date.now() - 7 * 24 * 60 * 60_000);
+  const end = requestedEnd && /^\d{4}-\d{2}-\d{2}$/.test(requestedEnd)
+    ? new Date(`${requestedEnd}T23:59:59.999Z`)
+    : new Date();
+  if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime()) || start >= end) {
+    return res.status(400).json({ error: "INVALID_HOURS_RANGE", message: "El rango de horas no es válido." });
+  }
+  const scope = tenantScope(req);
+  const metrics = await RiderShiftIncentiveMetric.find({ ...scope, startedAt: { $gte: start, $lte: end } })
+    .sort({ startedAt: -1 }).lean().exec() as any[];
+  const riderIds = metrics.map((metric) => metric.riderId).filter(Boolean);
+  const riders = await Rider.find({ _id: { $in: riderIds }, ...scope })
+    .select("name riderCode email vehicle city").lean().exec() as any[];
+  const riderById = new Map(riders.map((rider) => [String(rider._id), rider]));
+  const sessions = metrics.map((metric) => {
+    const loginAt = metric.startedAt ? new Date(metric.startedAt) : null;
+    const logoutAt = metric.completedAt ? new Date(metric.completedAt) : null;
+    const trackedSeconds = Number(metric.trackedSeconds || (loginAt && logoutAt ? Math.max(0, (logoutAt.getTime() - loginAt.getTime()) / 1000) : 0));
+    const rider = riderById.get(String(metric.riderId));
+    return { id: String(metric._id), riderId: String(metric.riderId), rider: rider ? { id: String(rider._id), name: rider.name, riderCode: rider.riderCode, email: rider.email, vehicle: rider.vehicle, city: rider.city } : null, loginAt, logoutAt, status: logoutAt ? "closed" : "open", trackedSeconds: Math.round(trackedSeconds), hours: Math.round((trackedSeconds / 3600) * 100) / 100, hourlyRateCents: 800, amountCents: Math.round((trackedSeconds / 3600) * 800), slotId: metric.slotId ? String(metric.slotId) : null };
+  });
+  const byRider = new Map<string, { rider: unknown; sessions: number; trackedSeconds: number; amountCents: number }>();
+  for (const session of sessions) {
+    const current = byRider.get(session.riderId) || { rider: session.rider, sessions: 0, trackedSeconds: 0, amountCents: 0 };
+    current.sessions += 1; current.trackedSeconds += session.trackedSeconds; current.amountCents += session.amountCents; byRider.set(session.riderId, current);
+  }
+  return res.json({ start: start.toISOString(), end: end.toISOString(), hourlyRateCents: 800, sessions, totals: [...byRider.entries()].map(([riderId, value]) => ({ riderId, ...value, hours: Math.round((value.trackedSeconds / 3600) * 100) / 100 })) });
+});
 app.get("/api/v1/admin/operations/live", requireRole("admin"), async (req, res) => {
   const tenant = tenantScope(req);
   const riders = await Rider.find({ ...tenant, isTestRider: { $ne: true } }).select("riderCode name email status lifecycleStatus lifecycleReason vehicle location lastLocationAt activeOrderId fleetId zoneSlug").lean().exec() as any[];
