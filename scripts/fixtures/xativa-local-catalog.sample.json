@@ -1,0 +1,90 @@
+{
+  "source": "MUESTRA QA · no corresponde a comercios reales",
+  "sourceContact": "qa@example.invalid",
+  "stores": [
+    {
+      "slug": "demo-supermercado-xativa",
+      "name": "Demo Supermercado Xàtiva",
+      "cuisine": "Alimentación",
+      "category": "Supermercado",
+      "locality": "Xàtiva Casco Urbano",
+      "address": "Carrer de Prova 1, Xàtiva",
+      "phone": "+34960000001",
+      "email": "supermercado@example.invalid",
+      "fulfillmentMode": "assisted_purchase",
+      "deliveryFeeCents": 299,
+      "commissionRateBps": 2000,
+      "tagline": "Muestra QA: no publicar",
+      "menu": [
+        {
+          "id": "demo-leche-1l",
+          "name": "Leche entera 1 l",
+          "description": "Producto de prueba",
+          "price": 1.35,
+          "category": "Lácteos",
+          "available": true,
+          "modifiers": []
+        },
+        {
+          "id": "demo-cesta-desayuno",
+          "name": "Cesta desayuno demo",
+          "description": "Producto de prueba con opciones",
+          "price": 5.00,
+          "category": "Cestas",
+          "available": true,
+          "modifiers": [
+            {
+              "id": "demo-tamano",
+              "name": "Tamaño",
+              "required": true,
+              "minSelections": 1,
+              "maxSelections": 1,
+              "options": ["Pequeña", "Grande"],
+              "optionItems": [
+                { "id": "demo-pequena", "name": "Pequeña", "price": 0, "available": true },
+                { "id": "demo-grande", "name": "Grande", "price": 2.50, "available": true }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "slug": "demo-tienda-local-xativa",
+      "name": "Demo Tienda Local Xàtiva",
+      "cuisine": "Comercio local",
+      "category": "Hogar y regalos",
+      "locality": "Xàtiva",
+      "address": "Plaça de Prova 2, Xàtiva",
+      "phone": "+34960000002",
+      "email": "tienda@example.invalid",
+      "fulfillmentMode": "partner_delivery",
+      "deliveryFeeCents": 299,
+      "commissionRateBps": 1500,
+      "tagline": "Muestra QA: no publicar",
+      "menu": [
+        {
+          "id": "demo-kit-hogar",
+          "name": "Kit hogar demo",
+          "description": "Producto de prueba",
+          "price": 8.90,
+          "category": "Hogar",
+          "available": true,
+          "modifiers": [
+            {
+              "id": "demo-color",
+              "name": "Color",
+              "minSelections": 0,
+              "maxSelections": 1,
+              "options": ["Natural", "Azul"],
+              "optionItems": [
+                { "id": "demo-natural", "name": "Natural", "price": 0, "available": true },
+                { "id": "demo-azul", "name": "Azul", "price": 1.25, "available": false }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
