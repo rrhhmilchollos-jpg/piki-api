@@ -1,0 +1,54 @@
+{
+  "source": "Fuentes públicas consultadas el 2026-10-21; candidatos, no partners confirmados",
+  "stores": [
+    {
+      "slug": "consum-xativa-reina",
+      "name": "Consum Xàtiva Reina",
+      "locality": "Xàtiva",
+      "address": "C/ de la Reina, 48, 46800 Xàtiva, Valencia",
+      "sourceUrls": ["https://www.consum.es/supermercados/xativa-reina/"]
+    },
+    {
+      "slug": "consum-xativa-baixada-del-carmen",
+      "name": "Consum Xàtiva Baixada del Carmen",
+      "locality": "Xàtiva",
+      "address": "Baixada del Carmen 8, 46800 Xàtiva, Valencia",
+      "sourceUrls": ["https://www.consum.es/supermercados/xativa-reina/"]
+    },
+    {
+      "slug": "consum-xativa-la-vila",
+      "name": "Consum Xàtiva La Vila",
+      "locality": "Xàtiva",
+      "address": "Calle la Vila 2, 46800 Xàtiva, Valencia",
+      "sourceUrls": ["https://www.consum.es/supermercados/xativa-reina/"]
+    },
+    {
+      "slug": "masymas-supermercados-xativa",
+      "name": "MASYMAS Supermercados Xàtiva",
+      "locality": "Xàtiva",
+      "address": "Pintor Guitera 5, Xàtiva, Valencia",
+      "sourceUrls": ["https://xativa.comercioscomunitatvalenciana.com/es/comercios/categoria/alimentacion-general/3"]
+    },
+    {
+      "slug": "mercadona-xativa-corts-valencianes",
+      "name": "Mercadona Xàtiva",
+      "locality": "Xàtiva",
+      "address": "Av. Corts Valencianes, Xàtiva, Valencia",
+      "sourceUrls": ["https://xativa.comercioscomunitatvalenciana.com/es/comercios/categoria/alimentacion-general/3"]
+    },
+    {
+      "slug": "aldi-san-isidro-xativa",
+      "name": "ALDI San Isidro Supermercados",
+      "locality": "Xàtiva",
+      "address": "Carretera Alzira s/n, 46800 Xàtiva, Valencia",
+      "sourceUrls": ["https://www.qdq.com/a/supermercados/valencia/xativa"]
+    },
+    {
+      "slug": "family-cash-xativa",
+      "name": "Family Cash Xàtiva",
+      "locality": "Xàtiva",
+      "address": "Polígono Ronda la Sequía la Vila 4, 46800 Xàtiva, Valencia",
+      "sourceUrls": ["https://www.qdq.com/a/supermercados/valencia/xativa"]
+    }
+  ]
+}
