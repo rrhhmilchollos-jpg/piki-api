@@ -1030,6 +1030,21 @@ app.post("/api/v1/admin/owner/bootstrap", requireOwner(), async (req, res) => {
   const owner = await EmployeeAccount.findOneAndUpdate({ email: parsed.data.email }, { $set: { name: parsed.data.name, jobRole: "admin", apiRole: "admin", accessLevel: "superadmin", authorizationStatus: "approved", authorizedAt: new Date(), passwordHash: hashPassword(parsed.data.password), active: true, ownerProtected: true, hiddenFromAdmin: true, mustChangePassword: false, passwordChangedAt: new Date() }, $setOnInsert: { portfolioId: "owner_piki_ceo" } }, { upsert: true, new: true, setDefaultsOnInsert: true }).select("_id email name jobRole apiRole ownerProtected hiddenFromAdmin").lean().exec() as any;
   return res.json({ owner: { id: owner?._id, email: owner?.email, name: owner?.name, role: owner?.jobRole }, protected: true, hiddenFromAdmin: true });
 });
+app.post("/api/v1/admin/orders/:id/confirm-bizum", requireRole("admin", "finance"), async (req, res) => {
+  const reference = String(req.body?.reference || "").trim().slice(0, 120);
+  if (!reference) return res.status(400).json({ error: "BIZUM_REFERENCE_REQUIRED" });
+  const idOrCode = String(req.params.id || "");
+  const order = await Order.findOne({ $or: [{ publicCode: idOrCode }, ...(objectId(idOrCode) ? [{ _id: objectId(idOrCode) }] : [])] }).lean().exec() as any;
+  if (!order || order.paymentMethod !== "bizum_manual") return res.status(404).json({ error: "BIZUM_ORDER_NOT_FOUND" });
+  if (["paid", "authorized"].includes(String(order.paymentState))) return res.json({ order: { id: order._id, publicCode: order.publicCode, paymentState: order.paymentState }, idempotent: true });
+  const amountCents = Number(req.body?.amountCents);
+  if (!Number.isInteger(amountCents) || amountCents <= 0) return res.status(400).json({ error: "FINAL_AMOUNT_REQUIRED" });
+  const updated = await Order.findOneAndUpdate({ _id: order._id, paymentMethod: "bizum_manual", paymentState: "pending" }, { $set: { paymentState: "paid", totalCents: amountCents, bizumPaymentReference: reference, status: "pending", assignmentState: "unassigned" }, $push: { statusHistory: { status: "pending", actorRole: "finance", reason: `Bizum conciliado por PIKI: ${reference}` } }, $inc: { version: 1 } }, { new: true }).lean().exec() as any;
+  if (!updated) return res.status(409).json({ error: "BIZUM_ORDER_CHANGED_RETRY" });
+  const dispatch = enqueueOrderForDispatch(updated._id).catch((error) => console.warn("Bizum dispatch enqueue failed", error instanceof Error ? error.message : error));
+  await Promise.all([dispatch, publishOrderIntakeEvents(updated, { settlement: "paid", message: "Bizum conciliado por PIKI; pedido liberado para dispatch." })]);
+  return res.json({ order: { id: updated._id, publicCode: updated.publicCode, paymentState: updated.paymentState, totalCents: updated.totalCents }, idempotent: false });
+});
 app.get("/api/v1/payments/status", (_req, res) => res.json({ provider: "stripe" }));
 app.get("/api/v1/signatures/status", (_req, res) => res.json({ provider: "signaturit" }));
 app.post("/api/v1/admin/signatures", requireRole("admin"), async (req, res) => {
@@ -1079,7 +1094,7 @@ app.get("/api/v1/catalog/restaurants", async (req, res) => {
   const restaurants = await Restaurant.find(filter)
     // Explicit inclusion avoids MongoDB path-collision errors caused by
     // partnerProfile.documents having select:false nested fields.
-    .select("slug name cuisine category locality partnerGroupKey listingType goldFounder tagline etaMinutes deliveryFeeCents cashPaymentsEnabled rating reviews promoted image accent phone address location menu isActive onboardingStatus availabilityStatus upcomingAt upcomingMessage partnerProfile.openingHours partnerProfile.postalCode partnerProfile.city partnerProfile.province")
+    .select("slug name cuisine category locality partnerGroupKey listingType fulfillmentMode goldFounder tagline etaMinutes deliveryFeeCents cashPaymentsEnabled rating reviews promoted image accent phone address location menu isActive onboardingStatus availabilityStatus upcomingAt upcomingMessage partnerProfile.openingHours partnerProfile.postalCode partnerProfile.city partnerProfile.province")
     .sort({ promoted: -1, rating: -1, reviews: -1 }).lean().exec();
   const catalogPriority: Record<string, number> = {
     "alibaba-kebab-xativa": 0,
@@ -1097,7 +1112,7 @@ app.get("/api/v1/catalog/restaurants", async (req, res) => {
     const presented = presentCustomerCatalogRestaurant({ ...restaurant, postalCode: restaurant.partnerProfile?.postalCode || postalCodeFromAddress, locality: restaurant.locality || restaurant.partnerProfile?.city || null, menu: canonicalRestaurantMenu(restaurant) });
     const founder = GOLDEN_FOUNDER_SLUGS.includes(restaurant.slug as typeof GOLDEN_FOUNDER_SLUGS[number]);
     const remaining = Math.max(0, FREE_DELIVERY_LAUNCH_LIMIT - (orderCountByRestaurant.get(String(restaurant._id)) || 0));
-    return { ...presented, freeDeliveryEligible: !founder && remaining > 0, freeDeliveryOrdersRemaining: founder ? 0 : remaining };
+    return { ...presented, fulfillmentMode: presented.fulfillmentMode || restaurant.fulfillmentMode || (restaurant.listingType === "local_directory" ? "assisted_purchase" : "partner_delivery"), freeDeliveryEligible: !founder && remaining > 0, freeDeliveryOrdersRemaining: founder ? 0 : remaining };
   }) };
   catalogCache.set(cacheKey, { expiresAt: Date.now() + CATALOG_CACHE_MS, body });
   void sharedCacheSet(`piki:catalog:${cacheKey}`, body, 30);
@@ -2916,7 +2931,7 @@ app.post("/api/v1/orders", rateLimit(20, 60_000, "orders-create"), async (req, r
     marketplace: { commissionRateBps: marketplace.commissionRateBps, commissionCents: marketplace.platformCommissionCents, partnerPayoutCents: marketplace.partnerPayoutCents, riderEarningsCents: marketplace.riderEarningsCents, platformNetBeforeProcessingCents: marketplace.platformNetBeforeProcessingCents }, freeDeliveryApplied: freeDelivery.eligible, freeDeliveryOrdersRemaining: freeDelivery.remaining, coverage, route, partnerPreparationLimitMinutes: PARTNER_PREPARATION_LIMIT_MINUTES, customerDeliveryTargetMinutes: CUSTOMER_DELIVERY_TARGET_MINUTES, etaMinutes: calculateEtaRange([PARTNER_PREPARATION_LIMIT_MINUTES, PARTNER_PREPARATION_LIMIT_MINUTES], [5, 15]) } });
 });
 
-const customerOrderSyncSchema = z.object({ publicCode: z.string().trim().min(6).max(64), restaurantSlug: z.string().trim().min(1).max(120), customerId: z.string().nullable().optional(), customerName: z.string().trim().max(160).nullable().optional(), deliveryAddress: z.string().trim().min(5).max(1000), deliveryNote: z.string().trim().max(500).default(""), deliveryLocation: z.object({ latitude: z.number().finite(), longitude: z.number().finite() }).nullable().optional(), items: z.array(z.object({ itemId: z.string().min(1), name: z.string().min(1), quantity: z.number().int().min(1).max(20), unitPriceCents: z.number().int().min(0), totalCents: z.number().int().min(0).optional() })).min(1), subtotalCents: z.number().int().min(0), deliveryFeeCents: z.number().int().min(0), serviceFeeCents: z.number().int().min(0), totalCents: z.number().int().min(0), paymentMethod: z.enum(["stripe", "cash"]).default("stripe"), paymentState: z.enum(["pending", "authorized", "paid", "failed", "refunded"]).default("pending"), stripeCheckoutSessionId: z.string().nullable().optional(), stripePaymentIntentId: z.string().nullable().optional() });
+const customerOrderSyncSchema = z.object({ publicCode: z.string().trim().min(6).max(64), restaurantSlug: z.string().trim().min(1).max(120), customerId: z.string().nullable().optional(), customerName: z.string().trim().max(160).nullable().optional(), deliveryAddress: z.string().trim().min(5).max(1000), deliveryNote: z.string().trim().max(500).default(""), deliveryLocation: z.object({ latitude: z.number().finite(), longitude: z.number().finite() }).nullable().optional(), items: z.array(z.object({ itemId: z.string().min(1), name: z.string().min(1), quantity: z.number().int().min(1).max(20), unitPriceCents: z.number().int().min(0), totalCents: z.number().int().min(0).optional() })).min(1), subtotalCents: z.number().int().min(0), deliveryFeeCents: z.number().int().min(0), serviceFeeCents: z.number().int().min(0), totalCents: z.number().int().min(0), paymentMethod: z.enum(["stripe", "cash", "bizum_manual"]).default("stripe"), paymentState: z.enum(["pending", "authorized", "paid", "failed", "refunded"]).default("pending"), stripeCheckoutSessionId: z.string().nullable().optional(), stripePaymentIntentId: z.string().nullable().optional() });
 app.post("/api/v1/internal/customer-orders/sync", async (req, res) => {
   const expected = process.env.PIKI_CUSTOMER_SYNC_SECRET;
   if (!expected || req.header("x-piki-customer-sync-secret") !== expected) return res.status(401).json({ error: "INVALID_SYNC_AUTH" });
