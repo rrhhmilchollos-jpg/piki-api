@@ -46,7 +46,7 @@ import { calculateMarketplaceBreakdown, DEFAULT_PARTNER_COMMISSION_BPS } from ".
 import { postMarketplaceOrderLedger, preparePartnerPayoutBatch } from "./marketplaceLedger.js";
 import { extractAndParseMenu, readAssetBytes } from "./menuImport.js";
 import { normalizePartnerMenuItems, partnerMenuItemsSchema } from "./menuContract.js";
-import { publishCatalogUpdate } from "./catalogRealtime.js";
+import { publishCatalogUpdate, serveCatalogEvents, startCatalogRelay } from "./catalogRealtime.js";
 import { purgeTestDataIfEnabled } from "./purgeTestData.js";
 import { validateDocumentRequestSubmission } from "./onboardingDocumentPolicy.js";
 import { dispatchInitialIdempotencyKey, dispatchRequeueIdempotencyKey, enqueueDispatchOutbox, processDispatchOutboxBatch, type DispatchOutboxEvent } from "./dispatchOutbox.js";
@@ -112,7 +112,7 @@ async function reversePhoton(latitude: number, longitude: number) {
   const label = [address.road, [address.postcode, address.locality].filter(Boolean).join(" ")].filter(Boolean).join(", ");
   return { label: label || `Ubicación GPS ${latitude.toFixed(5)}, ${longitude.toFixed(5)}`, latitude, longitude, locality: address.locality || null, address: properties };
 }
-mongoose.connection.on("connected", () => { databaseReady = true; startRealtimeRelay(); void syncPublicIds().catch((error) => console.error("Public ID sync failed", error)); });
+mongoose.connection.on("connected", () => { databaseReady = true; startRealtimeRelay(); startCatalogRelay(); void syncPublicIds().catch((error) => console.error("Public ID sync failed", error)); });
 mongoose.connection.on("disconnected", () => { databaseReady = false; console.warn("MongoDB disconnected; API entering not-ready state"); });
 mongoose.connection.on("error", (error) => { databaseReady = false; console.error("MongoDB connection error", error instanceof Error ? error.message : error); });
 
@@ -460,6 +460,7 @@ app.get("/ready", (_req, res) => {
   return res.json({ service: "piki-api", status: "ready" });
 });
 app.get("/api/v1", (_req, res) => res.json({ name: "PIKI API", status: databaseReady ? "ready" : "initializing" }));
+app.get("/api/v1/catalog/events", serveCatalogEvents);
 const releasePolicyToken = process.env.PIKI_RELEASE_POLICY_TOKEN || "";
 const pushSubscriptionSchema = z.object({
   subscription: z.object({
