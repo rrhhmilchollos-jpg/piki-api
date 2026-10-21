@@ -22,6 +22,12 @@ test('un restaurante aprobado, activo y disponible se presenta como operable', (
   assert.equal(view.upcomingMessage, '');
 });
 
+test('una ficha de directorio local se muestra pero nunca habilita checkout', () => {
+  const view = presentCustomerCatalogRestaurant({ name: 'Comercio local', slug: 'comercio-local', listingType: 'local_directory', availabilityStatus: 'available', isActive: true, onboardingStatus: 'approved', menu: [{ id: 'x', name: 'Producto informativo', price: 1 }] });
+  assert.equal(view.listingType, 'local_directory');
+  assert.equal(view.orderable, false);
+});
+
 test('un horario partido permite pedidos en mañana y tarde-noche y los bloquea entre franjas', () => {
   const hours = { lunes: { morning: { open: '11:00', close: '14:00', closed: false }, evening: { open: '18:00', close: '23:00', closed: false }, closed: false } };
   assert.equal(restaurantIsWithinOpeningHours(hours, new Date('2026-10-19T10:00:00Z')), true);

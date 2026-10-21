@@ -5,8 +5,11 @@ export const CUSTOMER_HIDDEN_TEST_SLUGS = ["kfc-xativa-test", "partner-test", "k
 export const CUSTOMER_ORDERABLE_RESTAURANT_FILTER = {
   slug: { $nin: [...CUSTOMER_HIDDEN_TEST_SLUGS] }, internalDemo: { $ne: true }, isActive: true, onboardingStatus: "approved", availabilityStatus: "available", "menu.0": { $exists: true },
 };
+export const CUSTOMER_DIRECTORY_RESTAURANT_FILTER = {
+  slug: { $nin: [...CUSTOMER_HIDDEN_TEST_SLUGS] }, internalDemo: { $ne: true }, listingType: "local_directory", isActive: true, onboardingStatus: "approved",
+};
 export const CUSTOMER_CATALOG_RESTAURANT_FILTER = {
-  $or: [CUSTOMER_ORDERABLE_RESTAURANT_FILTER, { slug: { $in: [...COMING_SOON_SLUGS] }, availabilityStatus: "coming_soon", onboardingStatus: { $ne: "rejected" } }],
+  $or: [CUSTOMER_ORDERABLE_RESTAURANT_FILTER, { slug: { $in: [...COMING_SOON_SLUGS] }, availabilityStatus: "coming_soon", onboardingStatus: { $ne: "rejected" } }, CUSTOMER_DIRECTORY_RESTAURANT_FILTER],
 };
 function withinOpeningSlot(current: number, slot: unknown): boolean {
   if (!slot || typeof slot !== "object") return false;
@@ -27,14 +30,19 @@ export function restaurantIsWithinOpeningHours(openingHours: unknown, now = new 
   return withinOpeningSlot(current, value);
 }
 export function customerCatalogRestaurantName(restaurant: { name: string; slug?: string }) { return restaurant.name; }
-export function presentCustomerCatalogRestaurant<T extends { name: string; slug?: string; menu?: any[]; availabilityStatus?: string; upcomingMessage?: string; isActive?: boolean; onboardingStatus?: string; cashPaymentsEnabled?: boolean; partnerProfile?: { openingHours?: unknown } }>(restaurant: T) {
+export function presentCustomerCatalogRestaurant<T extends { name: string; slug?: string; listingType?: string; goldFounder?: boolean; menu?: any[]; availabilityStatus?: string; upcomingMessage?: string; isActive?: boolean; onboardingStatus?: string; cashPaymentsEnabled?: boolean; partnerProfile?: { openingHours?: unknown } }>(restaurant: T) {
   const comingSoon = restaurant.availabilityStatus === "coming_soon";
   const withinHours = restaurantIsWithinOpeningHours(restaurant.partnerProfile?.openingHours);
-  const orderable = restaurant.isActive === true && restaurant.onboardingStatus === "approved" && !comingSoon && withinHours;
+  const listingType = restaurant.listingType === "local_directory" ? "local_directory" : "official_partner";
+  const goldFounder = Boolean(restaurant.goldFounder) || GOLDEN_FOUNDER_SLUGS.includes(restaurant.slug as typeof GOLDEN_FOUNDER_SLUGS[number]);
+  const hasMenu = !Object.prototype.hasOwnProperty.call(restaurant, "menu") || (Array.isArray(restaurant.menu) && restaurant.menu.length > 0);
+  const orderable = listingType === "official_partner" && restaurant.isActive === true && restaurant.onboardingStatus === "approved" && !comingSoon && withinHours && hasMenu;
   // Do not leak a stale persisted announcement after a restaurant becomes live.
   // The public catalog must derive this label from the operational status.
   return {
     ...restaurant,
+    listingType,
+    goldFounder,
     upcomingMessage: comingSoon ? (restaurant.upcomingMessage || "Disponible muy pronto") : "",
     cashPaymentsEnabled: isCashPaymentEnabledForRestaurant(restaurant),
     menu: customerMenuForRestaurant(restaurant),

@@ -1079,11 +1079,11 @@ app.get("/api/v1/catalog/restaurants", async (req, res) => {
   const restaurants = await Restaurant.find(filter)
     // Explicit inclusion avoids MongoDB path-collision errors caused by
     // partnerProfile.documents having select:false nested fields.
-    .select("slug name cuisine category locality partnerGroupKey tagline etaMinutes deliveryFeeCents cashPaymentsEnabled rating reviews promoted image accent phone address location menu isActive onboardingStatus availabilityStatus upcomingAt upcomingMessage partnerProfile.openingHours partnerProfile.postalCode partnerProfile.city partnerProfile.province")
+    .select("slug name cuisine category locality partnerGroupKey listingType goldFounder tagline etaMinutes deliveryFeeCents cashPaymentsEnabled rating reviews promoted image accent phone address location menu isActive onboardingStatus availabilityStatus upcomingAt upcomingMessage partnerProfile.openingHours partnerProfile.postalCode partnerProfile.city partnerProfile.province")
     .sort({ promoted: -1, rating: -1, reviews: -1 }).lean().exec();
   const catalogPriority: Record<string, number> = {
     "alibaba-kebab-xativa": 0,
-    "kings-tacos-xativa": 1,
+    "rooster-kebab-xativa": 1,
   };
   restaurants.sort((left: any, right: any) => (catalogPriority[left.slug] ?? 10) - (catalogPriority[right.slug] ?? 10));
   const restaurantIds = restaurants.map((restaurant: any) => restaurant._id).filter(Boolean);
