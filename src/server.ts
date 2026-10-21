@@ -1039,7 +1039,10 @@ app.post("/api/v1/admin/orders/:id/confirm-bizum", requireRole("admin", "finance
   if (["paid", "authorized"].includes(String(order.paymentState))) return res.json({ order: { id: order._id, publicCode: order.publicCode, paymentState: order.paymentState }, idempotent: true });
   const amountCents = Number(req.body?.amountCents);
   if (!Number.isInteger(amountCents) || amountCents <= 0) return res.status(400).json({ error: "FINAL_AMOUNT_REQUIRED" });
-  const updated = await Order.findOneAndUpdate({ _id: order._id, paymentMethod: "bizum_manual", paymentState: "pending" }, { $set: { paymentState: "paid", totalCents: amountCents, bizumPaymentReference: reference, status: "pending", assignmentState: "unassigned" }, $push: { statusHistory: { status: "pending", actorRole: "finance", reason: `Bizum conciliado por PIKI: ${reference}` } }, $inc: { version: 1 } }, { new: true }).lean().exec() as any;
+  if (amountCents !== Number(order.totalCents || 0)) return res.status(409).json({ error: "BIZUM_AMOUNT_MISMATCH", expectedAmountCents: Number(order.totalCents || 0), message: "El importe conciliado debe coincidir exactamente con el total del pedido." });
+  const duplicateReference = await Order.findOne({ bizumPaymentReference: reference, _id: { $ne: order._id } }).select("_id publicCode").lean().exec() as any;
+  if (duplicateReference) return res.status(409).json({ error: "BIZUM_REFERENCE_ALREADY_USED", publicCode: duplicateReference.publicCode });
+  const updated = await Order.findOneAndUpdate({ _id: order._id, paymentMethod: "bizum_manual", paymentState: "pending" }, { $set: { paymentState: "paid", bizumPaymentReference: reference, status: "pending", assignmentState: "unassigned" }, $push: { statusHistory: { status: "pending", actorRole: "finance", reason: `Bizum conciliado por PIKI: ${reference}` } }, $inc: { version: 1 } }, { new: true }).lean().exec() as any;
   if (!updated) return res.status(409).json({ error: "BIZUM_ORDER_CHANGED_RETRY" });
   const dispatch = enqueueOrderForDispatch(updated._id).catch((error) => console.warn("Bizum dispatch enqueue failed", error instanceof Error ? error.message : error));
   await Promise.all([dispatch, publishOrderIntakeEvents(updated, { settlement: "paid", message: "Bizum conciliado por PIKI; pedido liberado para dispatch." })]);
