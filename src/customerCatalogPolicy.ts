@@ -101,7 +101,10 @@ function applyPartnerMenuPricing<T extends Record<string, any>>(item: T, rate: n
     id: String(modifier.id || `${String(item.id || "item")}-group-${groupIndex + 1}`),
     name: String(modifier.name || modifier.title || modifier.label || `Opciones ${groupIndex + 1}`),
     price: apply(modifier.price),
-    options: (Array.isArray(modifier.options) ? modifier.options : Array.isArray(modifier.items) ? modifier.items : [])
+    options: (Array.isArray(modifier.optionItems) && modifier.optionItems.length
+      ? modifier.optionItems
+      : Array.isArray(modifier.options) ? modifier.options : Array.isArray(modifier.items) ? modifier.items : [])
+      .filter((option: any) => option?.available !== false)
       .map((option: any, optionIndex: number) => ({
         ...option,
         id: String(option.id || `${String(modifier.id || groupIndex)}-option-${optionIndex + 1}`),

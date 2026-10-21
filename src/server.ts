@@ -45,6 +45,8 @@ import { cashOrderLimitError, cashPaymentDisabledError, isCashOrderWithinLimit, 
 import { calculateMarketplaceBreakdown, DEFAULT_PARTNER_COMMISSION_BPS } from "./marketplaceAccounting.js";
 import { postMarketplaceOrderLedger, preparePartnerPayoutBatch } from "./marketplaceLedger.js";
 import { extractAndParseMenu, readAssetBytes } from "./menuImport.js";
+import { normalizePartnerMenuItems, partnerMenuItemsSchema } from "./menuContract.js";
+import { publishCatalogUpdate } from "./catalogRealtime.js";
 import { purgeTestDataIfEnabled } from "./purgeTestData.js";
 import { validateDocumentRequestSubmission } from "./onboardingDocumentPolicy.js";
 import { dispatchInitialIdempotencyKey, dispatchRequeueIdempotencyKey, enqueueDispatchOutbox, processDispatchOutboxBatch, type DispatchOutboxEvent } from "./dispatchOutbox.js";
@@ -1403,9 +1405,6 @@ async function partnerRequestAccess(req: express.Request, permission: PartnerPer
   const access = await partnerAccessForRequest(req);
   return { access, allowed: Boolean(access && partnerCan(access.roles, permission)) };
 }
-const menuModifierOptionSchema = z.union([z.string().max(120), z.object({ id: z.string().min(1).max(80), name: z.string().min(1).max(120), price: z.number().min(0).max(1000) })]);
-const menuModifierSchema = z.object({ id: z.string().min(1).max(80), name: z.string().min(1).max(120), description: z.string().max(240).default(""), price: z.number().min(0).max(1000).default(0), required: z.boolean().default(false), minSelections: z.number().int().min(0).max(30).default(0), maxSelections: z.number().int().min(1).max(30).default(1), options: z.array(menuModifierOptionSchema).max(30).default([]) });
-const partnerMenuItemSchema = z.object({ id: z.string().min(1).max(80), name: z.string().min(1).max(160), description: z.string().max(500).default(""), price: z.number().min(0).max(1000), category: z.string().max(100).default("General"), image: z.string().max(1200).refine((value) => value === "" || value.startsWith("https://api.pikidelivery.com/api/v1/catalog/assets/"), "La imagen debe proceder del almacenamiento de PIKI").default(""), allergens: z.array(z.string().max(80)).max(30).default([]), modifiers: z.array(menuModifierSchema).max(20).default([]), available: z.boolean().default(true), vegetarian: z.boolean().default(false), popular: z.boolean().default(false) });
 function detectedMenuMime(bytes: Buffer): string | null {
   if (bytes.length >= 12 && bytes.subarray(0, 3).equals(Buffer.from([0xff, 0xd8, 0xff]))) return "image/jpeg";
   if (bytes.length >= 8 && bytes.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) return "image/png";
@@ -1486,7 +1485,7 @@ function menuImportResponse(draft: any) {
     publishedAt: draft.publishedAt || null,
   };
 }
-const importedMenuItemsSchema = z.array(partnerMenuItemSchema).max(500);
+const importedMenuItemsSchema = partnerMenuItemsSchema;
 app.post("/api/v1/partners/menu/imports", requireRole("partner"), async (req, res) => {
   const { access, allowed } = await partnerRequestAccess(req, "menu:write");
   if (!allowed) return res.status(403).json({ error: "PARTNER_PERMISSION_DENIED", permission: "menu:write" });
@@ -1524,7 +1523,7 @@ app.put("/api/v1/partners/menu/imports/:id", requireRole("partner"), async (req,
   const id = objectId(String(req.params.id));
   const parsed = z.object({ items: importedMenuItemsSchema }).safeParse(req.body);
   if (!restaurantId || !id || !parsed.success) return res.status(400).json({ error: "INVALID_MENU_IMPORT_ITEMS", details: parsed.success ? undefined : parsed.error.flatten() });
-  const draft = await MenuImportDraft.findOneAndUpdate({ _id: id, restaurantId: objectId(restaurantId), status: "draft" }, { $set: { items: parsed.data.items, reviewedBy: objectId(String(req.auth?.employeeId || "")) } }, { new: true }).lean().exec();
+  const draft = await MenuImportDraft.findOneAndUpdate({ _id: id, restaurantId: objectId(restaurantId), status: "draft" }, { $set: { items: normalizePartnerMenuItems(parsed.data.items), reviewedBy: objectId(String(req.auth?.employeeId || "")) } }, { new: true }).lean().exec();
   if (!draft) return res.status(404).json({ error: "MENU_IMPORT_NOT_FOUND_OR_CLOSED" });
   return res.json({ draft: menuImportResponse(draft) });
 });
@@ -1542,11 +1541,13 @@ app.post("/api/v1/partners/menu/imports/:id/publish", requireRole("partner"), as
     let restaurant: any = null;
     let published: any = null;
     await session.withTransaction(async () => {
-      restaurant = await Restaurant.findOneAndUpdate({ _id: objectId(restaurantId), onboardingStatus: "approved" }, { $set: { menu: draft.items } }, { new: true, session }).select("name menu").lean().exec() as any;
+      restaurant = await Restaurant.findOneAndUpdate({ _id: objectId(restaurantId), onboardingStatus: "approved" }, { $set: { menu: normalizePartnerMenuItems(draft.items) } }, { new: true, session }).select("name menu").lean().exec() as any;
       if (!restaurant) throw new Error("RESTAURANT_NOT_APPROVED");
       published = await MenuImportDraft.findOneAndUpdate({ _id: id, restaurantId: objectId(restaurantId), status: "draft" }, { $set: { status: "published", publishedAt: new Date(), reviewedBy: objectId(String(req.auth?.employeeId || "")) } }, { new: true, session }).lean().exec();
       if (!published) throw new Error("MENU_IMPORT_NOT_FOUND_OR_CLOSED");
     });
+    invalidateCatalogCache();
+    void publishCatalogUpdate(restaurant?._id, "partner.menu.import.published");
     return res.json({ published: true, restaurant, draft: menuImportResponse(published) });
   } catch (error) {
     const code = error instanceof Error ? error.message : "MENU_IMPORT_PUBLISH_FAILED";
@@ -1710,12 +1711,14 @@ app.put("/api/v1/partners/menu", requireRole("partner"), async (req, res) => {
   if (!allowed) return res.status(403).json({ error: "PARTNER_PERMISSION_DENIED", permission: "menu:write" });
   const restaurantId = await employeeRestaurant(req, access);
   if (!restaurantId) return res.status(403).json({ error: access?.restaurantIds.length ? "PARTNER_RESTAURANT_ACCESS_DENIED" : "PARTNER_RESTAURANT_NOT_ASSIGNED" });
-  const parsed = z.object({ items: z.array(partnerMenuItemSchema).max(500) }).safeParse(req.body);
+  const parsed = z.object({ items: partnerMenuItemsSchema }).safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_MENU", details: parsed.error.flatten() });
   const current = await Restaurant.findById(restaurantId).select("slug").lean().exec() as any;
-  const items = current?.slug === ALIBABA_KEBAB_SLUG ? alibabaKebabMenu : parsed.data.items;
+  const items = current?.slug === ALIBABA_KEBAB_SLUG ? alibabaKebabMenu : normalizePartnerMenuItems(parsed.data.items);
   const restaurant = await Restaurant.findByIdAndUpdate(restaurantId, { $set: { menu: items } }, { new: true }).select("name menu slug").lean().exec() as any;
   if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
+  invalidateCatalogCache();
+  void publishCatalogUpdate(restaurant._id, "partner.menu.updated");
   return res.json({ restaurant, menu: restaurant.menu || [] });
 });
 
@@ -1730,7 +1733,7 @@ app.get("/api/v1/admin/restaurants/:id/menu", requireOwner(), async (req, res) =
 app.put("/api/v1/admin/restaurants/:id/menu", requireOwner(), async (req, res) => {
   const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
   if (!id) return res.status(400).json({ error: "INVALID_RESTAURANT_ID" });
-  const parsed = z.object({ items: z.array(partnerMenuItemSchema).max(500) }).safeParse(req.body);
+  const parsed = z.object({ items: partnerMenuItemsSchema }).safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_MENU", details: parsed.error.flatten() });
   const restaurant = await Restaurant.findOneAndUpdate(
     { _id: id, onboardingStatus: "approved" },
