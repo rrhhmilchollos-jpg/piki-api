@@ -10,7 +10,7 @@ const menu = [
   { id: "paused", name: "Pausado", price: 8, available: false },
   { id: "legacy", name: "Sin flag antiguo", price: 7 },
 ];
-const restaurant = { _id: "6acad53e7f55ddba7e05c189", name: "Mr Rooster", slug: "rooster-kebab-xativa", isActive: true, availabilityStatus: "available", onboardingStatus: "approved", menu };
+const restaurant = { _id: "6acad53e7f55ddba7e05c189", name: "Mr Rooster", slug: "rooster-kebab-xativa", cashPaymentsEnabled: true, isActive: true, availabilityStatus: "available", onboardingStatus: "approved", menu };
 const query = (data: unknown) => ({ sort() { return this; }, lean() { return this; }, exec: async () => data });
 function response() {
   return {
@@ -39,6 +39,7 @@ test("the actual Customer tRPC catalog route is no-store and omits paused produc
     await handleCustomerTrpc(request("catalog.list"), res as unknown as Response);
     assert.equal(res.headers["Cache-Control"], "no-store, max-age=0");
     assert.deepEqual(res.body.result.data.json[0].menu.map((item: any) => item.id), ["active", "legacy"]);
+    assert.equal(res.body.result.data.json[0].cashPaymentsEnabled, true);
   } finally { Restaurant.find = originalFind; }
 });
 
