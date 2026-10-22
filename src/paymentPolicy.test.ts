@@ -27,3 +27,7 @@ test("efectivo requiere autorización expresa y Alibaba queda solo online", () =
   assert.equal(isCashPaymentEnabledForRestaurant({ slug: "mr-rooster-xativa", cashPaymentsEnabled: true }), true);
   assert.equal(isCashPaymentEnabledForRestaurant({ slug: "alibaba-kebab-xativa", cashPaymentsEnabled: true }), false);
 });
+
+test("Mr Rooster Xàtiva queda habilitado para contrareembolso con su slug operativo", () => {
+  assert.equal(isCashPaymentEnabledForRestaurant({ slug: "rooster-kebab-xativa", name: "Mr Rooster Xàtiva", cashPaymentsEnabled: true }), true);
+});

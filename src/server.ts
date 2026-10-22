@@ -5073,17 +5073,18 @@ async function ensureMrRoosterOperational() {
       cuisine: "Kebab",
       category: "Kebab",
       locality: "Xàtiva",
-      availabilityStatus: "available",
-      upcomingMessage: "",
-      onboardingStatus: "approved",
-      isActive: true,
-      deliveryFeeCents: 299,
+	      availabilityStatus: "available",
+	      upcomingMessage: "",
+	      onboardingStatus: "approved",
+	      isActive: true,
+	      cashPaymentsEnabled: true,
+	      deliveryFeeCents: 299,
       image: "https://files.manuscdn.com/user_upload_by_module/session_file/310519663931061405/PSnZzuCOslUOgNQN.jpg",
       "partnerProfile.commissionRateBps": 2500,
       menu: mrRoosterMenu,
     } },
   ).exec();
-  if (result.matchedCount > 0) console.log(JSON.stringify({ event: "mr_rooster_operational", slug: "rooster-kebab-xativa", modified: result.modifiedCount > 0, menuCount: mrRoosterMenu.length, commissionRateBps: 2500 }));
+	  if (result.matchedCount > 0) console.log(JSON.stringify({ event: "mr_rooster_operational", slug: "rooster-kebab-xativa", modified: result.modifiedCount > 0, menuCount: mrRoosterMenu.length, commissionRateBps: 2500, cashPaymentsEnabled: true }));
 }
 async function start() {
   const uri = process.env.MONGODB_URI;
