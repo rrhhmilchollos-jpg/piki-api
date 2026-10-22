@@ -42,6 +42,7 @@ export const riderTrainingAssignmentSchema = new Schema({
   courseId: { type: Schema.Types.ObjectId, ref: "RiderTrainingCourse", required: true, index: true },
   riderApplicationId: { type: Schema.Types.ObjectId, ref: "RiderApplication", default: null, index: true },
   riderId: { type: Schema.Types.ObjectId, ref: "Rider", required: true, index: true },
+  fleetId: { type: Schema.Types.ObjectId, ref: "Fleet", default: null, index: true },
   employeeId: { type: Schema.Types.ObjectId, ref: "EmployeeAccount", required: true, index: true },
   status: { type: String, enum: ["assigned", "in_progress", "submitted", "reviewed", "expired"], default: "assigned", index: true },
   accessTokenHash: { type: String, required: true, unique: true, select: false },
