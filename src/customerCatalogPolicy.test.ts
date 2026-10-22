@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { CUSTOMER_CATALOG_RESTAURANT_FILTER, CUSTOMER_ORDERABLE_RESTAURANT_FILTER, COMING_SOON_SLUGS, presentCustomerCatalogRestaurant, restaurantIsWithinOpeningHours } from './customerCatalogPolicy.js';
 
 test('los partners próximos son visibles pero no son operables ni indexables como catálogo activo', () => {
-  assert.equal(COMING_SOON_SLUGS.length, 4);
+  assert.equal(COMING_SOON_SLUGS.length, 3);
   const upcomingFilter = CUSTOMER_CATALOG_RESTAURANT_FILTER.$or[1] as { slug: { $in: readonly string[] } };
   assert.deepEqual(upcomingFilter.slug.$in, [...COMING_SOON_SLUGS]);
   assert.equal(CUSTOMER_ORDERABLE_RESTAURANT_FILTER.availabilityStatus, 'available');
