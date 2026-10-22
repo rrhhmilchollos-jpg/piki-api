@@ -3,7 +3,8 @@ import assert from 'node:assert/strict';
 import { CUSTOMER_CATALOG_RESTAURANT_FILTER, CUSTOMER_ORDERABLE_RESTAURANT_FILTER, COMING_SOON_SLUGS, presentCustomerCatalogRestaurant, restaurantIsWithinOpeningHours } from './customerCatalogPolicy.js';
 
 test('los partners próximos son visibles pero no son operables ni indexables como catálogo activo', () => {
-  assert.equal(COMING_SOON_SLUGS.length, 3);
+  assert.equal(COMING_SOON_SLUGS.length, 2);
+  assert.equal(COMING_SOON_SLUGS.length, 2);
   const upcomingFilter = CUSTOMER_CATALOG_RESTAURANT_FILTER.$or[1] as { slug: { $in: readonly string[] } };
   assert.deepEqual(upcomingFilter.slug.$in, [...COMING_SOON_SLUGS]);
   assert.equal(CUSTOMER_ORDERABLE_RESTAURANT_FILTER.availabilityStatus, 'available');
@@ -13,6 +14,11 @@ test('los partners próximos son visibles pero no son operables ni indexables co
     assert.equal(view.orderable, false);
     assert.equal(view.availabilityLabel, 'Disponible muy pronto');
   }
+});
+
+test('los partners Gold operativos no forman parte de la lista de próximos', () => {
+  assert.equal(COMING_SOON_SLUGS.includes('alibaba-kebab-xativa' as never), false);
+  assert.equal(COMING_SOON_SLUGS.includes('rooster-kebab-xativa' as never), false);
 });
 
 test('un restaurante aprobado, activo y disponible se presenta como operable', () => {
