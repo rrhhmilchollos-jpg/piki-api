@@ -1,5 +1,6 @@
 import mongoose, { InferSchemaType, Schema } from "mongoose";
 import { RiderIncentiveBudget, RiderIncentiveEntry, RiderReferralProfile, RiderShiftIncentiveMetric } from "./riderIncentivesModels.js";
+import { RiderTrainingAssignment, RiderTrainingCourse, RiderTrainingResponse } from "./riderTraining.js";
 
 const tenantSchema = new Schema({
   slug: { type: String, required: true, unique: true, lowercase: true, trim: true, index: true },
@@ -232,6 +233,21 @@ const riderAssignmentReservationSchema = new Schema({
   expiresAt: { type: Date, default: null, index: true },
 }, { timestamps: true, collection: "rider_assignment_reservations" });
 riderAssignmentReservationSchema.index({ riderId: 1, status: 1, slot: 1 }, { unique: true, partialFilterExpression: { status: "reserved" } });
+// The launch promotion has a bounded set of slots per restaurant. The counter
+// and claim documents are written in the same transaction as the order.
+const freeDeliveryLaunchStateSchema = new Schema({
+  restaurantId: { type: Schema.Types.ObjectId, ref: "Restaurant", required: true, unique: true, index: true },
+  usedSlots: { type: Number, required: true, min: 0, max: 30, default: 0 },
+  legacyUsedSlots: { type: Number, required: true, min: 0, max: 30, default: 0 },
+}, { timestamps: true, collection: "free_delivery_launch_states" });
+const freeDeliveryClaimSchema = new Schema({
+  restaurantId: { type: Schema.Types.ObjectId, ref: "Restaurant", required: true, index: true },
+  publicCode: { type: String, required: true, maxlength: 64 },
+  slot: { type: Number, required: true, min: 1, max: 30 },
+}, { timestamps: true, collection: "free_delivery_claims" });
+freeDeliveryClaimSchema.index({ restaurantId: 1, publicCode: 1 }, { unique: true });
+freeDeliveryClaimSchema.index({ restaurantId: 1, slot: 1 }, { unique: true });
+freeDeliveryClaimSchema.index({ restaurantId: 1, createdAt: -1 });
 const dispatchDecisionSchema = new Schema({
   tenantId: { type: Schema.Types.ObjectId, ref: "Tenant", default: null, index: true }, orderId: { type: Schema.Types.ObjectId, ref: "Order", required: true, index: true }, riderId: { type: Schema.Types.ObjectId, ref: "Rider", default: null, index: true }, algorithmVersion: { type: String, required: true }, score: { type: Number, required: true }, pickupDistanceKm: { type: Number, required: true }, customerEtaMinutes: { type: Number, required: true }, totalEtaMinutes: { type: Number, required: true }, pickupEtaMinutes: { type: Number, required: true }, routeDistanceKm: { type: Number, default: null }, requiredVehicleClasses: { type: [String], default: [] }, reasons: { type: [String], default: [] }, outcome: { type: String, enum: ["preview", "offered", "accepted", "rejected", "expired", "race_lost"], required: true }, actorRole: { type: String, default: "system" } }, { timestamps: true, collection: "dispatch_decisions" });
 const dispatchOutboxSchema = new Schema({
@@ -426,6 +442,8 @@ export const PushSubscription = mongoose.models.PushSubscription || mongoose.mod
 export const Notification = mongoose.models.Notification || mongoose.model("Notification", notificationSchema);
 export const RealtimeEvent = mongoose.models.RealtimeEvent || mongoose.model("RealtimeEvent", realtimeEventSchema);
 export const RiderAssignmentReservation = mongoose.models.RiderAssignmentReservation || mongoose.model("RiderAssignmentReservation", riderAssignmentReservationSchema);
+export const FreeDeliveryLaunchState = mongoose.models.FreeDeliveryLaunchState || mongoose.model("FreeDeliveryLaunchState", freeDeliveryLaunchStateSchema);
+export const FreeDeliveryClaim = mongoose.models.FreeDeliveryClaim || mongoose.model("FreeDeliveryClaim", freeDeliveryClaimSchema);
 export const TrackingSession = mongoose.models.TrackingSession || mongoose.model("TrackingSession", trackingSessionSchema);
 export const LocationSample = mongoose.models.LocationSample || mongoose.model("LocationSample", locationSampleSchema);
 
@@ -437,7 +455,7 @@ export async function ensureIndexes() {
     }
   }
   await Promise.all([PartnerLocalityGroup.syncIndexes(), Fleet.syncIndexes(), Zone.syncIndexes(), RiderSlot.syncIndexes(), RiderReferralProfile.syncIndexes(), RiderShiftIncentiveMetric.syncIndexes(), RiderIncentiveEntry.syncIndexes(), RiderIncentiveBudget.syncIndexes()]);
-  await Promise.all([Tenant.init(), TenantMembership.init(), Restaurant.init(), PartnerAsset.init(), PartnerLocalityGroup.init(), MenuImportDraft.init(), Fleet.init(), Order.init(), Zone.init(), MarketplaceLedgerEntry.init(), PartnerPayoutBatch.init(), StripeEvent.init(), CashLedgerEntry.init(), DispatchDecision.init(), DispatchOutbox.init(), RiderIncident.init(), RiderOrderMessage.init(), RiderApplication.init(), PartnerLead.init(), RiderLead.init(), DocumentRequest.init(), CustomerAccount.init(), RiderSlot.init(), SignatureRequest.init(), PasskeyCredential.init(), PasskeyChallenge.init(), PushSubscription.init(), Notification.init(), RealtimeEvent.init(), RiderAssignmentReservation.init(), TrackingSession.init(), LocationSample.init(), EmployeeAccount.init(), AccessAuthorization.init(), OnboardingRequest.init(), RiderReferralProfile.init(), RiderShiftIncentiveMetric.init(), RiderIncentiveEntry.init(), RiderIncentiveBudget.init()]);
+  await Promise.all([Tenant.init(), TenantMembership.init(), Restaurant.init(), PartnerAsset.init(), PartnerLocalityGroup.init(), MenuImportDraft.init(), Fleet.init(), Order.init(), Zone.init(), MarketplaceLedgerEntry.init(), PartnerPayoutBatch.init(), StripeEvent.init(), CashLedgerEntry.init(), DispatchDecision.init(), DispatchOutbox.init(), RiderIncident.init(), RiderOrderMessage.init(), RiderApplication.init(), PartnerLead.init(), RiderLead.init(), DocumentRequest.init(), CustomerAccount.init(), RiderSlot.init(), SignatureRequest.init(), PasskeyCredential.init(), PasskeyChallenge.init(), PushSubscription.init(), Notification.init(), RealtimeEvent.init(), RiderAssignmentReservation.init(), FreeDeliveryLaunchState.init(), FreeDeliveryClaim.init(), TrackingSession.init(), LocationSample.init(), EmployeeAccount.init(), AccessAuthorization.init(), OnboardingRequest.init(), RiderReferralProfile.init(), RiderShiftIncentiveMetric.init(), RiderIncentiveEntry.init(), RiderIncentiveBudget.init(), RiderTrainingCourse.init(), RiderTrainingAssignment.init(), RiderTrainingResponse.init()]);
   const ridersWithoutCode = await Rider.find({ $or: [{ riderCode: { $exists: false } }, { riderCode: null }, { riderCode: "" }] }).select("_id").lean().exec();
   for (const rider of ridersWithoutCode) {
     const base = `PIKI-R-${String(rider._id).slice(-6).toUpperCase()}`;

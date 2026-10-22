@@ -8,7 +8,8 @@ import cors from "cors";
 import express from "express";
 import mongoose from "mongoose";
 import { z } from "zod";
-import { CashLedgerEntry, CustomerAccount, DispatchDecision, DocumentRequest, EmployeeAccount, AccessAuthorization, Fleet, Order, Restaurant, PartnerAsset, PartnerLocalityGroup, MenuImportDraft, Rider, RiderApplication, PartnerLead, RiderLead, RiderIncident, RiderOrderMessage, RiderSlot, SignatureRequest, Zone, PushSubscription, RealtimeEvent, Notification, Tenant, TenantMembership, RiderAssignmentReservation, SupportTicket, OnboardingRequest, TrackingSession, RiderPayoutBatch, PartnerPayoutBatch, GovernanceAuditEvent, LocationSample, ensureIndexes } from "./models.js";
+import { CashLedgerEntry, CustomerAccount, DispatchDecision, DocumentRequest, EmployeeAccount, AccessAuthorization, Fleet, Order, Restaurant, PartnerAsset, PartnerLocalityGroup, MenuImportDraft, Rider, RiderApplication, PartnerLead, RiderLead, RiderIncident, RiderOrderMessage, RiderSlot, SignatureRequest, Zone, PushSubscription, RealtimeEvent, Notification, Tenant, TenantMembership, RiderAssignmentReservation, SupportTicket, OnboardingRequest, TrackingSession, RiderPayoutBatch, PartnerPayoutBatch, GovernanceAuditEvent, LocationSample, FreeDeliveryClaim, FreeDeliveryLaunchState, ensureIndexes } from "./models.js";
+import { PIKI_PRL_COURSE_SLUG, RiderTrainingAssignment, RiderTrainingCourse, RiderTrainingResponse, ensurePikiPrlCourse, publicTrainingQuestions, scoreTrainingAnswers, trainingToken, trainingTokenHash } from "./riderTraining.js";
 import { RiderShiftIncentiveMetric } from "./riderIncentivesModels.js";
 import { normalizeLeadEmail, partnerLeadSubmissionSchema, riderLeadSubmissionSchema, webLeadReviewSchema, webLeadStatusSchema } from "./webLeads.js";
 import { assertTransition, calculateEtaRange, transitionSchema, validateCoordinates } from "./algorithms/index.js";
@@ -39,10 +40,12 @@ import { ALIBABA_KEBAB_COVER_IMAGE, alibabaKebabMenu } from "./alibabaKebabMenu.
 import { mrRoosterMenu } from "./mrRoosterMenu.js";
 import { configuredPartnerRestaurantUpsert } from "./partnerRepairPolicy.js";
 import { quoteMenuItem, usesReferenceAddOns } from "./menuModifiers.js";
+import { buildCanonicalOrderSnapshot, OrderSnapshotError } from "./orderSnapshot.js";
 import { pointDistanceMeters } from "./pickupPolicy.js";
 import { buildLegacyRiderSupportTicketFilter, buildRiderSupportTicketFilter } from "./supportTicketScope.js";
 import { cashOrderLimitError, cashPaymentDisabledError, isCashOrderWithinLimit, isCashPaymentEnabledForRestaurant } from "./paymentPolicy.js";
 import { calculateMarketplaceBreakdown, DEFAULT_PARTNER_COMMISSION_BPS } from "./marketplaceAccounting.js";
+import { claimFreeDeliveryPromotion, FREE_DELIVERY_LAUNCH_LIMIT } from "./freeDeliveryPromo.js";
 import { postMarketplaceOrderLedger, preparePartnerPayoutBatch } from "./marketplaceLedger.js";
 import { extractAndParseMenu, readAssetBytes } from "./menuImport.js";
 import { purgeTestDataIfEnabled } from "./purgeTestData.js";
@@ -110,7 +113,7 @@ async function reversePhoton(latitude: number, longitude: number) {
   const label = [address.road, [address.postcode, address.locality].filter(Boolean).join(" ")].filter(Boolean).join(", ");
   return { label: label || `Ubicación GPS ${latitude.toFixed(5)}, ${longitude.toFixed(5)}`, latitude, longitude, locality: address.locality || null, address: properties };
 }
-mongoose.connection.on("connected", () => { databaseReady = true; startRealtimeRelay(); void syncPublicIds().catch((error) => console.error("Public ID sync failed", error)); });
+mongoose.connection.on("connected", () => { databaseReady = true; startRealtimeRelay(); void syncPublicIds().catch((error) => console.error("Public ID sync failed", error)); void ensurePikiPrlCourse().catch((error) => console.error("PIKI PRL course seed failed", error)); });
 mongoose.connection.on("disconnected", () => { databaseReady = false; console.warn("MongoDB disconnected; API entering not-ready state"); });
 mongoose.connection.on("error", (error) => { databaseReady = false; console.error("MongoDB connection error", error instanceof Error ? error.message : error); });
 
@@ -357,11 +360,40 @@ function canonicalRestaurantMenu(restaurant: any) {
 function pricedRestaurantMenu(restaurant: any) {
   return customerMenuForRestaurant({ ...restaurant, menu: canonicalRestaurantMenu(restaurant) });
 }
-const FREE_DELIVERY_LAUNCH_LIMIT = 30;
-async function freeDeliveryState(restaurant: { _id: unknown; slug?: string }) {
-  if (GOLDEN_FOUNDER_SLUGS.includes(restaurant.slug as typeof GOLDEN_FOUNDER_SLUGS[number])) return { eligible: false, remaining: 0 };
-  const used = await Order.countDocuments({ restaurantId: restaurant._id, isTestOrder: { $ne: true }, status: { $nin: ["cancelled"] } }).exec();
-  return { eligible: used < FREE_DELIVERY_LAUNCH_LIMIT, remaining: Math.max(0, FREE_DELIVERY_LAUNCH_LIMIT - used) };
+function goldenFounderRestaurant(restaurant: { slug?: string }) {
+  return GOLDEN_FOUNDER_SLUGS.includes(restaurant.slug as typeof GOLDEN_FOUNDER_SLUGS[number]);
+}
+function noFreeDeliveryPromotion() { return { eligible: false, remaining: 0, slot: null, idempotent: false }; }
+function freeDeliveryPromotionStore(session: mongoose.ClientSession) {
+  return {
+    findClaim: async (restaurantId: string, publicCode: string) => await FreeDeliveryClaim.findOne({ restaurantId, publicCode }).session(session).lean().exec() as any,
+    ensureState: async (restaurantId: string, legacyUsedSlots: number, limit: number) => await FreeDeliveryLaunchState.findOneAndUpdate(
+      { restaurantId },
+      { $setOnInsert: { restaurantId, usedSlots: Math.min(limit, legacyUsedSlots), legacyUsedSlots: Math.min(limit, legacyUsedSlots) } },
+      { upsert: true, new: true, setDefaultsOnInsert: true, session },
+    ).lean().exec() as any,
+    getState: async (restaurantId: string) => await FreeDeliveryLaunchState.findOne({ restaurantId }).session(session).lean().exec() as any,
+    incrementIfBelowLimit: async (restaurantId: string, limit: number) => await FreeDeliveryLaunchState.findOneAndUpdate(
+      { restaurantId, usedSlots: { $lt: limit } },
+      { $inc: { usedSlots: 1 } },
+      { new: true, session },
+    ).lean().exec() as any,
+    insertClaim: async (claim: { restaurantId: string; publicCode: string; slot: number }) => { await FreeDeliveryClaim.create([{ ...claim }], { session }); },
+  };
+}
+async function claimFreeDeliveryForOrder(restaurant: { _id: unknown; slug?: string }, publicCode: string, session: mongoose.ClientSession) {
+  if (goldenFounderRestaurant(restaurant)) return noFreeDeliveryPromotion();
+  // On rollout, the old count seeds the one persistent counter exactly once.
+  // Later requests use only its conditional increment, never count-then-write.
+  const legacyUsedSlots = await Order.countDocuments({ restaurantId: restaurant._id, isTestOrder: { $ne: true }, status: { $nin: ["cancelled"] } }).session(session).exec();
+  return claimFreeDeliveryPromotion({ restaurantId: String(restaurant._id), publicCode, legacyUsedSlots, store: freeDeliveryPromotionStore(session) });
+}
+async function existingFreeDeliveryPromotion(restaurant: { _id: unknown; slug?: string }, publicCode: string, session: mongoose.ClientSession) {
+  if (goldenFounderRestaurant(restaurant)) return noFreeDeliveryPromotion();
+  const claim = await FreeDeliveryClaim.findOne({ restaurantId: restaurant._id, publicCode }).session(session).lean().exec() as any;
+  if (!claim) return noFreeDeliveryPromotion();
+  const state = await FreeDeliveryLaunchState.findOne({ restaurantId: restaurant._id }).session(session).lean().exec() as any;
+  return { eligible: true, remaining: Math.max(0, FREE_DELIVERY_LAUNCH_LIMIT - Math.max(Number(state?.usedSlots || 0), Number(claim.slot || 0))), slot: Number(claim.slot), idempotent: true };
 }
 function localityKey(value: string) { return value.trim().toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "") || "sin-localidad"; }
 function organizationFolder(locality: string, restaurantId: string) { return `partners/${localityKey(locality)}/${restaurantId}/menu`; }
@@ -2534,6 +2566,65 @@ app.patch("/api/v1/rider-applications/:id/status", requireRole("admin"), async (
 
 function normalizedZoneSlug(value: string) { return String(value || "").trim().toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, ""); }
 const leadRoutingSchema = z.object({ zoneSlug: z.string().regex(/^[a-z0-9-]+$/).optional() });
+app.post("/api/v1/admin/rider-applications/:id/prl-course", requireRole("admin"), async (req, res) => {
+  const applicationId = objectId(String(req.params.id));
+  if (!applicationId) return res.status(400).json({ error: "INVALID_APPLICATION_ID" });
+  const application = await RiderApplication.findOne({ _id: applicationId, ...await adminOnboardingScope(req) }).lean().exec() as any;
+  if (!application) return res.status(404).json({ error: "APPLICATION_NOT_FOUND" });
+  if (application.status !== "approved") return res.status(409).json({ error: "RIDER_APPLICATION_NOT_APPROVED" });
+  const tenantId = objectId(String(application.tenantId || ""));
+  if (!tenantId) return res.status(409).json({ error: "RIDER_APPLICATION_TENANT_REQUIRED" });
+  const rider = await Rider.findOne({ email: String(application.email).trim().toLowerCase(), tenantId }).select("_id").lean().exec() as any;
+  const employee = await EmployeeAccount.findOne({ email: String(application.email).trim().toLowerCase(), tenantId }).select("_id email name").lean().exec() as any;
+  if (!rider || !employee) return res.status(409).json({ error: "RIDER_ACCESS_NOT_PROVISIONED" });
+  const course = await ensurePikiPrlCourse() as any;
+  if (!course) return res.status(503).json({ error: "PRL_COURSE_UNAVAILABLE" });
+  const token = trainingToken();
+  const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
+  const assignment = await RiderTrainingAssignment.findOneAndUpdate({ tenantId, riderId: rider._id, courseId: course._id }, { $set: { riderApplicationId: application._id, employeeId: employee._id, status: "assigned", accessTokenHash: trainingTokenHash(token), tokenPrefix: token.slice(0, 10), expiresAt, consentAcceptedAt: null, submittedAt: null, reviewDecision: "pending", reviewNotes: "", reviewedBy: null, reviewedAt: null } }, { upsert: true, new: true, setDefaultsOnInsert: true }).lean().exec() as any;
+  const baseUrl = String(process.env.RIDER_APP_URL || "https://rider.pikidelivery.com").replace(/\/$/, "");
+  const courseUrl = `${baseUrl}/training/prl?token=${encodeURIComponent(token)}`;
+  const email = await sendCorporateEmail({ recipientEmail: employee.email, subject: "PIKI · Curso PRL 1 obligatorio", idempotencyKey: `piki-prl-course-${assignment._id}-${assignment.tokenPrefix}`, text: `Hola ${employee.name || application.name},\n\nTienes asignado el curso PIKI 1 de Prevención de Riesgos Laborales para Riders.\n\nAccede aquí: ${courseUrl}\n\nEl enlace caduca en 7 días y la evaluación final será revisada por el equipo PIKI.`, html: `<p>Hola ${employee.name || application.name},</p><p>Tienes asignado el curso <strong>PIKI 1 · Prevención de Riesgos Laborales para Riders</strong>.</p><p><a href="${courseUrl}">Acceder al curso</a></p><p>El enlace caduca en 7 días y la evaluación final será revisada por el equipo PIKI.</p>` });
+  return res.json({ assignment: { id: assignment._id, status: assignment.status, expiresAt: assignment.expiresAt }, course: { slug: PIKI_PRL_COURSE_SLUG, title: course.title, version: course.version, questions: publicTrainingQuestions, passPercent: course.passPercent }, delivery: { emailSent: email.sent, courseUrl: email.sent ? undefined : courseUrl, error: email.sent ? undefined : email.error } });
+});
+app.get("/api/v1/rider-training/access", async (req, res) => {
+  const token = typeof req.query.token === "string" ? req.query.token : "";
+  if (!token) return res.status(400).json({ error: "TRAINING_TOKEN_REQUIRED" });
+  const assignment = await RiderTrainingAssignment.findOne({ accessTokenHash: trainingTokenHash(token), expiresAt: { $gt: new Date() }, status: { $in: ["assigned", "in_progress"] } }).lean().exec() as any;
+  if (!assignment) return res.status(404).json({ error: "TRAINING_LINK_INVALID_OR_EXPIRED" });
+  const course = await RiderTrainingCourse.findById(assignment.courseId).select("title version purpose questions passPercent").lean().exec() as any;
+  if (!course) return res.status(404).json({ error: "PRL_COURSE_NOT_FOUND" });
+  if (assignment.status === "assigned") await RiderTrainingAssignment.updateOne({ _id: assignment._id, status: "assigned" }, { $set: { status: "in_progress" } }).exec();
+  return res.json({ assignment: { id: assignment._id, status: assignment.status, expiresAt: assignment.expiresAt }, course });
+});
+app.post("/api/v1/rider-training/submit", async (req, res) => {
+  const parsed = z.object({ token: z.string().min(20), consentAccepted: z.literal(true), answers: z.record(z.string(), z.number().int().min(0).max(10)) }).safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "INVALID_TRAINING_SUBMISSION" });
+  const assignment = await RiderTrainingAssignment.findOne({ accessTokenHash: trainingTokenHash(parsed.data.token), expiresAt: { $gt: new Date() }, status: { $in: ["assigned", "in_progress"] } }).lean().exec() as any;
+  if (!assignment) return res.status(404).json({ error: "TRAINING_LINK_INVALID_OR_EXPIRED" });
+  const course = await RiderTrainingCourse.findById(assignment.courseId).select("passPercent").lean().exec() as any;
+  if (!course) return res.status(404).json({ error: "PRL_COURSE_NOT_FOUND" });
+  const result = scoreTrainingAnswers(parsed.data.answers as Record<string, number>, Number(course.passPercent || 75));
+  const response = await RiderTrainingResponse.findOneAndUpdate({ assignmentId: assignment._id }, { $setOnInsert: { tenantId: assignment.tenantId, assignmentId: assignment._id, answers: Object.entries(parsed.data.answers).map(([questionId, selectedIndex]) => ({ questionId, selectedIndex })), scorePercent: result.scorePercent, passedKnowledgeThreshold: result.passedKnowledgeThreshold, consentTextVersion: "prl-piki-1-v1", submittedAt: new Date() } }, { upsert: true, new: true, setDefaultsOnInsert: true }).lean().exec() as any;
+  await RiderTrainingAssignment.updateOne({ _id: assignment._id, status: { $in: ["assigned", "in_progress"] } }, { $set: { status: "submitted", consentAcceptedAt: new Date(), submittedAt: response.submittedAt || new Date() } }).exec();
+  return res.json({ response: { id: response._id, scorePercent: response.scorePercent, passedKnowledgeThreshold: response.passedKnowledgeThreshold, status: "submitted" }, notice: "El resultado queda pendiente de revisión humana por el equipo PIKI." });
+});
+app.get("/api/v1/admin/rider-training", requireRole("admin"), async (req, res) => {
+  const scope = await buildTenantScope(req);
+  const assignments = await RiderTrainingAssignment.find(scope).sort({ updatedAt: -1 }).limit(200).lean().exec() as any[];
+  const responses = await RiderTrainingResponse.find({ tenantId: { $in: assignments.map((item) => item.tenantId) } }).lean().exec() as any[];
+  const byAssignment = new Map(responses.map((item) => [String(item.assignmentId), item]));
+  return res.json({ assignments: assignments.map((item) => ({ ...item, accessTokenHash: undefined, response: byAssignment.get(String(item._id)) || null })) });
+});
+app.patch("/api/v1/admin/rider-training/:id/review", requireRole("admin"), async (req, res) => {
+  const parsed = z.object({ decision: z.enum(["approved", "needs_review", "rejected"]), notes: z.string().max(2000).default("") }).safeParse(req.body);
+  const id = objectId(String(req.params.id));
+  if (!id || !parsed.success) return res.status(400).json({ error: "INVALID_TRAINING_REVIEW" });
+  const assignment = await RiderTrainingAssignment.findOne({ _id: id, ...await buildTenantScope(req) }).lean().exec() as any;
+  if (!assignment) return res.status(404).json({ error: "TRAINING_ASSIGNMENT_NOT_FOUND" });
+  const updated = await RiderTrainingAssignment.findOneAndUpdate({ _id: id, tenantId: assignment.tenantId }, { $set: { status: "reviewed", reviewDecision: parsed.data.decision, reviewNotes: parsed.data.notes, reviewedAt: new Date(), reviewedBy: objectId(String(req.auth?.employeeId || "")) } }, { new: true }).select("_id tenantId status reviewDecision reviewNotes reviewedAt").lean().exec();
+  return res.json({ assignment: updated });
+});
 app.post("/api/v1/admin/rider-leads/:id/prl-request", requireRole("admin"), async (req, res) => {
   const id = objectId(String(req.params.id));
   if (!id) return res.status(400).json({ error: "INVALID_LEAD_ID" });
@@ -2543,6 +2634,34 @@ app.post("/api/v1/admin/rider-leads/:id/prl-request", requireRole("admin"), asyn
   const result = await sendCorporateEmail({ recipientEmail: lead.email, subject: "PIKI · Formación PRL obligatoria", idempotencyKey: `piki-prl-${id}`, text: `Hola ${lead.name},\n\nComo siguiente paso de tu incorporación a PIKI, debes completar el curso breve de Prevención de Riesgos Laborales (PRL).\n\nAccede aquí: ${courseUrl}\n\nCuando lo termines, confirma la finalización desde PIKI o responde a este correo.\n\nEquipo PIKI`, html: `<p>Hola ${lead.name},</p><p>Como siguiente paso de tu incorporación a PIKI, debes completar el curso breve de <strong>Prevención de Riesgos Laborales (PRL)</strong>.</p><p><a href="${courseUrl}">Acceder al curso PRL</a></p><p>Cuando lo termines, confirma la finalización desde PIKI o responde a este correo.</p><p>Equipo PIKI</p>` });
   const updated = await RiderLead.findOneAndUpdate({ _id: id, ...await onboardingScope(req) }, { $set: { prlStatus: "requested", prlRequestedAt: new Date(), prlRequestedBy: objectId(String(req.auth?.employeeId || "")) }, $push: { history: { status: "qualified", notes: "Curso PRL solicitado como proceso separado del expediente documental.", actorEmployeeId: objectId(String(req.auth?.employeeId || "")), changedAt: new Date() } } }, { new: true }).lean().exec();
   return res.json({ lead: updated, training: { type: "prl", courseUrl, emailSent: result.sent } });
+});
+app.post("/api/v1/admin/rider-applications/:id/route", requireRole("admin"), async (req, res) => {
+  const id = objectId(String(req.params.id));
+  const parsed = z.object({ fleetId: z.string().regex(/^[a-f\d]{24}$/).optional(), zoneSlug: z.string().regex(/^[a-z0-9-]+$/).optional() }).refine((value) => value.fleetId || value.zoneSlug, "fleetId_or_zone_required").safeParse(req.body || {});
+  if (!id || !parsed.success) return res.status(400).json({ error: "INVALID_RIDER_APPLICATION_ROUTING" });
+  const application = await RiderApplication.findOne({ _id: id, ...await adminOnboardingScope(req) }).lean().exec() as any;
+  if (!application) return res.status(404).json({ error: "APPLICATION_NOT_FOUND" });
+  if (application.status !== "approved") return res.status(409).json({ error: "RIDER_APPLICATION_NOT_APPROVED" });
+  const tenantId = objectId(String(application.tenantId || ""));
+  if (!tenantId) return res.status(409).json({ error: "RIDER_APPLICATION_TENANT_REQUIRED" });
+  const fleetFilter: Record<string, unknown> = { tenantId, isActive: true };
+  if (parsed.data.fleetId) fleetFilter._id = objectId(parsed.data.fleetId);
+  if (parsed.data.zoneSlug) fleetFilter.serviceZones = parsed.data.zoneSlug;
+  const fleets = await Fleet.find(fleetFilter).select("_id name managerName contactEmail contactPhone serviceZones").lean().exec() as any[];
+  if (!fleets.length) return res.status(409).json({ error: "ZONE_FLEET_NOT_FOUND", message: "No existe una Fleet activa para esa zona y tenant." });
+  if (fleets.length > 1 && !parsed.data.fleetId) return res.status(409).json({ error: "ZONE_FLEET_AMBIGUOUS", message: "Hay varias Fleets activas para la zona; selecciona una explícitamente." });
+  const fleet = fleets[0];
+  const rider = await Rider.findOneAndUpdate({ email: String(application.email).trim().toLowerCase(), tenantId }, { $set: { fleetId: fleet._id } }, { new: true }).select("_id fleetId").lean().exec() as any;
+  await EmployeeAccount.updateOne({ email: String(application.email).trim().toLowerCase(), tenantId, jobRole: "rider" }, { $set: { fleetId: fleet._id } }).exec();
+  const updated = await RiderApplication.findOneAndUpdate({ _id: id, tenantId }, { $set: { assignedFleetId: fleet._id, notes: `${String(application.notes || "").trim()}\nDerivado a Fleet ${fleet.name}.` .trim() } }, { new: true }).select("_id status assignedFleetId tenantId").lean().exec();
+  const targetEmail = String(fleet.contactEmail || "").trim().toLowerCase();
+  let emailSent = false;
+  if (targetEmail) {
+    const email = await sendCorporateEmail({ recipientEmail: targetEmail, subject: `PIKI · Rider aprobado derivado a ${fleet.name}`, idempotencyKey: `piki-rider-application-route-${id}-${fleet._id}`, text: `Se ha derivado a tu Fleet el rider aprobado ${application.name} (${application.email}) de ${application.city}. Accede al panel Fleet para continuar con su activación operativa.`, html: `<p>Se ha derivado a tu Fleet el rider aprobado <strong>${application.name}</strong> (${application.email}) de ${application.city}.</p><p>Accede al panel Fleet para continuar con su activación operativa.</p>` });
+    emailSent = email.sent;
+  }
+  await recordGovernanceEvent({ actor: { employeeId: objectId(String(req.auth?.employeeId || "")), role: req.auth?.role, tenantId }, action: "rider_application_routed_to_fleet", targetType: "rider", targetId: rider?._id || id, after: { fleetId: String(fleet._id), fleetName: fleet.name, riderId: rider?._id ? String(rider._id) : null, targetEmail, emailSent }, reason: "Rider aprobado derivado explícitamente a Fleet activa del mismo tenant." });
+  return res.json({ application: updated, routing: { fleetId: String(fleet._id), fleetName: fleet.name, targetEmail, emailSent } });
 });
 app.post("/api/v1/admin/:kind-leads/:id/route", requireRole("admin"), async (req, res) => {
   const kind = String(req.params.kind) as "rider" | "partner";
@@ -2995,7 +3114,7 @@ app.post("/api/v1/orders", rateLimit(20, 60_000, "orders-create"), async (req, r
   if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_AVAILABLE" });
   if (parsed.data.paymentMethod === "cash" && !isCashPaymentEnabledForRestaurant(restaurant)) return res.status(409).json(cashPaymentDisabledError(restaurant));
   // El catálogo público y el checkout deben compartir exactamente la misma política de precio.
-  // Alibaba aplica el 18% por producto; Kings Tacos y el resto no se alteran.
+  // Alibaba aplica el 15 % por producto, Mr Rooster el 25 % y el resto el 20 %.
   const pricedMenu = pricedRestaurantMenu(restaurant);
   const pricedRestaurant = { ...restaurant, menu: pricedMenu };
   const useReferenceFallback = usesReferenceAddOns(pricedRestaurant);
@@ -3020,76 +3139,217 @@ app.post("/api/v1/orders", rateLimit(20, 60_000, "orders-create"), async (req, r
   if (!Array.isArray(restaurantPoint) || restaurantPoint.length < 2) return res.status(409).json({ error: "RESTAURANT_LOCATION_UNAVAILABLE" });
   const route = await quoteDeliveryRoute([Number(restaurantPoint[0]), Number(restaurantPoint[1])], deliveryPoint);
   const subtotalCents = normalizedItems.reduce((sum, item) => sum + item.unitPriceCents * item.quantity, 0);
-  const freeDelivery = await freeDeliveryState(restaurant);
-  const deliveryFeeCents = freeDelivery.eligible ? 0 : coverage.deliveryFeeCents;
-  const serviceFeeCents = coverage.serviceFeeCents;
-  const totalCents = subtotalCents + deliveryFeeCents + serviceFeeCents;
-  const marketplace = calculateMarketplaceBreakdown({
-    subtotalCents,
-    deliveryFeeCents,
-    serviceFeeCents,
-    commissionRateBps: Number(restaurant.partnerProfile?.commissionRateBps ?? DEFAULT_PARTNER_COMMISSION_BPS),
-    riderEarningsCents: configuredRiderPayoutCents(),
-  });
-  if (marketplace.customerTotalCents !== totalCents) return res.status(500).json({ error: "MARKETPLACE_TOTAL_MISMATCH" });
-  if (!isCashOrderWithinLimit(parsed.data.paymentMethod, totalCents)) return res.status(422).json(cashOrderLimitError(totalCents));
   const publicCode = await createRandomOrderCode();
   const dailyCode = await createDailyDisplayCode();
   const authenticatedCustomer = await currentCustomer(req) as any;
-  const order = await Order.create({ tenantId: restaurant.tenantId || null, publicCode, ...dailyCode, restaurantId: restaurant._id, customerId: authenticatedCustomer?._id || null, customerName: String(authenticatedCustomer?.name || "").trim(), items: normalizedItems, deliveryAddress: parsed.data.deliveryAddress, deliveryNote: parsed.data.deliveryNote, deliveryLocation: { type: "Point", coordinates: deliveryPoint }, coveragePolicySlug: coverage.policySlug, coveragePolicyVersion: coverage.policyVersion, coverageDecision: coverage.reason, straightLineDistanceKm: coverage.straightLineDistanceKm, withinMunicipality: coverage.withinMunicipality, deliveryBaseFeeCents: coverage.deliveryBaseFeeCents, outsideMunicipalitySurchargeCents: coverage.outsideMunicipalitySurchargeCents, routeDistanceKm: route.routeDistanceKm, routeDurationMinutes: route.routeDurationMinutes, routeProvider: route.routeProvider, routingDegraded: route.routingDegraded, requiredVehicleClasses: route.requiredVehicleClasses, subtotalCents, deliveryFeeCents, serviceFeeCents, totalCents,
-    marketplaceCommissionRateBps: marketplace.commissionRateBps,
-    marketplaceCommissionCents: marketplace.platformCommissionCents,
-    partnerPayoutCents: marketplace.partnerPayoutCents,
-    riderEarningsCents: marketplace.riderEarningsCents,
-    platformNetBeforeProcessingCents: marketplace.platformNetBeforeProcessingCents,
-    payoutStatus: "pending", paymentMethod: parsed.data.paymentMethod, paymentState: "pending", statusHistory: [{ status: "pending", actorRole: "customer", reason: parsed.data.paymentMethod === "cash" ? "Pedido a contrarreembolso; cobro pendiente hasta la entrega" : "Pedido creado con política de cobertura Xàtiva" }] });
+  const quotedDeliveryFeeCents = Number(coverage.deliveryFeeCents);
+  const serviceFeeCents = Number(coverage.serviceFeeCents);
+  let freeDelivery: Awaited<ReturnType<typeof claimFreeDeliveryPromotion>> = noFreeDeliveryPromotion();
+  let deliveryFeeCents = quotedDeliveryFeeCents;
+  let totalCents = subtotalCents + deliveryFeeCents + serviceFeeCents;
+  let marketplace: ReturnType<typeof calculateMarketplaceBreakdown> | null = null;
+  let order: any = null;
+  const orderSession = await mongoose.startSession();
+  try {
+    await orderSession.withTransaction(async () => {
+      // The state increment, idempotent claim and order insertion commit together.
+      freeDelivery = await claimFreeDeliveryForOrder(restaurant, publicCode, orderSession);
+      deliveryFeeCents = freeDelivery.eligible ? 0 : quotedDeliveryFeeCents;
+      totalCents = subtotalCents + deliveryFeeCents + serviceFeeCents;
+      marketplace = calculateMarketplaceBreakdown({
+        subtotalCents,
+        deliveryFeeCents,
+        serviceFeeCents,
+        commissionRateBps: Number(restaurant.partnerProfile?.commissionRateBps ?? DEFAULT_PARTNER_COMMISSION_BPS),
+        riderEarningsCents: configuredRiderPayoutCents(),
+      });
+      if (marketplace.customerTotalCents !== totalCents) throw new Error("MARKETPLACE_TOTAL_MISMATCH");
+      if (!isCashOrderWithinLimit(parsed.data.paymentMethod, totalCents)) throw new Error("CASH_ORDER_LIMIT_EXCEEDED");
+      const created = await Order.create([{
+        tenantId: restaurant.tenantId || null, publicCode, ...dailyCode, restaurantId: restaurant._id,
+        customerId: authenticatedCustomer?._id || null, customerName: String(authenticatedCustomer?.name || "").trim(),
+        items: normalizedItems, deliveryAddress: parsed.data.deliveryAddress, deliveryNote: parsed.data.deliveryNote,
+        deliveryLocation: { type: "Point", coordinates: deliveryPoint }, coveragePolicySlug: coverage.policySlug,
+        coveragePolicyVersion: coverage.policyVersion, coverageDecision: coverage.reason,
+        straightLineDistanceKm: coverage.straightLineDistanceKm, withinMunicipality: coverage.withinMunicipality,
+        deliveryBaseFeeCents: coverage.deliveryBaseFeeCents, outsideMunicipalitySurchargeCents: coverage.outsideMunicipalitySurchargeCents,
+        routeDistanceKm: route.routeDistanceKm, routeDurationMinutes: route.routeDurationMinutes, routeProvider: route.routeProvider,
+        routingDegraded: route.routingDegraded, requiredVehicleClasses: route.requiredVehicleClasses,
+        subtotalCents, deliveryFeeCents, serviceFeeCents, totalCents,
+        marketplaceCommissionRateBps: marketplace.commissionRateBps,
+        marketplaceCommissionCents: marketplace.platformCommissionCents,
+        partnerPayoutCents: marketplace.partnerPayoutCents,
+        riderEarningsCents: marketplace.riderEarningsCents,
+        platformNetBeforeProcessingCents: marketplace.platformNetBeforeProcessingCents,
+        payoutStatus: "pending", paymentMethod: parsed.data.paymentMethod, paymentState: "pending",
+        statusHistory: [{ status: "pending", actorRole: "customer", reason: parsed.data.paymentMethod === "cash" ? "Pedido a contrarreembolso; cobro pendiente hasta la entrega" : "Pedido creado con política de cobertura Xàtiva" }],
+      }], { session: orderSession });
+      order = created[0];
+    });
+  } catch (error) {
+    if (error instanceof Error && error.message === "CASH_ORDER_LIMIT_EXCEEDED") return res.status(422).json(cashOrderLimitError(totalCents));
+    throw error;
+  } finally {
+    await orderSession.endSession();
+  }
+  if (!order || !marketplace) throw new Error("ORDER_TRANSACTION_DID_NOT_COMMIT");
+  const confirmedMarketplace = marketplace as ReturnType<typeof calculateMarketplaceBreakdown>;
   if (parsed.data.paymentMethod === "cash") {
     const dispatch = enqueueOrderForDispatch(order._id as mongoose.Types.ObjectId).catch((error) => console.warn("Dispatch outbox enqueue failed", error instanceof Error ? error.message : error));
     await Promise.all([dispatch, publishOrderIntakeEvents(order, { settlement: "cash_due", message: "Contrarreembolso: el Rider cobrará en efectivo al entregar." })]);
   }
   res.status(201).json({ order: { id: order.id, publicCode, displayCode: order.displayCode, displayCodeDate: order.displayCodeDate, status: order.status, paymentState: parsed.data.paymentMethod === "cash" ? "pending_cash_collection" : order.paymentState, paymentMethod: parsed.data.paymentMethod, cashDueAtDelivery: parsed.data.paymentMethod === "cash", deliveryQrUrl: deliveryQrUrl(publicCode), subtotalCents, deliveryFeeCents, serviceFeeCents, totalCents,
-    marketplace: { commissionRateBps: marketplace.commissionRateBps, commissionCents: marketplace.platformCommissionCents, partnerPayoutCents: marketplace.partnerPayoutCents, riderEarningsCents: marketplace.riderEarningsCents, platformNetBeforeProcessingCents: marketplace.platformNetBeforeProcessingCents }, freeDeliveryApplied: freeDelivery.eligible, freeDeliveryOrdersRemaining: freeDelivery.remaining, coverage, route, partnerPreparationLimitMinutes: PARTNER_PREPARATION_LIMIT_MINUTES, customerDeliveryTargetMinutes: CUSTOMER_DELIVERY_TARGET_MINUTES, etaMinutes: calculateEtaRange([PARTNER_PREPARATION_LIMIT_MINUTES, PARTNER_PREPARATION_LIMIT_MINUTES], [5, 15]) } });
+    marketplace: { commissionRateBps: confirmedMarketplace.commissionRateBps, commissionCents: confirmedMarketplace.platformCommissionCents, partnerPayoutCents: confirmedMarketplace.partnerPayoutCents, riderEarningsCents: confirmedMarketplace.riderEarningsCents, platformNetBeforeProcessingCents: confirmedMarketplace.platformNetBeforeProcessingCents }, freeDeliveryApplied: freeDelivery.eligible, freeDeliveryOrdersRemaining: freeDelivery.remaining, coverage, route, partnerPreparationLimitMinutes: PARTNER_PREPARATION_LIMIT_MINUTES, customerDeliveryTargetMinutes: CUSTOMER_DELIVERY_TARGET_MINUTES, etaMinutes: calculateEtaRange([PARTNER_PREPARATION_LIMIT_MINUTES, PARTNER_PREPARATION_LIMIT_MINUTES], [5, 15]) } });
 });
 
-const customerOrderSyncSchema = z.object({ publicCode: z.string().trim().min(6).max(64), restaurantSlug: z.string().trim().min(1).max(120), customerId: z.string().nullable().optional(), customerName: z.string().trim().max(160).nullable().optional(), deliveryAddress: z.string().trim().min(5).max(1000), deliveryNote: z.string().trim().max(500).default(""), deliveryLocation: z.object({ latitude: z.number().finite(), longitude: z.number().finite() }).nullable().optional(), items: z.array(z.object({ itemId: z.string().min(1), name: z.string().min(1), quantity: z.number().int().min(1).max(20), unitPriceCents: z.number().int().min(0), totalCents: z.number().int().min(0).optional() })).min(1), subtotalCents: z.number().int().min(0), deliveryFeeCents: z.number().int().min(0), serviceFeeCents: z.number().int().min(0), totalCents: z.number().int().min(0), paymentMethod: z.enum(["stripe", "cash"]).default("stripe"), paymentState: z.enum(["pending", "authorized", "paid", "failed", "refunded"]).default("pending"), stripeCheckoutSessionId: z.string().nullable().optional(), stripePaymentIntentId: z.string().nullable().optional() });
+const customerOrderSyncSchema = z.object({
+  publicCode: z.string().trim().min(6).max(64),
+  restaurantSlug: z.string().trim().min(1).max(120),
+  customerId: z.string().nullable().optional(),
+  customerName: z.string().trim().max(160).nullable().optional(),
+  deliveryAddress: z.string().trim().min(5).max(1000),
+  deliveryNote: z.string().trim().max(500).default(""),
+  deliveryLocation: z.object({ latitude: z.number().finite(), longitude: z.number().finite() }).nullable().optional(),
+  items: z.array(z.object({
+    itemId: z.string().min(1), name: z.string().min(1), quantity: z.number().int().min(1).max(20),
+    unitPriceCents: z.number().int().min(0), totalCents: z.number().int().min(0).optional(),
+    // Both representations are accepted so existing Customer clients stay
+    // compatible while the server now requotes every modifier itself.
+    selections: z.array(z.object({ groupId: z.string().min(1).max(80), optionIds: z.array(z.string().min(1).max(80)).max(30) })).max(20).optional(),
+    selectedOptions: z.array(z.object({ groupId: z.string().min(1).max(80), optionId: z.string().min(1).max(80) })).max(60).optional(),
+  })).min(1),
+  subtotalCents: z.number().int().min(0), deliveryFeeCents: z.number().int().min(0), serviceFeeCents: z.number().int().min(0), totalCents: z.number().int().min(0),
+  paymentMethod: z.enum(["stripe", "cash"]).default("stripe"), paymentState: z.enum(["pending", "authorized", "paid", "failed", "refunded"]).default("pending"),
+  stripeCheckoutSessionId: z.string().nullable().optional(), stripePaymentIntentId: z.string().nullable().optional(),
+});
+type CustomerOrderSyncConflict = Error & { syncConflict: true; payload: Record<string, unknown> };
+function customerOrderSyncConflict(error: string, payload: Record<string, unknown>): CustomerOrderSyncConflict {
+  return Object.assign(new Error(error), { syncConflict: true as const, payload: { error, ...payload } });
+}
+function sameCanonicalFinancials(order: any, input: { subtotalCents: number; deliveryFeeCents: number; serviceFeeCents: number; totalCents: number }) {
+  return Number(order?.subtotalCents) === input.subtotalCents
+    && Number(order?.deliveryFeeCents) === input.deliveryFeeCents
+    && Number(order?.serviceFeeCents) === input.serviceFeeCents
+    && Number(order?.totalCents) === input.totalCents;
+}
 app.post("/api/v1/internal/customer-orders/sync", async (req, res) => {
   const expected = process.env.PIKI_CUSTOMER_SYNC_SECRET;
   if (!expected || req.header("x-piki-customer-sync-secret") !== expected) return res.status(401).json({ error: "INVALID_SYNC_AUTH" });
-  const parsed = customerOrderSyncSchema.safeParse(req.body); if (!parsed.success) return res.status(400).json({ error: "INVALID_CUSTOMER_ORDER", details: parsed.error.flatten() });
+  const parsed = customerOrderSyncSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "INVALID_CUSTOMER_ORDER", details: parsed.error.flatten() });
   const input = parsed.data;
   const restaurantId = objectId(input.restaurantSlug);
   const restaurant = await Restaurant.findOne({ $or: [{ slug: input.restaurantSlug }, ...(restaurantId ? [{ _id: restaurantId }] : [])], isActive: true, onboardingStatus: "approved" }).lean().exec() as any;
   if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_AVAILABLE" });
   if (input.paymentMethod === "cash" && !isCashPaymentEnabledForRestaurant(restaurant)) return res.status(409).json(cashPaymentDisabledError(restaurant));
-  const existing = await Order.findOne({ publicCode: input.publicCode }).lean().exec() as any;
-  const location = input.deliveryLocation ? { type: "Point", coordinates: [input.deliveryLocation.longitude, input.deliveryLocation.latitude] } : restaurant.location;
-  if (!location?.coordinates?.length) return res.status(409).json({ error: "DELIVERY_LOCATION_REQUIRED" });
-  const freeDelivery = await freeDeliveryState(restaurant);
-  const effectiveDeliveryFeeCents = freeDelivery.eligible ? 0 : input.deliveryFeeCents;
-  if (!isCashOrderWithinLimit(input.paymentMethod, input.totalCents)) return res.status(422).json(cashOrderLimitError(input.totalCents));
-  const marketplace = calculateMarketplaceBreakdown({
-    subtotalCents: input.subtotalCents,
-    deliveryFeeCents: effectiveDeliveryFeeCents,
-    serviceFeeCents: input.serviceFeeCents,
-    commissionRateBps: Math.round(customerCommissionRate(restaurant) * 10_000),
-    riderEarningsCents: configuredRiderPayoutCents(),
-  });
-  if (marketplace.customerTotalCents !== input.totalCents) return res.status(409).json({ error: "MARKETPLACE_TOTAL_MISMATCH" });
-  // Customer is the source of truth: never rebuild lines from a second menu copy.
-  // This prevents price/name drift between Customer, Partner and Rider screens.
-  const pricedMenu = pricedRestaurantMenu(restaurant);
-  const menuById = new Map(pricedMenu.map((item: any) => [String(item.id), item]));
-  const canonicalItems = input.items.map(({ itemId, name, quantity, unitPriceCents, totalCents }) => {
-    const catalogItem = menuById.get(String(itemId));
-    const effectiveUnitPriceCents = catalogItem ? Math.round(Number(catalogItem.price || 0) * 100) : unitPriceCents;
-    return { itemId, name: catalogItem?.name || name, quantity, unitPriceCents: effectiveUnitPriceCents, ...(totalCents == null ? {} : { totalCents: effectiveUnitPriceCents * quantity }) };
-  });
-  const canonicalSubtotalCents = canonicalItems.reduce((sum, item) => sum + item.unitPriceCents * item.quantity, 0);
-  const canonicalTotalCents = canonicalSubtotalCents + effectiveDeliveryFeeCents + input.serviceFeeCents;
-  if (!isCashOrderWithinLimit(input.paymentMethod, canonicalTotalCents)) return res.status(422).json(cashOrderLimitError(canonicalTotalCents));
-  const order = await Order.findOneAndUpdate({ publicCode: input.publicCode }, { $set: { tenantId: restaurant.tenantId || null, restaurantId: restaurant._id, customerId: input.customerId || null, ...(input.customerName !== undefined ? { customerName: input.customerName || "" } : {}), items: canonicalItems, deliveryAddress: input.deliveryAddress, deliveryNote: input.deliveryNote, deliveryLocation: location, subtotalCents: canonicalSubtotalCents, deliveryFeeCents: effectiveDeliveryFeeCents, serviceFeeCents: input.serviceFeeCents, totalCents: canonicalTotalCents, marketplaceCommissionRateBps: marketplace.commissionRateBps, marketplaceCommissionCents: marketplace.platformCommissionCents, partnerPayoutCents: marketplace.partnerPayoutCents, riderEarningsCents: marketplace.riderEarningsCents, platformNetBeforeProcessingCents: marketplace.platformNetBeforeProcessingCents, payoutStatus: "pending", paymentMethod: input.paymentMethod, paymentState: input.paymentState, ...(input.stripeCheckoutSessionId !== undefined ? { stripeCheckoutSessionId: input.stripeCheckoutSessionId } : {}), ...(input.stripePaymentIntentId !== undefined ? { stripePaymentIntentId: input.stripePaymentIntentId } : {}), ...(["authorized", "paid"].includes(input.paymentState) && !["authorized", "paid"].includes(existing?.paymentState || "") ? { status: "pending", assignmentState: "unassigned" } : {}) }, $setOnInsert: { publicCode: input.publicCode, status: "pending", assignmentState: "unassigned", statusHistory: [{ status: "pending", actorRole: "system", reason: "Pedido sincronizado desde PIKI Customer" }] } }, { upsert: true, new: true, setDefaultsOnInsert: true }).lean().exec() as any;
+
+  const pricedRestaurant = { ...restaurant, menu: pricedRestaurantMenu(restaurant) };
+  let snapshot: ReturnType<typeof buildCanonicalOrderSnapshot>;
+  try {
+    snapshot = buildCanonicalOrderSnapshot({ menu: pricedRestaurant.menu, items: input.items, useReferenceAddOns: usesReferenceAddOns(pricedRestaurant) });
+  } catch (error) {
+    if (error instanceof OrderSnapshotError) return res.status(400).json({ error: error.code });
+    throw error;
+  }
+
+  // A retry may omit coordinates; only a pre-existing order can reuse its
+  // server-persisted point. New orders must be quoted from a delivery address,
+  // never from the restaurant location or a client-provided fee.
+  const initialExisting = await Order.findOne({ publicCode: input.publicCode }).lean().exec() as any;
+  const locationCoordinates = input.deliveryLocation
+    ? [input.deliveryLocation.longitude, input.deliveryLocation.latitude]
+    : initialExisting?.deliveryLocation?.coordinates;
+  if (!Array.isArray(locationCoordinates) || locationCoordinates.length < 2) return res.status(409).json({ error: "DELIVERY_LOCATION_REQUIRED" });
+  const deliveryPoint: [number, number] = [Number(locationCoordinates[0]), Number(locationCoordinates[1])];
+  if (!Number.isFinite(deliveryPoint[0]) || !Number.isFinite(deliveryPoint[1])) return res.status(409).json({ error: "DELIVERY_LOCATION_REQUIRED" });
+  const coverage = evaluateXativaCoverage(deliveryPoint);
+  if (!coverage.covered || coverage.deliveryFeeCents === null || coverage.serviceFeeCents === null) return res.status(422).json({ error: "DELIVERY_OUTSIDE_XATIVA_RADIUS", message: "Todavía no repartimos en esa dirección.", ...coverage });
+  const quotedDeliveryFeeCents = Number(coverage.deliveryFeeCents);
+  const quotedServiceFeeCents = Number(coverage.serviceFeeCents);
+
+  let existing: any = initialExisting;
+  let order: any = null;
+  let freeDelivery: Awaited<ReturnType<typeof claimFreeDeliveryPromotion>> = noFreeDeliveryPromotion();
+  let canonicalDeliveryFeeCents = quotedDeliveryFeeCents;
+  let canonicalTotalCents = 0;
+  let marketplace: ReturnType<typeof calculateMarketplaceBreakdown> | null = null;
+  let created = false;
+  const syncSession = await mongoose.startSession();
+  try {
+    await syncSession.withTransaction(async () => {
+      existing = await Order.findOne({ publicCode: input.publicCode }).session(syncSession).lean().exec() as any;
+      const settled = ["authorized", "paid"].includes(existing?.paymentState || "");
+      freeDelivery = settled
+        ? await existingFreeDeliveryPromotion(restaurant, input.publicCode, syncSession)
+        : await claimFreeDeliveryForOrder(restaurant, input.publicCode, syncSession);
+      canonicalDeliveryFeeCents = freeDelivery.eligible ? 0 : quotedDeliveryFeeCents;
+      canonicalTotalCents = snapshot.subtotalCents + canonicalDeliveryFeeCents + quotedServiceFeeCents;
+      const canonicalFinancials = { subtotalCents: snapshot.subtotalCents, deliveryFeeCents: canonicalDeliveryFeeCents, serviceFeeCents: quotedServiceFeeCents, totalCents: canonicalTotalCents };
+
+      // A settled order is immutable. Do this check before the upsert and before
+      // any ledger can see a changed amount.
+      if (settled && !sameCanonicalFinancials(existing, canonicalFinancials)) {
+        throw customerOrderSyncConflict("PAID_ORDER_TOTAL_MISMATCH", { expected: canonicalFinancials, persisted: { subtotalCents: existing.subtotalCents, deliveryFeeCents: existing.deliveryFeeCents, serviceFeeCents: existing.serviceFeeCents, totalCents: existing.totalCents } });
+      }
+      const inputMatchesCanonical = snapshot.pricesMatchInput
+        && input.subtotalCents === snapshot.subtotalCents
+        && input.deliveryFeeCents === canonicalDeliveryFeeCents
+        && input.serviceFeeCents === quotedServiceFeeCents
+        && input.totalCents === canonicalTotalCents;
+      if (!inputMatchesCanonical) {
+        throw customerOrderSyncConflict("ORDER_PRICE_CHANGED", { expected: canonicalFinancials, coverage, freeDeliveryApplied: freeDelivery.eligible });
+      }
+      if (!isCashOrderWithinLimit(input.paymentMethod, canonicalTotalCents)) throw customerOrderSyncConflict("CASH_ORDER_LIMIT_EXCEEDED", { totalCents: canonicalTotalCents });
+
+      marketplace = calculateMarketplaceBreakdown({
+        subtotalCents: snapshot.subtotalCents,
+        deliveryFeeCents: canonicalDeliveryFeeCents,
+        serviceFeeCents: quotedServiceFeeCents,
+        commissionRateBps: Math.round(customerCommissionRate(restaurant) * 10_000),
+        riderEarningsCents: configuredRiderPayoutCents(),
+      });
+      if (marketplace.customerTotalCents !== canonicalTotalCents) throw new Error("MARKETPLACE_TOTAL_MISMATCH");
+      if (settled) { order = existing; return; }
+
+      order = await Order.findOneAndUpdate(
+        { publicCode: input.publicCode },
+        {
+          $set: {
+            tenantId: restaurant.tenantId || null, restaurantId: restaurant._id, customerId: input.customerId || null,
+            ...(input.customerName !== undefined ? { customerName: input.customerName || "" } : {}),
+            items: snapshot.items, deliveryAddress: input.deliveryAddress, deliveryNote: input.deliveryNote,
+            deliveryLocation: { type: "Point", coordinates: deliveryPoint }, coveragePolicySlug: coverage.policySlug,
+            coveragePolicyVersion: coverage.policyVersion, coverageDecision: coverage.reason,
+            straightLineDistanceKm: coverage.straightLineDistanceKm, withinMunicipality: coverage.withinMunicipality,
+            deliveryBaseFeeCents: coverage.deliveryBaseFeeCents, outsideMunicipalitySurchargeCents: coverage.outsideMunicipalitySurchargeCents,
+            subtotalCents: snapshot.subtotalCents, deliveryFeeCents: canonicalDeliveryFeeCents, serviceFeeCents: quotedServiceFeeCents, totalCents: canonicalTotalCents,
+            marketplaceCommissionRateBps: marketplace.commissionRateBps, marketplaceCommissionCents: marketplace.platformCommissionCents,
+            partnerPayoutCents: marketplace.partnerPayoutCents, riderEarningsCents: marketplace.riderEarningsCents,
+            platformNetBeforeProcessingCents: marketplace.platformNetBeforeProcessingCents, payoutStatus: "pending",
+            paymentMethod: input.paymentMethod, paymentState: input.paymentState,
+            ...(input.stripeCheckoutSessionId !== undefined ? { stripeCheckoutSessionId: input.stripeCheckoutSessionId } : {}),
+            ...(input.stripePaymentIntentId !== undefined ? { stripePaymentIntentId: input.stripePaymentIntentId } : {}),
+            ...(["authorized", "paid"].includes(input.paymentState) && !["authorized", "paid"].includes(existing?.paymentState || "") ? { status: "pending", assignmentState: "unassigned" } : {}),
+          },
+          $setOnInsert: { publicCode: input.publicCode, status: "pending", assignmentState: "unassigned", statusHistory: [{ status: "pending", actorRole: "system", reason: "Pedido sincronizado desde PIKI Customer" }] },
+        },
+        { upsert: true, new: true, setDefaultsOnInsert: true, session: syncSession },
+      ).lean().exec() as any;
+      created = !existing;
+    });
+  } catch (error) {
+    if ((error as CustomerOrderSyncConflict)?.syncConflict) {
+      const conflict = error as CustomerOrderSyncConflict;
+      if (conflict.payload.error === "CASH_ORDER_LIMIT_EXCEEDED") return res.status(422).json(cashOrderLimitError(canonicalTotalCents));
+      return res.status(409).json(conflict.payload);
+    }
+    throw error;
+  } finally {
+    await syncSession.endSession();
+  }
+  if (!order || !marketplace) throw new Error("SYNC_TRANSACTION_DID_NOT_COMMIT");
   const newlyPaid = ["authorized", "paid"].includes(input.paymentState) && !["authorized", "paid"].includes(existing?.paymentState || "");
-  const newCashOrder = input.paymentMethod === "cash" && !existing;
+  const newCashOrder = input.paymentMethod === "cash" && created;
   if (newlyPaid || newCashOrder) {
     const dispatch = enqueueOrderForDispatch(order._id as mongoose.Types.ObjectId).catch((error) => console.warn("Dispatch outbox enqueue failed", error instanceof Error ? error.message : error));
     const settlement = newCashOrder
@@ -3097,7 +3357,7 @@ app.post("/api/v1/internal/customer-orders/sync", async (req, res) => {
       : { settlement: "paid" as const, message: "Pago confirmado desde PIKI Customer." };
     await Promise.all([dispatch, publishOrderIntakeEvents(order, settlement)]);
   }
-  return res.status(existing ? 200 : 201).json({ order: { id: order._id, publicCode: order.publicCode, checkoutToken: checkoutToken(order.publicCode), status: order.status, paymentState: order.paymentState, assignmentState: order.assignmentState } });
+  return res.status(created ? 201 : 200).json({ order: { id: order._id, publicCode: order.publicCode, checkoutToken: checkoutToken(order.publicCode), status: order.status, paymentState: order.paymentState, assignmentState: order.assignmentState, subtotalCents: snapshot.subtotalCents, deliveryFeeCents: canonicalDeliveryFeeCents, serviceFeeCents: quotedServiceFeeCents, totalCents: canonicalTotalCents, freeDeliveryApplied: freeDelivery.eligible, freeDeliveryOrdersRemaining: freeDelivery.remaining } });
 });
 
 function requireCustomerSyncSecret(req: express.Request, res: express.Response) {
