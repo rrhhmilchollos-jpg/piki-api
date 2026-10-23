@@ -125,6 +125,10 @@ function getSession(req: Request) {
 }
 export async function currentCustomer(req: Request) { const raw = getSession(req); return raw ? CustomerAccount.findOne({ sessionHash: hashToken(raw) }).lean().exec() : null; }
 export async function issueCustomerSession(res: Response, userId: string) { const raw = randomBytes(32).toString("base64url"); await CustomerAccount.updateOne({ _id: userId }, { $set: { sessionHash: hashToken(raw), lastSignedIn: new Date() } }).exec(); const domain = process.env.NODE_ENV === "production" ? "; Domain=.pikidelivery.com" : ""; res.setHeader("Set-Cookie", `${COOKIE}=${raw}; Max-Age=31536000; Path=/; HttpOnly; Secure; SameSite=None${domain}`); return raw; }
+function clearCustomerSession(res: Response) {
+  const domain = process.env.NODE_ENV === "production" ? "; Domain=.pikidelivery.com" : "";
+  res.setHeader("Set-Cookie", `${COOKIE}=; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT; Path=/; HttpOnly; Secure; SameSite=None${domain}`);
+}
 async function setSession(res: Response, userId: string) { return issueCustomerSession(res, userId); }
 const customerPaymentMethod = (value: unknown) => {
   const method = String(value || "cash");
@@ -286,7 +290,7 @@ export async function handleCustomerTrpc(req: Request, res: Response) {
       if (!user || !checkPassword(String(input?.password || ""), user.passwordHash)) return fail(res, "Email o contraseña incorrectos", "UNAUTHORIZED");
       const sessionToken = await setSession(res, String(user._id)); return reply(res, { user: publicUser(user), sessionToken });
     }
-    if (procedure === "auth.logout") { res.clearCookie(COOKIE); return reply(res, { success: true }); }
+    if (procedure === "auth.logout") { clearCustomerSession(res); return reply(res, { success: true }); }
     if (procedure === "order.get" || procedure === "order.customerTracking") {
       const user = await currentCustomer(req) as any;
       if (!user) return fail(res, "Inicia sesión con la cuenta que realizó el pedido.", "AUTH_REQUIRED");
