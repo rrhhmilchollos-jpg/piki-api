@@ -54,6 +54,7 @@ import { buildFleetEntityScope, buildTenantScope } from "./tenantScope.js";
 import { authenticationOptions, registrationOptions, verifyAuthentication, verifyRegistration } from "./passkeys.js";
 import { markPartnerBatchPaid, markRiderBatchPaid, publicPartnerCode, publicRiderCode, recordGovernanceEvent, syncPublicIds } from "./pikiGovernance.js";
 import { openingHoursSchema } from "./openingHours.js";
+import { PRL_COURSE_VERSION, PRL_PASS_MARK, PrlEnrollment, certificateIssuer, certificateMode, createPrlToken, hashPrlToken, prlQuestions, publicPrlEnrollment } from "./prlTraining.js";
 import { GoogleBusinessConnection, GoogleOauthState, MunicipalExpansion } from "./expansionModels.js";
 import { decryptGoogleSecret, exchangeGoogleCode, fromGoogleRegularHours, googleAuthorizationUrl, googleBusinessConfigured, googleBusinessScopes, listGoogleAccounts, listGoogleLocations, readGoogleLocation, toGoogleRegularHours, updateGoogleLocationHours, encryptGoogleSecret } from "./googleBusinessProfile.js";
 
@@ -2477,12 +2478,84 @@ app.post("/api/v1/admin/:kind-leads/:id/prl-request", requireRole("admin"), asyn
   const scope = await onboardingScope(req);
   const lead = await Model.findOne({ _id: id, ...scope }).lean().exec() as any;
   if (!lead) return res.status(404).json({ error: "LEAD_NOT_FOUND" });
-  const configuredCourseUrl = String(process.env.PRL_COURSE_URL || "").trim();
-  const courseUrl = configuredCourseUrl && !configuredCourseUrl.includes("app.pikidelivery.com") ? configuredCourseUrl : "https://pikidelivery.com/formacion-prl";
-  const result = await sendCorporateEmail({ recipientEmail: lead.email, subject: "PIKI · Formación PRL obligatoria", idempotencyKey: `piki-prl-${kind}-${id}`, text: `Hola ${lead.name},\n\nComo siguiente paso de tu incorporación a PIKI, debes completar el curso breve de Prevención de Riesgos Laborales (PRL).\n\nAccede aquí: ${courseUrl}\n\nCuando lo termines, confirma la finalización desde PIKI o responde a este correo.\n\nEquipo PIKI`, html: `<p>Hola ${lead.name},</p><p>Como siguiente paso de tu incorporación a PIKI, debes completar el curso breve de <strong>Prevención de Riesgos Laborales (PRL)</strong>.</p><p><a href="${courseUrl}">Acceder al curso PRL</a></p><p>Cuando lo termines, confirma la finalización desde PIKI o responde a este correo.</p><p>Equipo PIKI</p>` });
-  const updated = await Model.findOneAndUpdate({ _id: id, ...scope }, { $set: { prlStatus: "requested", prlRequestedAt: new Date(), prlRequestedBy: objectId(String(req.auth?.employeeId || "")) }, $push: { history: { status: "qualified", notes: `Curso PRL solicitado para ${kind === "rider" ? "rider" : "partner"} como proceso separado del expediente documental.`, actorEmployeeId: objectId(String(req.auth?.employeeId || "")), changedAt: new Date() } } }, { new: true }).lean().exec();
-  return res.json({ lead: updated, training: { type: "prl", courseUrl, emailSent: result.sent } });
+  const { token, tokenHash } = createPrlToken();
+  const enrollment = await PrlEnrollment.create({ tenantId: lead.tenantId || null, leadKind: kind, leadId: id, name: lead.name, email: String(lead.email).toLowerCase(), tokenHash, courseVersion: PRL_COURSE_VERSION, status: "issued", certificate: { status: "not_eligible" } });
+  const configuredCourseUrl = String(process.env.PRL_COURSE_URL || "https://pikidelivery.com/formacion-prl").trim().replace(/\/$/, "");
+  const courseUrl = `${configuredCourseUrl}?token=${encodeURIComponent(token)}`;
+  const result = await sendCorporateEmail({ recipientEmail: lead.email, subject: "PIKI · Formación preventiva PRL", idempotencyKey: `piki-prl-${kind}-${id}-${String(enrollment._id)}`, text: `Hola ${lead.name},\n\nDebes completar la formación preventiva específica de PIKI. Este enlace es personal y registra tu asistencia, módulos consultados y evaluación:\n\n${courseUrl}\n\nLa constancia de finalización no sustituye la formación del servicio de prevención ajeno de la empresa. El certificado oficial solo se emitirá cuando el proveedor preventivo autorizado valide el expediente.\n\nEquipo PIKI`, html: `<p>Hola ${lead.name},</p><p>Debes completar la <strong>formación preventiva específica de PIKI</strong>. Este enlace es personal y registra asistencia, módulos y evaluación.</p><p><a href="${courseUrl}">Abrir formación</a></p><p>La constancia de finalización no sustituye la formación del servicio de prevención ajeno. El certificado oficial solo se emitirá cuando el proveedor preventivo autorizado valide el expediente.</p><p>Equipo PIKI</p>` });
+  const updated = await Model.findOneAndUpdate({ _id: id, ...scope }, { $set: { prlStatus: "requested", prlRequestedAt: new Date(), prlRequestedBy: objectId(String(req.auth?.employeeId || "")) }, $push: { history: { status: "qualified", notes: `Expediente PRL ${String(enrollment._id)} emitido para ${kind}.`, actorEmployeeId: objectId(String(req.auth?.employeeId || "")), changedAt: new Date() } } }, { new: true }).lean().exec();
+  return res.json({ lead: updated, training: { type: "prl", enrollmentId: String(enrollment._id), courseUrl, emailSent: result.sent, certificateMode: certificateMode(), officialIssuerConfigured: Boolean(certificateIssuer()) } });
 });
+
+app.get("/api/v1/public/prl/enrollments/:token", async (req, res) => {
+  const token = String(req.params.token || "");
+  const enrollment = await PrlEnrollment.findOne({ tokenHash: hashPrlToken(token) }).lean().exec();
+  if (!enrollment) return res.status(404).json({ error: "PRL_ENROLLMENT_NOT_FOUND" });
+  return res.json({ enrollment: publicPrlEnrollment(enrollment), modules: [
+    { id: 1, title: "Seguridad antes de empezar", body: "Comprueba vehículo, batería, frenos, luces y teléfono. No inicies la jornada si existe una avería que comprometa tu seguridad." },
+    { id: 2, title: "Circulación y reparto", body: "Respeta la normativa de tráfico y utiliza casco y elementos reflectantes cuando corresponda." },
+    { id: 3, title: "Entrega segura", body: "Aparca sin bloquear pasos, confirma el pedido y no uses el teléfono durante la marcha." },
+    { id: 4, title: "Incidentes y emergencias", body: "Ponte a salvo, llama al 112 si procede y comunica el incidente al soporte." },
+  ], questions: prlQuestions.map(({ answer: _answer, ...question }) => question), officialCertificate: false, notice: "Esta plataforma registra la formación interna. La acreditación oficial requiere validación del servicio de prevención autorizado de la empresa." });
+});
+
+app.post("/api/v1/public/prl/enrollments/:token/start", async (req, res) => {
+  const token = String(req.params.token || "");
+  const now = new Date();
+  const enrollment = await PrlEnrollment.findOneAndUpdate({ tokenHash: hashPrlToken(token) }, { $set: { status: "started", startedAt: now }, $push: { attendance: { event: "course_started", at: now, ip: req.ip, userAgent: String(req.headers["user-agent"] || "") } } }, { new: true }).lean().exec();
+  if (!enrollment) return res.status(404).json({ error: "PRL_ENROLLMENT_NOT_FOUND" });
+  return res.json({ enrollment: publicPrlEnrollment(enrollment) });
+});
+
+app.post("/api/v1/public/prl/enrollments/:token/attendance", async (req, res) => {
+  const token = String(req.params.token || "");
+  const moduleNumber = Number(req.body?.module);
+  if (!Number.isInteger(moduleNumber) || moduleNumber < 1 || moduleNumber > 4) return res.status(400).json({ error: "INVALID_PRL_MODULE" });
+  const now = new Date();
+  const enrollment = await PrlEnrollment.findOneAndUpdate({ tokenHash: hashPrlToken(token), status: { $in: ["issued", "started"] } }, { $set: { status: "started" }, $addToSet: { modulesViewed: moduleNumber }, $push: { attendance: { event: "module_viewed", module: moduleNumber, at: now, ip: req.ip, userAgent: String(req.headers["user-agent"] || "") } } }, { new: true }).lean().exec();
+  if (!enrollment) return res.status(404).json({ error: "PRL_ENROLLMENT_NOT_FOUND" });
+  return res.json({ enrollment: publicPrlEnrollment(enrollment) });
+});
+
+app.post("/api/v1/public/prl/enrollments/:token/submit", async (req, res) => {
+  const token = String(req.params.token || "");
+  const answers = (req.body?.answers && typeof req.body.answers === "object") ? req.body.answers : {};
+  const enrollment = await PrlEnrollment.findOne({ tokenHash: hashPrlToken(token), status: { $in: ["issued", "started"] } }).exec();
+  if (!enrollment) return res.status(404).json({ error: "PRL_ENROLLMENT_NOT_FOUND" });
+  const viewed = new Set((enrollment.modulesViewed || []).map(Number));
+  const answered = prlQuestions.filter((question) => Number(answers[question.id]) === question.answer);
+  const score = Math.round((answered.length / prlQuestions.length) * 100);
+  const passed = score >= PRL_PASS_MARK && [1, 2, 3, 4].every((module) => viewed.has(module));
+  const now = new Date();
+  enrollment.answers = Object.fromEntries(prlQuestions.map((question) => [question.id, Number(answers[question.id])])) as any;
+  enrollment.score = score; enrollment.passed = passed; enrollment.status = passed ? "passed" : "failed"; enrollment.completedAt = now;
+  enrollment.certificate = { status: passed ? "provider_pending" : "not_eligible", serial: null, issuer: null, issuedAt: null, providerReference: null } as any;
+  enrollment.attendance.push({ event: "assessment_submitted", at: now, ip: req.ip, userAgent: String(req.headers["user-agent"] || "") } as any);
+  await enrollment.save();
+  if (passed) {
+    const Model = enrollment.leadKind === "rider" ? RiderLead : PartnerLead;
+    await Model.updateOne({ _id: enrollment.leadId }, { $set: { prlStatus: "completed" } }).exec();
+  }
+  return res.json({ enrollment: publicPrlEnrollment(enrollment), passed, score, passMark: PRL_PASS_MARK, certificate: passed ? "provider_pending" : "not_eligible" });
+});
+
+app.get("/api/v1/admin/prl/enrollments", requireRole("admin"), async (req, res) => {
+  const scope = await onboardingScope(req);
+  const rows = await PrlEnrollment.find(scope).sort({ createdAt: -1 }).limit(500).lean().exec();
+  return res.json({ enrollments: rows.map(publicPrlEnrollment), certificateMode: certificateMode(), officialIssuerConfigured: Boolean(certificateIssuer()) });
+});
+
+app.post("/api/v1/admin/prl/enrollments/:id/provider-confirmation", requireRole("admin"), async (req, res) => {
+  if (certificateMode() !== "provider") return res.status(409).json({ error: "PRL_PROVIDER_NOT_CONFIGURED", message: "Configura un proveedor preventivo autorizado antes de emitir certificados oficiales." });
+  const id = objectId(String(req.params.id));
+  const reference = String(req.body?.providerReference || "").trim();
+  if (!id || !reference || !certificateIssuer()) return res.status(400).json({ error: "PRL_PROVIDER_REFERENCE_REQUIRED" });
+  const serial = `PIKI-PRL-${new Date().getUTCFullYear()}-${randomUUID().slice(0, 8).toUpperCase()}`;
+  const enrollment = await PrlEnrollment.findOneAndUpdate({ _id: id, passed: true }, { $set: { status: "provider_confirmed", "certificate.status": "issued", "certificate.serial": serial, "certificate.issuer": certificateIssuer(), "certificate.issuedAt": new Date(), "certificate.providerReference": reference } }, { new: true }).lean().exec();
+  if (!enrollment) return res.status(404).json({ error: "PRL_ENROLLMENT_NOT_FOUND_OR_NOT_PASSED" });
+  return res.json({ enrollment: publicPrlEnrollment(enrollment), certificate: { serial, issuer: certificateIssuer(), providerReference: reference } });
+});
+
 app.post("/api/v1/admin/:kind-leads/:id/route", requireRole("admin"), async (req, res) => {
   const kind = String(req.params.kind) as "rider" | "partner";
   const Model = leadModel(kind) as any;
