@@ -124,7 +124,7 @@ function getSession(req: Request) {
   return cookie ? cookie.slice(COOKIE.length + 1) : null;
 }
 export async function currentCustomer(req: Request) { const raw = getSession(req); return raw ? CustomerAccount.findOne({ sessionHash: hashToken(raw) }).lean().exec() : null; }
-export async function issueCustomerSession(res: Response, userId: string) { const raw = randomBytes(32).toString("base64url"); await CustomerAccount.updateOne({ _id: userId }, { $set: { sessionHash: hashToken(raw), lastSignedIn: new Date() } }).exec(); const domain = process.env.NODE_ENV === "production" ? "; Domain=.pikidelivery.com" : ""; res.setHeader("Set-Cookie", `${COOKIE}=${raw}; Max-Age=31536000; Path=/; HttpOnly; Secure; SameSite=None${domain}`); }
+export async function issueCustomerSession(res: Response, userId: string) { const raw = randomBytes(32).toString("base64url"); await CustomerAccount.updateOne({ _id: userId }, { $set: { sessionHash: hashToken(raw), lastSignedIn: new Date() } }).exec(); const domain = process.env.NODE_ENV === "production" ? "; Domain=.pikidelivery.com" : ""; res.setHeader("Set-Cookie", `${COOKIE}=${raw}; Max-Age=31536000; Path=/; HttpOnly; Secure; SameSite=None${domain}`); return raw; }
 async function setSession(res: Response, userId: string) { return issueCustomerSession(res, userId); }
 const customerPaymentMethod = (value: unknown) => {
   const method = String(value || "cash");
@@ -279,12 +279,12 @@ export async function handleCustomerTrpc(req: Request, res: Response) {
       const name = String(input?.name || "").trim(); const email = String(input?.email || "").trim().toLowerCase(); const password = String(input?.password || "");
       if (name.length < 2 || !email.includes("@") || password.length < 8) return fail(res, "Datos de cuenta no válidos");
       if (await CustomerAccount.exists({ email })) return fail(res, "Ya existe una cuenta con este email", "CONFLICT");
-      const referralInput = String(input?.referralCode || "").trim().toUpperCase(); const user = await CustomerAccount.create({ name, email, referralCode: undefined, referredByCode: referralInput || null, passwordHash: hashPassword(password) }); await setSession(res, String(user._id)); return reply(res, { user: publicUser(user) });
+      const referralInput = String(input?.referralCode || "").trim().toUpperCase(); const user = await CustomerAccount.create({ name, email, referralCode: undefined, referredByCode: referralInput || null, passwordHash: hashPassword(password) }); const sessionToken = await setSession(res, String(user._id)); return reply(res, { user: publicUser(user), sessionToken });
     }
     if (procedure === "auth.login") {
       const email = String(input?.email || "").trim().toLowerCase(); const user = await CustomerAccount.findOne({ email }).exec();
       if (!user || !checkPassword(String(input?.password || ""), user.passwordHash)) return fail(res, "Email o contraseña incorrectos", "UNAUTHORIZED");
-      await setSession(res, String(user._id)); return reply(res, { user: publicUser(user) });
+      const sessionToken = await setSession(res, String(user._id)); return reply(res, { user: publicUser(user), sessionToken });
     }
     if (procedure === "auth.logout") { res.clearCookie(COOKIE); return reply(res, { success: true }); }
     if (procedure === "order.get" || procedure === "order.customerTracking") {

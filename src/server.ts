@@ -2468,14 +2468,19 @@ app.patch("/api/v1/rider-applications/:id/status", requireRole("admin"), async (
 
 function normalizedZoneSlug(value: string) { return String(value || "").trim().toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, ""); }
 const leadRoutingSchema = z.object({ zoneSlug: z.string().regex(/^[a-z0-9-]+$/).optional() });
-app.post("/api/v1/admin/rider-leads/:id/prl-request", requireRole("admin"), async (req, res) => {
+app.post("/api/v1/admin/:kind-leads/:id/prl-request", requireRole("admin"), async (req, res) => {
+  const kind = String(req.params.kind) as "rider" | "partner";
+  const Model = kind === "partner" ? PartnerLead : kind === "rider" ? RiderLead : null;
+  if (!Model) return res.status(400).json({ error: "INVALID_LEAD_KIND" });
   const id = objectId(String(req.params.id));
   if (!id) return res.status(400).json({ error: "INVALID_LEAD_ID" });
-  const lead = await RiderLead.findOne({ _id: id, ...await onboardingScope(req) }).lean().exec() as any;
-  if (!lead) return res.status(404).json({ error: "RIDER_LEAD_NOT_FOUND" });
-  const courseUrl = process.env.PRL_COURSE_URL || "https://app.pikidelivery.com/formacion-prl";
-  const result = await sendCorporateEmail({ recipientEmail: lead.email, subject: "PIKI · Formación PRL obligatoria", idempotencyKey: `piki-prl-${id}`, text: `Hola ${lead.name},\n\nComo siguiente paso de tu incorporación a PIKI, debes completar el curso breve de Prevención de Riesgos Laborales (PRL).\n\nAccede aquí: ${courseUrl}\n\nCuando lo termines, confirma la finalización desde PIKI o responde a este correo.\n\nEquipo PIKI`, html: `<p>Hola ${lead.name},</p><p>Como siguiente paso de tu incorporación a PIKI, debes completar el curso breve de <strong>Prevención de Riesgos Laborales (PRL)</strong>.</p><p><a href="${courseUrl}">Acceder al curso PRL</a></p><p>Cuando lo termines, confirma la finalización desde PIKI o responde a este correo.</p><p>Equipo PIKI</p>` });
-  const updated = await RiderLead.findOneAndUpdate({ _id: id, ...await onboardingScope(req) }, { $set: { prlStatus: "requested", prlRequestedAt: new Date(), prlRequestedBy: objectId(String(req.auth?.employeeId || "")) }, $push: { history: { status: "qualified", notes: "Curso PRL solicitado como proceso separado del expediente documental.", actorEmployeeId: objectId(String(req.auth?.employeeId || "")), changedAt: new Date() } } }, { new: true }).lean().exec();
+  const scope = await onboardingScope(req);
+  const lead = await Model.findOne({ _id: id, ...scope }).lean().exec() as any;
+  if (!lead) return res.status(404).json({ error: "LEAD_NOT_FOUND" });
+  const configuredCourseUrl = String(process.env.PRL_COURSE_URL || "").trim();
+  const courseUrl = configuredCourseUrl && !configuredCourseUrl.includes("app.pikidelivery.com") ? configuredCourseUrl : "https://pikidelivery.com/formacion-prl";
+  const result = await sendCorporateEmail({ recipientEmail: lead.email, subject: "PIKI · Formación PRL obligatoria", idempotencyKey: `piki-prl-${kind}-${id}`, text: `Hola ${lead.name},\n\nComo siguiente paso de tu incorporación a PIKI, debes completar el curso breve de Prevención de Riesgos Laborales (PRL).\n\nAccede aquí: ${courseUrl}\n\nCuando lo termines, confirma la finalización desde PIKI o responde a este correo.\n\nEquipo PIKI`, html: `<p>Hola ${lead.name},</p><p>Como siguiente paso de tu incorporación a PIKI, debes completar el curso breve de <strong>Prevención de Riesgos Laborales (PRL)</strong>.</p><p><a href="${courseUrl}">Acceder al curso PRL</a></p><p>Cuando lo termines, confirma la finalización desde PIKI o responde a este correo.</p><p>Equipo PIKI</p>` });
+  const updated = await Model.findOneAndUpdate({ _id: id, ...scope }, { $set: { prlStatus: "requested", prlRequestedAt: new Date(), prlRequestedBy: objectId(String(req.auth?.employeeId || "")) }, $push: { history: { status: "qualified", notes: `Curso PRL solicitado para ${kind === "rider" ? "rider" : "partner"} como proceso separado del expediente documental.`, actorEmployeeId: objectId(String(req.auth?.employeeId || "")), changedAt: new Date() } } }, { new: true }).lean().exec();
   return res.json({ lead: updated, training: { type: "prl", courseUrl, emailSent: result.sent } });
 });
 app.post("/api/v1/admin/:kind-leads/:id/route", requireRole("admin"), async (req, res) => {
