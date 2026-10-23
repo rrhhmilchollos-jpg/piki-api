@@ -2401,12 +2401,59 @@ app.patch("/api/v1/rider-applications/:id/status", requireRole("admin"), async (
   const application = await RiderApplication.findOneAndUpdate({ _id: id, ...scope }, { $set: update }, { new: true }).lean().exec() as any;
   if (!application) return res.status(404).json({ error: "APPLICATION_NOT_FOUND" });
   let approvedRiderId = "";
+  let credentialEmail: { sent: boolean; error?: string; surface?: EmployeeCredentialSurface } = { sent: false };
   if (parsed.data.status === "approved") {
     const applicationTenantScope = application.tenantId ? { tenantId: application.tenantId } : { tenantId: null };
     const existingRider = await Rider.findOne({ email: application.email }).select("_id tenantId riderCode").lean().exec() as any;
     if (existingRider && String(existingRider.tenantId || "") !== String(application.tenantId || "")) return res.status(409).json({ error: "RIDER_EMAIL_OWNED_BY_ANOTHER_TENANT" });
     const approvedRider = await Rider.findOneAndUpdate({ email: application.email, ...applicationTenantScope }, { $set: { tenantId: application.tenantId || null, ...buildApprovedRiderOperationalProfile(application), fleetId: application.assignedFleetId || null, status: "offline" }, $setOnInsert: { riderCode: existingRider?.riderCode || await nextRiderCode() } }, { upsert: true, new: true }).select("_id").lean().exec() as any;
     approvedRiderId = approvedRider ? String(approvedRider._id) : "";
+    const employee = await EmployeeAccount.findOneAndUpdate(
+      { email: application.email, ...applicationTenantScope },
+      {
+        $set: {
+          tenantId: application.tenantId || null,
+          name: application.name,
+          jobRole: "rider",
+          apiRole: "rider",
+          roles: ["rider"],
+          primaryRole: "rider",
+          accessLevel: "subadmin",
+          authorizationStatus: "approved",
+          authorizedAt: new Date(),
+          authorizedBy: objectId(req.auth!.employeeId!),
+          active: true,
+          mustChangePassword: true,
+          fleetId: application.assignedFleetId || null,
+        },
+        $setOnInsert: {
+          employeeCode: `PIKI-E-${String(approvedRider?._id || application._id).replace(/[^a-z0-9]/gi, "").slice(-8).toUpperCase()}`,
+          passwordHash: hashPassword(generateTemporaryPassword()),
+        },
+      },
+      { upsert: true, new: true, setDefaultsOnInsert: true },
+    ).select("_id name email jobRole apiRole roles primaryRole accessLevel authorizationStatus active mustChangePassword").lean().exec() as any;
+    if (employee) {
+      const surface = preferredCredentialSurface(employee);
+      if (surface) {
+        const delivery = await sendEmployeePasswordLink(employee, surface, "activation");
+        credentialEmail = { sent: delivery.delivery.sent, error: delivery.delivery.error, surface };
+        if (delivery.delivery.sent) {
+          await AccessAuthorization.create({
+            tenantId: application.tenantId || null,
+            employeeId: employee._id,
+            action: "credentials_sent",
+            previousStatus: "approved",
+            nextStatus: "approved",
+            previousRole: "rider",
+            nextRole: "rider",
+            accessLevel: "subadmin",
+            actorEmployeeId: objectId(req.auth!.employeeId!),
+            reason: `Enlace de activación enviado para ${employeeCredentialLabels[surface]}.`,
+          });
+        }
+      }
+    }
   }
   if (existing.status !== parsed.data.status && ["approved", "rejected"].includes(parsed.data.status)) {
     const type = `onboarding.rider_application.${parsed.data.status}`;
@@ -2415,7 +2462,7 @@ app.patch("/api/v1/rider-applications/:id/status", requireRole("admin"), async (
     if (parsed.data.status === "approved") await notifyOnboarding({ channel: "fleet", type, entityId: approvedRiderId || String(application._id), tenantId: (application as any).tenantId, payload });
   }
   const documentReviewPending = (application.documents || []).some((document: any) => document.status !== "approved");
-  return res.json({ application: { ...application, applicationCode: onboardingCode("R", application._id) }, documentReviewPending, warning: documentReviewPending ? "La solicitud se ha gestionado; el expediente documental continúa pendiente de revisión." : undefined });
+  return res.json({ application: { ...application, applicationCode: onboardingCode("R", application._id) }, documentReviewPending, credentialEmail, warning: documentReviewPending ? "La solicitud se ha gestionado; el expediente documental continúa pendiente de revisión." : undefined });
 });
 
 
