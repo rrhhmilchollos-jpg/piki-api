@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { customerMenuForRestaurant } from "./customerCatalogPolicy.js";
-import { normalizePartnerMenuItems, partnerMenuItemsSchema } from "./menuContract.js";
+import { canonicalRestaurantMenu, normalizePartnerMenuItems, partnerMenuItemsSchema } from "./menuContract.js";
 
 test("conserva optionItems, precios propios y disponibilidad del editor Partner", () => {
   const parsed = partnerMenuItemsSchema.parse([{
@@ -47,4 +47,10 @@ test("el menú guardado del partner de prueba llega al catálogo público con el
     name: "Bowl de prueba de sincronización",
     price: 10.2,
   }]);
+});
+
+test("el catálogo conserva el menú persistido aunque el partner tenga un slug con datos históricos", () => {
+  const persistedMenu = [{ id: "partner-live-001", name: "Plato actualizado por Partner", price: 9.25, available: true }];
+  assert.deepEqual(canonicalRestaurantMenu({ slug: "alibaba-kebab-xativa", menu: persistedMenu }), persistedMenu);
+  assert.deepEqual(canonicalRestaurantMenu({ slug: "rooster-kebab-xativa" }), []);
 });

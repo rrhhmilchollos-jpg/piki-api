@@ -54,6 +54,12 @@ export function parseCustomerTrpcInput(value: unknown): any {
   return record;
 }
 
+export function parseCustomerTrpcBatchInputs(value: unknown, procedureCount: number): unknown[] {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return Array.from({ length: procedureCount }, () => ({}));
+  const record = value as Record<string, unknown>;
+  return Array.from({ length: procedureCount }, (_, index) => parseCustomerTrpcInput(record[String(index)]));
+}
+
 export function customerDisplayStatus(value: unknown): string {
   const canonicalStatus = String(value || "pending");
   // Existing Android Customer bundles use `ready` for the preparation step.
@@ -155,7 +161,7 @@ function restaurantView(row: any) {
   return { id: String(row._id), name: customerCatalogRestaurantName(row), availabilityStatus: isMrRooster ? "available" : (row.availabilityStatus || "available"), isActive: isMrRooster ? true : row.isActive, onboardingStatus: isMrRooster ? "approved" : row.onboardingStatus, cashPaymentsEnabled: isCashPaymentEnabledForRestaurant({ ...row, cashPaymentsEnabled: isMrRooster ? true : row.cashPaymentsEnabled }), cuisine: row.cuisine, category: row.category, tagline: row.tagline || "Descubre este establecimiento en PIKI.", eta: `${row.etaMinutes?.[0] || 20}–${row.etaMinutes?.[1] || 35} min`, fee: (row.deliveryFeeCents || 0) / 100, rating: row.rating || 0, reviews: row.reviews || 0, promoted: row.promoted, image: row.image || "", accent: row.accent || "#FFD72E", menu: (row.menu || []).filter(menuItemIsAvailable).map((item: any) => ({ id: item.id, name: item.name, description: item.description || "", price: item.price, allergens: Array.isArray(item.allergens) ? item.allergens : [], vegetarian: Boolean(item.vegetarian), popular: Boolean(item.popular), modifierGroups: modifierGroupsForItem(item, useReferenceFallback) })) };
 }
 
-export async function handleCustomerTrpc(req: Request, res: Response) {
+async function handleCustomerTrpcSingle(req: Request, res: Response) {
   // Some proxy/rewrite combinations preserve the tRPC path in req.path but
   // leave the named Express parameter empty. Resolve both forms so customer
   // support and pilot requests do not fall through as an unsupported procedure.
@@ -406,4 +412,41 @@ export async function handleCustomerTrpc(req: Request, res: Response) {
     }
     return fail(res, `Procedimiento no soportado: ${procedure}`, "NOT_FOUND");
   } catch (error) { console.error(`[customerCompat] ${procedure}`, error); return fail(res, "Error interno de la plataforma", "INTERNAL_SERVER_ERROR"); }
+}
+
+export async function handleCustomerTrpc(req: Request, res: Response) {
+  const routePath = String(req.originalUrl || req.url || req.path);
+  const pathProcedure = routePath.match(/\/api\/trpc\/([^?/#]+)/)?.[1] || req.path.split("/").filter(Boolean).pop() || "";
+  const procedurePath = decodeURIComponent(String(req.params.procedure || pathProcedure)).split("?")[0];
+  const procedures = procedurePath.split(",").filter(Boolean);
+  if (procedures.length < 2) return handleCustomerTrpcSingle(req, res);
+
+  let rawBatchInput: unknown = (req.body as any)?.input ?? req.query.input ?? req.body;
+  if (typeof rawBatchInput === "string") {
+    try { rawBatchInput = JSON.parse(rawBatchInput); } catch { rawBatchInput = {}; }
+  }
+  const inputs = parseCustomerTrpcBatchInputs(rawBatchInput, procedures.length);
+  const results: unknown[] = [];
+  const statuses: number[] = [];
+
+  for (let index = 0; index < procedures.length; index += 1) {
+    let statusCode = 200;
+    let responseBody: unknown;
+    const singleResponse = {
+      status(code: number) { statusCode = code; return this; },
+      json(value: unknown) { responseBody = value; return this; },
+      setHeader(name: string, value: string | number | readonly string[]) { res.setHeader(name, value as any); return this; },
+    } as unknown as Response;
+    const singleRequest = Object.assign(Object.create(Object.getPrototypeOf(req)), req, {
+      params: { ...req.params, procedure: procedures[index] },
+      body: { json: inputs[index] },
+    }) as Request;
+    await handleCustomerTrpcSingle(singleRequest, singleResponse);
+    statuses.push(statusCode);
+    results.push(responseBody);
+  }
+
+  const uniqueStatuses = new Set(statuses);
+  const batchStatus = uniqueStatuses.size > 1 ? 207 : (statuses[0] || 200);
+  return res.status(batchStatus).json(results);
 }

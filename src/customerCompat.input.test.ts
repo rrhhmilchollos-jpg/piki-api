@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { customerDisplayStatus, parseCustomerTrpcInput } from "./customerCompat.js";
+import { customerDisplayStatus, parseCustomerTrpcBatchInputs, parseCustomerTrpcInput } from "./customerCompat.js";
 
 test("obtiene el pedido de una petición tRPC GET por lotes", () => {
   const input = parseCustomerTrpcInput({ "0": { json: { id: "PIKI-MVBP4EQA" } } });
@@ -15,6 +15,20 @@ test("conserva el formato tRPC no agrupado", () => {
 test("conserva un cuerpo directo de Customer", () => {
   const input = parseCustomerTrpcInput({ id: "PIKI-DIRECTO" });
   assert.deepEqual(input, { id: "PIKI-DIRECTO" });
+});
+
+test("extrae cada input tRPC por lotes en el orden de los procedimientos", () => {
+  const inputs = parseCustomerTrpcBatchInputs({
+    "0": { json: null, meta: { values: ["undefined"] } },
+    "1": { json: { category: null, query: null }, meta: { values: { category: ["undefined"], query: ["undefined"] } } },
+  }, 2);
+  assert.deepEqual(inputs, [null, { category: null, query: null }]);
+});
+
+test("rellena inputs ausentes de un batch sin compartir objetos mutables", () => {
+  const inputs = parseCustomerTrpcBatchInputs({ "0": { json: { id: "PIKI-ABC123" } } }, 2);
+  assert.deepEqual(inputs, [{ id: "PIKI-ABC123" }, {}]);
+  assert.notEqual(inputs[0], inputs[1]);
 });
 
 test("expone el pedido listo como ready a los bundles Android anteriores", () => {

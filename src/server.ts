@@ -34,9 +34,8 @@ import { awardRiderRecruitmentMilestones, claimRiderReferralCode, completeRiderS
 import { buildApprovedRiderOperationalProfile } from "./riderApproval.js";
 import { COMING_SOON_SLUGS, CUSTOMER_CATALOG_RESTAURANT_FILTER, CUSTOMER_ORDERABLE_RESTAURANT_FILTER, GOLDEN_FOUNDER_SLUGS, customerCommissionRate, customerMenuForRestaurant, presentCustomerCatalogRestaurant } from "./customerCatalogPolicy.js";
 import { PARTNER_DEMO_MENU_VERSION, partnerDemoMenu } from "./partnerDemoMenu.js";
-import { KINGS_TACOS_COVER_IMAGE, kingsTacosMenu } from "./kingsTacosMenu.js";
-import { ALIBABA_KEBAB_COVER_IMAGE, alibabaKebabMenu } from "./alibabaKebabMenu.js";
-import { mrRoosterMenu } from "./mrRoosterMenu.js";
+import { KINGS_TACOS_COVER_IMAGE } from "./kingsTacosMenu.js";
+import { ALIBABA_KEBAB_COVER_IMAGE } from "./alibabaKebabMenu.js";
 import { configuredPartnerRestaurantUpsert } from "./partnerRepairPolicy.js";
 import { quoteMenuItem, usesReferenceAddOns } from "./menuModifiers.js";
 import { pointDistanceMeters } from "./pickupPolicy.js";
@@ -45,7 +44,7 @@ import { cashOrderLimitError, cashPaymentDisabledError, isCashOrderWithinLimit, 
 import { calculateMarketplaceBreakdown, DEFAULT_PARTNER_COMMISSION_BPS } from "./marketplaceAccounting.js";
 import { postMarketplaceOrderLedger, preparePartnerPayoutBatch } from "./marketplaceLedger.js";
 import { extractAndParseMenu, readAssetBytes } from "./menuImport.js";
-import { normalizePartnerMenuItems, partnerMenuItemsSchema } from "./menuContract.js";
+import { canonicalRestaurantMenu, normalizePartnerMenuItems, partnerMenuItemsSchema } from "./menuContract.js";
 import { publishCatalogUpdate, serveCatalogEvents, startCatalogRelay } from "./catalogRealtime.js";
 import { purgeTestDataIfEnabled } from "./purgeTestData.js";
 import { validateDocumentRequestSubmission } from "./onboardingDocumentPolicy.js";
@@ -354,10 +353,6 @@ const MENU_IMAGE_MIME_TYPES = ["image/webp", "image/jpeg", "image/png", "image/g
 const MENU_FILE_MIME_TYPES = ["application/pdf"] as const;
 const MENU_ASSET_MIME_TYPES = [...MENU_IMAGE_MIME_TYPES, ...MENU_FILE_MIME_TYPES] as const;
 const MENU_ASSET_KINDS = ["menu_image", "menu_file"] as const;
-const ALIBABA_KEBAB_SLUG = "alibaba-kebab-xativa";
-function canonicalRestaurantMenu(restaurant: any) {
-  return restaurant?.slug === ALIBABA_KEBAB_SLUG ? alibabaKebabMenu : (Array.isArray(restaurant?.menu) ? restaurant.menu : []);
-}
 function pricedRestaurantMenu(restaurant: any) {
   return customerMenuForRestaurant({ ...restaurant, menu: canonicalRestaurantMenu(restaurant) });
 }
@@ -1716,8 +1711,7 @@ app.put("/api/v1/partners/menu", requireRole("partner"), async (req, res) => {
   if (!restaurantId) return res.status(403).json({ error: access?.restaurantIds.length ? "PARTNER_RESTAURANT_ACCESS_DENIED" : "PARTNER_RESTAURANT_NOT_ASSIGNED" });
   const parsed = z.object({ items: partnerMenuItemsSchema }).safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_MENU", details: parsed.error.flatten() });
-  const current = await Restaurant.findById(restaurantId).select("slug").lean().exec() as any;
-  const items = current?.slug === ALIBABA_KEBAB_SLUG ? alibabaKebabMenu : normalizePartnerMenuItems(parsed.data.items);
+  const items = normalizePartnerMenuItems(parsed.data.items);
   const restaurant = await Restaurant.findByIdAndUpdate(restaurantId, { $set: { menu: items } }, { new: true }).select("name menu slug").lean().exec() as any;
   if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
   invalidateCatalogCache();
@@ -5227,11 +5221,9 @@ async function repairConfiguredPartnerAccess() {
             promoted: true,
             deliveryFeeCents: 299,
             "partnerProfile.commissionRateBps": 1500,
-            menu: alibabaKebabMenu,
           } : location.slug === "rooster-kebab-xativa" ? {
             deliveryFeeCents: 299,
             "partnerProfile.commissionRateBps": 2500,
-            menu: mrRoosterMenu,
           } : location.slug === "nakama-sushi-xativa" ? {
             deliveryFeeCents: 299,
             "partnerProfile.commissionRateBps": 2300,
@@ -5255,7 +5247,7 @@ async function repairConfiguredPartnerAccess() {
   if (kingsGoLive) {
     await Restaurant.updateOne(
       { slug: "kings-tacos-xativa", tenantId: account.tenantId || null, onboardingStatus: "approved" },
-      { $set: { availabilityStatus: "available", upcomingMessage: "", isActive: true, image: KINGS_TACOS_COVER_IMAGE, promoted: false, menu: kingsTacosMenu } },
+      { $set: { availabilityStatus: "available", upcomingMessage: "", isActive: true, image: KINGS_TACOS_COVER_IMAGE, promoted: false } },
     ).exec();
   }
   const portfolioIds = [restaurant._id, ...assignedRestaurants.map((location: any) => location._id)];
@@ -5292,18 +5284,17 @@ async function ensureMrRoosterOperational() {
       cuisine: "Kebab",
       category: "Kebab",
       locality: "Xàtiva",
-	      availabilityStatus: "available",
-	      upcomingMessage: "",
-	      onboardingStatus: "approved",
-	      isActive: true,
-	      cashPaymentsEnabled: true,
-	      deliveryFeeCents: 299,
+      availabilityStatus: "available",
+      upcomingMessage: "",
+      onboardingStatus: "approved",
+      isActive: true,
+      cashPaymentsEnabled: true,
+      deliveryFeeCents: 299,
       image: "https://files.manuscdn.com/user_upload_by_module/session_file/310519663931061405/PSnZzuCOslUOgNQN.jpg",
       "partnerProfile.commissionRateBps": 2500,
-      menu: mrRoosterMenu,
     } },
   ).exec();
-	  if (result.matchedCount > 0) console.log(JSON.stringify({ event: "mr_rooster_operational", slug: "rooster-kebab-xativa", modified: result.modifiedCount > 0, menuCount: mrRoosterMenu.length, commissionRateBps: 2500, cashPaymentsEnabled: true }));
+  if (result.matchedCount > 0) console.log(JSON.stringify({ event: "mr_rooster_operational", slug: "rooster-kebab-xativa", modified: result.modifiedCount > 0, menuPreserved: true, commissionRateBps: 2500, cashPaymentsEnabled: true }));
 }
 async function start() {
   const uri = process.env.MONGODB_URI;

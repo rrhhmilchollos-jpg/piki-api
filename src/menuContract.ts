@@ -44,6 +44,10 @@ export const partnerMenuItemSchema = z.object({
 export const partnerMenuItemsSchema = z.array(partnerMenuItemSchema).max(500);
 export type PartnerMenuItem = z.infer<typeof partnerMenuItemSchema>;
 
+export function canonicalRestaurantMenu(restaurant: { menu?: unknown; [key: string]: unknown } | null | undefined): any[] {
+  return Array.isArray(restaurant?.menu) ? restaurant.menu : [];
+}
+
 type ModifierOption = { id: string; name: string; price: number; available: boolean; description: string };
 
 function canonicalOptions(group: PartnerMenuItem["modifiers"][number]): ModifierOption[] {
