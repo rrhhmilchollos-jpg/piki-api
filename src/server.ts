@@ -49,6 +49,7 @@ import { normalizePartnerMenuItems, partnerMenuItemsSchema } from "./menuContrac
 import { publishCatalogUpdate, serveCatalogEvents, startCatalogRelay } from "./catalogRealtime.js";
 import { purgeTestDataIfEnabled } from "./purgeTestData.js";
 import { validateDocumentRequestSubmission } from "./onboardingDocumentPolicy.js";
+import { PIKI_PRL_COURSE_SLUG, RiderTrainingAssignment, RiderTrainingCourse, RiderTrainingResponse, ensurePikiPrlCourse, publicTrainingQuestions, scoreTrainingAnswers, trainingToken, trainingTokenHash } from "./riderTraining.js";
 import { dispatchInitialIdempotencyKey, dispatchRequeueIdempotencyKey, enqueueDispatchOutbox, processDispatchOutboxBatch, type DispatchOutboxEvent } from "./dispatchOutbox.js";
 import { buildFleetEntityScope, buildTenantScope } from "./tenantScope.js";
 import { authenticationOptions, registrationOptions, verifyAuthentication, verifyRegistration } from "./passkeys.js";
@@ -113,7 +114,7 @@ async function reversePhoton(latitude: number, longitude: number) {
   const label = [address.road, [address.postcode, address.locality].filter(Boolean).join(" ")].filter(Boolean).join(", ");
   return { label: label || `Ubicación GPS ${latitude.toFixed(5)}, ${longitude.toFixed(5)}`, latitude, longitude, locality: address.locality || null, address: properties };
 }
-mongoose.connection.on("connected", () => { databaseReady = true; startRealtimeRelay(); startCatalogRelay(); void syncPublicIds().catch((error) => console.error("Public ID sync failed", error)); });
+mongoose.connection.on("connected", () => { databaseReady = true; startRealtimeRelay(); startCatalogRelay(); void syncPublicIds().catch((error) => console.error("Public ID sync failed", error)); void ensurePikiPrlCourse().catch((error) => console.error("PIKI PRL course seed failed", error)); });
 mongoose.connection.on("disconnected", () => { databaseReady = false; console.warn("MongoDB disconnected; API entering not-ready state"); });
 mongoose.connection.on("error", (error) => { databaseReady = false; console.error("MongoDB connection error", error instanceof Error ? error.message : error); });
 
@@ -2469,6 +2470,99 @@ app.patch("/api/v1/rider-applications/:id/status", requireRole("admin"), async (
 
 function normalizedZoneSlug(value: string) { return String(value || "").trim().toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, ""); }
 const leadRoutingSchema = z.object({ zoneSlug: z.string().regex(/^[a-z0-9-]+$/).optional() });
+app.post("/api/v1/admin/rider-applications/:id/prl-course", requireRole("admin", "fleet"), async (req, res) => {
+  const applicationId = objectId(String(req.params.id));
+  if (!applicationId) return res.status(400).json({ error: "INVALID_APPLICATION_ID" });
+  const application = await RiderApplication.findOne({ _id: applicationId, ...await adminOnboardingScope(req) }).lean().exec() as any;
+  if (!application) return res.status(404).json({ error: "APPLICATION_NOT_FOUND" });
+  if (req.auth?.role === "fleet") { const fleetEmployee = await employeeScope(req); if (!fleetEmployee?.fleetId || String(application.assignedFleetId || "") !== String(fleetEmployee.fleetId)) return res.status(403).json({ error: "FLEET_APPLICATION_FORBIDDEN" }); }
+  if (application.status !== "approved") return res.status(409).json({ error: "RIDER_APPLICATION_NOT_APPROVED" });
+  const tenantId = objectId(String(application.tenantId || ""));
+  if (!tenantId) return res.status(409).json({ error: "RIDER_APPLICATION_TENANT_REQUIRED" });
+  const rider = await Rider.findOne({ email: String(application.email).trim().toLowerCase(), tenantId }).select("_id").lean().exec() as any;
+  const employee = await EmployeeAccount.findOne({ email: String(application.email).trim().toLowerCase(), tenantId }).select("_id email name").lean().exec() as any;
+  if (!rider || !employee) return res.status(409).json({ error: "RIDER_ACCESS_NOT_PROVISIONED" });
+  const course = await ensurePikiPrlCourse() as any;
+  if (!course) return res.status(503).json({ error: "PRL_COURSE_UNAVAILABLE" });
+  const token = trainingToken();
+  const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
+  const assignment = await RiderTrainingAssignment.findOneAndUpdate({ tenantId, riderId: rider._id, courseId: course._id }, { $set: { riderApplicationId: application._id, fleetId: rider.fleetId || application.assignedFleetId || null, employeeId: employee._id, status: "assigned", accessTokenHash: trainingTokenHash(token), tokenPrefix: token.slice(0, 10), expiresAt, consentAcceptedAt: null, submittedAt: null, reviewDecision: "pending", reviewNotes: "", reviewedBy: null, reviewedAt: null } }, { upsert: true, new: true, setDefaultsOnInsert: true }).lean().exec() as any;
+  const baseUrl = String(process.env.RIDER_APP_URL || "https://rider.pikidelivery.com").replace(/\/$/, "");
+  const courseUrl = `${baseUrl}/training/prl?token=${encodeURIComponent(token)}`;
+  const email = await sendCorporateEmail({ recipientEmail: employee.email, subject: "PIKI · Curso PRL 1 obligatorio", idempotencyKey: `piki-prl-course-${assignment._id}-${assignment.tokenPrefix}`, text: `Hola ${employee.name || application.name},\n\nTienes asignado el curso PIKI 1 de Prevención de Riesgos Laborales para Riders.\n\nAccede aquí: ${courseUrl}\n\nEl enlace caduca en 7 días y la evaluación final será revisada por el equipo PIKI.`, html: `<p>Hola ${employee.name || application.name},</p><p>Tienes asignado el curso <strong>PIKI 1 · Prevención de Riesgos Laborales para Riders</strong>.</p><p><a href="${courseUrl}">Acceder al curso</a></p><p>El enlace caduca en 7 días y la evaluación final será revisada por el equipo PIKI.</p>` });
+  return res.json({ assignment: { id: assignment._id, status: assignment.status, expiresAt: assignment.expiresAt }, course: { slug: PIKI_PRL_COURSE_SLUG, title: course.title, version: course.version, questions: publicTrainingQuestions, passPercent: course.passPercent }, delivery: { emailSent: email.sent, courseUrl: email.sent ? undefined : courseUrl, error: email.sent ? undefined : email.error } });
+});
+app.get("/api/v1/rider-training/access", async (req, res) => {
+  const token = typeof req.query.token === "string" ? req.query.token : "";
+  if (!token) return res.status(400).json({ error: "TRAINING_TOKEN_REQUIRED" });
+  const assignment = await RiderTrainingAssignment.findOne({ accessTokenHash: trainingTokenHash(token), expiresAt: { $gt: new Date() }, status: { $in: ["assigned", "in_progress"] } }).lean().exec() as any;
+  if (!assignment) return res.status(404).json({ error: "TRAINING_LINK_INVALID_OR_EXPIRED" });
+  const course = await RiderTrainingCourse.findById(assignment.courseId).select("title version purpose questions passPercent").lean().exec() as any;
+  if (!course) return res.status(404).json({ error: "PRL_COURSE_NOT_FOUND" });
+  if (assignment.status === "assigned") await RiderTrainingAssignment.updateOne({ _id: assignment._id, status: "assigned" }, { $set: { status: "in_progress" } }).exec();
+  return res.json({ assignment: { id: assignment._id, status: assignment.status, expiresAt: assignment.expiresAt }, course });
+});
+app.post("/api/v1/rider-training/submit", async (req, res) => {
+  const parsed = z.object({ token: z.string().min(20), consentAccepted: z.literal(true), answers: z.record(z.string(), z.number().int().min(0).max(10)) }).safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "INVALID_TRAINING_SUBMISSION" });
+  const assignment = await RiderTrainingAssignment.findOne({ accessTokenHash: trainingTokenHash(parsed.data.token), expiresAt: { $gt: new Date() }, status: { $in: ["assigned", "in_progress"] } }).lean().exec() as any;
+  if (!assignment) return res.status(404).json({ error: "TRAINING_LINK_INVALID_OR_EXPIRED" });
+  const course = await RiderTrainingCourse.findById(assignment.courseId).select("passPercent").lean().exec() as any;
+  if (!course) return res.status(404).json({ error: "PRL_COURSE_NOT_FOUND" });
+  const result = scoreTrainingAnswers(parsed.data.answers as Record<string, number>, Number(course.passPercent || 75));
+  const response = await RiderTrainingResponse.findOneAndUpdate({ assignmentId: assignment._id }, { $setOnInsert: { tenantId: assignment.tenantId, assignmentId: assignment._id, answers: Object.entries(parsed.data.answers).map(([questionId, selectedIndex]) => ({ questionId, selectedIndex })), scorePercent: result.scorePercent, passedKnowledgeThreshold: result.passedKnowledgeThreshold, consentTextVersion: "prl-piki-1-v1", submittedAt: new Date() } }, { upsert: true, new: true, setDefaultsOnInsert: true }).lean().exec() as any;
+  await RiderTrainingAssignment.updateOne({ _id: assignment._id, status: { $in: ["assigned", "in_progress"] } }, { $set: { status: "submitted", consentAcceptedAt: new Date(), submittedAt: response.submittedAt || new Date() } }).exec();
+  return res.json({ response: { id: response._id, scorePercent: response.scorePercent, passedKnowledgeThreshold: response.passedKnowledgeThreshold, status: "submitted" }, notice: "El resultado queda pendiente de revisión humana por el equipo PIKI." });
+});
+app.get("/api/v1/admin/rider-training", requireRole("admin", "fleet"), async (req, res) => {
+  const scope = await buildTenantScope(req);
+  if (req.auth?.role === "fleet") { const fleetEmployee = await employeeScope(req); scope.fleetId = fleetEmployee?.fleetId || null; }
+  const assignments = await RiderTrainingAssignment.find(scope).sort({ updatedAt: -1 }).limit(200).lean().exec() as any[];
+  const responses = await RiderTrainingResponse.find({ tenantId: { $in: assignments.map((item) => item.tenantId) } }).lean().exec() as any[];
+  const byAssignment = new Map(responses.map((item) => [String(item.assignmentId), item]));
+  return res.json({ assignments: assignments.map((item) => ({ ...item, accessTokenHash: undefined, response: byAssignment.get(String(item._id)) || null })) });
+});
+app.patch("/api/v1/admin/rider-training/:id/review", requireRole("admin", "fleet"), async (req, res) => {
+  const parsed = z.object({ decision: z.enum(["approved", "needs_review", "rejected"]), notes: z.string().max(2000).default("") }).safeParse(req.body);
+  const id = objectId(String(req.params.id));
+  if (!id || !parsed.success) return res.status(400).json({ error: "INVALID_TRAINING_REVIEW" });
+  const reviewScope = await buildTenantScope(req);
+  if (req.auth?.role === "fleet") { const fleetEmployee = await employeeScope(req); reviewScope.fleetId = fleetEmployee?.fleetId || null; }
+  const assignment = await RiderTrainingAssignment.findOne({ _id: id, ...reviewScope }).lean().exec() as any;
+  if (!assignment) return res.status(404).json({ error: "TRAINING_ASSIGNMENT_NOT_FOUND" });
+  const updated = await RiderTrainingAssignment.findOneAndUpdate({ _id: id, tenantId: assignment.tenantId }, { $set: { status: "reviewed", reviewDecision: parsed.data.decision, reviewNotes: parsed.data.notes, reviewedAt: new Date(), reviewedBy: objectId(String(req.auth?.employeeId || "")) } }, { new: true }).select("_id tenantId status reviewDecision reviewNotes reviewedAt").lean().exec();
+  return res.json({ assignment: updated });
+});
+
+app.post("/api/v1/admin/rider-applications/:id/route", requireRole("admin"), async (req, res) => {
+  const id = objectId(String(req.params.id));
+  const parsed = z.object({ fleetId: z.string().regex(/^[a-f\d]{24}$/).optional(), zoneSlug: z.string().regex(/^[a-z0-9-]+$/).optional() }).refine((value) => value.fleetId || value.zoneSlug, "fleetId_or_zone_required").safeParse(req.body || {});
+  if (!id || !parsed.success) return res.status(400).json({ error: "INVALID_RIDER_APPLICATION_ROUTING" });
+  const application = await RiderApplication.findOne({ _id: id, ...await adminOnboardingScope(req) }).lean().exec() as any;
+  if (!application) return res.status(404).json({ error: "APPLICATION_NOT_FOUND" });
+  if (application.status !== "approved") return res.status(409).json({ error: "RIDER_APPLICATION_NOT_APPROVED" });
+  const tenantId = objectId(String(application.tenantId || ""));
+  if (!tenantId) return res.status(409).json({ error: "RIDER_APPLICATION_TENANT_REQUIRED" });
+  const fleetFilter: Record<string, unknown> = { tenantId, isActive: true };
+  if (parsed.data.fleetId) fleetFilter._id = objectId(parsed.data.fleetId);
+  if (parsed.data.zoneSlug) fleetFilter.serviceZones = parsed.data.zoneSlug;
+  const fleets = await Fleet.find(fleetFilter).select("_id name managerName contactEmail contactPhone serviceZones").lean().exec() as any[];
+  if (!fleets.length) return res.status(409).json({ error: "ZONE_FLEET_NOT_FOUND", message: "No existe una Fleet activa para esa zona y tenant." });
+  if (fleets.length > 1 && !parsed.data.fleetId) return res.status(409).json({ error: "ZONE_FLEET_AMBIGUOUS", message: "Hay varias Fleets activas para la zona; selecciona una explícitamente." });
+  const fleet = fleets[0];
+  const rider = await Rider.findOneAndUpdate({ email: String(application.email).trim().toLowerCase(), tenantId }, { $set: { fleetId: fleet._id } }, { new: true }).select("_id fleetId").lean().exec() as any;
+  await EmployeeAccount.updateOne({ email: String(application.email).trim().toLowerCase(), tenantId, jobRole: "rider" }, { $set: { fleetId: fleet._id } }).exec();
+  const updated = await RiderApplication.findOneAndUpdate({ _id: id, tenantId }, { $set: { assignedFleetId: fleet._id, notes: `${String(application.notes || "").trim()}\nDerivado a Fleet ${fleet.name}.` .trim() } }, { new: true }).select("_id status assignedFleetId tenantId").lean().exec();
+  const targetEmail = String(fleet.contactEmail || "").trim().toLowerCase();
+  let emailSent = false;
+  if (targetEmail) {
+    const email = await sendCorporateEmail({ recipientEmail: targetEmail, subject: `PIKI · Rider aprobado derivado a ${fleet.name}`, idempotencyKey: `piki-rider-application-route-${id}-${fleet._id}`, text: `Se ha derivado a tu Fleet el rider aprobado ${application.name} (${application.email}) de ${application.city}. Accede al panel Fleet para continuar con su activación operativa.`, html: `<p>Se ha derivado a tu Fleet el rider aprobado <strong>${application.name}</strong> (${application.email}) de ${application.city}.</p><p>Accede al panel Fleet para continuar con su activación operativa.</p>` });
+    emailSent = email.sent;
+  }
+  await recordGovernanceEvent({ actor: { employeeId: objectId(String(req.auth?.employeeId || "")), role: req.auth?.role, tenantId }, action: "rider_application_routed_to_fleet", targetType: "rider", targetId: rider?._id || id, after: { fleetId: String(fleet._id), fleetName: fleet.name, riderId: rider?._id ? String(rider._id) : null, targetEmail, emailSent }, reason: "Rider aprobado derivado explícitamente a Fleet activa del mismo tenant." });
+  return res.json({ application: updated, routing: { fleetId: String(fleet._id), fleetName: fleet.name, targetEmail, emailSent } });
+});
+
 app.post("/api/v1/admin/:kind-leads/:id/prl-request", requireRole("admin"), async (req, res) => {
   const kind = String(req.params.kind) as "rider" | "partner";
   const Model = kind === "partner" ? PartnerLead : kind === "rider" ? RiderLead : null;
