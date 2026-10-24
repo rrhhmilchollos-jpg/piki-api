@@ -1399,6 +1399,13 @@ async function employeeRestaurant(req: express.Request, access?: Awaited<ReturnT
   return resolvedAccess.restaurantIds[0] || null;
 }
 
+function setPartnerMenuResponseHeaders(res: express.Response) {
+  // The selected restaurant is carried by a request header. Never allow a
+  // browser, CDN, or shared proxy to reuse another restaurant's menu.
+  res.setHeader("Cache-Control", "no-store, no-cache, max-age=0, must-revalidate");
+  res.setHeader("Vary", "x-piki-restaurant-id, Cookie, Authorization");
+}
+
 async function partnerRequestAccess(req: express.Request, permission: PartnerPermission) {
   const access = await partnerAccessForRequest(req);
   return { access, allowed: Boolean(access && partnerCan(access.roles, permission)) };
@@ -1695,16 +1702,18 @@ app.patch("/api/v1/partners/google-business/publish-hours", requireRole("partner
   try { const result = await updateGoogleLocationHours(connection, connection.googleLocationName, toGoogleRegularHours(parsed.data)); await Restaurant.updateOne({ _id: objectId(restaurantId), ...tenantScope(req) }, { $set: { "partnerProfile.openingHours": parsed.data } }); connection.lastSyncAt = new Date(); connection.lastSyncStatus = "success"; connection.lastSyncError = ""; await connection.save(); return res.json({ synced: true, direction: "piki_to_google", result }); } catch (error) { return res.status(502).json({ error: "GOOGLE_PUBLISH_FAILED", message: error instanceof Error ? error.message : "GOOGLE_PUBLISH_FAILED" }); }
 });
 app.get("/api/v1/partners/menu", requireRole("partner"), async (req, res) => {
+  setPartnerMenuResponseHeaders(res);
   const { access, allowed } = await partnerRequestAccess(req, "menu:read");
   if (!allowed) return res.status(403).json({ error: "PARTNER_PERMISSION_DENIED", permission: "menu:read" });
   const restaurantId = await employeeRestaurant(req, access);
   if (!restaurantId) return res.status(403).json({ error: access?.restaurantIds.length ? "PARTNER_RESTAURANT_ACCESS_DENIED" : "PARTNER_RESTAURANT_NOT_ASSIGNED" });
-  const restaurant = await Restaurant.findById(restaurantId).select("name slug internalDemo menu").lean().exec() as any;
+  const restaurant = await Restaurant.findOne({ _id: objectId(restaurantId), ...tenantScope(req) }).select("name slug internalDemo menu").lean().exec() as any;
   if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
   const menu = canonicalRestaurantMenu(restaurant);
-  return res.json({ restaurant: { ...restaurant, menu }, menu });
+  return res.json({ restaurant: { ...restaurant, restaurantId: String(restaurant._id), menu }, restaurantId: String(restaurant._id), menu });
 });
 app.put("/api/v1/partners/menu", requireRole("partner"), async (req, res) => {
+  setPartnerMenuResponseHeaders(res);
   const { access, allowed } = await partnerRequestAccess(req, "menu:write");
   if (!allowed) return res.status(403).json({ error: "PARTNER_PERMISSION_DENIED", permission: "menu:write" });
   const restaurantId = await employeeRestaurant(req, access);
@@ -1712,11 +1721,11 @@ app.put("/api/v1/partners/menu", requireRole("partner"), async (req, res) => {
   const parsed = z.object({ items: partnerMenuItemsSchema }).safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_MENU", details: parsed.error.flatten() });
   const items = normalizePartnerMenuItems(parsed.data.items);
-  const restaurant = await Restaurant.findByIdAndUpdate(restaurantId, { $set: { menu: items } }, { new: true }).select("name menu slug").lean().exec() as any;
+  const restaurant = await Restaurant.findOneAndUpdate({ _id: objectId(restaurantId), ...tenantScope(req) }, { $set: { menu: items } }, { new: true }).select("name menu slug").lean().exec() as any;
   if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
   invalidateCatalogCache();
   void publishCatalogUpdate(restaurant._id, "partner.menu.updated");
-  return res.json({ restaurant, menu: restaurant.menu || [] });
+  return res.json({ restaurant: { ...restaurant, restaurantId: String(restaurant._id) }, restaurantId: String(restaurant._id), menu: restaurant.menu || [] });
 });
 
 app.get("/api/v1/admin/restaurants/:id/menu", requireOwner(), async (req, res) => {
