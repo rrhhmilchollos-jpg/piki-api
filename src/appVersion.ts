@@ -8,6 +8,8 @@ export const versionPolicySchema = z.object({
   minimumVersion: z.string().regex(/^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/),
   buildId: z.string().min(6).max(160),
   forceUpdate: z.boolean(),
+  playUpdateAvailable: z.boolean().optional(),
+  playVersion: z.string().regex(/^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/).optional(),
 }).strict().superRefine((value, context) => {
   if (compareSemver(value.minimumVersion, value.version) > 0) {
     context.addIssue({ code: "custom", message: "minimumVersion must not be newer than version" });
