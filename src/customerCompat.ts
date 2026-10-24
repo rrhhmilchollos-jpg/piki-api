@@ -12,6 +12,7 @@ import { createCheckoutSession } from "./stripe.js";
 import { dispatchInitialIdempotencyKey, enqueueDispatchOutbox } from "./dispatchOutbox.js";
 import { SupportTicket } from "./models.js";
 import { customerSupportCreateSchema, customerSupportTicketNumber, customerSupportTicketView } from "./customerSupportPolicy.js";
+import { checkoutOrigin } from "./checkoutOrigin.js";
 
 const COOKIE = "piki_customer_session";
 let dispatchCustomerOrder: ((orderId: string) => Promise<unknown>) | null = null;
@@ -134,18 +135,6 @@ const customerPaymentMethod = (value: unknown) => {
   const method = String(value || "cash");
   return method === "cash" || method === "stripe" ? method : null;
 };
-
-function checkoutOrigin(raw: unknown) {
-  const fallback = String(process.env.CUSTOMER_APP_URL || "https://pikidelivery.com").replace(/\/$/, "");
-  const candidate = String(raw || fallback).replace(/\/$/, "");
-  try {
-    const url = new URL(candidate);
-    const allowed = url.protocol === "https:" && (url.hostname === "pikidelivery.com" || url.hostname === "www.pikidelivery.com" || url.hostname.endsWith(".vercel.app"));
-    if (allowed) return url.origin;
-    if (process.env.NODE_ENV !== "production" && (url.hostname === "localhost" || url.hostname === "127.0.0.1")) return url.origin;
-  } catch { /* use the configured production origin below */ }
-  return fallback;
-}
 
 const deliveryQrUrl = (orderCode: string) => {
   const secret = String(process.env.DELIVERY_QR_SECRET || "").trim();

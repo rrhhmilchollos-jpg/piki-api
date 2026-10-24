@@ -60,6 +60,25 @@ test("anonymous SSE receives ready, committed updates and cleans up on disconnec
   } finally { first.close(); }
 });
 
+test("Partner fixture menu update emits a public invalidation for Customers only", () => {
+  const fixture = {
+    _id: "fixture-partner-menu-sync",
+    slug: "fixture-partner-menu-sync",
+    isActive: true,
+    onboardingStatus: "approved",
+    availabilityStatus: "available",
+    menu: [{ id: "sync-fixture-bowl-001", name: "Bowl de prueba de sincronización", price: 9.9 }],
+  };
+  const stream = new CatalogEventStream();
+  const subscriber = client(stream);
+  try {
+    stream.publish(publicCatalogUpdate(fixture, "partner.menu.updated"));
+    assert.match(subscriber.response.output, /"restaurantId":"fixture-partner-menu-sync"/);
+    assert.match(subscriber.response.output, /partner\.menu\.updated/);
+    assert.doesNotMatch(subscriber.response.output, /Bowl de prueba de sincronización|sync-fixture-bowl-001/);
+  } finally { subscriber.close(); }
+});
+
 test("SSE connection limit is enforced and disconnected clients release their slot once", () => {
   const stream = new CatalogEventStream(2, 1);
   const first = client(stream);

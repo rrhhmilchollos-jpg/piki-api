@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { customerMenuForRestaurant } from "./customerCatalogPolicy.js";
 import { normalizePartnerMenuItems, partnerMenuItemsSchema } from "./menuContract.js";
 
 test("conserva optionItems, precios propios y disponibilidad del editor Partner", () => {
@@ -27,4 +28,23 @@ test("migra un menú antiguo que solo tenía options de texto", () => {
   const [item] = normalizePartnerMenuItems(parsed);
   assert.deepEqual(item.modifiers[0].optionItems.map((option) => option.name), ["Yogur", "Picante"]);
   assert.deepEqual(item.modifiers[0].options.map((option) => (option as { price: number }).price), [0.5, 0.5]);
+});
+
+test("el menú guardado del partner de prueba llega al catálogo público con el mismo producto", () => {
+  const partnerDraft = partnerMenuItemsSchema.parse([{
+    id: "sync-fixture-bowl-001",
+    name: "Bowl de prueba de sincronización",
+    description: "Fixture sintético para verificar Partner → catálogo",
+    price: 8.5,
+    category: "Pruebas",
+    available: true,
+  }]);
+  const persistedMenu = normalizePartnerMenuItems(partnerDraft);
+  const publicMenu = customerMenuForRestaurant({ slug: "sync-fixture-partner", menu: persistedMenu });
+
+  assert.deepEqual(publicMenu.map(({ id, name, price }) => ({ id, name, price })), [{
+    id: "sync-fixture-bowl-001",
+    name: "Bowl de prueba de sincronización",
+    price: 10.2,
+  }]);
 });
