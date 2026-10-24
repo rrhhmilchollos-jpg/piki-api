@@ -130,9 +130,9 @@ export async function markDispatchOutboxProcessed(event: DispatchOutboxEvent, wo
   return result.modifiedCount === 1;
 }
 
-export async function rescheduleDispatchOutboxEvent(event: DispatchOutboxEvent, workerId: string, error: unknown, maxAttempts = DEFAULT_DISPATCH_MAX_ATTEMPTS) {
+export async function rescheduleDispatchOutboxEvent(event: DispatchOutboxEvent, workerId: string, error: unknown, maxAttempts = DEFAULT_DISPATCH_MAX_ATTEMPTS, deadLetterOnExhaustion = true) {
   const message = (error instanceof Error ? error.message : String(error || "DISPATCH_FAILED")).slice(0, 1000);
-  const deadLetter = event.attempts >= maxAttempts;
+  const deadLetter = deadLetterOnExhaustion && event.attempts >= maxAttempts;
   const result = await DispatchOutbox.updateOne(
     { _id: event._id, status: "processing", leaseOwner: workerId },
     {
@@ -147,7 +147,7 @@ export async function rescheduleDispatchOutboxEvent(event: DispatchOutboxEvent, 
 export async function processDispatchOutboxBatch(
   workerId: string,
   handler: (event: DispatchOutboxEvent) => Promise<void>,
-  options: { batchSize?: number; leaseMs?: number; maxAttempts?: number } = {},
+  options: { batchSize?: number; leaseMs?: number; maxAttempts?: number; deadLetterOnExhaustion?: (event: DispatchOutboxEvent, error: unknown) => boolean } = {},
 ) {
   let processed = 0;
   let deadLettered = 0;
@@ -161,7 +161,8 @@ export async function processDispatchOutboxBatch(
       await markDispatchOutboxProcessed(event, workerId);
       processed += 1;
     } catch (error) {
-      const outcome = await rescheduleDispatchOutboxEvent(event, workerId, error, options.maxAttempts);
+      const deadLetterOnExhaustion = options.deadLetterOnExhaustion ? options.deadLetterOnExhaustion(event, error) : true;
+      const outcome = await rescheduleDispatchOutboxEvent(event, workerId, error, options.maxAttempts, deadLetterOnExhaustion);
       if (outcome.deadLetter) {
         deadLettered += 1;
         deadLetters.push({

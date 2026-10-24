@@ -5338,12 +5338,16 @@ async function start() {
   if (process.env.PIKI_NO_LISTEN !== "true" && process.env.PIKI_INLINE_DISPATCH_WORKER !== "false") {
     const inlineWorkerId = `api-dispatch-${process.pid}-${randomUUID()}`;
     const pollInlineDispatch = async () => {
+      if (!databaseReady || mongoose.connection.readyState !== 1) return;
       try {
         const result = await processDispatchOutboxBatch(inlineWorkerId, async (event: DispatchOutboxEvent) => {
           const preferredRiderId = event.payload?.preferredRiderId;
           const outcome = await queueAutomaticDispatch(new mongoose.Types.ObjectId(String(event.orderId)), preferredRiderId && mongoose.isValidObjectId(preferredRiderId) ? new mongoose.Types.ObjectId(preferredRiderId) : undefined);
           if (["no_eligible_rider", "reservation_race", "database_unavailable", "in_progress"].includes(String(outcome.state))) throw new Error(`DISPATCH_${String(outcome.state).toUpperCase()}`);
-        }, { batchSize: 10 });
+        }, {
+          batchSize: 10,
+          deadLetterOnExhaustion: (_event, error) => !String(error instanceof Error ? error.message : error).includes("DISPATCH_NO_ELIGIBLE_RIDER"),
+        });
         if (result.processed || result.deadLettered) console.log(JSON.stringify({ event: "inline_dispatch_outbox_batch", workerId: inlineWorkerId, ...result, ...(result.deadLettered ? { deadLetters: result.deadLetters } : {}) }));
       } catch (error) {
         console.error(JSON.stringify({ event: "inline_dispatch_worker_error", workerId: inlineWorkerId, error: error instanceof Error ? error.message : String(error) }));

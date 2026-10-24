@@ -88,7 +88,10 @@ async function start() {
       // Expiry and late-pickup recovery are executed in this dedicated worker,
       // never by a web API interval. Each recovery writes a new outbox event.
       await dispatch.runDispatchMaintenance();
-      const result = await processDispatchOutboxBatch(workerId, handle, { batchSize });
+      const result = await processDispatchOutboxBatch(workerId, handle, {
+        batchSize,
+        deadLetterOnExhaustion: (_event, error) => !String(error instanceof Error ? error.message : error).includes("DISPATCH_NO_ELIGIBLE_RIDER"),
+      });
       workerStats.processed += result.processed;
       workerStats.deadLettered += result.deadLettered;
       workerStats.lastSuccessAt = new Date().toISOString();
