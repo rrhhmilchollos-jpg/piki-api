@@ -42,7 +42,7 @@ const googleOauthStateSchema = new Schema({
   restaurantId: { type: Schema.Types.ObjectId, ref: "Restaurant", required: true, index: true },
   employeeId: { type: Schema.Types.ObjectId, ref: "EmployeeAccount", required: true },
   tenantId: { type: Schema.Types.ObjectId, ref: "Tenant", default: null, index: true },
-  expiresAt: { type: Date, required: true, index: true },
+  expiresAt: { type: Date, required: true },
   usedAt: { type: Date, default: null },
 }, { timestamps: true, collection: "google_business_oauth_states" });
 googleOauthStateSchema.index({ expiresAt: 1 }, { expireAfterSeconds: 0 });
