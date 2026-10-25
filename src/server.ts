@@ -36,6 +36,7 @@ import { COMING_SOON_SLUGS, CUSTOMER_CATALOG_RESTAURANT_FILTER, CUSTOMER_ORDERAB
 import { PARTNER_DEMO_MENU_VERSION, partnerDemoMenu } from "./partnerDemoMenu.js";
 import { KINGS_TACOS_COVER_IMAGE } from "./kingsTacosMenu.js";
 import { ALIBABA_KEBAB_COVER_IMAGE } from "./alibabaKebabMenu.js";
+import { mrRoosterMenu } from "./mrRoosterMenu.js";
 import { configuredPartnerRestaurantUpsert } from "./partnerRepairPolicy.js";
 import { quoteMenuItem, usesReferenceAddOns } from "./menuModifiers.js";
 import { pointDistanceMeters } from "./pickupPolicy.js";
