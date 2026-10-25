@@ -354,12 +354,15 @@ const MENU_IMAGE_MIME_TYPES = ["image/webp", "image/jpeg", "image/png", "image/g
 const MENU_FILE_MIME_TYPES = ["application/pdf"] as const;
 const MENU_ASSET_MIME_TYPES = [...MENU_IMAGE_MIME_TYPES, ...MENU_FILE_MIME_TYPES] as const;
 const MENU_ASSET_KINDS = ["menu_image", "menu_file"] as const;
-function pricedRestaurantMenu(restaurant: any) {
-  return customerMenuForRestaurant({ ...restaurant, menu: canonicalRestaurantMenu(restaurant) });
-}
-const FREE_DELIVERY_LAUNCH_LIMIT = 30;
-async function freeDeliveryState(restaurant: { _id: unknown; slug?: string }) {
-  if (GOLDEN_FOUNDER_SLUGS.includes(restaurant.slug as typeof GOLDEN_FOUNDER_SLUGS[number])) return { eligible: false, remaining: 0 };
+  function pricedRestaurantMenu(restaurant: any) {
+    return customerMenuForRestaurant({ ...restaurant, menu: canonicalRestaurantMenu(restaurant) });
+  }
+  const FREE_DELIVERY_LAUNCH_LIMIT = 30;
+  const FREE_DELIVERY_LAUNCH_START = Date.parse(process.env.PIKI_FREE_DELIVERY_START || "2026-10-28T00:00:00+02:00");
+  const FREE_DELIVERY_LAUNCH_END = Date.parse(process.env.PIKI_FREE_DELIVERY_END || "2026-11-04T00:00:00+01:00");
+  function isFreeDeliveryLaunchWindow(now = Date.now()) { return now >= FREE_DELIVERY_LAUNCH_START && now < FREE_DELIVERY_LAUNCH_END; }
+  async function freeDeliveryState(restaurant: { _id: unknown; slug?: string }) {
+    if (!isFreeDeliveryLaunchWindow() || GOLDEN_FOUNDER_SLUGS.includes(restaurant.slug as typeof GOLDEN_FOUNDER_SLUGS[number])) return { eligible: false, remaining: 0 };
   const used = await Order.countDocuments({ restaurantId: restaurant._id, isTestOrder: { $ne: true }, status: { $nin: ["cancelled"] } }).exec();
   return { eligible: used < FREE_DELIVERY_LAUNCH_LIMIT, remaining: Math.max(0, FREE_DELIVERY_LAUNCH_LIMIT - used) };
 }
