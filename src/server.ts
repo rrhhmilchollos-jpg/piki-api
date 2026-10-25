@@ -362,7 +362,7 @@ const MENU_ASSET_KINDS = ["menu_image", "menu_file"] as const;
   const FREE_DELIVERY_LAUNCH_END = Date.parse(process.env.PIKI_FREE_DELIVERY_END || "2026-11-04T00:00:00+01:00");
   function isFreeDeliveryLaunchWindow(now = Date.now()) { return now >= FREE_DELIVERY_LAUNCH_START && now < FREE_DELIVERY_LAUNCH_END; }
   async function freeDeliveryState(restaurant: { _id: unknown; slug?: string }) {
-    if (!isFreeDeliveryLaunchWindow() || GOLDEN_FOUNDER_SLUGS.includes(restaurant.slug as typeof GOLDEN_FOUNDER_SLUGS[number])) return { eligible: false, remaining: 0 };
+    if (!isFreeDeliveryLaunchWindow()) return { eligible: false, remaining: 0 };
   const used = await Order.countDocuments({ restaurantId: restaurant._id, isTestOrder: { $ne: true }, status: { $nin: ["cancelled"] } }).exec();
   return { eligible: used < FREE_DELIVERY_LAUNCH_LIMIT, remaining: Math.max(0, FREE_DELIVERY_LAUNCH_LIMIT - used) };
 }
@@ -1117,9 +1117,9 @@ app.get("/api/v1/catalog/restaurants", async (req, res) => {
   const body = { restaurants: restaurants.map((restaurant: any) => {
     const postalCodeFromAddress = String(restaurant.address || "").match(/\b\d{5}\b/)?.[0] || null;
     const presented = presentCustomerCatalogRestaurant({ ...restaurant, postalCode: restaurant.partnerProfile?.postalCode || postalCodeFromAddress, locality: restaurant.locality || restaurant.partnerProfile?.city || null, menu: canonicalRestaurantMenu(restaurant) });
-    const founder = GOLDEN_FOUNDER_SLUGS.includes(restaurant.slug as typeof GOLDEN_FOUNDER_SLUGS[number]);
     const remaining = Math.max(0, FREE_DELIVERY_LAUNCH_LIMIT - (orderCountByRestaurant.get(String(restaurant._id)) || 0));
-    return { ...presented, fulfillmentMode: presented.fulfillmentMode || restaurant.fulfillmentMode || (restaurant.listingType === "local_directory" ? "assisted_purchase" : "partner_delivery"), freeDeliveryEligible: !founder && remaining > 0, freeDeliveryOrdersRemaining: founder ? 0 : remaining };
+    const launchWindow = isFreeDeliveryLaunchWindow();
+    return { ...presented, fulfillmentMode: presented.fulfillmentMode || restaurant.fulfillmentMode || (restaurant.listingType === "local_directory" ? "assisted_purchase" : "partner_delivery"), freeDeliveryEligible: launchWindow && remaining > 0, freeDeliveryOrdersRemaining: launchWindow ? remaining : 0 };
   }) };
   catalogCache.set(cacheKey, { expiresAt: Date.now() + CATALOG_CACHE_MS, body });
   void sharedCacheSet(`piki:catalog:${cacheKey}`, body, 30);
