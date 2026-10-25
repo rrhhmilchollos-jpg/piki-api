@@ -1,7 +1,7 @@
 import { nativeReleasePolicy } from "./nativeReleasePolicy.js";
 import "dotenv/config";
 import "express-async-errors";
-import { createHash, createHmac, randomBytes, randomInt, randomUUID } from "node:crypto";
+import { createHash, createHmac, randomBytes, randomInt, randomUUID, timingSafeEqual } from "node:crypto";
 import { MalwareDetectedError, MalwareScannerUnavailableError, DOCUMENT_UPLOAD_MIME_TYPES, normalizeDocumentUpload, sanitizePdfFileName, sanitizeUploadFileName, scanUploadBuffer, scanUploadBuffers } from "./fileSecurity.js";
 import { fileURLToPath } from "node:url";
 import cors from "cors";
@@ -258,6 +258,30 @@ const stripeWebhookHandler = async (req: express.Request, res: express.Response)
 };
 app.post(["/api/v1/payments/webhook", "/api/webhooks/stripe"], express.raw({ type: "application/json" }), stripeWebhookHandler);
 app.use(express.json({ limit: "20mb" }));
+
+// Signed Customer -> API/Admin bridge. It accepts profile metadata only;
+// password material and session cookies never cross this boundary.
+app.post("/api/v1/internal/customer-sync", async (req, res) => {
+  const secret = String(process.env.PIKI_CUSTOMER_SYNC_SECRET || "");
+  const timestamp = String(req.header("x-piki-sync-timestamp") || "");
+  const supplied = String(req.header("x-piki-sync-signature") || "");
+  const body = JSON.stringify(req.body ?? {});
+  const timestampMs = Number(timestamp);
+  if (!secret || !/^\d{10,16}$/.test(timestamp) || !Number.isFinite(timestampMs) || Math.abs(Date.now() - timestampMs) > 5 * 60_000 || !/^[a-f0-9]{64}$/i.test(supplied)) return res.status(401).json({ error: "CUSTOMER_SYNC_UNAUTHORIZED" });
+  const expected = createHmac("sha256", secret).update(`${timestamp}.${body}`).digest("hex");
+  if (!timingSafeEqual(Buffer.from(expected, "hex"), Buffer.from(supplied, "hex"))) return res.status(401).json({ error: "CUSTOMER_SYNC_UNAUTHORIZED" });
+  const parsed = z.object({ sourceId: z.string().trim().min(1).max(80), name: z.string().trim().min(2).max(160), email: z.string().trim().email().max(320), referralCode: z.string().trim().max(32).nullable().optional(), referredByCode: z.string().trim().max(32).nullable().optional() }).safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "CUSTOMER_SYNC_INVALID_PAYLOAD" });
+  const email = parsed.data.email.toLowerCase();
+  const placeholderPasswordHash = `bridge_disabled_${createHash("sha256").update(`${secret}:${email}`).digest("hex")}`;
+  const account = await CustomerAccount.findOneAndUpdate(
+    { email },
+    { $set: { name: parsed.data.name, ...(parsed.data.referralCode ? { referralCode: parsed.data.referralCode } : {}), referredByCode: parsed.data.referredByCode ?? null }, $setOnInsert: { email, passwordHash: placeholderPasswordHash, sessionHash: null } },
+    { upsert: true, new: true, setDefaultsOnInsert: true },
+  ).lean().exec() as any;
+  void publishRealtimeEvent({ channel: "admin", audienceKey: tenantAudienceKey(account?.tenantId, "admin"), tenantId: account?.tenantId ?? null, type: "customer.created", payload: { customerId: String(account._id), sourceId: parsed.data.sourceId, name: account.name, email: account.email, referralCode: account.referralCode ?? null, createdAt: account.createdAt, updatedAt: account.updatedAt }, dedupeKey: `customer-sync:${parsed.data.sourceId}` }).catch((error) => console.warn("Customer SSE event failed", error instanceof Error ? error.message : "unknown error"));
+  return res.status(200).json({ ok: true, customerId: String(account._id), synced: true });
+});
 
 const objectId = (value: string) => mongoose.isValidObjectId(value) ? new mongoose.Types.ObjectId(value) : null;
 function hasExplicitPlatformSuperadminScope(req: express.Request): boolean {
