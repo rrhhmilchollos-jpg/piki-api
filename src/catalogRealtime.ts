@@ -83,10 +83,20 @@ export class CatalogEventStream {
 const catalogStream = new CatalogEventStream();
 export const serveCatalogEvents = (request: Request, response: Response) => catalogStream.serve(request, response);
 
-export async function publishCatalogUpdate(_restaurantId: unknown, reason: string) {
-  // A generic local invalidation needs no extra DB read and cannot leak ids
-  // when the update pauses/hides the restaurant. The relay adds public ids.
-  catalogStream.publish(publicCatalogUpdate(null, reason));
+export async function publishCatalogUpdate(restaurantId: unknown, reason: string) {
+  // Resolve only the public projection after the write. Hidden/paused records
+  // intentionally become a global invalidation without exposing identifiers.
+  try {
+    const id = restaurantId && mongoose.isValidObjectId(restaurantId) ? restaurantId : null;
+    const restaurant = id
+      ? await Restaurant.findById(id).select("_id slug internalDemo isActive onboardingStatus availabilityStatus menu").lean().exec()
+      : null;
+    catalogStream.publish(publicCatalogUpdate(restaurant, reason));
+  } catch {
+    // A successful menu write must still invalidate clients if the follow-up
+    // projection read fails; omit identifiers rather than exposing stale data.
+    catalogStream.publish(publicCatalogUpdate(null, reason));
+  }
 }
 
 let activeWatch: ReturnType<typeof Restaurant.watch> | undefined;

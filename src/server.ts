@@ -5286,24 +5286,34 @@ async function repairConfiguredPartnerAccess() {
   console.log(JSON.stringify({ event: "partner_access_repair", email, result: "repaired", restaurantId: String(restaurant._id), restaurantName: restaurant.name, assignedRestaurantCount: portfolioIds.length, ownerPreserved: isProtectedOwner }));
 }
 async function ensureMrRoosterOperational() {
+  const existing = await Restaurant.findOne({ slug: "rooster-kebab-xativa" }).select("menu").lean().exec() as { menu?: unknown[] } | null;
+  const shouldSeedMenu = !Array.isArray(existing?.menu) || existing.menu.length === 0;
+  const setFields: Record<string, unknown> = {
+    name: "Mr Rooster Xàtiva",
+    cuisine: "Kebab",
+    category: "Kebab",
+    locality: "Xàtiva",
+    availabilityStatus: "available",
+    upcomingMessage: "",
+    onboardingStatus: "approved",
+    isActive: true,
+    cashPaymentsEnabled: true,
+    deliveryFeeCents: 299,
+    image: "https://files.manuscdn.com/user_upload_by_module/session_file/310519663931061405/PSnZzuCOslUOgNQN.jpg",
+    "partnerProfile.commissionRateBps": 2500,
+  };
+  // Never replace a live Partner edit during a restart. The bundled menu is
+  // only a bootstrap for a new/empty restaurant; an explicit repair may opt
+  // in with REPAIR_MR_ROOSTER_MENU=true during a controlled maintenance window.
+  if (shouldSeedMenu || process.env.REPAIR_MR_ROOSTER_MENU === "true") setFields.menu = mrRoosterMenu;
   const result = await Restaurant.updateOne(
     { slug: "rooster-kebab-xativa" },
-    { $set: {
-      name: "Mr Rooster Xàtiva",
-      cuisine: "Kebab",
-      category: "Kebab",
-      locality: "Xàtiva",
-      availabilityStatus: "available",
-      upcomingMessage: "",
-      onboardingStatus: "approved",
-      isActive: true,
-      cashPaymentsEnabled: true,
-      deliveryFeeCents: 299,
-      image: "https://files.manuscdn.com/user_upload_by_module/session_file/310519663931061405/PSnZzuCOslUOgNQN.jpg",
-      "partnerProfile.commissionRateBps": 2500,
-    } },
+    { $set: setFields },
   ).exec();
-  if (result.matchedCount > 0) console.log(JSON.stringify({ event: "mr_rooster_operational", slug: "rooster-kebab-xativa", modified: result.modifiedCount > 0, menuPreserved: true, commissionRateBps: 2500, cashPaymentsEnabled: true }));
+  const menuCount = shouldSeedMenu || process.env.REPAIR_MR_ROOSTER_MENU === "true"
+    ? mrRoosterMenu.length
+    : Array.isArray(existing?.menu) ? existing.menu.length : 0;
+  if (result.matchedCount > 0) console.log(JSON.stringify({ event: "mr_rooster_operational", slug: "rooster-kebab-xativa", modified: result.modifiedCount > 0, menuCount, menuSeeded: shouldSeedMenu || process.env.REPAIR_MR_ROOSTER_MENU === "true", menuPreserved: !shouldSeedMenu && process.env.REPAIR_MR_ROOSTER_MENU !== "true", commissionRateBps: 2500, cashPaymentsEnabled: true }));
 }
 async function start() {
   const uri = process.env.MONGODB_URI;
