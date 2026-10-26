@@ -106,10 +106,10 @@ export function setAllVersionPolicies(next: VersionPolicyMap): void {
 }
 
 /**
- * A semantic minimum protects compatibility. Once a release is published with
- * forceUpdate, a different build hash also means the tab is stale and must
- * receive the recovery/update UI; the frontend still defers the reload while
- * a payment, delivery, or form is active.
+ * A semantic minimum protects compatibility. A build hash is diagnostic
+ * metadata only: a different hash can be caused by a second deployment or a
+ * stale CDN/Service Worker and must not trap an otherwise compatible client in
+ * an update loop.
  */
 export function requiresUpdate(
   policy: VersionPolicy,
@@ -119,6 +119,6 @@ export function requiresUpdate(
 ): boolean {
   if (!policy.forceUpdate) return false;
   const olderSemanticVersion = Boolean(clientVersion && compareSemver(clientVersion, policy.minimumVersion) < 0);
-  const staleBuild = Boolean(clientBuildId && clientBuildId !== policy.buildId);
-  return olderSemanticVersion || staleBuild;
+  void clientBuildId;
+  return olderSemanticVersion;
 }

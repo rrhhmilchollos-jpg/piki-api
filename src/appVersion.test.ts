@@ -13,8 +13,8 @@ test("forces an older semantic version", () => {
   assert.equal(requiresUpdate(policy, "0.2.10", "old-build", "admin"), true);
 });
 
-test("forces a stale build at the same compatible version", () => {
-  assert.equal(requiresUpdate(policy, "0.2.11", "old-build", "admin"), true);
+test("does not force a different build at the same compatible version", () => {
+  assert.equal(requiresUpdate(policy, "0.2.11", "old-build", "admin"), false);
 });
 
 test("does not force the current build or optional releases", () => {
