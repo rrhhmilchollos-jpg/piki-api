@@ -156,9 +156,46 @@ const deliveryPin = (orderCode: string) => {
 
 function restaurantView(row: any) {
   const useReferenceFallback = usesReferenceAddOns(row);
-  if (row.availabilityStatus === "coming_soon" && row.slug !== "rooster-kebab-xativa") return { id: String(row._id), name: row.name, cuisine: row.cuisine, category: row.category, locality: row.locality, tagline: "Disponible muy pronto", availabilityStatus: "coming_soon", isActive: false, onboardingStatus: row.onboardingStatus, menu: [], image: row.image || "" };
-  const isMrRooster = row.slug === "rooster-kebab-xativa";
-  return { id: String(row._id), name: customerCatalogRestaurantName(row), availabilityStatus: isMrRooster ? "available" : (row.availabilityStatus || "available"), isActive: isMrRooster ? true : row.isActive, onboardingStatus: isMrRooster ? "approved" : row.onboardingStatus, cashPaymentsEnabled: isCashPaymentEnabledForRestaurant({ ...row, cashPaymentsEnabled: isMrRooster ? true : row.cashPaymentsEnabled }), cuisine: row.cuisine, category: row.category, tagline: row.tagline || "Descubre este establecimiento en PIKI.", eta: `${row.etaMinutes?.[0] || 20}–${row.etaMinutes?.[1] || 35} min`, fee: (row.deliveryFeeCents || 0) / 100, rating: row.rating || 0, reviews: row.reviews || 0, promoted: row.promoted, image: row.image || "", accent: row.accent || "#FFD72E", menu: (row.menu || []).filter(menuItemIsAvailable).map((item: any) => ({ id: item.id, name: item.name, description: item.description || "", price: item.price, allergens: Array.isArray(item.allergens) ? item.allergens : [], vegetarian: Boolean(item.vegetarian), popular: Boolean(item.popular), modifierGroups: modifierGroupsForItem(item, useReferenceFallback) })) };
+  const comingSoon = row.availabilityStatus === "coming_soon";
+  // Both tRPC (Vercel/Android) and the REST catalogue read the same persisted
+  // restaurant. Keep display fields instead of stripping categories and media.
+  // Preserve this route's pricing contract; billing is not a catalogue repair.
+  return {
+    id: String(row._id),
+    slug: row.slug,
+    name: customerCatalogRestaurantName(row),
+    locality: row.locality || row.partnerProfile?.city || null,
+    postalCode: row.partnerProfile?.postalCode || row.postalCode || String(row.address || "").match(/\b\d{5}\b/)?.[0] || null,
+    availabilityStatus: row.availabilityStatus || "available",
+    isActive: comingSoon ? false : row.isActive,
+    onboardingStatus: row.onboardingStatus,
+    listingType: row.listingType || "official_partner",
+    fulfillmentMode: row.fulfillmentMode || (row.listingType === "local_directory" ? "assisted_purchase" : "partner_delivery"),
+    cashPaymentsEnabled: isCashPaymentEnabledForRestaurant(row),
+    cuisine: row.cuisine,
+    category: row.category,
+    tagline: comingSoon ? "Disponible muy pronto" : row.tagline || "Descubre este establecimiento en PIKI.",
+    eta: `${row.etaMinutes?.[0] || 20}–${row.etaMinutes?.[1] || 35} min`,
+    fee: (row.deliveryFeeCents || 0) / 100,
+    rating: row.rating || 0,
+    reviews: row.reviews || 0,
+    promoted: row.promoted,
+    image: row.image || "",
+    accent: row.accent || "#FFD72E",
+    menu: comingSoon ? [] : (Array.isArray(row.menu) ? row.menu : []).filter(menuItemIsAvailable).map((item: any) => ({
+      id: item.id,
+      name: item.name,
+      description: item.description || "",
+      price: item.price,
+      category: item.category || "Carta",
+      image: item.image || item.imageUrl || item.photoUrl || "",
+      requestOnly: Boolean(item.requestOnly),
+      allergens: Array.isArray(item.allergens) ? item.allergens : [],
+      vegetarian: Boolean(item.vegetarian),
+      popular: Boolean(item.popular),
+      modifierGroups: modifierGroupsForItem(item, useReferenceFallback),
+    })),
+  };
 }
 
 async function handleCustomerTrpcSingle(req: Request, res: Response) {
@@ -173,13 +210,18 @@ async function handleCustomerTrpcSingle(req: Request, res: Response) {
     if (procedure.startsWith("catalog.")) res.setHeader("Cache-Control", "no-store, max-age=0");
     if (procedure === "catalog.list") {
       const filter: Record<string, unknown> = { ...CUSTOMER_CATALOG_RESTAURANT_FILTER };
-      if (input?.category) filter.category = input.category;
+      if (input?.category && input.category !== "Todos") filter.category = input.category;
       const rows = await Restaurant.find(filter).sort({ promoted: -1, rating: -1, reviews: -1 }).lean().exec();
       const query = String(input?.query || "").trim().toLowerCase();
-      return reply(res, rows.map(restaurantView).filter((row) => !query || `${row.name} ${row.cuisine} ${row.category}`.toLowerCase().includes(query)));
+      // Retain existing delivery-area behavior. Missing postcode metadata must
+      // not newly suppress an otherwise eligible, configured Partner menu.
+      return reply(res, rows.map(restaurantView).filter((row) => !query || `${row.name} ${row.cuisine || ""} ${row.category || ""}`.toLowerCase().includes(query)));
     }
     if (procedure === "catalog.byId") {
-      const row = await Restaurant.findOne({ _id: input?.id, ...CUSTOMER_CATALOG_RESTAURANT_FILTER }).lean().exec();
+      const id = String(input?.id || "").trim();
+      if (!id) return reply(res, null);
+      const identity = /^[a-f\d]{24}$/i.test(id) ? { _id: id } : { slug: id };
+      const row = await Restaurant.findOne({ ...identity, ...CUSTOMER_CATALOG_RESTAURANT_FILTER }).lean().exec();
       return reply(res, row ? restaurantView(row) : null);
     }
     if (procedure === "auth.me") { const user = await currentCustomer(req) as any; if (user) user.referralCode = await ensureReferralCode(user); return reply(res, publicUser(user)); }
@@ -419,7 +461,9 @@ export async function handleCustomerTrpc(req: Request, res: Response) {
   const pathProcedure = routePath.match(/\/api\/trpc\/([^?/#]+)/)?.[1] || req.path.split("/").filter(Boolean).pop() || "";
   const procedurePath = decodeURIComponent(String(req.params.procedure || pathProcedure)).split("?")[0];
   const procedures = procedurePath.split(",").filter(Boolean);
-  if (procedures.length < 2) return handleCustomerTrpcSingle(req, res);
+  // httpBatchLink still expects an array when its batch contains ONE call.
+  const explicitlyBatched = String(req.query.batch || "") === "1" || /[?&]batch=1(?:&|$)/.test(routePath);
+  if (procedures.length < 2 && !explicitlyBatched) return handleCustomerTrpcSingle(req, res);
 
   let rawBatchInput: unknown = (req.body as any)?.input ?? req.query.input ?? req.body;
   if (typeof rawBatchInput === "string") {
