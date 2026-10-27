@@ -1,4 +1,6 @@
 import { isCashPaymentEnabledForRestaurant } from "./paymentPolicy.js";
+import { evaluateOpeningHours } from "./openingHours.js";
+import { customerAvailability } from "./customerAvailability.js";
 
 export const COMING_SOON_SLUGS = ["eleven-burgers-xativa", "nakama-sushi-xativa"] as const;
 export const CUSTOMER_HIDDEN_TEST_SLUGS = ["kfc-xativa-test", "partner-test", "kings-tacos-xativa"] as const;
@@ -11,23 +13,8 @@ export const CUSTOMER_DIRECTORY_RESTAURANT_FILTER = {
 export const CUSTOMER_CATALOG_RESTAURANT_FILTER = {
   $or: [CUSTOMER_ORDERABLE_RESTAURANT_FILTER, { slug: { $in: [...COMING_SOON_SLUGS] }, availabilityStatus: "coming_soon", onboardingStatus: { $ne: "rejected" } }, CUSTOMER_DIRECTORY_RESTAURANT_FILTER],
 };
-function withinOpeningSlot(current: number, slot: unknown): boolean {
-  if (!slot || typeof slot !== "object") return false;
-  const value = slot as { open?: string; close?: string };
-  const open = String(value.open || ""); const close = String(value.close || "");
-  if (!/^\d{2}:\d{2}$/.test(open) || !/^\d{2}:\d{2}$/.test(close)) return false;
-  const start = Number(open.replace(":", "")); const end = Number(close.replace(":", ""));
-  return end >= start ? current >= start && current <= end : current >= start || current <= end;
-}
 export function restaurantIsWithinOpeningHours(openingHours: unknown, now = new Date()): boolean {
-  if (!openingHours || typeof openingHours !== "object") return true;
-  const day = new Intl.DateTimeFormat("es-ES", { weekday: "long", timeZone: "Europe/Madrid" }).format(now).toLocaleLowerCase("es-ES");
-  const value = (openingHours as Record<string, unknown>)[day] as { open?: string; close?: string; closed?: boolean; morning?: unknown; afternoon?: unknown; evening?: unknown } | undefined;
-  if (!value || value.closed === true) return false;
-  const current = Number(new Intl.DateTimeFormat("es-ES", { hour: "2-digit", minute: "2-digit", hour12: false, timeZone: "Europe/Madrid" }).format(now).replace(":", ""));
-  if (value.morning || value.afternoon || value.evening) return withinOpeningSlot(current, value.morning) || withinOpeningSlot(current, value.afternoon || value.evening);
-  if (!value.open || !value.close) return true;
-  return withinOpeningSlot(current, value);
+  return evaluateOpeningHours(openingHours, now).open;
 }
 export function customerCatalogRestaurantName(restaurant: { name: string; slug?: string }) { return restaurant.name; }
 export function presentCustomerCatalogRestaurant<T extends { name: string; slug?: string; listingType?: string; goldFounder?: boolean; menu?: any[]; availabilityStatus?: string; upcomingMessage?: string; isActive?: boolean; onboardingStatus?: string; cashPaymentsEnabled?: boolean; partnerProfile?: { openingHours?: unknown } }>(restaurant: T) {
@@ -36,7 +23,8 @@ export function presentCustomerCatalogRestaurant<T extends { name: string; slug?
   const listingType = restaurant.listingType === "local_directory" ? "local_directory" : "official_partner";
   const goldFounder = Boolean(restaurant.goldFounder) || GOLDEN_FOUNDER_SLUGS.includes(restaurant.slug as typeof GOLDEN_FOUNDER_SLUGS[number]);
   const hasMenu = !Object.prototype.hasOwnProperty.call(restaurant, "menu") || (Array.isArray(restaurant.menu) && restaurant.menu.length > 0);
-  const orderable = listingType === "official_partner" && restaurant.isActive === true && restaurant.onboardingStatus === "approved" && !comingSoon && withinHours && hasMenu;
+  const availability = customerAvailability({ ...restaurant, comingSoon, listingType, hasMenu });
+  const orderable = availability.canOrder && listingType === "official_partner";
   // Do not leak a stale persisted announcement after a restaurant becomes live.
   // The public catalog must derive this label from the operational status.
   return {
@@ -49,6 +37,9 @@ export function presentCustomerCatalogRestaurant<T extends { name: string; slug?
     name: customerCatalogRestaurantName(restaurant),
     comingSoon,
     withinHours,
+    canOrder: orderable,
+    isOpen: availability.isOpen,
+    reason: availability.reason,
     orderable,
     availabilityLabel: comingSoon ? "Disponible muy pronto" : withinHours ? "" : "Cerrado ahora",
     goldenFounder: GOLDEN_FOUNDER_SLUGS.includes(restaurant.slug as typeof GOLDEN_FOUNDER_SLUGS[number]),

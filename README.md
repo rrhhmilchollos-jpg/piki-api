@@ -10,7 +10,7 @@ La conexión de Atlas no se guarda en el repositorio. La variable `MONGODB_URI` 
 
 ### Google Business Profile para partners
 
-La sincronización de horarios usa OAuth de Google Business Profile. En Render deben configurarse `GOOGLE_BUSINESS_CLIENT_ID`, `GOOGLE_BUSINESS_CLIENT_SECRET`, `GOOGLE_BUSINESS_REDIRECT_URI` y `GOOGLE_BUSINESS_TOKEN_ENCRYPTION_KEY`. El callback de producción es `https://api.pikidelivery.com/api/v1/partners/google-business/callback`. El partner conecta su cuenta, selecciona la ubicación real y puede importar horarios desde Google o publicar los horarios de PIKI. Los tokens se guardan cifrados y nunca se exponen en respuestas HTTP.
+La sincronización de horarios usa OAuth de Google Business Profile. En Render deben configurarse `GOOGLE_BUSINESS_CLIENT_ID`, `GOOGLE_BUSINESS_CLIENT_SECRET`, `GOOGLE_BUSINESS_REDIRECT_URI` y `GOOGLE_BUSINESS_TOKEN_ENCRYPTION_KEY`. El callback de producción es `https://api.pikidelivery.com/api/v1/partners/google-business/callback`. El partner conecta su cuenta, selecciona la ubicación real y puede importar horarios desde Google o publicar los horarios de PIKI. Los tokens se guardan cifrados y nunca se exponen en respuestas HTTP. El worker periódico está apagado por defecto: requiere `GOOGLE_BUSINESS_SYNC_ENABLED=true`, sólo procesa conexiones OAuth con ubicación seleccionada y admite `GOOGLE_BUSINESS_SYNC_CADENCE_MINUTES` (mínimo 5; 15 por defecto). Un horario guardado por PIKI queda marcado como fuente `piki` y no es sobrescrito automáticamente por Google.
 
 ## Migración formal a tenants
 

@@ -6,6 +6,7 @@ import { publishOrderIntakeEvents } from "./realtime.js";
 import { evaluateXativaCoverage } from "./coverage/xativaPolicy.js";
 import { quoteDeliveryRoute } from "./coverage/routing.js";
 import { CUSTOMER_CATALOG_RESTAURANT_FILTER, CUSTOMER_ORDERABLE_RESTAURANT_FILTER, customerCatalogRestaurantName, menuItemIsAvailable, restaurantIsWithinOpeningHours } from "./customerCatalogPolicy.js";
+import { customerAvailability } from "./customerAvailability.js";
 import { modifierGroupsForItem, quoteMenuItem, usesReferenceAddOns } from "./menuModifiers.js";
 import { cashOrderLimitError, cashPaymentDisabledError, isCashOrderWithinLimit, isCashPaymentEnabledForRestaurant } from "./paymentPolicy.js";
 import { createCheckoutSession } from "./stripe.js";
@@ -157,6 +158,8 @@ const deliveryPin = (orderCode: string) => {
 function restaurantView(row: any) {
   const useReferenceFallback = usesReferenceAddOns(row);
   const comingSoon = row.availabilityStatus === "coming_soon";
+  const withinHours = restaurantIsWithinOpeningHours(row.partnerProfile?.openingHours);
+  const availability = customerAvailability({ ...row, comingSoon, listingType: row.listingType || "official_partner", hasMenu: Array.isArray(row.menu) && row.menu.length > 0 });
   // Both tRPC (Vercel/Android) and the REST catalogue read the same persisted
   // restaurant. Keep display fields instead of stripping categories and media.
   // Preserve this route's pricing contract; billing is not a catalogue repair.
@@ -168,6 +171,11 @@ function restaurantView(row: any) {
     postalCode: row.partnerProfile?.postalCode || row.postalCode || String(row.address || "").match(/\b\d{5}\b/)?.[0] || null,
     availabilityStatus: row.availabilityStatus || "available",
     isActive: comingSoon ? false : row.isActive,
+    canOrder: availability.canOrder,
+    isOpen: availability.isOpen,
+    withinHours: availability.withinHours,
+    reason: availability.reason,
+    orderable: availability.canOrder,
     onboardingStatus: row.onboardingStatus,
     listingType: row.listingType || "official_partner",
     fulfillmentMode: row.fulfillmentMode || (row.listingType === "local_directory" ? "assisted_purchase" : "partner_delivery"),
@@ -450,7 +458,7 @@ async function handleCustomerTrpcSingle(req: Request, res: Response) {
         }
       }
       if (paymentMethod === "cash") await publishOrderIntakeEvents(order, { settlement: "cash_due", message: "Pedido a contrarreembolso: el Rider cobrará en efectivo al entregar." });
-      return reply(res, { orderId: code, checkoutUrl, totalCents, paymentMethod, paymentState: paymentMethod === "cash" ? "pending_cash_collection" : "pending", cashDueAtDelivery: paymentMethod === "cash", deliveryQrUrl: deliveryQrUrl(code), coverage, route });
+      return reply(res, { orderId: code, checkoutUrl, totalCents, paymentMethod, paymentState: paymentMethod === "cash" ? "pending_cash_collection" : "pending", cashDueAtDelivery: paymentMethod === "cash", coverage, route });
     }
     return fail(res, `Procedimiento no soportado: ${procedure}`, "NOT_FOUND");
   } catch (error) { console.error(`[customerCompat] ${procedure}`, error); return fail(res, "Error interno de la plataforma", "INTERNAL_SERVER_ERROR"); }

@@ -3,6 +3,7 @@ export type RiderApplicationOperationalInput = {
   email: string;
   phone: string;
   city: string;
+  requestedZoneSlug?: string | null;
   availability: string;
   vehicle: string;
 };
@@ -86,6 +87,7 @@ export function buildApprovedRiderOperationalProfile(application: RiderApplicati
     email: application.email.trim().toLowerCase(),
     phone: application.phone.trim(),
     city: application.city.trim(),
+    zoneSlug: application.requestedZoneSlug || null,
     availability: application.availability.trim(),
     vehicle: application.vehicle,
   };

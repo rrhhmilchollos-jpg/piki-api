@@ -32,8 +32,13 @@ const googleBusinessConnectionSchema = new Schema({
   lastSyncStatus: { type: String, enum: ["never", "success", "error"], default: "never" },
   lastSyncError: { type: String, default: "" },
   lastGoogleUpdatedAt: { type: Date, default: null },
+  syncLockOwner: { type: String, default: null, select: false },
+  syncLockUntil: { type: Date, default: null, index: true },
+  nextSyncAt: { type: Date, default: null, index: true },
+  syncFailureCount: { type: Number, default: 0, min: 0 },
 }, { timestamps: true, collection: "google_business_connections" });
 googleBusinessConnectionSchema.index({ tenantId: 1, status: 1 });
+googleBusinessConnectionSchema.index({ status: 1, nextSyncAt: 1, syncLockUntil: 1 });
 
 export const GoogleBusinessConnection = mongoose.models.GoogleBusinessConnection || mongoose.model("GoogleBusinessConnection", googleBusinessConnectionSchema);
 

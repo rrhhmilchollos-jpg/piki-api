@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { openingHoursSchema } from "./openingHours.js";
+import { openingHoursSchema, type LegacyOpeningHours } from "./openingHours.js";
 
 test("acepta el formato del panel con franja evening y normaliza la hora 00:00", () => {
   const result = openingHoursSchema.safeParse({
@@ -13,7 +13,7 @@ test("acepta el formato del panel con franja evening y normaliza la hora 00:00",
 
   assert.equal(result.success, true);
   if (result.success) {
-    assert.deepEqual(result.data.lunes.evening, { open: "19:00", close: "00:00", closed: false });
+    assert.deepEqual((result.data as LegacyOpeningHours).lunes.evening, { open: "19:00", close: "00:00", closed: false });
   }
 });
 
@@ -28,7 +28,7 @@ test("acepta datos antiguos con afternoon y los devuelve como evening", () => {
 
   assert.equal(result.success, true);
   if (result.success) {
-    assert.deepEqual(result.data.martes.evening, { open: "18:00", close: "23:30", closed: false });
+    assert.deepEqual((result.data as LegacyOpeningHours).martes.evening, { open: "18:00", close: "23:30", closed: false });
   }
 });
 

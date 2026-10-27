@@ -32,7 +32,7 @@ import { activeOperationalOrderStatuses, dispatchableOrderStatuses, dispatchable
 import { canReceivePartnerLocations, partnerCan, partnerPermissions, partnerRolesForEmployee, permissionsForPartnerRoles, type PartnerPermission } from "./partnerAccess.js";
 import { awardRiderRecruitmentMilestones, claimRiderReferralCode, completeRiderShiftIncentiveTracking, incentiveProgramStatus, loadRiderIncentiveSnapshot, trackRiderLocationForIncentive, trackRiderShiftStart } from "./riderIncentives.js";
 import { buildApprovedRiderOperationalProfile } from "./riderApproval.js";
-import { COMING_SOON_SLUGS, CUSTOMER_CATALOG_RESTAURANT_FILTER, CUSTOMER_ORDERABLE_RESTAURANT_FILTER, GOLDEN_FOUNDER_SLUGS, customerCommissionRate, customerMenuForRestaurant, presentCustomerCatalogRestaurant } from "./customerCatalogPolicy.js";
+import { COMING_SOON_SLUGS, CUSTOMER_CATALOG_RESTAURANT_FILTER, CUSTOMER_ORDERABLE_RESTAURANT_FILTER, GOLDEN_FOUNDER_SLUGS, customerCommissionRate, customerMenuForRestaurant, presentCustomerCatalogRestaurant, restaurantIsWithinOpeningHours } from "./customerCatalogPolicy.js";
 import { PARTNER_DEMO_MENU_VERSION, partnerDemoMenu } from "./partnerDemoMenu.js";
 import { KINGS_TACOS_COVER_IMAGE } from "./kingsTacosMenu.js";
 import { ALIBABA_KEBAB_COVER_IMAGE } from "./alibabaKebabMenu.js";
@@ -54,10 +54,14 @@ import { dispatchInitialIdempotencyKey, dispatchRequeueIdempotencyKey, enqueueDi
 import { buildFleetEntityScope, buildTenantScope } from "./tenantScope.js";
 import { authenticationOptions, registrationOptions, verifyAuthentication, verifyRegistration } from "./passkeys.js";
 import { markPartnerBatchPaid, markRiderBatchPaid, publicPartnerCode, publicRiderCode, recordGovernanceEvent, syncPublicIds } from "./pikiGovernance.js";
-import { openingHoursSchema } from "./openingHours.js";
+import { legacyOpeningHoursProjection, normalizeOpeningHours, openingHoursSchema } from "./openingHours.js";
 import { PRL_COURSE_VERSION, PRL_PASS_MARK, PrlEnrollment, certificateIssuer, certificateMode, createPrlToken, hashPrlToken, prlQuestions, publicPrlEnrollment } from "./prlTraining.js";
 import { GoogleBusinessConnection, GoogleOauthState, MunicipalExpansion } from "./expansionModels.js";
-import { decryptGoogleSecret, exchangeGoogleCode, fromGoogleRegularHours, googleAuthorizationUrl, googleBusinessConfigured, googleBusinessScopes, listGoogleAccounts, listGoogleLocations, readGoogleLocation, toGoogleRegularHours, updateGoogleLocationHours, encryptGoogleSecret } from "./googleBusinessProfile.js";
+import { decryptGoogleSecret, exchangeGoogleCode, fromGoogleLocationHours, googleAuthorizationUrl, googleBusinessConfiguration, googleBusinessConfigured, googleBusinessScopes, listGoogleAccounts, listGoogleLocations, readGoogleLocation, toGoogleLocationHours, updateGoogleLocationHours, encryptGoogleSecret } from "./googleBusinessProfile.js";
+import { deliveredConfirmationResponse, deliveryCredentialNotLockedFilter, deliveryFailureAtomicUpdate, deliveryFailureLock, parseDeliveryCredential } from "./deliveryConfirmation.js";
+import { fleetPublicView } from "./fleetView.js";
+import { activeRecruitmentProvinces, resolveRecruitmentSelection } from "./recruitmentAreas.js";
+import { startGoogleBusinessSyncWorker, stopGoogleBusinessSyncWorker, googleBusinessSyncSettings, googleBusinessHoursChanged } from "./googleBusinessSyncWorker.js";
 
 export const app = express();
 app.set("trust proxy", 1);
@@ -114,7 +118,7 @@ async function reversePhoton(latitude: number, longitude: number) {
   const label = [address.road, [address.postcode, address.locality].filter(Boolean).join(" ")].filter(Boolean).join(", ");
   return { label: label || `Ubicación GPS ${latitude.toFixed(5)}, ${longitude.toFixed(5)}`, latitude, longitude, locality: address.locality || null, address: properties };
 }
-mongoose.connection.on("connected", () => { databaseReady = true; startRealtimeRelay(); startCatalogRelay(); void syncPublicIds().catch((error) => console.error("Public ID sync failed", error)); void ensurePikiPrlCourse().catch((error) => console.error("PIKI PRL course seed failed", error)); });
+mongoose.connection.on("connected", () => { databaseReady = true; startRealtimeRelay(); startCatalogRelay(); startGoogleBusinessSyncWorker(); void syncPublicIds().catch((error) => console.error("Public ID sync failed", error)); void ensurePikiPrlCourse().catch((error) => console.error("PIKI PRL course seed failed", error)); });
 mongoose.connection.on("disconnected", () => { databaseReady = false; console.warn("MongoDB disconnected; API entering not-ready state"); });
 mongoose.connection.on("error", (error) => { databaseReady = false; console.error("MongoDB connection error", error instanceof Error ? error.message : error); });
 
@@ -342,10 +346,13 @@ const deliveryQrUrl = (orderCode: string) => `${(process.env.CUSTOMER_APP_URL ||
 const checkoutTokenSecret = String(process.env.CHECKOUT_TOKEN_SECRET || deliveryQrSecret).trim();
 const checkoutToken = (orderCode: string) => createHmac("sha256", checkoutTokenSecret || "development-only-checkout-secret").update(`checkout:${orderCode}`).digest("base64url");
 const checkoutTokenIsValid = (orderCode: string, raw: unknown) => typeof raw === "string" && raw.length >= 20 && raw === checkoutToken(orderCode);
-	const deliveryQrIsValid = (orderCode: string, raw: unknown) => {
-	  if (String(raw || "").trim().toUpperCase() === deliveryPin(orderCode)) return true;
-	  try { const url = new URL(String(raw)); return url.searchParams.get("order_id") === orderCode && url.searchParams.get("delivery_token") === deliveryQrSignature(orderCode); } catch { return false; }
-	};
+		const deliveryQrIsValid = (orderCode: string, raw: unknown) => {
+		  const proof = typeof raw === "string" ? raw : "";
+		  // Normalize only a PIN. A QR URL is parsed from the original proof so
+		  // its case-sensitive signed token is never rewritten by the API.
+		  if (!/^https?:\/\//i.test(proof) && proof.trim().toUpperCase() === deliveryPin(orderCode)) return true;
+		  try { const url = new URL(proof); return url.searchParams.get("order_id") === orderCode && url.searchParams.get("delivery_token") === deliveryQrSignature(orderCode); } catch { return false; }
+		};
 const riderLocationSchema = locationSchema.extend({ riderId: z.string().min(1) });
 const trackingSessionCreateSchema = z.object({ shiftId: z.string().regex(/^[a-f\d]{24}$/).optional(), platform: z.enum(["ios", "android", "web"]), appVersion: z.string().trim().min(1).max(80).default("unknown"), consentVersion: z.string().trim().min(1).max(80) });
 const trackingSampleSchema = z.object({ sampleId: z.string().trim().min(8).max(160), latitude: z.number().min(-90).max(90), longitude: z.number().min(-180).max(180), accuracyMeters: z.number().min(0).max(500), recordedAt: z.coerce.date() });
@@ -357,7 +364,7 @@ const riderSlotSchema = z.object({ zoneSlug: z.string().regex(/^[a-z0-9-]+$/), d
 const riderSlotCreateSchema = riderSlotSchema.extend({ riderId: z.string().regex(/^[a-f\d]{24}$/) });
 const riderSlotWeekSchema = riderSlotCreateSchema.extend({ weekdays: z.array(z.number().int().min(0).max(6)).min(1).max(7).default([0, 1, 2, 3, 4, 5, 6]) });
 const riderDocumentInputSchema = z.object({ type: z.enum(["identity", "residence_permit", "social_security_number", "bank_certificate", "profile_photo", "driving_license", "insurance", "vehicle_registration", "vehicle_technical_sheet", "scooter_responsible_declaration", "dgt_mvp_homologation", "work_authorization_confirmation", "ppe_and_safety", "other"]), fileName: z.string().min(1).max(180), mimeType: z.enum(DOCUMENT_UPLOAD_MIME_TYPES), sizeBytes: z.number().int().min(1).max(2_500_000), sha256: z.string().regex(/^[a-f0-9]{64}$/i), contentBase64: z.string().min(1).max(3_500_000) });
-const riderApplicationSchema = z.object({ name: z.string().min(2).max(160), email: z.string().email(), phone: z.string().min(6).max(40), city: z.string().min(2).max(120), vehicle: z.enum(["bike", "electric_bike", "electric_scooter", "motorcycle", "scooter", "car"]), availability: z.string().min(2).max(160), socialSecurityNumber: z.string().min(4).max(40), identityVerificationMethod: z.literal("online_scan"), safetyDeclarationAccepted: z.literal(true), documents: z.array(riderDocumentInputSchema).min(3).max(12), website: z.string().max(0).optional() });
+const riderApplicationSchema = z.object({ name: z.string().min(2).max(160), email: z.string().email(), phone: z.string().min(6).max(40), city: z.string().min(2).max(120), localityCode: z.string().regex(/^\d{5}$/).optional(), provinceCode: z.string().regex(/^\d{2}$/).optional(), requestedZoneSlug: z.string().regex(/^[a-z0-9-]+$/).optional(), vehicle: z.enum(["bike", "electric_bike", "electric_scooter", "motorcycle", "scooter", "car"]), availability: z.string().min(2).max(160), socialSecurityNumber: z.string().min(4).max(40), identityVerificationMethod: z.literal("online_scan"), safetyDeclarationAccepted: z.literal(true), documents: z.array(riderDocumentInputSchema).min(3).max(12), website: z.string().max(0).optional() });
 const documentRequestSubjectSchema = z.enum(["rider_application", "restaurant", "rider_lead", "partner_lead"]);
 const documentRequestRequirementInputSchema = z.object({ type: z.string().regex(/^[a-z0-9_]{2,80}$/), inputMode: z.enum(["file", "form"]).default("file"), label: z.string().trim().min(2).max(160), description: z.string().trim().max(500).default("") });
 const documentRequestCreateSchema = z.object({ subjectType: documentRequestSubjectSchema, subjectId: z.string().regex(/^[a-f\d]{24}$/), message: z.string().trim().min(10).max(2000), dueAt: z.coerce.date().nullable().optional(), requirements: z.array(documentRequestRequirementInputSchema).min(1).max(12), sendEmail: z.boolean().default(true) });
@@ -1262,13 +1269,21 @@ async function notifyOnboarding(input: { channel: "admin" | "fleet"; type: strin
   }
 }
 
+app.get("/api/v1/public/recruitment/areas", (_req, res) => {
+  // Never derive this response from planned MunicipalExpansion or Fleet zones.
+  // It is intentionally limited to the executable active coverage policy.
+  return res.json({ provinces: activeRecruitmentProvinces() });
+});
+
 app.post("/api/v1/public/partner-leads", async (req, res) => {
   const parsed = partnerLeadSubmissionSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_PARTNER_LEAD", details: parsed.error.flatten() });
   if (parsed.data.website) return res.status(400).json({ error: "INVALID_PARTNER_LEAD" });
   const { website: _website, ...data } = parsed.data;
+  const selection = resolveRecruitmentSelection(data);
+  if (!selection) return res.status(400).json({ error: "INVALID_RECRUITMENT_AREA", message: "Selecciona una localidad, provincia y zona de cobertura activas y coherentes." });
   try {
-    const lead = await PartnerLead.create({ ...data, email: normalizeLeadEmail(data.email), privacyNoticeAcceptedAt: new Date(), status: "new", history: [{ status: "new", notes: "Solicitud recibida desde Únete a PIKI." }] });
+    const lead = await PartnerLead.create({ ...data, city: selection.localityName, localityCode: selection.localityCode, provinceCode: selection.provinceCode, requestedZoneSlug: selection.requestedZoneSlug, email: normalizeLeadEmail(data.email), privacyNoticeAcceptedAt: new Date(), status: "new", history: [{ status: "new", notes: "Solicitud recibida desde Únete a PIKI." }] });
     await notifyOnboarding({ channel: "admin", type: "onboarding.partner_lead.created", entityId: String(lead._id), tenantId: (lead as any).tenantId });
     return res.status(201).json({ message: "Solicitud recibida. El equipo comercial revisará tus datos.", lead: { id: String(lead._id), status: lead.status } });
   } catch (error) {
@@ -1656,6 +1671,13 @@ app.get("/api/v1/partners/store/profile", requireRole("partner"), async (req, re
   if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
   return res.json({ restaurant: { ...restaurant, id: String(restaurant._id), commissionRateBps: Number(restaurant.partnerProfile?.commissionRateBps || 0) } });
 });
+function pikiManagedOpeningHours(value: unknown) {
+  const schedule = normalizeOpeningHours(value);
+  if (!schedule) return value;
+  const managed = { ...schedule, source: { mode: "piki" as const, syncedAt: new Date() } };
+  return { ...legacyOpeningHoursProjection(managed), ...managed };
+}
+function partnerIsOpenNow(restaurant: any) { return Boolean(restaurant?.isActive) && restaurantIsWithinOpeningHours(restaurant?.partnerProfile?.openingHours); }
 app.get("/api/v1/partners/store/hours", requireRole("partner"), async (req, res) => {
   const { access, allowed } = await partnerRequestAccess(req, "store:write");
   if (!allowed) return res.status(403).json({ error: "PARTNER_PERMISSION_DENIED", permission: "store:write" });
@@ -1663,7 +1685,7 @@ app.get("/api/v1/partners/store/hours", requireRole("partner"), async (req, res)
   if (!restaurantId) return res.status(403).json({ error: "PARTNER_RESTAURANT_NOT_ASSIGNED" });
   const restaurant = await Restaurant.findOne({ _id: restaurantId, onboardingStatus: "approved", ...tenantScope(req) }).select("_id name isActive partnerProfile.openingHours").lean().exec() as any;
   if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
-  return res.json({ restaurantId: String(restaurant._id), name: restaurant.name, isOpen: Boolean(restaurant.isActive), openingHours: restaurant.partnerProfile?.openingHours || {} });
+  return res.json({ restaurantId: String(restaurant._id), name: restaurant.name, isOpen: partnerIsOpenNow(restaurant), paused: !restaurant.isActive, openingHours: restaurant.partnerProfile?.openingHours || {} });
 });
 app.patch("/api/v1/partners/store/hours", requireRole("partner"), async (req, res) => {
   const { access, allowed } = await partnerRequestAccess(req, "store:write");
@@ -1672,16 +1694,19 @@ app.patch("/api/v1/partners/store/hours", requireRole("partner"), async (req, re
   const parsed = openingHoursSchema.safeParse(req.body?.openingHours ?? req.body);
   if (!restaurantId) return res.status(403).json({ error: "PARTNER_RESTAURANT_NOT_ASSIGNED" });
   if (!parsed.success) return res.status(400).json({ error: "INVALID_OPENING_HOURS", details: parsed.error.flatten() });
-  const restaurant = await Restaurant.findOneAndUpdate({ _id: restaurantId, onboardingStatus: "approved", ...tenantScope(req) }, { $set: { "partnerProfile.openingHours": parsed.data } }, { new: true }).select("_id name isActive partnerProfile.openingHours").lean().exec() as any;
+  const openingHours = pikiManagedOpeningHours(parsed.data);
+  const restaurant = await Restaurant.findOneAndUpdate({ _id: restaurantId, onboardingStatus: "approved", ...tenantScope(req) }, { $set: { "partnerProfile.openingHours": openingHours } }, { new: true }).select("_id name isActive partnerProfile.openingHours").lean().exec() as any;
   if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
-  return res.json({ restaurantId: String(restaurant._id), name: restaurant.name, isOpen: Boolean(restaurant.isActive), openingHours: restaurant.partnerProfile?.openingHours || parsed.data });
+  return res.json({ restaurantId: String(restaurant._id), name: restaurant.name, isOpen: partnerIsOpenNow(restaurant), paused: !restaurant.isActive, openingHours: restaurant.partnerProfile?.openingHours || openingHours });
 });
 app.get("/api/v1/partners/google-business/status", requireRole("partner"), async (req, res) => {
   const { access, allowed } = await partnerRequestAccess(req, "store:write");
   if (!allowed) return res.status(403).json({ error: "PARTNER_PERMISSION_DENIED", permission: "store:write" });
   const restaurantId = await employeeRestaurant(req, access); if (!restaurantId) return res.status(403).json({ error: "PARTNER_RESTAURANT_NOT_ASSIGNED" });
   const connection = await GoogleBusinessConnection.findOne({ restaurantId: objectId(restaurantId), ...tenantScope(req) }).select("restaurantId googleAccountName googleLocationName googleLocationTitle status scopes lastSyncAt lastSyncStatus lastSyncError lastGoogleUpdatedAt").lean().exec() as any;
-  return res.json({ configured: googleBusinessConfigured(), scopes: googleBusinessScopes(), connected: Boolean(connection), connection: connection ? { ...connection, restaurantId: String(connection.restaurantId) } : null });
+  const configuration = googleBusinessConfiguration();
+  const syncSettings = googleBusinessSyncSettings();
+  return res.json({ configured: configuration.configured, configuration: { enabled: syncSettings.enabled, missing: configuration.missing, syncCadenceMinutes: syncSettings.cadenceMinutes }, scopes: googleBusinessScopes(), connected: Boolean(connection), connection: connection ? { ...connection, restaurantId: String(connection.restaurantId) } : null });
 });
 app.get("/api/v1/partners/google-business/connect", requireRole("partner"), async (req, res) => {
   const { access, allowed } = await partnerRequestAccess(req, "store:write");
@@ -1717,17 +1742,23 @@ app.get("/api/v1/partners/google-business/callback", async (req, res) => {
 });
 app.post("/api/v1/partners/google-business/sync", requireRole("partner"), async (req, res) => {
   const { access, allowed } = await partnerRequestAccess(req, "store:write"); if (!allowed) return res.status(403).json({ error: "PARTNER_PERMISSION_DENIED", permission: "store:write" });
+  if (!googleBusinessConfigured()) return res.status(503).json({ error: "GOOGLE_BUSINESS_NOT_CONFIGURED", configuration: googleBusinessConfiguration() });
   const restaurantId = await employeeRestaurant(req, access); if (!restaurantId) return res.status(403).json({ error: "PARTNER_RESTAURANT_NOT_ASSIGNED" });
   const connection = await GoogleBusinessConnection.findOne({ restaurantId: objectId(restaurantId), ...tenantScope(req) }).select("+accessTokenEncrypted +refreshTokenEncrypted").exec() as any; if (!connection?.googleLocationName) return res.status(409).json({ error: "GOOGLE_LOCATION_NOT_SELECTED", message: "Selecciona primero la ubicación de Google Business Profile." });
-  try { const googleLocation = await readGoogleLocation(connection, connection.googleLocationName); const hours = fromGoogleRegularHours(googleLocation.regularHours); await Restaurant.updateOne({ _id: objectId(restaurantId), ...tenantScope(req) }, { $set: { "partnerProfile.openingHours": hours } }); connection.lastSyncAt = new Date(); connection.lastSyncStatus = "success"; connection.lastSyncError = ""; connection.lastGoogleUpdatedAt = new Date(); await connection.save(); return res.json({ synced: true, direction: "google_to_piki", openingHours: hours }); }
+  // A signed-in Partner's manual import is the explicit conflict-resolution
+  // action that switches the source back to Google. The background worker
+  // still refuses to overwrite schedules whose source remains `piki`.
+  try { const restaurant = await Restaurant.findOne({ _id: objectId(restaurantId), ...tenantScope(req) }).select("partnerProfile.openingHours").lean().exec() as any; const googleLocation = await readGoogleLocation(connection, connection.googleLocationName); const hours = fromGoogleLocationHours(googleLocation, restaurant?.partnerProfile?.openingHours); const changed = googleBusinessHoursChanged(restaurant?.partnerProfile?.openingHours, hours); const writeResult = await Restaurant.updateOne({ _id: objectId(restaurantId), ...tenantScope(req) }, { $set: { "partnerProfile.openingHours": hours } }); if (changed && writeResult.modifiedCount > 0) await publishCatalogUpdate(restaurantId, "restaurant.opening_hours.google_sync"); connection.lastSyncAt = new Date(); connection.nextSyncAt = new Date(Date.now() + googleBusinessSyncSettings().cadenceMs); connection.lastSyncStatus = "success"; connection.lastSyncError = ""; const googleUpdatedAt = googleLocation?.metadata?.updateTime ? new Date(googleLocation.metadata.updateTime) : new Date(); connection.lastGoogleUpdatedAt = Number.isNaN(googleUpdatedAt.getTime()) ? new Date() : googleUpdatedAt; await connection.save(); return res.json({ synced: true, direction: "google_to_piki", openingHours: hours }); }
   catch (error) { connection.lastSyncAt = new Date(); connection.lastSyncStatus = "error"; connection.lastSyncError = error instanceof Error ? error.message : "GOOGLE_SYNC_FAILED"; connection.status = connection.lastSyncError === "GOOGLE_REAUTH_REQUIRED" ? "needs_reauth" : "error"; await connection.save(); return res.status(502).json({ error: "GOOGLE_SYNC_FAILED", message: connection.lastSyncError }); }
 });
 app.patch("/api/v1/partners/google-business/publish-hours", requireRole("partner"), async (req, res) => {
   const { access, allowed } = await partnerRequestAccess(req, "store:write"); if (!allowed) return res.status(403).json({ error: "PARTNER_PERMISSION_DENIED", permission: "store:write" });
+  if (!googleBusinessConfigured()) return res.status(503).json({ error: "GOOGLE_BUSINESS_NOT_CONFIGURED", configuration: googleBusinessConfiguration() });
   const restaurantId = await employeeRestaurant(req, access); if (!restaurantId) return res.status(403).json({ error: "PARTNER_RESTAURANT_NOT_ASSIGNED" });
   const parsed = openingHoursSchema.safeParse(req.body?.openingHours ?? req.body); if (!parsed.success) return res.status(400).json({ error: "INVALID_OPENING_HOURS", details: parsed.error.flatten() });
   const connection = await GoogleBusinessConnection.findOne({ restaurantId: objectId(restaurantId), ...tenantScope(req) }).select("+accessTokenEncrypted +refreshTokenEncrypted").exec() as any; if (!connection?.googleLocationName) return res.status(409).json({ error: "GOOGLE_LOCATION_NOT_SELECTED" });
-  try { const result = await updateGoogleLocationHours(connection, connection.googleLocationName, toGoogleRegularHours(parsed.data)); await Restaurant.updateOne({ _id: objectId(restaurantId), ...tenantScope(req) }, { $set: { "partnerProfile.openingHours": parsed.data } }); connection.lastSyncAt = new Date(); connection.lastSyncStatus = "success"; connection.lastSyncError = ""; await connection.save(); return res.json({ synced: true, direction: "piki_to_google", result }); } catch (error) { return res.status(502).json({ error: "GOOGLE_PUBLISH_FAILED", message: error instanceof Error ? error.message : "GOOGLE_PUBLISH_FAILED" }); }
+  const openingHours = pikiManagedOpeningHours(parsed.data);
+  try { const result = await updateGoogleLocationHours(connection, connection.googleLocationName, toGoogleLocationHours(openingHours)); await Restaurant.updateOne({ _id: objectId(restaurantId), ...tenantScope(req) }, { $set: { "partnerProfile.openingHours": openingHours } }); connection.lastSyncAt = new Date(); connection.nextSyncAt = new Date(Date.now() + googleBusinessSyncSettings().cadenceMs); connection.lastSyncStatus = "success"; connection.lastSyncError = ""; await connection.save(); return res.json({ synced: true, direction: "piki_to_google", result }); } catch (error) { return res.status(502).json({ error: "GOOGLE_PUBLISH_FAILED", message: error instanceof Error ? error.message : "GOOGLE_PUBLISH_FAILED" }); }
 });
 app.get("/api/v1/partners/menu", requireRole("partner"), async (req, res) => {
   setPartnerMenuResponseHeaders(res);
@@ -2236,8 +2267,10 @@ app.post("/api/v1/public/rider-leads", async (req, res) => {
   if (!parsed.success) return res.status(400).json({ error: "INVALID_RIDER_LEAD", details: parsed.error.flatten() });
   if (parsed.data.website) return res.status(400).json({ error: "INVALID_RIDER_LEAD" });
   const { website: _website, ...data } = parsed.data;
+  const selection = resolveRecruitmentSelection(data);
+  if (!selection) return res.status(400).json({ error: "INVALID_RECRUITMENT_AREA", message: "Selecciona una localidad, provincia y zona de cobertura activas y coherentes." });
   try {
-    const lead = await RiderLead.create({ ...data, email: normalizeLeadEmail(data.email), privacyNoticeAcceptedAt: new Date(), status: "new", history: [{ status: "new", notes: "Solicitud recibida desde Únete a PIKI." }] });
+    const lead = await RiderLead.create({ ...data, city: selection.localityName, localityCode: selection.localityCode, provinceCode: selection.provinceCode, requestedZoneSlug: selection.requestedZoneSlug, email: normalizeLeadEmail(data.email), privacyNoticeAcceptedAt: new Date(), status: "new", history: [{ status: "new", notes: "Solicitud recibida desde Únete a PIKI." }] });
     await notifyOnboarding({ channel: "admin", type: "onboarding.rider_lead.created", entityId: String(lead._id), tenantId: (lead as any).tenantId });
     return res.status(201).json({ message: "Solicitud recibida. El equipo Fleet revisará tus datos y te contactará.", lead: { id: String(lead._id), status: lead.status } });
   } catch (error) {
@@ -2344,6 +2377,8 @@ app.post("/api/v1/riders/applications", async (req, res) => {
   const parsed = riderApplicationSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_RIDER_APPLICATION", details: parsed.error.flatten() });
   if (parsed.data.website) return res.status(400).json({ error: "INVALID_RIDER_APPLICATION" });
+  const selection = resolveRecruitmentSelection(parsed.data);
+  if (!selection) return res.status(400).json({ error: "INVALID_RECRUITMENT_AREA", message: "Selecciona una localidad, provincia y zona de cobertura activas y coherentes." });
   const documentTypes = new Set<string>(parsed.data.documents.map((document) => document.type));
   const missing: string[] = ["identity or residence_permit", "bank_certificate"].filter((required) => required === "identity or residence_permit" ? !documentTypes.has("identity") && !documentTypes.has("residence_permit") : !documentTypes.has(required));
   if (["motorcycle", "scooter", "car"].includes(parsed.data.vehicle)) {
@@ -2362,7 +2397,7 @@ app.post("/api/v1/riders/applications", async (req, res) => {
   const publicTenant = await publicOnboardingTenantScope();
   const duplicate = await RiderApplication.findOne({ ...publicTenant, email: parsed.data.email.toLowerCase(), status: { $in: ["pending", "contacted", "approved"] } }).lean().exec();
   if (duplicate) return res.status(409).json({ error: "APPLICATION_ALREADY_EXISTS" });
-  const application = await RiderApplication.create({ ...parsed.data, ...publicTenant, documents, email: parsed.data.email.toLowerCase(), status: "pending", source: "rider_landing" });
+  const application = await RiderApplication.create({ ...parsed.data, ...publicTenant, city: selection.localityName, localityCode: selection.localityCode, provinceCode: selection.provinceCode, requestedZoneSlug: selection.requestedZoneSlug, documents, email: parsed.data.email.toLowerCase(), status: "pending", source: "rider_landing" });
   await notifyOnboarding({ channel: "admin", type: "onboarding.rider_application.created", entityId: String(application._id), tenantId: (application as any).tenantId });
   return res.status(201).json({ message: "Solicitud recibida. El equipo Fleet se pondrá en contacto contigo.", application: { id: application.id, applicationCode: onboardingCode("R", application._id), status: application.status } });
 });
@@ -2420,7 +2455,7 @@ app.patch("/api/v1/rider-applications/:id/status", requireRole("admin"), async (
   const parsed = z.object({ status: z.enum(["pending", "contacted", "approved", "rejected"]), notes: z.string().max(1000).optional(), assignedFleetId: z.string().regex(/^[a-f\d]{24}$/).nullable().optional() }).safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_APPLICATION_STATUS", details: parsed.error.flatten() });
   const scope = await adminOnboardingScope(req);
-  const existing = await RiderApplication.findOne({ _id: id, ...scope }).select("documents status tenantId").lean().exec() as any;
+  const existing = await RiderApplication.findOne({ _id: id, ...scope }).select("documents status tenantId requestedZoneSlug").lean().exec() as any;
   if (!existing) return res.status(404).json({ error: "APPLICATION_NOT_FOUND" });
   if (parsed.data.status === "approved") {
     const documents = existing.documents || [];
@@ -2430,7 +2465,15 @@ app.patch("/api/v1/rider-applications/:id/status", requireRole("admin"), async (
   }
   const update: Record<string, unknown> = { status: parsed.data.status, notes: parsed.data.notes, reviewedBy: objectId(req.auth!.employeeId!), reviewedAt: new Date() };
   if (parsed.data.status === "approved") update.identityVerificationStatus = "verified";
-  if (parsed.data.assignedFleetId !== undefined) update.assignedFleetId = parsed.data.assignedFleetId ? objectId(parsed.data.assignedFleetId) : null;
+  if (parsed.data.assignedFleetId !== undefined) {
+    const assignedFleetId = parsed.data.assignedFleetId ? objectId(parsed.data.assignedFleetId) : null;
+    if (assignedFleetId && existing.requestedZoneSlug) {
+      const fleet = await Fleet.findOne({ _id: assignedFleetId, ...(existing.tenantId ? { tenantId: existing.tenantId } : tenantScope(req)), isActive: true }).select("serviceZones").lean().exec() as any;
+      if (!fleet) return res.status(404).json({ error: "FLEET_NOT_FOUND" });
+      if (!Array.isArray(fleet.serviceZones) || !fleet.serviceZones.includes(existing.requestedZoneSlug)) return res.status(409).json({ error: "FLEET_ZONE_INCOMPATIBLE", message: "La Fleet seleccionada no cubre la zona solicitada por el Rider." });
+    }
+    update.assignedFleetId = assignedFleetId;
+  }
   const application = await RiderApplication.findOneAndUpdate({ _id: id, ...scope }, { $set: update }, { new: true }).lean().exec() as any;
   if (!application) return res.status(404).json({ error: "APPLICATION_NOT_FOUND" });
   let approvedRiderId = "";
@@ -2500,7 +2543,7 @@ app.patch("/api/v1/rider-applications/:id/status", requireRole("admin"), async (
 
 
 function normalizedZoneSlug(value: string) { return String(value || "").trim().toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, ""); }
-const leadRoutingSchema = z.object({ zoneSlug: z.string().regex(/^[a-z0-9-]+$/).optional() });
+const leadRoutingSchema = z.object({ zoneSlug: z.string().regex(/^[a-z0-9-]+$/).optional(), reason: z.string().trim().min(3).max(500).optional() });
 app.post("/api/v1/admin/rider-applications/:id/prl-course", requireRole("admin", "fleet"), async (req, res) => {
   const applicationId = objectId(String(req.params.id));
   if (!applicationId) return res.status(400).json({ error: "INVALID_APPLICATION_ID" });
@@ -2567,31 +2610,33 @@ app.patch("/api/v1/admin/rider-training/:id/review", requireRole("admin", "fleet
 
 app.post("/api/v1/admin/rider-applications/:id/route", requireRole("admin"), async (req, res) => {
   const id = objectId(String(req.params.id));
-  const parsed = z.object({ fleetId: z.string().regex(/^[a-f\d]{24}$/).optional(), zoneSlug: z.string().regex(/^[a-z0-9-]+$/).optional() }).refine((value) => value.fleetId || value.zoneSlug, "fleetId_or_zone_required").safeParse(req.body || {});
+  const parsed = z.object({ fleetId: z.string().regex(/^[a-f\d]{24}$/).optional(), zoneSlug: z.string().regex(/^[a-z0-9-]+$/).optional() }).safeParse(req.body || {});
   if (!id || !parsed.success) return res.status(400).json({ error: "INVALID_RIDER_APPLICATION_ROUTING" });
   const application = await RiderApplication.findOne({ _id: id, ...await adminOnboardingScope(req) }).lean().exec() as any;
   if (!application) return res.status(404).json({ error: "APPLICATION_NOT_FOUND" });
   if (application.status !== "approved") return res.status(409).json({ error: "RIDER_APPLICATION_NOT_APPROVED" });
   const tenantId = objectId(String(application.tenantId || ""));
   if (!tenantId) return res.status(409).json({ error: "RIDER_APPLICATION_TENANT_REQUIRED" });
+  const zoneSlug = parsed.data.zoneSlug || application.requestedZoneSlug;
+  if (!zoneSlug) return res.status(409).json({ error: "RIDER_APPLICATION_ZONE_REQUIRED", message: "La solicitud no tiene una zona canónica seleccionada; elige una zona antes de derivar." });
   const fleetFilter: Record<string, unknown> = { tenantId, isActive: true };
   if (parsed.data.fleetId) fleetFilter._id = objectId(parsed.data.fleetId);
-  if (parsed.data.zoneSlug) fleetFilter.serviceZones = parsed.data.zoneSlug;
+  fleetFilter.serviceZones = zoneSlug;
   const fleets = await Fleet.find(fleetFilter).select("_id name managerName contactEmail contactPhone serviceZones").lean().exec() as any[];
   if (!fleets.length) return res.status(409).json({ error: "ZONE_FLEET_NOT_FOUND", message: "No existe una Fleet activa para esa zona y tenant." });
   if (fleets.length > 1 && !parsed.data.fleetId) return res.status(409).json({ error: "ZONE_FLEET_AMBIGUOUS", message: "Hay varias Fleets activas para la zona; selecciona una explícitamente." });
   const fleet = fleets[0];
-  const rider = await Rider.findOneAndUpdate({ email: String(application.email).trim().toLowerCase(), tenantId }, { $set: { fleetId: fleet._id } }, { new: true }).select("_id fleetId").lean().exec() as any;
+  const rider = await Rider.findOneAndUpdate({ email: String(application.email).trim().toLowerCase(), tenantId }, { $set: { fleetId: fleet._id, zoneSlug } }, { new: true }).select("_id fleetId zoneSlug").lean().exec() as any;
   await EmployeeAccount.updateOne({ email: String(application.email).trim().toLowerCase(), tenantId, jobRole: "rider" }, { $set: { fleetId: fleet._id } }).exec();
-  const updated = await RiderApplication.findOneAndUpdate({ _id: id, tenantId }, { $set: { assignedFleetId: fleet._id, notes: `${String(application.notes || "").trim()}\nDerivado a Fleet ${fleet.name}.` .trim() } }, { new: true }).select("_id status assignedFleetId tenantId").lean().exec();
+  const updated = await RiderApplication.findOneAndUpdate({ _id: id, tenantId }, { $set: { assignedFleetId: fleet._id, assignedZoneSlug: zoneSlug, notes: `${String(application.notes || "").trim()}\nDerivado a Fleet ${fleet.name} (${zoneSlug}).` .trim() } }, { new: true }).select("_id status assignedFleetId assignedZoneSlug requestedZoneSlug tenantId").lean().exec();
   const targetEmail = String(fleet.contactEmail || "").trim().toLowerCase();
   let emailSent = false;
   if (targetEmail) {
     const email = await sendCorporateEmail({ recipientEmail: targetEmail, subject: `PIKI · Rider aprobado derivado a ${fleet.name}`, idempotencyKey: `piki-rider-application-route-${id}-${fleet._id}`, text: `Se ha derivado a tu Fleet el rider aprobado ${application.name} (${application.email}) de ${application.city}. Accede al panel Fleet para continuar con su activación operativa.`, html: `<p>Se ha derivado a tu Fleet el rider aprobado <strong>${application.name}</strong> (${application.email}) de ${application.city}.</p><p>Accede al panel Fleet para continuar con su activación operativa.</p>` });
     emailSent = email.sent;
   }
-  await recordGovernanceEvent({ actor: { employeeId: objectId(String(req.auth?.employeeId || "")), role: req.auth?.role, tenantId }, action: "rider_application_routed_to_fleet", targetType: "rider", targetId: rider?._id || id, after: { fleetId: String(fleet._id), fleetName: fleet.name, riderId: rider?._id ? String(rider._id) : null, targetEmail, emailSent }, reason: "Rider aprobado derivado explícitamente a Fleet activa del mismo tenant." });
-  return res.json({ application: updated, routing: { fleetId: String(fleet._id), fleetName: fleet.name, targetEmail, emailSent } });
+  await recordGovernanceEvent({ actor: { employeeId: objectId(String(req.auth?.employeeId || "")), role: req.auth?.role, tenantId }, action: "rider_application_routed_to_fleet", targetType: "rider", targetId: rider?._id || id, after: { fleetId: String(fleet._id), fleetName: fleet.name, zoneSlug, riderId: rider?._id ? String(rider._id) : null, targetEmail, emailSent }, reason: "Rider aprobado derivado explícitamente a Fleet activa compatible con su zona solicitada." });
+  return res.json({ application: updated, routing: { fleetId: String(fleet._id), fleetName: fleet.name, zoneSlug, targetEmail, emailSent } });
 });
 
 app.post("/api/v1/admin/:kind-leads/:id/prl-request", requireRole("admin"), async (req, res) => {
@@ -2691,8 +2736,10 @@ app.post("/api/v1/admin/:kind-leads/:id/route", requireRole("admin"), async (req
   const lead = await Model.findOne({ _id: id, ...scope }).lean().exec() as any;
   if (!lead) return res.status(404).json({ error: "LEAD_NOT_FOUND" });
   if (lead.status !== "qualified") return res.status(409).json({ error: "LEAD_MUST_BE_QUALIFIED", message: "Cualifica primero la solicitud antes de derivarla a operaciones." });
-  const zoneSlug = parsed.data.zoneSlug || normalizedZoneSlug(kind === "rider" ? lead.city : lead.city || lead.address);
+  const legacySelection = lead.requestedZoneSlug ? null : resolveRecruitmentSelection({ city: lead.city });
+  const zoneSlug = parsed.data.zoneSlug || lead.requestedZoneSlug || legacySelection?.requestedZoneSlug;
   if (!zoneSlug) return res.status(409).json({ error: "LEAD_ZONE_REQUIRED", message: "No se ha podido identificar la zona operativa." });
+  const routingReason = parsed.data.reason || "Motivo no indicado (compatibilidad con clientes legacy).";
   const tenant = tenantScope(req);
   let target: any = null;
   if (kind === "rider") {
@@ -2705,15 +2752,17 @@ app.post("/api/v1/admin/:kind-leads/:id/route", requireRole("admin"), async (req
   const update: Record<string, unknown> = { assignedZoneSlug: zoneSlug, routedAt: new Date(), routedBy: objectId(String(req.auth?.employeeId || "")) };
   if (kind === "rider") update.assignedFleetId = target._id;
   else update.assignedManagerId = target._id;
-  const routed = await Model.findOneAndUpdate({ _id: id, ...scope }, { $set: update, $push: { history: { status: "qualified", notes: kind === "rider" ? `Derivado a Fleet ${target.name} (${zoneSlug}).` : `Derivado al gerente de zona ${target.name} (${zoneSlug}).`, actorEmployeeId: objectId(String(req.auth?.employeeId || "")), changedAt: new Date() } } }, { new: true }).lean().exec();
+  const routingHistory = `${kind === "rider" ? `Derivado a Fleet ${target.name} (${zoneSlug}).` : `Derivado al gerente de zona ${target.name} (${zoneSlug}).`} Motivo: ${routingReason}`;
+  const routed = await Model.findOneAndUpdate({ _id: id, ...scope }, { $set: update, $push: { history: { status: "qualified", notes: routingHistory, actorEmployeeId: objectId(String(req.auth?.employeeId || "")), changedAt: new Date() } } }, { new: true }).lean().exec();
   const targetEmail = kind === "rider" ? String(target.contactEmail || "").trim().toLowerCase() : String(target.email || "").trim().toLowerCase();
   let emailSent = false;
   if (targetEmail) {
     const result = await sendCorporateEmail({ recipientEmail: targetEmail, subject: kind === "rider" ? `PIKI · Nuevo rider cualificado · ${lead.name}` : `PIKI · Nuevo Partner Orders cualificado · ${lead.name}`, idempotencyKey: `piki-lead-route-${kind}-${id}-${zoneSlug}`, text: `Hola ${kind === "rider" ? target.managerName || target.name : target.name},\n\nSe ha cualificado una nueva alta para tu zona (${zoneSlug}).\n\nNombre: ${lead.name}\nCorreo: ${lead.email}\nTeléfono: ${lead.phone}\nCiudad: ${lead.city}\n${kind === "rider" ? `Vehículo: ${lead.vehicle}\nDisponibilidad: ${lead.availability}` : `Dirección: ${lead.address || "Pendiente"}`}\n\nAccede a PIKI ${kind === "rider" ? "Fleet" : "Partner Orders"} para continuar con slots, horarios y activación operativa.\n\nEquipo PIKI`, html: `<p>Se ha cualificado una nueva alta para tu zona <strong>${zoneSlug}</strong>.</p><p><strong>${lead.name}</strong> · ${lead.email} · ${lead.phone}</p><p>${kind === "rider" ? `Vehículo: ${lead.vehicle}<br>Disponibilidad: ${lead.availability}` : `Dirección: ${lead.address || "Pendiente"}`}</p><p>Accede a PIKI para continuar con la gestión operativa.</p>` });
     emailSent = result.sent;
   }
+  await recordGovernanceEvent({ actor: { employeeId: objectId(String(req.auth?.employeeId || "")), role: req.auth?.role, tenantId: (routed as any)?.tenantId || null }, action: kind === "rider" ? "rider_lead_routed_to_fleet" : "partner_lead_routed_to_zone_manager", targetType: "system", targetId: id, after: { kind, requestedZoneSlug: lead.requestedZoneSlug || null, assignedZoneSlug: zoneSlug, targetId: String(target._id), targetName: target.name, targetEmail, emailSent }, reason: routingReason });
   await notifyOnboarding({ channel: kind === "rider" ? "fleet" : "admin", type: kind === "rider" ? "onboarding.rider_lead.routed" : "onboarding.partner_lead.routed", entityId: String(id), tenantId: (routed as any)?.tenantId, payload: { leadId: String(id), zoneSlug, targetId: String(target._id), targetEmail, targetName: target.name, kind } });
-  return res.json({ lead: routed, routing: { kind, zoneSlug, targetId: String(target._id), targetName: kind === "rider" ? target.name : target.name, targetEmail, emailSent } });
+  return res.json({ lead: routed, routing: { kind, zoneSlug, reason: routingReason, targetId: String(target._id), targetName: kind === "rider" ? target.name : target.name, targetEmail, emailSent } });
 });
 function documentRequestTokenHash(token: string) { return createHash("sha256").update(token).digest("hex"); }
 function documentRequestUploadUrl(token: string) { return `${String(process.env.ADMIN_APP_URL || "https://admin.pikidelivery.com").replace(/\/$/, "")}/#document-request=${encodeURIComponent(token)}`; }
@@ -3130,6 +3179,7 @@ app.post("/api/v1/orders", rateLimit(20, 60_000, "orders-create"), async (req, r
   if (!restaurantObjectId) return res.status(400).json({ error: "INVALID_RESTAURANT_ID" });
   const restaurant = await Restaurant.findOne({ _id: restaurantObjectId, isActive: true, onboardingStatus: "approved" }).lean().exec() as any;
   if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_AVAILABLE" });
+  if (!restaurantIsWithinOpeningHours(restaurant.partnerProfile?.openingHours)) return res.status(409).json({ error: "PARTNER_CLOSED", message: "Este establecimiento está cerrado ahora. Elige otro horario para realizar el pedido." });
   if (parsed.data.paymentMethod === "cash" && !isCashPaymentEnabledForRestaurant(restaurant)) return res.status(409).json(cashPaymentDisabledError(restaurant));
   // El catálogo público y el checkout deben compartir exactamente la misma política de precio.
   // Alibaba aplica el 18% por producto; Kings Tacos y el resto no se alteran.
@@ -3184,7 +3234,7 @@ app.post("/api/v1/orders", rateLimit(20, 60_000, "orders-create"), async (req, r
     const dispatch = enqueueOrderForDispatch(order._id as mongoose.Types.ObjectId).catch((error) => console.warn("Dispatch outbox enqueue failed", error instanceof Error ? error.message : error));
     await Promise.all([dispatch, publishOrderIntakeEvents(order, { settlement: "cash_due", message: "Contrarreembolso: el Rider cobrará en efectivo al entregar." })]);
   }
-  res.status(201).json({ order: { id: order.id, publicCode, displayCode: order.displayCode, displayCodeDate: order.displayCodeDate, status: order.status, paymentState: parsed.data.paymentMethod === "cash" ? "pending_cash_collection" : order.paymentState, paymentMethod: parsed.data.paymentMethod, cashDueAtDelivery: parsed.data.paymentMethod === "cash", deliveryQrUrl: deliveryQrUrl(publicCode), subtotalCents, deliveryFeeCents, serviceFeeCents, totalCents,
+  res.status(201).json({ order: { id: order.id, publicCode, displayCode: order.displayCode, displayCodeDate: order.displayCodeDate, status: order.status, paymentState: parsed.data.paymentMethod === "cash" ? "pending_cash_collection" : order.paymentState, paymentMethod: parsed.data.paymentMethod, cashDueAtDelivery: parsed.data.paymentMethod === "cash", subtotalCents, deliveryFeeCents, serviceFeeCents, totalCents,
     marketplace: { commissionRateBps: marketplace.commissionRateBps, commissionCents: marketplace.platformCommissionCents, partnerPayoutCents: marketplace.partnerPayoutCents, riderEarningsCents: marketplace.riderEarningsCents, platformNetBeforeProcessingCents: marketplace.platformNetBeforeProcessingCents }, freeDeliveryApplied: freeDelivery.eligible, freeDeliveryOrdersRemaining: freeDelivery.remaining, coverage, route, partnerPreparationLimitMinutes: PARTNER_PREPARATION_LIMIT_MINUTES, customerDeliveryTargetMinutes: CUSTOMER_DELIVERY_TARGET_MINUTES, etaMinutes: calculateEtaRange([PARTNER_PREPARATION_LIMIT_MINUTES, PARTNER_PREPARATION_LIMIT_MINUTES], [5, 15]) } });
 });
 
@@ -3894,39 +3944,72 @@ app.post("/api/v1/riders/:riderId/orders/:orderId/confirm-delivery", requireRole
   if (!riderAccess) return res.status(403).json({ error: "RIDER_ACCESS_DENIED" });
   const order = await Order.findOne({ _id: orderId, riderId, assignmentState: "assigned" }).lean().exec() as any;
   if (!order) return res.status(404).json({ error: "ASSIGNED_ORDER_NOT_FOUND" });
+  if (order.status === "delivered" && String(order.deliveryProof?.riderId || order.riderId) === String(riderId)) {
+    return res.json(deliveredConfirmationResponse(order, true, order.deliveryProof?.gpsDistanceMeters ?? null, Boolean(order.deliveryProof?.gpsOutsideConfiguredRadius)));
+  }
   if (order.status !== "on_the_way") return res.status(409).json({ error: "ORDER_NOT_ON_THE_WAY", message: "Primero confirma que has recogido el pedido e iniciado la ruta." });
+  const credential = parseDeliveryCredential(req.body);
+  if (!credential) return res.status(400).json({ error: "INVALID_DELIVERY_CREDENTIAL", message: "Envía un único deliveryQr legado o una única credencial PIN/QR." });
+  const credentialNow = new Date();
+  const lockedUntil = deliveryFailureLock(order.deliveryCredentialFailures, credentialNow);
+  if (lockedUntil) return res.status(429).json({ error: "DELIVERY_CREDENTIAL_RATE_LIMITED", retryAfterSeconds: Math.ceil((lockedUntil.getTime() - Date.now()) / 1000) });
   const rider = await Rider.findById(riderId).select("location lastLocationAt").lean().exec() as any;
   if (!rider?.lastLocationAt || new Date(rider.lastLocationAt).getTime() < Date.now() - 90_000) return res.status(409).json({ error: "FRESH_LOCATION_REQUIRED", message: "Actualiza tu GPS antes de confirmar la entrega." });
   // El PIN/QR firmado por el Customer es la prueba de entrega. Validarlo
   // antes del radio evita bloquear una entrega legítima por un pin de mapa
   // desplazado o por el error normal del GPS urbano.
-  if (!deliveryQrIsValid(order.publicCode, req.body?.deliveryQr)) return res.status(422).json({ error: "DELIVERY_QR_INVALID", message: "Escanea el QR o introduce el PIN que proporciona el Customer antes de confirmar la entrega." });
-  const deliveryDistanceMeters = pointDistanceMeters(rider.location, order.deliveryLocation);
+  if (!deliveryQrIsValid(order.publicCode, credential.credential)) {
+    const failedOrder = await Order.findOneAndUpdate({ _id: orderId, riderId, assignmentState: "assigned", status: "on_the_way", ...deliveryCredentialNotLockedFilter(credentialNow) }, deliveryFailureAtomicUpdate(credentialNow) as any, { new: true }).lean().exec() as any;
+    if (!failedOrder) {
+      const current = await Order.findOne({ _id: orderId, riderId, assignmentState: "assigned" }).lean().exec() as any;
+      if (current?.status === "delivered" && String(current.deliveryProof?.riderId || current.riderId) === String(riderId)) return res.json(deliveredConfirmationResponse(current, true, current.deliveryProof?.gpsDistanceMeters ?? null, Boolean(current.deliveryProof?.gpsOutsideConfiguredRadius)));
+      const currentLock = deliveryFailureLock(current?.deliveryCredentialFailures, credentialNow);
+      if (currentLock) return res.status(429).json({ error: "DELIVERY_CREDENTIAL_RATE_LIMITED", retryAfterSeconds: Math.ceil((currentLock.getTime() - Date.now()) / 1000) });
+      return res.status(409).json({ error: "ORDER_CHANGED_RETRY" });
+    }
+    const failures = failedOrder.deliveryCredentialFailures;
+    const failureLock = deliveryFailureLock(failures, credentialNow);
+    return res.status(422).json({ error: "DELIVERY_QR_INVALID", message: "Escanea el QR o introduce el PIN que proporciona el Customer antes de confirmar la entrega.", attemptsRemaining: Math.max(0, 5 - Number(failures?.count || 0)), ...(failureLock ? { retryAfterSeconds: Math.ceil((failureLock.getTime() - Date.now()) / 1000) } : {}) });
+  }
+  const confirmedOrder = await Order.findOneAndUpdate({ _id: orderId, riderId, assignmentState: "assigned", status: "on_the_way", ...deliveryCredentialNotLockedFilter(credentialNow) }, { $set: { "deliveryCredentialFailures.count": 0, "deliveryCredentialFailures.windowStartedAt": null, "deliveryCredentialFailures.lockedUntil": null } }, { new: true }).lean().exec() as any;
+  if (!confirmedOrder) {
+    const current = await Order.findOne({ _id: orderId, riderId, assignmentState: "assigned" }).lean().exec() as any;
+    if (current?.status === "delivered" && String(current.deliveryProof?.riderId || current.riderId) === String(riderId)) return res.json(deliveredConfirmationResponse(current, true, current.deliveryProof?.gpsDistanceMeters ?? null, Boolean(current.deliveryProof?.gpsOutsideConfiguredRadius)));
+    const currentLock = deliveryFailureLock(current?.deliveryCredentialFailures, credentialNow);
+    if (currentLock) return res.status(429).json({ error: "DELIVERY_CREDENTIAL_RATE_LIMITED", retryAfterSeconds: Math.ceil((currentLock.getTime() - Date.now()) / 1000) });
+    return res.status(409).json({ error: "ORDER_CHANGED_RETRY" });
+  }
+  const deliveryDistanceMeters = pointDistanceMeters(rider.location, confirmedOrder.deliveryLocation);
   if (deliveryDistanceMeters == null) return res.status(409).json({ error: "DELIVERY_LOCATION_REQUIRED", message: "No se puede verificar la entrega: falta una ubicación GPS válida del cliente." });
   const outsideGpsRadius = deliveryDistanceMeters > DELIVERY_CONFIRMATION_RADIUS_METERS;
-  if (order.paymentMethod === "stripe") {
-    if (!order.stripePaymentIntentId || order.paymentState !== "authorized") return res.status(409).json({ error: "PAYMENT_NOT_AUTHORIZED", message: "El pago online todavía no está autorizado para capturarse." });
-    try { await captureStripePaymentIntent(order.stripePaymentIntentId); }
+  if (confirmedOrder.paymentMethod === "stripe") {
+    if (!confirmedOrder.stripePaymentIntentId || confirmedOrder.paymentState !== "authorized") return res.status(409).json({ error: "PAYMENT_NOT_AUTHORIZED", message: "El pago online todavía no está autorizado para capturarse." });
+    try { await captureStripePaymentIntent(confirmedOrder.stripePaymentIntentId); }
     catch (error) { return res.status(409).json({ error: "PAYMENT_CAPTURE_FAILED", message: error instanceof Error ? error.message : "No se pudo capturar el pago." }); }
   }
-  if (order.paymentMethod === "cash") {
-    const cashEntry = await recordCashCollection(order, riderId, "rider");
-    if (cashEntry) await publishCashWalletEvent({ riderId, amountCents: Number(order.totalCents || 0), type: "cash.wallet_changed", reference: String(order.publicCode || "") });
+  if (confirmedOrder.paymentMethod === "cash") {
+    const cashEntry = await recordCashCollection(confirmedOrder, riderId, "rider");
+    if (cashEntry) await publishCashWalletEvent({ riderId, amountCents: Number(confirmedOrder.totalCents || 0), type: "cash.wallet_changed", reference: String(confirmedOrder.publicCode || "") });
   }
   // Stripe may emit payment_intent.succeeded between capture() and this write.
   // Webhooks are payment-only, but they still increment version; do not reject
   // a successfully captured delivery merely because that benign event won the
   // version race. Status/rider/assignment predicates remain the concurrency
   // guard, and Stripe orders must be authorized or already marked paid.
-  const updated = await Order.findOneAndUpdate({ _id: orderId, riderId, assignmentState: "assigned", status: "on_the_way", ...(order.paymentMethod === "stripe" ? { paymentState: { $in: ["authorized", "paid"] } } : {}) }, { $set: { status: "delivered", deliveredAt: new Date(), archivedAt: new Date(), paymentState: "paid" }, $inc: { version: 1 }, $push: { statusHistory: { status: "delivered", actorRole: "rider", reason: order.paymentMethod === "cash" ? "Entrega confirmada y cobro en efectivo registrado" : "Entrega confirmada por el Rider" } } }, { new: true }).lean().exec();
-  if (!updated) return res.status(409).json({ error: "ORDER_CHANGED_RETRY" });
+  const deliveredAt = new Date();
+  const updated = await Order.findOneAndUpdate({ _id: orderId, riderId, assignmentState: "assigned", status: "on_the_way", ...(confirmedOrder.paymentMethod === "stripe" ? { paymentState: { $in: ["authorized", "paid"] } } : {}) }, { $set: { status: "delivered", deliveredAt, archivedAt: deliveredAt, paymentState: "paid", deliveryProof: { method: credential.method, riderId, confirmedAt: deliveredAt, idempotencyKey: credential.idempotencyKey, gpsDistanceMeters: deliveryDistanceMeters, gpsOutsideConfiguredRadius: outsideGpsRadius } }, $inc: { version: 1 }, $push: { statusHistory: { status: "delivered", actorRole: "rider", reason: confirmedOrder.paymentMethod === "cash" ? "Entrega confirmada y cobro en efectivo registrado" : "Entrega confirmada por el Rider" } } }, { new: true }).lean().exec();
+  if (!updated) {
+    const delivered = await Order.findOne({ _id: orderId, riderId, assignmentState: "assigned", status: "delivered" }).lean().exec() as any;
+    if (delivered) return res.json(deliveredConfirmationResponse(delivered, true, delivered.deliveryProof?.gpsDistanceMeters ?? null, Boolean(delivered.deliveryProof?.gpsOutsideConfiguredRadius)));
+    return res.status(409).json({ error: "ORDER_CHANGED_RETRY" });
+  }
   const deliveredOrder = updated as any;
   await postMarketplaceOrderLedger(deliveredOrder).catch((error) => console.error("Marketplace ledger posting failed", error instanceof Error ? error.message : error));
   await RiderOrderMessage.deleteMany({ orderId, riderId }).exec();
   await releaseRiderOrderSlot(orderId, riderId);
-  if (!order.isTestOrder) await awardRiderRecruitmentMilestones(riderId).catch((error) => console.error("Rider referral milestone evaluation failed", error instanceof Error ? error.message : error));
+  if (!confirmedOrder.isTestOrder) await awardRiderRecruitmentMilestones(riderId).catch((error) => console.error("Rider referral milestone evaluation failed", error instanceof Error ? error.message : error));
   scheduleCustomerOrderPush(deliveredOrder, "delivered");
-  return res.json({ message: order.paymentMethod === "cash" ? "Entrega confirmada y efectivo registrado en cartera." : "Entrega confirmada.", chatPurged: true, gpsDistanceMeters: deliveryDistanceMeters, gpsOutsideConfiguredRadius: outsideGpsRadius, order: { id: deliveredOrder._id, publicCode: deliveredOrder.publicCode, status: deliveredOrder.status, deliveredAt: deliveredOrder.deliveredAt, paymentMethod: deliveredOrder.paymentMethod, cashCollected: Boolean(deliveredOrder.cashCollectedAt) } });
+  return res.json(deliveredConfirmationResponse(deliveredOrder, false, deliveryDistanceMeters, outsideGpsRadius));
 });
 
 app.get("/api/v1/riders/:id/cash-wallet", requireRole("admin", "rider", "fleet"), async (req, res) => {
@@ -4869,13 +4952,16 @@ app.get("/api/v1/zones", requireRole("admin", "fleet"), async (req, res) => {
 });
 
 app.get("/api/v1/fleets", requireRole("admin", "fleet"), async (req, res) => {
-  const employee = req.auth?.employeeId ? await EmployeeAccount.findById(req.auth.employeeId).select("fleetId").lean().exec() as any : null;
-  const filter = req.auth?.role === "fleet" ? { _id: employee?.fleetId || null } : {};
-  const fleets = await Fleet.find(filter).sort({ name: 1 }).lean().exec();
-  return res.json({ fleets });
+  const employee = await employeeScope(req);
+  const filter = { ...tenantScope(req), ...(req.auth?.role === "fleet" ? { _id: employee?.fleetId || null } : {}) };
+  const fleets = await Fleet.find(filter).select("_id name city localityCode localityName provinceCode provinceName vehicleTypes maxRiders serviceZones isActive createdAt updatedAt").sort({ name: 1 }).lean().exec() as any[];
+  const slugs = [...new Set(fleets.flatMap((fleet) => Array.isArray(fleet.serviceZones) ? fleet.serviceZones : []))];
+  const zones = slugs.length ? await Zone.find({ ...tenantScope(req), isActive: true, slug: { $in: slugs } }).select("slug name").lean().exec() as any[] : [];
+  const serviceZoneNames = Object.fromEntries(zones.map((zone) => [zone.slug, zone.name]));
+  return res.json({ fleets: fleets.map((fleet) => fleetPublicView(fleet, serviceZoneNames)) });
 });
 
-const fleetInputSchema = z.object({ name: z.string().trim().min(2).max(120), managerName: z.string().trim().min(2).max(120), managerDni: z.string().trim().min(5).max(20), contactEmail: z.string().trim().email().or(z.literal("")), contactPhone: z.string().trim().min(6).max(40), address: z.string().trim().min(5).max(240), postalCode: z.string().trim().min(3).max(12), city: z.string().trim().min(2).max(120), vehicleTypes: z.array(z.enum(["bike", "electric_bike", "electric_scooter", "motorcycle", "scooter", "car"])).min(1).max(6), maxRiders: z.coerce.number().int().min(1).max(10000), serviceZones: z.array(z.string().regex(/^[a-z0-9-]+$/)).min(1).max(300), notes: z.string().trim().max(2000).default("") });
+const fleetInputSchema = z.object({ name: z.string().trim().min(2).max(120), localityCode: z.string().regex(/^\d{5}$/).optional(), localityName: z.string().trim().min(2).max(120).optional(), provinceCode: z.string().regex(/^\d{2}$/).optional(), provinceName: z.string().trim().min(2).max(120).optional(), managerName: z.string().trim().min(2).max(120).optional().default(""), managerDni: z.string().trim().min(5).max(20).optional().default(""), contactEmail: z.string().trim().email().or(z.literal("")), contactPhone: z.string().trim().min(6).max(40), address: z.string().trim().min(5).max(240), postalCode: z.string().trim().min(3).max(12), city: z.string().trim().min(2).max(120), vehicleTypes: z.array(z.enum(["bike", "electric_bike", "electric_scooter", "motorcycle", "scooter", "car"])).min(1).max(6), maxRiders: z.coerce.number().int().min(1).max(10000), serviceZones: z.array(z.string().regex(/^[a-z0-9-]+$/)).min(1).max(300), notes: z.string().trim().max(2000).default("") });
 app.post("/api/v1/fleets", requireRole("admin", "fleet"), async (req, res) => {
   const parsed = fleetInputSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_FLEET", details: parsed.error.flatten() });
@@ -4883,12 +4969,16 @@ app.post("/api/v1/fleets", requireRole("admin", "fleet"), async (req, res) => {
   if (req.auth?.role === "fleet" && employee?.fleetId) return res.status(409).json({ error: "FLEET_ALREADY_ASSIGNED", message: "Tu cuenta ya está vinculada a una Fleet y no puede crear otra." });
   const zoneCount = await Zone.countDocuments({ ...tenantScope(req), slug: { $in: parsed.data.serviceZones }, isActive: true });
   if (zoneCount !== parsed.data.serviceZones.length) return res.status(400).json({ error: "INVALID_FLEET_ZONES", message: "Una o más zonas no existen o no están activas." });
+  const hasTerritorialSelection = Boolean(parsed.data.localityCode || parsed.data.provinceCode || parsed.data.localityName || parsed.data.provinceName);
+  const selection = resolveRecruitmentSelection({ city: parsed.data.localityName || parsed.data.city, localityCode: parsed.data.localityCode, provinceCode: parsed.data.provinceCode, requestedZoneSlug: hasTerritorialSelection ? (parsed.data.serviceZones.length === 1 ? parsed.data.serviceZones[0] : undefined) : undefined });
+  if (hasTerritorialSelection && !selection) return res.status(400).json({ error: "INVALID_FLEET_LOCALITY", message: "La localidad territorial debe coincidir con una zona de cobertura activa." });
   const duplicate = await Fleet.exists({ ...tenantScope(req), name: parsed.data.name });
   if (duplicate) return res.status(409).json({ error: "FLEET_NAME_ALREADY_EXISTS", message: "Ya existe una Fleet con ese nombre operativo." });
   try {
-    const fleet = await Fleet.create({ ...parsed.data, ...tenantScope(req), managerDni: parsed.data.managerDni.toUpperCase(), createdBy: req.auth?.employeeId ? objectId(req.auth.employeeId) : null, createdByRole: req.auth?.role || null });
+    const fleet = await Fleet.create({ ...parsed.data, ...tenantScope(req), city: selection?.localityName || parsed.data.city, ...(selection ? { localityCode: selection.localityCode, localityName: selection.localityName, provinceCode: selection.provinceCode, provinceName: selection.provinceName } : { localityName: parsed.data.localityName || "", provinceName: parsed.data.provinceName || "" }), managerDni: parsed.data.managerDni ? parsed.data.managerDni.toUpperCase() : "", createdBy: req.auth?.employeeId ? objectId(req.auth.employeeId) : null, createdByRole: req.auth?.role || null });
     if (req.auth?.role === "fleet" && req.auth.employeeId) await EmployeeAccount.updateOne({ _id: req.auth.employeeId, fleetId: null }, { $set: { fleetId: fleet._id } }).exec();
-    return res.status(201).json({ created: true, fleet: fleet.toObject() });
+    const zones = await Zone.find({ ...tenantScope(req), isActive: true, slug: { $in: parsed.data.serviceZones } }).select("slug name").lean().exec() as any[];
+    return res.status(201).json({ created: true, fleet: fleetPublicView(fleet.toObject(), Object.fromEntries(zones.map((zone) => [zone.slug, zone.name]))) });
   } catch (error) {
     if ((error as any)?.code === 11000) return res.status(409).json({ error: "FLEET_NAME_ALREADY_EXISTS", message: "Ya existe una Fleet con ese nombre operativo." });
     throw error;
@@ -4900,13 +4990,18 @@ app.patch("/api/v1/rider-applications/:id/assign-fleet", requireRole("admin", "f
   const fleetId = objectId(typeof req.body?.fleetId === "string" ? req.body.fleetId : ""); if (!fleetId) return res.status(400).json({ error: "INVALID_FLEET_ID" });
   const tenant = tenantScope(req);
   const fleet = await Fleet.findOne({ _id: fleetId, ...tenant, ...(req.auth?.role === "fleet" ? { _id: (await employeeScope(req))?.fleetId || null } : {}) }).lean() as any; if (!fleet) return res.status(404).json({ error: "FLEET_NOT_FOUND" });
-  const application = await RiderApplication.findOneAndUpdate({ _id: id, ...await adminOnboardingScope(req), ...(req.auth?.role === "fleet" ? { assignedFleetId: fleet._id } : {}) }, { $set: { assignedFleetId: fleetId } }, { new: true }).lean().exec() as any;
+  const applicationScope = { _id: id, ...await adminOnboardingScope(req), ...(req.auth?.role === "fleet" ? { assignedFleetId: fleet._id } : {}) };
+  const existingApplication = await RiderApplication.findOne(applicationScope).select("requestedZoneSlug").lean().exec() as any;
+  if (!existingApplication) return res.status(404).json({ error: "APPLICATION_NOT_FOUND" });
+  if (existingApplication.requestedZoneSlug && (!Array.isArray(fleet.serviceZones) || !fleet.serviceZones.includes(existingApplication.requestedZoneSlug))) return res.status(409).json({ error: "FLEET_ZONE_INCOMPATIBLE", message: "La Fleet seleccionada no cubre la zona solicitada por el Rider." });
+  const application = await RiderApplication.findOneAndUpdate(applicationScope, { $set: { assignedFleetId: fleetId, ...(existingApplication.requestedZoneSlug ? { assignedZoneSlug: existingApplication.requestedZoneSlug } : {}) } }, { new: true }).lean().exec() as any;
   if (!application) return res.status(404).json({ error: "APPLICATION_NOT_FOUND" });
   if (application.status === "approved") {
-    const rider = await Rider.findOneAndUpdate({ email: application.email, ...(application.tenantId ? { tenantId: application.tenantId } : { tenantId: null }) }, { $set: { fleetId } }, { new: true }).select("_id riderCode name email fleetId tenantId").lean().exec() as any;
+    const rider = await Rider.findOneAndUpdate({ email: application.email, ...(application.tenantId ? { tenantId: application.tenantId } : { tenantId: null }) }, { $set: { fleetId, ...(application.requestedZoneSlug ? { zoneSlug: application.requestedZoneSlug } : {}) } }, { new: true }).select("_id riderCode name email fleetId tenantId").lean().exec() as any;
     if (rider) await notifyOnboarding({ channel: "fleet", type: "onboarding.rider_assigned", entityId: String(rider._id), tenantId: rider.tenantId, payload: { riderId: String(rider._id), riderCode: rider.riderCode, riderName: rider.name, fleetId: String(fleetId) } });
   }
-  return res.json({ application: { ...application, applicationCode: onboardingCode("R", application._id) }, fleet });
+  const zones = await Zone.find({ ...tenant, isActive: true, slug: { $in: fleet.serviceZones || [] } }).select("slug name").lean().exec() as any[];
+  return res.json({ application: { ...application, applicationCode: onboardingCode("R", application._id) }, fleet: fleetPublicView(fleet, Object.fromEntries(zones.map((zone) => [zone.slug, zone.name]))) });
 });
 
 app.get("/api/v1/fleets/pending-partner-orders", requireRole("admin", "fleet", "commercial"), async (req, res) => {
@@ -5095,14 +5190,14 @@ app.get("/api/v1/admin/riders/hours", requireRole("admin", "finance"), async (re
 });
 app.get("/api/v1/admin/operations/live", requireRole("admin"), async (req, res) => {
   const tenant = tenantScope(req);
-  const riders = await Rider.find({ ...tenant, isTestRider: { $ne: true } }).select("riderCode name email status lifecycleStatus lifecycleReason vehicle location lastLocationAt activeOrderId fleetId zoneSlug").lean().exec() as any[];
+  const riders = await Rider.find({ ...tenant, isTestRider: { $ne: true } }).select("riderCode name email status lifecycleStatus lifecycleReason vehicle city location lastLocationAt activeOrderId fleetId zoneSlug").lean().exec() as any[];
   const riderIds = riders.map((rider) => rider._id);
   const orders = await Order.find({ ...tenant, riderId: { $in: riderIds }, status: { $in: [...activeOperationalOrderStatuses] } }).select("publicCode displayCode status assignmentState deliveryAddress restaurantId customerId riderId").select("+customerPhone").lean().exec() as any[];
   const restaurants = await Restaurant.find({ ...tenant, _id: { $in: orders.map((order) => order.restaurantId) } }).select("name address").lean().exec() as any[];
   const restaurantMap = new Map(restaurants.map((restaurant) => [String(restaurant._id), restaurant]));
   const orderMap = new Map(orders.map((order) => [String(order.riderId), { ...order, customerPhone: order.customerPhone || null, restaurant: restaurantMap.get(String(order.restaurantId)) || null }]));
   const now = Date.now();
-  return res.json({ refreshedAt: new Date().toISOString(), riders: riders.map((rider) => { const age = rider.lastLocationAt ? Math.max(0, Math.round((now - new Date(rider.lastLocationAt).getTime()) / 1000)) : null; return { id: String(rider._id), riderCode: rider.riderCode, name: rider.name, status: rider.status, lifecycleStatus: rider.lifecycleStatus || "active", lifecycleReason: rider.lifecycleReason || "", vehicle: rider.vehicle, location: rider.location, lastLocationAt: rider.lastLocationAt, gpsState: age !== null && age <= 90 && rider.location?.coordinates?.length === 2 ? "fresh" : age !== null && age <= 600 ? "stale" : "missing", gpsAgeSeconds: age, activeOrder: orderMap.get(String(rider._id)) || null }; }) });
+  return res.json({ refreshedAt: new Date().toISOString(), riders: riders.map((rider) => { const age = rider.lastLocationAt ? Math.max(0, Math.round((now - new Date(rider.lastLocationAt).getTime()) / 1000)) : null; return { id: String(rider._id), riderCode: rider.riderCode, name: rider.name, status: rider.status, lifecycleStatus: rider.lifecycleStatus || "active", lifecycleReason: rider.lifecycleReason || "", vehicle: rider.vehicle, fleetId: rider.fleetId ? String(rider.fleetId) : null, city: String(rider.city || "").trim() || "Localidad pendiente", zoneSlug: rider.zoneSlug || null, location: rider.location, lastLocationAt: rider.lastLocationAt, gpsState: age !== null && age <= 90 && rider.location?.coordinates?.length === 2 ? "fresh" : age !== null && age <= 600 ? "stale" : "missing", gpsAgeSeconds: age, activeOrder: orderMap.get(String(rider._id)) || null }; }) });
 });
 
 /**
@@ -5355,6 +5450,7 @@ async function start() {
     await backfillEmployeeCodes();
     startRealtimeRelay();
     startNotificationWorker();
+    startGoogleBusinessSyncWorker();
     await repairConfiguredPartnerAccess();
     await purgeExpiredQaPartner();
     setInterval(() => { void purgeExpiredQaPartner().catch((error) => console.warn("QA partner purge failed", error instanceof Error ? error.message : String(error))); }, 60_000).unref();
@@ -5398,11 +5494,13 @@ async function start() {
   // Dispatch is intentionally not scheduled in the web process. Run
   // `npm run start:dispatch-worker` as a separate service to consume the
   // persistent dispatch_outbox with atomic leases and retry/backoff.
-  process.once("SIGTERM", () => {
-    stopNotificationWorker(); databaseReady = false;
+  const shutdown = () => {
+    stopGoogleBusinessSyncWorker(); stopNotificationWorker(); databaseReady = false;
     server.close(() => { void mongoose.disconnect().finally(() => process.exit(0)); });
     setTimeout(() => process.exit(0), 25_000).unref();
-  });
+  };
+  process.once("SIGTERM", shutdown);
+  process.once("SIGINT", shutdown);
 }
 
 if (process.env.PIKI_NO_LISTEN !== "true") start().catch((error) => { console.error("Unable to start PIKI API", error); process.exit(1); });

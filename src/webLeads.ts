@@ -8,14 +8,22 @@ const contactFields = {
   website: z.string().max(200).optional(),
 };
 
+const recruitmentSelectionFields = {
+  localityCode: z.string().trim().regex(/^\d{5}$/).optional(),
+  provinceCode: z.string().trim().regex(/^\d{2}$/).optional(),
+  requestedZoneSlug: z.string().trim().regex(/^[a-z0-9-]+$/).optional(),
+};
+
 export const partnerLeadSubmissionSchema = z.object({
   ...contactFields,
+  ...recruitmentSelectionFields,
   address: z.string().trim().min(5).max(280),
   city: z.string().trim().min(2).max(100),
 });
 
 export const riderLeadSubmissionSchema = z.object({
   ...contactFields,
+  ...recruitmentSelectionFields,
   city: z.string().trim().min(2).max(120),
   vehicle: z.enum(["bike", "electric_bike", "electric_scooter", "motorcycle", "scooter", "car"]),
   availability: z.string().trim().min(2).max(160),
