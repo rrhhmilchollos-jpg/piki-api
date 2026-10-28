@@ -98,3 +98,16 @@ export function buildFleetEntityScope({
   if (!isObjectIdLike(fleetId)) return denyTenantScope();
   return { tenantId, [fleetField]: fleetId };
 }
+
+
+/**
+ * Scope for a Fleet's Rider picker: its own Riders plus same-tenant Riders that
+ * have not yet been claimed by any fleet. Assigned Riders from other fleets
+ * remain invisible; an absent/invalid context still fails closed.
+ */
+export function buildFleetRiderPickerScope({ tenantId, role, fleetId }: FleetEntityScopeInput): TenantScopedQuery {
+  const tenant = buildTenantScope(tenantId);
+  if (role !== "fleet") return tenant;
+  if (!isObjectIdLike(tenantId) || !isObjectIdLike(fleetId)) return denyTenantScope();
+  return { ...tenant, $or: [{ fleetId }, { fleetId: null }] };
+}

@@ -56,7 +56,8 @@ import { purgeTestDataIfEnabled } from "./purgeTestData.js";
 import { validateDocumentRequestSubmission } from "./onboardingDocumentPolicy.js";
 import { PIKI_PRL_COURSE_SLUG, RiderTrainingAssignment, RiderTrainingCourse, RiderTrainingResponse, ensurePikiPrlCourse, publicTrainingQuestions, scoreTrainingAnswers, trainingToken, trainingTokenHash } from "./riderTraining.js";
 import { dispatchInitialIdempotencyKey, dispatchRequeueIdempotencyKey, enqueueDispatchOutbox, processDispatchOutboxBatch, type DispatchOutboxEvent } from "./dispatchOutbox.js";
-import { buildFleetEntityScope, buildTenantScope } from "./tenantScope.js";
+import { buildFleetEntityScope, buildFleetRiderPickerScope, buildTenantScope } from "./tenantScope.js";
+import { parseRiderListPagination } from "./riderListPagination.js";
 import { authenticationOptions, registrationOptions, verifyAuthentication, verifyRegistration } from "./passkeys.js";
 import { markPartnerBatchPaid, markRiderBatchPaid, publicPartnerCode, publicRiderCode, recordGovernanceEvent, syncPublicIds } from "./pikiGovernance.js";
 import { legacyOpeningHoursProjection, normalizeOpeningHours, openingHoursSchema } from "./openingHours.js";
@@ -3227,16 +3228,28 @@ app.post("/api/v1/public/document-requests/:token/documents", async (req, res) =
 });
 
 app.get("/api/v1/riders", requireRole("admin", "fleet"), async (req, res) => {
+  const pagination = parseRiderListPagination(req.query.limit, req.query.offset, 200);
+  if (!pagination) return res.status(400).json({ error: "INVALID_RIDER_PAGINATION" });
   const status = typeof req.query.status === "string" ? req.query.status : undefined;
-  const riders = await Rider.find({ ...(status ? { status } : {}), ...(await fleetRiderFilter(req)) }).sort({ name: 1 }).limit(200).lean().exec();
-  return res.json({ riders });
+  const employee = req.auth?.role === "fleet" ? await employeeScope(req) : null;
+  const riderFilter = { ...(status ? { status } : {}), ...buildFleetRiderPickerScope({ tenantId: req.auth?.tenantId, role: req.auth?.role, fleetId: employee?.fleetId }) };
+  const [total, riders] = await Promise.all([
+    Rider.countDocuments(riderFilter).exec(),
+    Rider.find(riderFilter).sort({ name: 1, _id: 1 }).skip(pagination.offset).limit(pagination.limit).lean().exec(),
+  ]);
+  return res.json({ riders, total, limit: pagination.limit, offset: pagination.offset, hasMore: pagination.offset + riders.length < total });
 });
 
 const riderLifecycleStatuses = ["pending_documents", "active", "suspended", "terminated"] as const;
 app.get("/api/v1/admin/riders/directory", requireRole("admin", "fleet"), async (req, res) => {
+  const pagination = parseRiderListPagination(req.query.limit, req.query.offset, 500);
+  if (!pagination) return res.status(400).json({ error: "INVALID_RIDER_PAGINATION" });
   const lifecycle = typeof req.query.lifecycleStatus === "string" && riderLifecycleStatuses.includes(req.query.lifecycleStatus as typeof riderLifecycleStatuses[number]) ? req.query.lifecycleStatus : undefined;
   const riderFilter = { ...(await fleetRiderFilter(req)), isTestRider: { $ne: true }, ...(lifecycle ? { lifecycleStatus: lifecycle } : {}) };
-  const riders = await Rider.find(riderFilter).select("riderCode name email phone city availability fleetId zoneSlug status lifecycleStatus lifecycleReason lifecycleChangedAt vehicle location lastLocationAt activeOrderId reliabilityScore createdAt").sort({ name: 1 }).limit(500).lean().exec() as any[];
+  const [total, riders] = await Promise.all([
+    Rider.countDocuments(riderFilter).exec(),
+    Rider.find(riderFilter).select("riderCode name email phone city availability fleetId zoneSlug status lifecycleStatus lifecycleReason lifecycleChangedAt vehicle location lastLocationAt activeOrderId reliabilityScore createdAt").sort({ name: 1, _id: 1 }).skip(pagination.offset).limit(pagination.limit).lean().exec(),
+  ]) as [number, any[]];
   const riderIds = riders.map((rider) => rider._id);
   const [orders, incidents] = await Promise.all([
     Order.find({ riderId: { $in: riderIds }, status: { $in: [...activeOperationalOrderStatuses] } }).select("_id riderId publicCode displayCode status assignmentState deliveryAddress restaurantId").lean().exec(),
@@ -3255,7 +3268,7 @@ app.get("/api/v1/admin/riders/directory", requireRole("admin", "fleet"), async (
     const effectiveLifecycleStatus = rider.lifecycleStatus === "active" && ["review", "temporary_restriction"].includes(sanction.severity) ? "suspended" : rider.lifecycleStatus || "active";
     return { ...rider, id: String(rider._id), activeOrder: orderByRider.get(String(rider._id)) || null, incidentCount: activeIncidents.length, sanction, gpsState, gpsAgeSeconds, effectiveLifecycleStatus };
   });
-  return res.json({ generatedAt: new Date().toISOString(), total: result.length, statuses: riderLifecycleStatuses.map((status) => ({ status, count: result.filter((rider) => rider.effectiveLifecycleStatus === status).length })), riders: result });
+  return res.json({ generatedAt: new Date().toISOString(), total, limit: pagination.limit, offset: pagination.offset, hasMore: pagination.offset + result.length < total, statuses: riderLifecycleStatuses.map((status) => ({ status, count: result.filter((rider) => rider.effectiveLifecycleStatus === status).length })), riders: result });
 });
 
 app.patch("/api/v1/admin/riders/:id/lifecycle", requireRole("admin"), async (req, res) => {

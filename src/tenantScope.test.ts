@@ -52,3 +52,15 @@ test("Fleet direct-ownership scope cannot fall back to tenant-wide or global dat
   });
   assert.deepEqual(buildFleetEntityScope({ tenantId: tenantA, role: "fleet", fleetId: fleetA, fleetField: "tenantId" }), { _id: null });
 });
+
+
+test("Fleet Rider picker includes its assigned fleet and unassigned Riders only within the tenant", async () => {
+  const { buildFleetRiderPickerScope } = await import("./tenantScope.js");
+  assert.deepEqual(buildFleetRiderPickerScope({ tenantId: tenantA, role: "fleet", fleetId: fleetA }), {
+    tenantId: tenantA,
+    $or: [{ fleetId: fleetA }, { fleetId: null }],
+  });
+  assert.deepEqual(buildFleetRiderPickerScope({ tenantId: tenantA, role: "fleet" }), { _id: null });
+  assert.deepEqual(buildFleetRiderPickerScope({ tenantId: "invalid", role: "fleet", fleetId: fleetA }), { _id: null });
+  assert.deepEqual(buildFleetRiderPickerScope({ tenantId: tenantA, role: "admin", fleetId: fleetA }), { tenantId: tenantA });
+});
