@@ -3,6 +3,7 @@ import { registerEmployeeDeletionRoutes } from "./employeeDeletion.js";
 import { dispatchVehicleInputForOrder } from "./dispatchVehiclePolicy.js";
 import { registerTerritoryRoutes } from "./coverage/territoryRoutes.js";
 import { operationalZoneInputSchema } from "./coverage/zoneInput.js";
+import { missingPartnerDocumentTypes, missingRiderDocumentTypes, type RiderVehicle } from "./manualOnboardingPolicy.js";
 import "dotenv/config";
 import "express-async-errors";
 import { createHash, createHmac, randomBytes, randomInt, randomUUID, timingSafeEqual } from "node:crypto";
@@ -416,6 +417,7 @@ const riderSlotCreateSchema = riderSlotSchema.extend({ riderId: z.string().regex
 const riderSlotWeekSchema = riderSlotCreateSchema.extend({ weekdays: z.array(z.number().int().min(0).max(6)).min(1).max(7).default([0, 1, 2, 3, 4, 5, 6]) });
 const riderDocumentInputSchema = z.object({ type: z.enum(["identity", "residence_permit", "social_security_number", "bank_certificate", "profile_photo", "driving_license", "insurance", "vehicle_registration", "vehicle_technical_sheet", "scooter_responsible_declaration", "dgt_mvp_homologation", "work_authorization_confirmation", "ppe_and_safety", "other"]), fileName: z.string().min(1).max(180), mimeType: z.enum(DOCUMENT_UPLOAD_MIME_TYPES), sizeBytes: z.number().int().min(1).max(2_500_000), sha256: z.string().regex(/^[a-f0-9]{64}$/i), contentBase64: z.string().min(1).max(3_500_000) });
 const riderApplicationSchema = z.object({ name: z.string().min(2).max(160), email: z.string().email(), phone: z.string().min(6).max(40), city: z.string().min(2).max(120), localityCode: z.string().regex(/^\d{5}$/).optional(), provinceCode: z.string().regex(/^\d{2}$/).optional(), requestedZoneSlug: z.string().regex(/^[a-z0-9-]+$/).optional(), vehicle: z.enum(["bike", "electric_bike", "electric_scooter", "motorcycle", "scooter", "car"]), availability: z.string().min(2).max(160), socialSecurityNumber: z.string().min(4).max(40), identityVerificationMethod: z.literal("online_scan"), safetyDeclarationAccepted: z.literal(true), documents: z.array(riderDocumentInputSchema).min(3).max(12), website: z.string().max(0).optional() });
+const manualRiderApplicationSchema = riderApplicationSchema.extend({ identityVerificationMethod: z.literal("manual_admin_review") });
 const documentRequestSubjectSchema = z.enum(["rider_application", "restaurant", "rider_lead", "partner_lead"]);
 const documentRequestRequirementInputSchema = z.object({ type: z.string().regex(/^[a-z0-9_]{2,80}$/), inputMode: z.enum(["file", "form"]).default("file"), label: z.string().trim().min(2).max(160), description: z.string().trim().max(500).default("") });
 const documentRequestCreateSchema = z.object({ subjectType: documentRequestSubjectSchema, subjectId: z.string().regex(/^[a-f\d]{24}$/), message: z.string().trim().min(10).max(2000), dueAt: z.coerce.date().nullable().optional(), requirements: z.array(documentRequestRequirementInputSchema).min(1).max(12), sendEmail: z.boolean().default(true) });
@@ -1438,6 +1440,123 @@ app.post("/api/v1/partners/onboarding", async (req, res) => {
   await PartnerLocalityGroup.findOneAndUpdate({ ...publicTenant, localityKey: groupKey }, { $set: { localityName: locality, province, isActive: true }, $setOnInsert: publicTenant, $addToSet: { restaurantIds: partner._id } }, { upsert: true, new: true });
   await notifyOnboarding({ channel: "admin", type: "onboarding.partner_application.created", entityId: String(partner._id), tenantId: (partner as any).tenantId });
   res.status(201).json({ message: "Solicitud recibida. Completa la verificación de Stripe para que PIKI pueda liquidar tus ventas.", partner: { id: partner.id, partnerCode: onboardingCode("P", partner._id), name: partner.name, email: partner.email, phone: partner.phone, locality, partnerGroupKey: groupKey, onboarding_status: partner.onboardingStatus, onboarding_stage: stripeOnboarding ? "stripe" : "review", checklist: { profile: true, documents: true, stripe: Boolean(stripeOnboarding), adminReview: false }, stripe_onboarding_url: stripeOnboarding?.url || null } });
+});
+
+const manualPartnerSchema = partnerSchema.omit({ password: true });
+app.post("/api/v1/admin/partners/manual", requireOwner(), async (req, res) => {
+  const parsed = manualPartnerSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "INVALID_PARTNER", details: parsed.error.flatten() });
+  const missingDocuments = missingPartnerDocumentTypes(parsed.data.documents.map((document) => document.type));
+  if (missingDocuments.length) return res.status(400).json({ error: "REQUIRED_PARTNER_DOCUMENTS_MISSING", required: missingDocuments });
+  let documents: Array<typeof parsed.data.documents[number]>;
+  try {
+    documents = await normalizeAndScanOnboardingDocuments(parsed.data.documents) as Array<typeof parsed.data.documents[number]>;
+  } catch (error) {
+    if (error instanceof MalwareDetectedError) return res.status(422).json({ error: "MALWARE_DETECTED" });
+    if (error instanceof MalwareScannerUnavailableError) return res.status(503).json({ error: "MALWARE_SCANNER_UNAVAILABLE" });
+    return res.status(400).json({ error: error instanceof Error ? error.message : "DOCUMENT_VALIDATION_FAILED" });
+  }
+  const tenant = await publicOnboardingTenantScope();
+  const taxId = parsed.data.taxId.toUpperCase();
+  const email = parsed.data.email.toLowerCase();
+  const [existingTaxId, existingEmployee] = await Promise.all([
+    Restaurant.findOne({ ...tenant, "partnerProfile.taxId": taxId }).select("_id").lean().exec(),
+    EmployeeAccount.exists({ email }),
+  ]);
+  if (existingTaxId) return res.status(409).json({ error: "PARTNER_TAX_ID_ALREADY_EXISTS", message: "Ya existe un comercio con este NIF/CIF." });
+  if (existingEmployee) return res.status(409).json({ error: "PARTNER_EMAIL_ALREADY_EXISTS", message: "Ya existe una solicitud o cuenta con este correo." });
+
+  const locality = parsed.data.city.trim();
+  const groupKey = localityKey(locality);
+  const slug = `${parsed.data.name.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "")}-${Date.now().toString(36)}-${randomBytes(3).toString("hex")}`;
+  const { legalName, legalForm, representativeName, representativeRole, representativeDocument, fiscalAddress, operatingAddress, postalCode, province, iban, bankAccountHolder, cuisine, vatRate, pdaUnits, pdaUnitCostCents, openingHours, ...contact } = parsed.data;
+  const session = await mongoose.startSession();
+  let partner: any;
+  try {
+    await session.withTransaction(async () => {
+      const [createdPartner] = await Restaurant.create([{
+        ...tenant,
+        slug,
+        name: contact.name,
+        cuisine,
+        category: cuisine,
+        locality,
+        partnerGroupKey: groupKey,
+        address: operatingAddress,
+        tagline: "Alta manual · pendiente de revisión",
+        onboardingStatus: "pending_review",
+        onboardingStage: "review",
+        onboardingChecklist: { profile: true, documents: true, stripe: false, adminReview: false },
+        isActive: false,
+        email,
+        phone: contact.phone,
+        marketplaceCompliance: { pikiStatus: "in_review", stripeStatus: "not_created", chargesEnabled: false, payoutsEnabled: false },
+        partnerProfile: {
+          legalName,
+          taxId,
+          legalForm,
+          representativeName,
+          representativeRole,
+          representativeDocument,
+          fiscalAddress,
+          operatingAddress,
+          postalCode,
+          city: locality,
+          province,
+          iban: iban.toUpperCase(),
+          bankAccountHolder,
+          cuisine,
+          vatRate,
+          commissionAccepted: contact.commissionAccepted,
+          commissionRateBps: 1800,
+          termsAcceptedAt: contact.termsAcceptedAt,
+          contractAcceptedAt: contact.termsAcceptedAt,
+          privacyAcceptedAt: contact.privacyAcceptedAt,
+          dataProcessingAcceptedAt: contact.dataProcessingAcceptedAt,
+          pdaUnits,
+          pdaUnitCostCents,
+          pdaCostAcceptedAt: contact.pdaCostAcceptedAt,
+          openingHours,
+          documents: documents.map(({ contentBase64, ...metadata }) => ({ ...metadata, contentBase64, status: "received" })),
+        },
+      }], { session });
+      partner = createdPartner;
+      const accountId = new mongoose.Types.ObjectId();
+      await EmployeeAccount.create([{
+        ...tenant,
+        _id: accountId,
+        employeeCode: employeeCodeFor(accountId),
+        name: contact.name,
+        email,
+        jobRole: "partner",
+        apiRole: "partner",
+        roles: ["partner"],
+        partnerRoles: ["partner_admin"],
+        accessLevel: "subadmin",
+        authorizationStatus: "pending",
+        restaurantId: createdPartner._id,
+        restaurantIds: [createdPartner._id],
+        passwordHash: hashPassword(generateTemporaryPassword()),
+        mustChangePassword: true,
+        active: false,
+      }], { session });
+      await PartnerLocalityGroup.findOneAndUpdate(
+        { ...tenant, localityKey: groupKey },
+        { $set: { localityName: locality, province, isActive: true }, $setOnInsert: tenant, $addToSet: { restaurantIds: createdPartner._id } },
+        { upsert: true, new: true, session },
+      ).exec();
+    });
+  } catch (error) {
+    if ((error as any)?.code === 11000) return res.status(409).json({ error: "PARTNER_ALREADY_EXISTS", message: "Ya existe una solicitud, comercio o cuenta con esos datos." });
+    throw error;
+  } finally {
+    await session.endSession();
+  }
+  await notifyOnboarding({ channel: "admin", type: "onboarding.partner_application.created", entityId: String(partner._id), tenantId: (partner as any).tenantId });
+  return res.status(201).json({
+    message: "Partner guardado en el backend. El comercio y su cuenta quedan pendientes de revisión.",
+    partner: { id: String(partner._id), partnerCode: onboardingCode("P", partner._id), name: partner.name, email: partner.email, locality, onboarding_status: partner.onboardingStatus, onboarding_stage: partner.onboardingStage, stripe_status: partner.marketplaceCompliance?.stripeStatus || "not_created" },
+  });
 });
 
 function assignedRestaurantIds(employee: any): string[] {
@@ -2482,12 +2601,7 @@ app.post("/api/v1/riders/applications", async (req, res) => {
   if (parsed.data.website) return res.status(400).json({ error: "INVALID_RIDER_APPLICATION" });
   const selection = resolveRecruitmentSelection(parsed.data);
   if (!selection) return res.status(400).json({ error: "INVALID_RECRUITMENT_AREA", message: "Selecciona una localidad, provincia y zona de cobertura activas y coherentes." });
-  const documentTypes = new Set<string>(parsed.data.documents.map((document) => document.type));
-  const missing: string[] = ["identity or residence_permit", "bank_certificate"].filter((required) => required === "identity or residence_permit" ? !documentTypes.has("identity") && !documentTypes.has("residence_permit") : !documentTypes.has(required));
-  if (["motorcycle", "scooter", "car"].includes(parsed.data.vehicle)) {
-    for (const required of ["driving_license", "insurance", "vehicle_registration", "vehicle_technical_sheet"]) if (!documentTypes.has(required)) missing.push(required);
-  }
-  if (parsed.data.vehicle === "electric_scooter") for (const required of ["scooter_responsible_declaration", "dgt_mvp_homologation"]) if (!documentTypes.has(required)) missing.push(required);
+  const missing = missingRiderDocumentTypes(parsed.data.vehicle as RiderVehicle, parsed.data.documents.map((document) => document.type));
   if (missing.length) return res.status(400).json({ error: "REQUIRED_RIDER_DOCUMENTS_MISSING", required: missing });
   let documents: Array<typeof parsed.data.documents[number]>;
   try {
@@ -2503,6 +2617,49 @@ app.post("/api/v1/riders/applications", async (req, res) => {
   const application = await RiderApplication.create({ ...parsed.data, ...publicTenant, city: selection.localityName, localityCode: selection.localityCode, provinceCode: selection.provinceCode, requestedZoneSlug: selection.requestedZoneSlug, documents, email: parsed.data.email.toLowerCase(), status: "pending", source: "rider_landing" });
   await notifyOnboarding({ channel: "admin", type: "onboarding.rider_application.created", entityId: String(application._id), tenantId: (application as any).tenantId });
   return res.status(201).json({ message: "Solicitud recibida. El equipo Fleet se pondrá en contacto contigo.", application: { id: application.id, applicationCode: onboardingCode("R", application._id), status: application.status } });
+});
+
+app.post("/api/v1/admin/rider-applications/manual", requireOwner(), async (req, res) => {
+  const parsed = manualRiderApplicationSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "INVALID_RIDER_APPLICATION", details: parsed.error.flatten() });
+  if (parsed.data.website) return res.status(400).json({ error: "INVALID_RIDER_APPLICATION" });
+  const selection = resolveRecruitmentSelection(parsed.data);
+  if (!selection) return res.status(400).json({ error: "INVALID_RECRUITMENT_AREA", message: "Selecciona una localidad y zona de contratación activas y coherentes." });
+  const missing = missingRiderDocumentTypes(parsed.data.vehicle as RiderVehicle, parsed.data.documents.map((document) => document.type));
+  if (missing.length) return res.status(400).json({ error: "REQUIRED_RIDER_DOCUMENTS_MISSING", required: missing });
+  let documents: Array<typeof parsed.data.documents[number]>;
+  try {
+    documents = await normalizeAndScanOnboardingDocuments(parsed.data.documents) as Array<typeof parsed.data.documents[number]>;
+  } catch (error) {
+    if (error instanceof MalwareDetectedError) return res.status(422).json({ error: "MALWARE_DETECTED" });
+    if (error instanceof MalwareScannerUnavailableError) return res.status(503).json({ error: "MALWARE_SCANNER_UNAVAILABLE" });
+    return res.status(400).json({ error: error instanceof Error ? error.message : "DOCUMENT_VALIDATION_FAILED" });
+  }
+  const tenant = await publicOnboardingTenantScope();
+  const email = parsed.data.email.toLowerCase();
+  const [duplicateApplication, duplicateRider, duplicateEmployee] = await Promise.all([
+    RiderApplication.exists({ ...tenant, email, status: { $in: ["pending", "contacted", "approved"] } }),
+    Rider.exists({ ...tenant, email }),
+    EmployeeAccount.exists({ email }),
+  ]);
+  if (duplicateApplication || duplicateRider || duplicateEmployee) return res.status(409).json({ error: "RIDER_ALREADY_REGISTERED", message: "Ya existe una solicitud, perfil Rider o cuenta de empleado con este correo." });
+  const application = await RiderApplication.create({ ...parsed.data, ...tenant, city: selection.localityName, localityCode: selection.localityCode, provinceCode: selection.provinceCode, requestedZoneSlug: selection.requestedZoneSlug, documents, email, status: "pending", identityVerificationStatus: "pending", notes: "Alta manual del propietario; revisar identidad y documentación antes de aprobar.", source: "admin_manual" });
+  await notifyOnboarding({ channel: "admin", type: "onboarding.rider_application.created", entityId: String(application._id), tenantId: (application as any).tenantId });
+  return res.status(201).json({ message: "Expediente Rider guardado y pendiente de revisión documental.", application: { id: application.id, applicationCode: onboardingCode("R", application._id), status: application.status, source: application.source } });
+});
+
+app.get("/api/v1/admin/rider-applications/manual", requireOwner(), async (req, res) => {
+  const requestedLimit = Number(req.query.limit || 8);
+  const limit = Number.isFinite(requestedLimit) ? Math.max(1, Math.min(20, Math.trunc(requestedLimit))) : 8;
+  const applications = await RiderApplication.find({ ...await adminOnboardingScope(req), source: "admin_manual" })
+    .select("name email phone city vehicle status identityVerificationStatus documents.type documents.fileName documents.status createdAt")
+    .sort({ createdAt: -1 }).limit(limit).lean().exec() as any[];
+  return res.json({ applications: applications.map((application) => ({
+    ...application,
+    _id: String(application._id),
+    applicationCode: onboardingCode("R", application._id),
+    documents: (application.documents || []).map((document: any) => ({ type: document.type, fileName: document.fileName, status: document.status })),
+  })) });
 });
 
 app.get("/api/v1/rider-applications", requireRole("admin"), async (req, res) => {
