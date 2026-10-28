@@ -39,8 +39,8 @@ test("light vehicles cannot cross towns even when road distance is shorter than 
   const input = dispatchVehicleInputForOrder({ routeDistanceKm: 0.7, withinMunicipality: true, pickupLocation: { coordinates: origin }, deliveryLocation: { coordinates: destination } });
   assert.equal(input.withinMunicipality, false);
   assert.equal(evaluateDispatchVehicleEligibility("bike", input).eligible, false);
+  assert.equal(evaluateDispatchVehicleEligibility("electric_bike", input).eligible, false);
   assert.equal(evaluateDispatchVehicleEligibility("electric_scooter", input).eligible, false);
-  assert.equal(evaluateDispatchVehicleEligibility("electric_bike", input).eligible, true);
 });
 test("Alboi is not treated as El Genovés city centre; rural Bixquert never becomes an urban light-vehicle core", () => {
   assert.equal(withinSameOperationalCity(byName("Alboi").center, byName("El Genovés").center), false);

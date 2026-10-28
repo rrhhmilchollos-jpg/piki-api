@@ -13,7 +13,9 @@ export const XATIVA_COVERAGE_POLICY = {
   outsideMunicipalitySurchargeCents: 0,
   serviceFeeCents: 79,
   routeVehicleThresholdKm: 1.5,
-  routeVehicleClasses: ["electric_bike", "motorcycle", "scooter", "car"] as const,
+  // At or above 1.5 km, and when routing is unavailable, only motorized
+  // motorcycle/scooter or car classes may be offered.
+  routeVehicleClasses: ["motorcycle", "scooter", "car"] as const,
   municipalityBoundarySource: "Verified OSM and CartoCiudad/IGN municipal boundaries; per-area source is attached to OPERATIONAL_AREAS",
   phase2Enabled: true,
 } as const;

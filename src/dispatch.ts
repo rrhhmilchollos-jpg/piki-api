@@ -1,8 +1,10 @@
 import { distanceKm } from "./workflow.js";
 
 export const DISPATCH_ALGORITHM_VERSION = "piki-jarvis-v2-proximity-rating";
-export const LIGHT_URBAN_VEHICLES = ["bike", "electric_scooter"] as const;
-export const LONG_ROUTE_VEHICLES = ["electric_bike", "motorcycle", "scooter", "car"] as const;
+// Bicycles, including electric bicycles, and stand-up electric scooters are
+// restricted to verified urban routes strictly shorter than 1.5 km.
+export const LIGHT_URBAN_VEHICLES = ["bike", "electric_bike", "electric_scooter"] as const;
+export const LONG_ROUTE_VEHICLES = ["motorcycle", "scooter", "car"] as const;
 export const LIGHT_URBAN_ROUTE_MAX_KM = 1.5;
 
 export type DispatchVehicle = "bike" | "electric_bike" | "electric_scooter" | "motorcycle" | "scooter" | "car";

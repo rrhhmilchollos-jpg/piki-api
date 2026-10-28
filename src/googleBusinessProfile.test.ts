@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { fromGoogleRegularHours, toGoogleRegularHours } from "./googleBusinessProfile.js";
+import { encryptGoogleSecret, fromGoogleRegularHours, listGoogleAccounts, toGoogleRegularHours } from "./googleBusinessProfile.js";
 import type { LegacyOpeningHours } from "./openingHours.js";
 
 test("publica franjas nocturnas que cruzan medianoche en el día siguiente", () => {
@@ -15,4 +15,30 @@ test("importa una franja regular de Google al formato evening de PIKI", () => {
   assert.equal(evening.open, "19:00");
   assert.equal(evening.close, "23:30");
   assert.equal(result.viernes.closed, false);
+});
+
+test("lista las cuentas por Account Management, no por Business Information", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalEncryptionKey = process.env.GOOGLE_BUSINESS_TOKEN_ENCRYPTION_KEY;
+  process.env.GOOGLE_BUSINESS_TOKEN_ENCRYPTION_KEY = "test-only-encryption-key";
+  let requestedUrl = "";
+  let authorization = "";
+  const connection = {
+    accessTokenEncrypted: encryptGoogleSecret("test-access-token"),
+    tokenExpiryAt: new Date(Date.now() + 60 * 60 * 1000),
+  };
+  globalThis.fetch = (async (input, init) => {
+    requestedUrl = String(input);
+    authorization = new Headers(init?.headers).get("Authorization") || "";
+    return new Response(JSON.stringify({ accounts: [{ name: "accounts/123" }] }), { status: 200 });
+  }) as typeof fetch;
+  try {
+    assert.deepEqual(await listGoogleAccounts(connection), [{ name: "accounts/123" }]);
+    assert.equal(requestedUrl, "https://mybusinessaccountmanagement.googleapis.com/v1/accounts");
+    assert.equal(authorization, "Bearer test-access-token");
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalEncryptionKey === undefined) delete process.env.GOOGLE_BUSINESS_TOKEN_ENCRYPTION_KEY;
+    else process.env.GOOGLE_BUSINESS_TOKEN_ENCRYPTION_KEY = originalEncryptionKey;
+  }
 });

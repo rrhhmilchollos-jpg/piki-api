@@ -4,6 +4,7 @@ import { DEFAULT_PARTNER_TIME_ZONE, legacyOpeningHoursProjection, normalizeOpeni
 const GOOGLE_AUTH = "https://accounts.google.com/o/oauth2/v2/auth";
 const GOOGLE_TOKEN = "https://oauth2.googleapis.com/token";
 const BUSINESS_INFORMATION = "https://mybusinessbusinessinformation.googleapis.com/v1";
+const ACCOUNT_MANAGEMENT = "https://mybusinessaccountmanagement.googleapis.com/v1";
 const SCOPES = ["https://www.googleapis.com/auth/business.manage"];
 const dayMap: Record<string, WeekdayKey> = { MONDAY: "lunes", TUESDAY: "martes", WEDNESDAY: "miércoles", THURSDAY: "jueves", FRIDAY: "viernes", SATURDAY: "sábado", SUNDAY: "domingo" };
 const googleDayMap = Object.fromEntries(Object.entries(dayMap).map(([google, local]) => [local, google])) as Record<WeekdayKey, string>;
@@ -56,7 +57,7 @@ async function googleRequest(connection: any, path: string, init: RequestInit = 
   const response = await fetch(`${BUSINESS_INFORMATION}${path}`, { ...init, headers: { Authorization: `Bearer ${await accessToken(connection)}`, "Content-Type": "application/json", ...(init.headers || {}) } });
   const payload = await response.json().catch(() => ({})); if (!response.ok) throw new Error(payload.error?.message || `Google Business HTTP ${response.status}`); return payload;
 }
-export async function listGoogleAccounts(connection: any): Promise<any> { const token = await accessToken(connection); const response = await fetch(`${BUSINESS_INFORMATION}/accounts`, { headers: { Authorization: `Bearer ${token}` } }); const payload = await response.json().catch(() => ({})); if (!response.ok) throw new Error(payload.error?.message || `Google accounts HTTP ${response.status}`); return payload.accounts || []; }
+export async function listGoogleAccounts(connection: any): Promise<any> { const token = await accessToken(connection); const response = await fetch(`${ACCOUNT_MANAGEMENT}/accounts`, { headers: { Authorization: `Bearer ${token}` } }); const payload = await response.json().catch(() => ({})); if (!response.ok) throw new Error(payload.error?.message || `Google accounts HTTP ${response.status}`); return payload.accounts || []; }
 export async function listGoogleLocations(connection: any, accountName: string): Promise<any[]> { const payload = await googleRequest(connection, `/${accountName}/locations?readMask=name,title,storeCode,regularHours,specialHours,metadata`); return Array.isArray(payload.locations) ? payload.locations : []; }
 export async function readGoogleLocation(connection: any, locationName: string): Promise<any> { return googleRequest(connection, `/${locationName}?readMask=name,title,storeCode,regularHours,specialHours,metadata`); }
 export async function updateGoogleLocationHours(connection: any, locationName: string, hours: { regularHours: any; specialHours: any }): Promise<any> { return googleRequest(connection, `/${locationName}?updateMask=regularHours,specialHours`, { method: "PATCH", body: JSON.stringify(hours) }); }

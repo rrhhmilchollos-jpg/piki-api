@@ -30,6 +30,10 @@ export async function resolveRole(request: Request): Promise<{ role: ApiRole; em
   const [scheme, token] = header.split(" ");
   if (scheme?.toLowerCase() !== "bearer" || !token) return null;
   const match = tokenEntries.find(([, configured]) => configured && configured === token);
+  // Rider resources contain personal location and delivery data. A shared
+  // environment token has no persisted employee/rider binding, so it can
+  // never authenticate the Rider surface.
+  if (match?.[0] === "rider") return null;
   if (match?.[0]) return { role: match[0] };
   const scoped = await resolveEmployeeSession(token);
   if (scoped) return { ...scoped, role: scoped.role as ApiRole };
@@ -66,7 +70,7 @@ export function requireRole(...allowedRoles: ApiRole[]) {
         : null;
       const allowed = employee
         ? await Rider.exists({ ...riderScope, email: employee.email })
-        : process.env.RIDER_API_RIDER_ID === riderResource[1];
+        : false;
       if (!allowed) return response.status(403).json({ error: "RIDER_ACCESS_DENIED" });
     }
     return next();
