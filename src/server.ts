@@ -115,6 +115,37 @@ async function searchPhoton(query: string) {
     return { id: `photon:${properties.osm_type || "feature"}:${properties.osm_id || index}`, label, latitude: Number(coordinates?.[1]), longitude: Number(coordinates?.[0]), type: properties.type || "address", address: properties };
   }).filter((row) => Number.isFinite(row.latitude) && Number.isFinite(row.longitude));
 }
+function validOperationalCoordinates(value: unknown): value is [number, number] {
+  return Array.isArray(value) && value.length >= 2 && Number.isFinite(Number(value[0])) && Number.isFinite(Number(value[1])) && Number(value[0]) >= -180 && Number(value[0]) <= 180 && Number(value[1]) >= -90 && Number(value[1]) <= 90;
+}
+async function geocodePartnerAddress(address: string, locality: string) {
+  const original = String(address || "").trim();
+  const unitFree = original.replace(/,\s*(?:\d+\s*)?(?:bajo|bajos|entresuelo|principal|planta\s*\w+|piso\s*\w+|puerta\s*\w+|pta\.?\s*\w+)\s*(?=,|$)/i, "");
+  const variants = [...new Set([original, unitFree, unitFree.replace(/^(carrer|calle|rua)\b/i, "Avinguda")].filter(Boolean))];
+  for (const variant of variants) {
+    try {
+      const results = await searchPhoton(`${variant}, ${locality}`);
+      const match = results.find((row) => Number.isFinite(row.longitude) && Number.isFinite(row.latitude));
+      if (match) return [match.longitude, match.latitude] as [number, number];
+    } catch (error) {
+      console.warn("Partner address geocoding attempt failed", error instanceof Error ? error.message : String(error));
+    }
+  }
+  return null;
+}
+async function ensurePartnerOperationalLocation(restaurant: any, force = false) {
+  if (!restaurant?._id || (!force && validOperationalCoordinates(restaurant.location?.coordinates))) return Boolean(restaurant?.location);
+  const point = await geocodePartnerAddress(String(restaurant.address || restaurant.partnerProfile?.operatingAddress || ""), String(restaurant.locality || restaurant.partnerProfile?.city || ""));
+  if (!point) return false;
+  await Restaurant.updateOne({ _id: restaurant._id }, { $set: { location: { type: "Point", coordinates: point } } }).exec();
+  return true;
+}
+async function backfillPartnerOperationalLocations() {
+  const missing = await Restaurant.find({ $or: [{ location: { $exists: false } }, { "location.coordinates": { $exists: false } }] }).select("_id address locality partnerProfile.operatingAddress partnerProfile.city location").limit(200).lean().exec();
+  let repaired = 0;
+  for (const restaurant of missing) if (await ensurePartnerOperationalLocation(restaurant)) repaired += 1;
+  if (missing.length) console.log(JSON.stringify({ event: "partner_operational_location_backfill", scanned: missing.length, repaired, remaining: missing.length - repaired }));
+}
 async function reversePhoton(latitude: number, longitude: number) {
   const url = new URL("https://photon.komoot.io/reverse"); url.searchParams.set("lat", String(latitude)); url.searchParams.set("lon", String(longitude));
   const response = await boundedFetch(url, { headers: geocoderHeaders });
@@ -1382,6 +1413,7 @@ app.post("/api/v1/partners/onboarding", async (req, res) => {
   const locality = city.trim();
   const groupKey = localityKey(locality);
   const partner = await Restaurant.create({ ...publicTenant, slug, name: contact.name, cuisine, category: cuisine, locality, partnerGroupKey: groupKey, address: operatingAddress, tagline: "Solicitud recibida por PIKI", onboardingStatus: "pending_review", isActive: false, email: contact.email, phone: contact.phone, partnerProfile: { legalName, taxId: taxId.toUpperCase(), legalForm, representativeName, representativeRole, representativeDocument, fiscalAddress, operatingAddress, postalCode, city, province, iban: iban.toUpperCase(), bankAccountHolder, cuisine, vatRate, commissionAccepted, termsAcceptedAt, contractAcceptedAt: contractAccepted ? termsAcceptedAt : null, privacyAcceptedAt, dataProcessingAcceptedAt, pdaUnits, pdaUnitCostCents, pdaCostAcceptedAt: pdaCostAccepted ? pdaCostAcceptedAt : null, openingHours, documents: documents.map(({ contentBase64, ...metadata }) => ({ ...metadata, contentBase64, status: "received" })) } });
+  await ensurePartnerOperationalLocation(partner.toObject());
   let stripeOnboarding: { accountId: string; url: string } | null = null;
   if (process.env.STRIPE_SECRET_KEY) {
     try {
@@ -2076,6 +2108,7 @@ app.post("/api/v1/admin/restaurants", requireOwner(), async (req, res) => {
   const slug = `${baseSlug}-${Date.now().toString(36)}`;
   try {
     const restaurant = await Restaurant.create({ ...parsed.data, slug, tenantId: (req.auth as any)?.tenantId || null, onboardingStatus: "pending_review", isActive: false, availabilityStatus: "coming_soon", partnerProfile: { commissionRateBps: parsed.data.commissionRateBps } });
+    await ensurePartnerOperationalLocation(restaurant.toObject());
     await AccessAuthorization.create({ employeeId: objectId(String(req.auth!.employeeId!)), action: "partner_created", previousStatus: null, nextStatus: "pending_review", previousRole: null, nextRole: "partner", accessLevel: "superadmin", actorEmployeeId: objectId(String(req.auth!.employeeId!)), reason: `Partner creado por superadmin: ${restaurant.name}.` });
     return res.status(201).json({ created: true, restaurant: { ...restaurant.toObject(), id: String(restaurant._id), partnerCode: publicPartnerCode(restaurant._id), commissionRateBps: parsed.data.commissionRateBps, commissionPercent: parsed.data.commissionRateBps / 100 } });
   } catch (error: any) {
@@ -2118,6 +2151,7 @@ app.patch("/api/v1/admin/restaurants/:id/settings", requireOwner(), async (req, 
   const update = { ...settings, ...(commissionRateBps === undefined ? {} : { "partnerProfile.commissionRateBps": commissionRateBps }) };
   const restaurant = await Restaurant.findOneAndUpdate({ _id: id, ...tenantScope(req) }, { $set: update }, { new: true }).select("_id slug name cuisine category phone email address locality deliveryFeeCents cashPaymentsEnabled isActive availabilityStatus promoted image location onboardingStatus partnerProfile.commissionRateBps").lean().exec() as any;
   if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
+  if (settings.address !== undefined || settings.locality !== undefined) await ensurePartnerOperationalLocation(restaurant, true);
   invalidateCatalogCache();
   await AccessAuthorization.create({ employeeId: objectId(String(req.auth!.employeeId!)), action: "settings_updated", previousStatus: "approved", nextStatus: "approved", previousRole: "partner", nextRole: "partner", accessLevel: "superadmin", actorEmployeeId: objectId(String(req.auth!.employeeId!)), reason: `Configuración protegida actualizada para ${restaurant.name}; comisión definida por PIKI superadmin.` });
   return res.json({ updated: true, restaurant: { ...restaurant, id: String(restaurant._id), partnerCode: restaurant.partnerCode || publicPartnerCode(restaurant._id), commissionRateBps: Number(restaurant.partnerProfile?.commissionRateBps ?? DEFAULT_PARTNER_COMMISSION_BPS), commissionPercent: Number(restaurant.partnerProfile?.commissionRateBps ?? DEFAULT_PARTNER_COMMISSION_BPS) / 100 } });
@@ -5581,6 +5615,7 @@ async function start() {
     await purgeExpiredQaPartner();
     setInterval(() => { void purgeExpiredQaPartner().catch((error) => console.warn("QA partner purge failed", error instanceof Error ? error.message : String(error))); }, 60_000).unref();
     await ensureMrRoosterOperational();
+    await backfillPartnerOperationalLocations();
     await purgeTestDataIfEnabled();
     databaseReady = true;
     if (process.env.RUN_TENANT_MIGRATION === "true") {
