@@ -1707,7 +1707,10 @@ function pikiManagedOpeningHours(value: unknown) {
   const managed = { ...schedule, source: { mode: "piki" as const, syncedAt: new Date() } };
   return { ...legacyOpeningHoursProjection(managed), ...managed };
 }
-function partnerIsOpenNow(restaurant: any) { return Boolean(restaurant?.isActive) && restaurantIsWithinOpeningHours(restaurant?.partnerProfile?.openingHours); }
+// Customer ordering is intentionally 24/7 for active partners. Keep the
+// Partner dashboard aligned instead of reporting a legacy saved schedule as
+// closed while the store is active.
+function partnerIsOpenNow(restaurant: any) { return Boolean(restaurant?.isActive); }
 app.get("/api/v1/partners/store/hours", requireRole("partner"), async (req, res) => {
   const { access, allowed } = await partnerRequestAccess(req, "store:write");
   if (!allowed) return res.status(403).json({ error: "PARTNER_PERMISSION_DENIED", permission: "store:write" });
