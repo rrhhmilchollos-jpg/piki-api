@@ -7,7 +7,7 @@ import { employeeDeletionBlocker, type DeletionEmployee, type DeletionDependenci
 
 type Session = mongoose.mongo.ClientSession;
 type Filter = Record<string, any>;
-const inputSchema = z.object({ confirmationEmail: z.string().trim().email(), reason: z.string().trim().min(10).max(500) }).strict();
+const inputSchema = z.object({ confirmationEmail: z.string().trim().email(), reason: z.string().trim().min(10).max(500), includeLegacyUnboundProfiles: z.boolean().default(false) }).strict();
 const escaped = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 const idOf = (req: Request) => {
   const id = String(req.params.id || "");
@@ -21,7 +21,7 @@ function database() {
   return mongoose.connection.db;
 }
 
-async function contextFor(req: Request, session?: Session) {
+async function contextFor(req: Request, session?: Session, includeLegacyUnboundProfiles = false) {
   const id = idOf(req);
   if (!id) return null;
   const employee = await EmployeeAccount.findOne({ _id: id, ...actorScope(req) }).session(session || null).lean().exec() as any;
@@ -29,7 +29,11 @@ async function contextFor(req: Request, session?: Session) {
   const db = database();
   const options = session ? { session } : {};
   const email = new RegExp(`^${escaped(String(employee.email).trim())}$`, "i");
-  const scope: Filter = { tenantId: employee.tenantId || null };
+  // Only the protected root owner may explicitly include pre-tenant profiles.
+  // A matching email in another valid tenant is never silently claimed.
+  const scope: Filter = includeLegacyUnboundProfiles && req.auth?.isRootOwner
+    ? { $or: [{ tenantId: employee.tenantId || null }, { tenantId: null }] }
+    : { tenantId: employee.tenantId || null };
   const riders = await db.collection("riders").find({ ...scope, email }, options).project({ _id: 1, riderCode: 1 }).toArray();
   const riderIds = riders.map((rider) => rider._id);
   const linked = { riderId: { $in: riderIds } };
@@ -39,7 +43,7 @@ async function contextFor(req: Request, session?: Session) {
   const pendingPayouts = await db.collection("rider_payout_batches").countDocuments({ ...linked, status: { $in: ["prepared", "approved", "failed"] } }, options);
   const activeReservations = await db.collection("rider_assignment_reservations").countDocuments({ ...linked, status: "reserved" }, options);
   const historicalOrders = await db.collection("orders").countDocuments(linked, options);
-  const foreignProfiles = await db.collection("riders").countDocuments({ email, tenantId: { $ne: employee.tenantId || null } }, options);
+  const foreignProfiles = await db.collection("riders").countDocuments({ email, $nor: [scope] }, options);
   const dependencies: DeletionDependencies = { activeOrders, unsettledCashCents: cash.reduce((sum, item) => sum + Math.abs(Number(item.balance || 0)), 0), pendingPayouts, activeReservations };
   const blocker = foreignProfiles ? "PROFILE_TENANT_CONFLICT" : employeeDeletionBlocker(employee as DeletionEmployee, String(req.auth?.employeeId), String(employee.email), dependencies);
   return { employee, email, scope, riderIds, riders, dependencies, historicalOrders, blocker };
@@ -47,7 +51,7 @@ async function contextFor(req: Request, session?: Session) {
 
 export function registerEmployeeDeletionRoutes(app: Express) {
   app.get("/api/v1/admin/employees/:id/permanent-deletion/preview", requireOwner(), async (req, res) => {
-    const context = await contextFor(req);
+    const context = await contextFor(req, undefined, req.query.includeLegacyUnboundProfiles === "1");
     if (!context) return res.status(404).json({ error: "EMPLOYEE_NOT_FOUND" });
     const { employee, riders, dependencies, historicalOrders, blocker } = context;
     return res.json({ employee: { _id: employee._id, name: employee.name, email: employee.email, active: employee.active, authorizationStatus: employee.authorizationStatus }, riders: riders.map((rider) => ({ _id: rider._id, riderCode: rider.riderCode })), dependencies, historicalOrdersPreserved: historicalOrders, eligible: blocker === null, blocker, preserves: ["orders", "cash_ledger_entries", "marketplace_ledger_entries", "payout_batches", "legal_signatures", "audit_trail"], removes: ["employee_account", "rider_profiles", "employee_sessions", "passkeys", "push_subscriptions", "recruitment_profiles", "document_request_credentials", "tracking_locations"] });
@@ -57,9 +61,10 @@ export function registerEmployeeDeletionRoutes(app: Express) {
     const parsed = inputSchema.safeParse(req.body);
     if (!parsed.success) return res.status(400).json({ error: "EXPLICIT_DELETION_CONFIRMATION_REQUIRED" });
     if (!idOf(req)) return res.status(400).json({ error: "INVALID_EMPLOYEE_ID" });
+    if (parsed.data.includeLegacyUnboundProfiles && !req.auth?.isRootOwner) return res.status(403).json({ error: "ROOT_OWNER_REQUIRED_FOR_LEGACY_PROFILES" });
     try {
       const result = await mongoose.connection.transaction(async (session) => {
-        const context = await contextFor(req, session);
+        const context = await contextFor(req, session, parsed.data.includeLegacyUnboundProfiles);
         if (!context) throw new Error("EMPLOYEE_NOT_FOUND");
         const { employee, email, scope, riderIds, dependencies, historicalOrders } = context;
         const blocker = context.blocker || employeeDeletionBlocker(employee as DeletionEmployee, String(req.auth?.employeeId), parsed.data.confirmationEmail, dependencies);
@@ -84,10 +89,10 @@ export function registerEmployeeDeletionRoutes(app: Express) {
         await remove("notifications", { ownerType: "employee", ownerId: employeeId });
         await remove("location_samples", { riderId: { $in: riderIds } });
         await remove("tracking_sessions", { riderId: { $in: riderIds } });
-        await remove("document_requests", { ...scope, $or: [{ recipientEmail: email }, { subjectId: { $in: relatedIds } }] });
+        await remove("document_requests", { $and: [scope, { $or: [{ recipientEmail: email }, { subjectId: { $in: [...relatedIds, ...relatedIds.map(String)] } }] }] });
         await remove("rider_leads", { ...scope, email });
         await remove("rider_applications", { ...scope, email });
-        await remove("onboarding_requests", { ...scope, $or: [{ requestedBy: employeeId }, { "payload.email": email }] });
+        await remove("onboarding_requests", { $and: [scope, { $or: [{ requestedBy: employeeId }, { "payload.email": email }] }] });
         await remove("riders", { ...scope, _id: { $in: riderIds } });
         await remove("employee_accounts", { _id: employeeId, active: false, authorizationStatus: "revoked" });
         if (removed.employee_accounts !== 1) throw new Error("EMPLOYEE_CHANGED_DURING_DELETION");
