@@ -1,5 +1,8 @@
 import { nativeReleasePolicy } from "./nativeReleasePolicy.js";
 import { registerEmployeeDeletionRoutes } from "./employeeDeletion.js";
+import { dispatchVehicleInputForOrder } from "./dispatchVehiclePolicy.js";
+import { registerTerritoryRoutes } from "./coverage/territoryRoutes.js";
+import { operationalZoneInputSchema } from "./coverage/zoneInput.js";
 import "dotenv/config";
 import "express-async-errors";
 import { createHash, createHmac, randomBytes, randomInt, randomUUID, timingSafeEqual } from "node:crypto";
@@ -24,7 +27,7 @@ import { captureStripePaymentIntent, createCheckoutSession, createPartnerStripeO
 import { rankDispatchCandidates, evaluateDispatchVehicleEligibility, computeMobilityAdvice, calculateSanctionDecision, defaultSanctionPolicy } from "./algorithms/index.js";
 import { createSessionToken, generateTemporaryPassword, hashPassword, hashSessionToken, verifyPassword } from "./employeeAuth.js";
 import { EmployeePasswordReset } from "./passwordReset.js";
-import { evaluateXativaCoverage } from "./coverage/xativaPolicy.js";
+import { evaluateXativaCoverage, withinSameOperationalCity, XATIVA_PHASE_2_LOCALITIES } from "./coverage/xativaPolicy.js";
 import { quoteDeliveryRoute } from "./coverage/routing.js";
 import { ROOT_TENANT_SLUG, runTenantMigration } from "./tenantMigration.js";
 import { onboardingScope } from "./onboardingScope.js";
@@ -358,7 +361,7 @@ const riderLocationSchema = locationSchema.extend({ riderId: z.string().min(1) }
 const trackingSessionCreateSchema = z.object({ shiftId: z.string().regex(/^[a-f\d]{24}$/).optional(), platform: z.enum(["ios", "android", "web"]), appVersion: z.string().trim().min(1).max(80).default("unknown"), consentVersion: z.string().trim().min(1).max(80) });
 const trackingSampleSchema = z.object({ sampleId: z.string().trim().min(8).max(160), latitude: z.number().min(-90).max(90), longitude: z.number().min(-180).max(180), accuracyMeters: z.number().min(0).max(500), recordedAt: z.coerce.date() });
 const trackingBatchSchema = z.object({ sessionId: z.string().regex(/^[a-f\d]{24}$/), samples: z.array(trackingSampleSchema).min(1).max(100) });
-const zoneSchema = z.object({ name: z.string().min(2).max(120), slug: z.string().regex(/^[a-z0-9-]+$/), serviceFeeCents: z.number().int().min(0).max(10000).default(0), maxEtaMinutes: z.number().int().min(1).max(240).default(60), polygon: z.object({ coordinates: z.array(z.array(z.array(z.number()))).min(1) }) });
+const zoneSchema = operationalZoneInputSchema;
 const dispatchSchema = z.object({ preparationMinutes: z.coerce.number().int().min(1).max(180).default(PARTNER_PREPARATION_LIMIT_MINUTES), offerSeconds: z.coerce.number().int().min(15).max(180).default(60), maxCustomerEtaMinutes: z.coerce.number().int().min(10).max(240).default(CUSTOMER_DELIVERY_TARGET_MINUTES) });
 const riderIncidentSchema = z.object({ reason: z.enum(["late_acceptance", "late_delivery", "no_show", "unsafe_driving", "fraud_signal", "customer_complaint", "document_expired", "other"]), evidence: z.array(z.string().url()).max(10).default([]), occurredAt: z.coerce.date().optional() });
 const riderSlotSchema = z.object({ zoneSlug: z.string().regex(/^[a-z0-9-]+$/), date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/), startTime: z.string().regex(/^(?:[01]\d|2[0-3]):[0-5]\d$/), endTime: z.string().regex(/^(?:[01]\d|2[0-3]):[0-5]\d$/), status: z.enum(["planned", "active", "completed", "cancelled"]).default("planned"), notes: z.string().max(500).default("") });
@@ -454,18 +457,6 @@ async function activeOrderCounts(riderIds: mongoose.Types.ObjectId[]) {
 const DISPATCH_MAX_PICKUP_RADIUS_METERS = 25_000;
 function nearRestaurant(location: any) {
   return { $near: { $geometry: location, $maxDistance: DISPATCH_MAX_PICKUP_RADIUS_METERS } };
-}
-
-function dispatchVehicleInputForOrder(order: any) {
-  return {
-    routeDistanceKm: typeof order?.routeDistanceKm === "number" ? order.routeDistanceKm : null,
-    routeDurationMinutes: typeof order?.routeDurationMinutes === "number" ? order.routeDurationMinutes : null,
-    routingDegraded: order?.routingDegraded === true,
-    // This is a persisted coverage/geofence result, never a province match.
-    // A missing or false value must not be treated as intracity for light vehicles.
-    withinMunicipality: order?.withinMunicipality === true,
-    requiredVehicleClasses: Array.isArray(order?.requiredVehicleClasses) ? order.requiredVehicleClasses : [],
-  };
 }
 
 async function offeredRiderVehicleEligibility(order: any) {
@@ -970,6 +961,7 @@ app.post("/api/v1/admin/tenants/:id/memberships", requireOwner(), async (req, re
   return res.status(201).json({ membership });
 });
 registerEmployeeDeletionRoutes(app);
+registerTerritoryRoutes(app);
 app.get("/api/v1/admin/employees", requireRole("admin"), async (_req, res) => res.json({ employees: await EmployeeAccount.find({ email: { $ne: ownerEmail }, hiddenFromAdmin: { $ne: true } }).select("name email employeeCode jobRole apiRole roles primaryRole accessLevel authorizationStatus authorizedAt authorizedBy authorizationReason portfolioId fleetId zoneSlugs active mustChangePassword lastLoginAt createdAt").sort({ createdAt: -1 }).lean().exec() }));
 app.get("/api/v1/admin/authorization-audit", requireOwner(), async (req, res) => {
   const email = typeof req.query.email === "string" ? req.query.email.toLowerCase() : undefined;
@@ -3260,7 +3252,7 @@ app.post("/api/v1/orders", rateLimit(20, 60_000, "orders-create"), async (req, r
   const publicCode = await createRandomOrderCode();
   const dailyCode = await createDailyDisplayCode();
   const authenticatedCustomer = await currentCustomer(req) as any;
-  const order = await Order.create({ tenantId: restaurant.tenantId || null, publicCode, ...dailyCode, restaurantId: restaurant._id, customerId: authenticatedCustomer?._id || null, customerName: String(authenticatedCustomer?.name || "").trim(), items: normalizedItems, deliveryAddress: parsed.data.deliveryAddress, deliveryNote: parsed.data.deliveryNote, deliveryLocation: { type: "Point", coordinates: deliveryPoint }, coveragePolicySlug: coverage.policySlug, coveragePolicyVersion: coverage.policyVersion, coverageDecision: coverage.reason, straightLineDistanceKm: coverage.straightLineDistanceKm, withinMunicipality: coverage.withinMunicipality, deliveryBaseFeeCents: coverage.deliveryBaseFeeCents, outsideMunicipalitySurchargeCents: coverage.outsideMunicipalitySurchargeCents, routeDistanceKm: route.routeDistanceKm, routeDurationMinutes: route.routeDurationMinutes, routeProvider: route.routeProvider, routingDegraded: route.routingDegraded, requiredVehicleClasses: route.requiredVehicleClasses, subtotalCents, deliveryFeeCents, serviceFeeCents, totalCents,
+  const order = await Order.create({ tenantId: restaurant.tenantId || null, publicCode, ...dailyCode, restaurantId: restaurant._id, customerId: authenticatedCustomer?._id || null, customerName: String(authenticatedCustomer?.name || "").trim(), items: normalizedItems, deliveryAddress: parsed.data.deliveryAddress, deliveryNote: parsed.data.deliveryNote, deliveryLocation: { type: "Point", coordinates: deliveryPoint }, pickupLocation: restaurant.location || undefined, coveragePolicySlug: coverage.policySlug, coveragePolicyVersion: coverage.policyVersion, coverageDecision: coverage.reason, straightLineDistanceKm: coverage.straightLineDistanceKm, withinMunicipality: withinSameOperationalCity(restaurant.location?.coordinates, deliveryPoint), deliveryBaseFeeCents: coverage.deliveryBaseFeeCents, outsideMunicipalitySurchargeCents: coverage.outsideMunicipalitySurchargeCents, routeDistanceKm: route.routeDistanceKm, routeDurationMinutes: route.routeDurationMinutes, routeProvider: route.routeProvider, routingDegraded: route.routingDegraded, requiredVehicleClasses: route.requiredVehicleClasses, subtotalCents, deliveryFeeCents, serviceFeeCents, totalCents,
     marketplaceCommissionRateBps: marketplace.commissionRateBps,
     marketplaceCommissionCents: marketplace.platformCommissionCents,
     partnerPayoutCents: marketplace.partnerPayoutCents,
@@ -4954,7 +4946,7 @@ app.get("/api/v1/riders/:id/mobility-advice", requireRole("rider"), async (req, 
   const zones = await Zone.find({ ...tenant, isActive: true }).select("slug name polygon").lean().exec() as any[];
   const since = new Date(Date.now() - 45 * 60 * 1000);
   const zoneDemand = await Promise.all(zones.map(async (zone) => {
-    const coordinates = zone.polygon?.coordinates?.[0]?.[0];
+    const coordinates = zone.polygon?.type === "MultiPolygon" ? zone.polygon?.coordinates?.[0]?.[0]?.[0] : zone.polygon?.coordinates?.[0]?.[0];
     const anchor: [number, number] = Array.isArray(coordinates) ? [Number(coordinates[0]), Number(coordinates[1])] : [0, 0];
     const ordersLastWindow = await Order.countDocuments({ ...tenant, createdAt: { $gte: since }, status: { $nin: ["cancelled"] }, deliveryLocation: { $geoWithin: { $geometry: zone.polygon } } });
     return { slug: zone.slug, name: zone.name, anchor, ordersLastWindow };
@@ -4969,7 +4961,7 @@ app.get("/api/v1/riders/:id/mobility-advice", requireRole("rider"), async (req, 
 });
 const MUNICIPAL_EXPANSION_CATALOG = [
   { municipalityKey: "xativa", municipalityName: "Xàtiva", phase: 1, phaseLabel: "Fase actual · casco urbano", status: "active", notes: "Zona de lanzamiento inicial." },
-  ...["Novetlè", "La Llosa de Ranes", "Cerdà", "La Granja de la Costera", "Llanera de Ranes", "El Genovés", "Anahuir", "Ayacor"].map((municipalityName) => ({ municipalityKey: municipalityName.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().replace(/[^a-z0-9]+/g, "-"), municipalityName, phase: 1, phaseLabel: "Fase 1 · corona Costera y Vall d'Albaida", status: "planned", notes: "Preparada; requiere geocerca y flota local antes de activar." })),
+  ...[...XATIVA_PHASE_2_LOCALITIES, "Anahuir", "Ayacor"].map((municipalityName) => ({ municipalityKey: municipalityName.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().replace(/[^a-z0-9]+/g, "-"), municipalityName, phase: 1, phaseLabel: "Fase 1 · corona Costera y Vall d'Albaida", status: "planned", notes: "Preparada; requiere geocerca y flota local antes de activar." })),
   ...["Canals", "L'Alcúdia de Crespins"].map((municipalityName) => ({ municipalityKey: municipalityName.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().replace(/[^a-z0-9]+/g, "-"), municipalityName, phase: 1, phaseLabel: "Fase 1 · ampliación en bloque", status: "planned", notes: "Activación posterior a la corona inicial." })),
   ...["Alzira", "Gandía"].map((municipalityName) => ({ municipalityKey: municipalityName.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().replace(/[^a-z0-9]+/g, "-"), municipalityName, phase: 2, phaseLabel: "Fase 2 · Ribera Alta y Safor", status: "planned", notes: "Nueva célula logística con City Manager." })),
   ...["Torrent", "Sagunt", "Castellón", "Alicante"].map((municipalityName) => ({ municipalityKey: municipalityName.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().replace(/[^a-z0-9]+/g, "-"), municipalityName, phase: 3, phaseLabel: "Fase 3 · grandes núcleos", status: "planned", notes: "Expansión regional posterior." })),
@@ -4987,7 +4979,7 @@ app.patch("/api/v1/admin/expansion/municipalities/:key", requireRole("admin"), a
 });
 app.post("/api/v1/zones", requireRole("admin"), async (req, res) => {
   const parsed = zoneSchema.safeParse(req.body); if (!parsed.success) return res.status(400).json({ error: "INVALID_ZONE", details: parsed.error.flatten() });
-  const zone = await Zone.findOneAndUpdate({ ...tenantScope(req), slug: parsed.data.slug }, { $set: { ...parsed.data, ...tenantScope(req), polygon: { type: "Polygon", coordinates: parsed.data.polygon.coordinates } } }, { upsert: true, new: true }).lean().exec();
+  const zone = await Zone.findOneAndUpdate({ ...tenantScope(req), slug: parsed.data.slug }, { $set: { ...parsed.data, ...tenantScope(req), polygon: parsed.data.polygon } }, { upsert: true, new: true }).lean().exec();
   return res.status(201).json({ zone });
 });
 

@@ -1,25 +1,22 @@
 import { xativaMunicipalityGeometry } from "./xativaBoundary.js";
+import { OPERATIONAL_AREAS } from "./operationalAreas.js";
+import { distanceKm, insideGeometry, nearestCoveredArea, sameUrbanLocality, validCoordinate, type AreaGeometry, type Coordinate } from "./territoryGeometry.js";
 
-export const XATIVA_PHASE_2_LOCALITIES = ["Novetlè", "La Llosa de Ranes", "Cerdà", "La Granja", "Llanera", "El Genovés", "Anahuir", "Ayacor"] as const;
-
+export const XATIVA_PHASE_2_LOCALITIES = ["La Llosa de Ranes", "Novetlè", "El Genovés", "Alboi", "Bixquert", "La Granja de la Costera", "Llanera de Ranes", "Cerdà", "Torrella"] as const;
 export const XATIVA_COVERAGE_POLICY = {
   slug: "xativa-casco-urbano-fase-1",
   city: "Xàtiva",
-  version: 2,
-  center: [-0.521111, 38.990276] as [number, number],
-  // Fase 1: radio operativo del casco urbano. Los pueblos colindantes quedan
-  // preparados para una fase posterior, pero no se consideran cubiertos.
+  version: 3,
+  center: [-0.521111, 38.990276] as Coordinate,
   maxStraightLineDistanceKm: 3,
   deliveryBaseFeeCents: 299,
   outsideMunicipalitySurchargeCents: 0,
   serviceFeeCents: 79,
   routeVehicleThresholdKm: 1.5,
-  // `scooter` is the persisted motorized vehicle enum, not electric_scooter.
   routeVehicleClasses: ["electric_bike", "motorcycle", "scooter", "car"] as const,
-  municipalityBoundarySource: "OpenStreetMap relation via Nominatim, retrieved 2026-09-26",
-  phase2Enabled: false,
+  municipalityBoundarySource: "Verified OSM and CartoCiudad/IGN municipal boundaries; per-area source is attached to OPERATIONAL_AREAS",
+  phase2Enabled: true,
 } as const;
-
 export type VehicleClass = "bike" | "electric_bike" | "electric_scooter" | "motorcycle" | "scooter" | "car";
 export type CoverageDecision = {
   policySlug: string;
@@ -33,83 +30,49 @@ export type CoverageDecision = {
   outsideMunicipalitySurchargeCents: number;
   deliveryFeeCents: number | null;
   serviceFeeCents: number | null;
+  localityName: string | null;
+  municipalityCode: string | null;
+  coverageRule: "municipal_boundary" | "operational_radius" | "outside";
 };
-
-function distanceKm(a: [number, number], b: [number, number]) {
-  const [lonA, latA] = a;
-  const [lonB, latB] = b;
-  const latDelta = (latB - latA) * Math.PI / 180;
-  const lonDelta = (lonB - lonA) * Math.PI / 180;
-  const sinLat = Math.sin(latDelta / 2);
-  const sinLon = Math.sin(lonDelta / 2);
-  const h = sinLat * sinLat + Math.cos(latA * Math.PI / 180) * Math.cos(latB * Math.PI / 180) * sinLon * sinLon;
-  return 6371 * 2 * Math.atan2(Math.sqrt(h), Math.sqrt(1 - h));
+function extentKm(geometry: AreaGeometry, center: Coordinate) {
+  const polygons = geometry.type === "Polygon" ? [geometry.coordinates] : geometry.coordinates;
+  let maximum = 0;
+  for (const polygon of polygons) for (const ring of polygon) for (const point of ring) maximum = Math.max(maximum, distanceKm(center, [point[0], point[1]]));
+  return Math.ceil(maximum * 100) / 100;
 }
-
-function onSegment(point: [number, number], a: readonly number[], b: readonly number[]) {
-  const [x, y] = point;
-  const [ax, ay] = a;
-  const [bx, by] = b;
-  const cross = (x - ax) * (by - ay) - (y - ay) * (bx - ax);
-  if (Math.abs(cross) > 1e-10) return false;
-  return x >= Math.min(ax, bx) - 1e-10 && x <= Math.max(ax, bx) + 1e-10 && y >= Math.min(ay, by) - 1e-10 && y <= Math.max(ay, by) + 1e-10;
-}
-
-/** Ray-casting with explicit border inclusion so municipal boundaries have a stable price. */
-function insideRing(point: [number, number], ring: readonly (readonly number[])[]) {
-  let inside = false;
-  for (let index = 0, previous = ring.length - 1; index < ring.length; previous = index++) {
-    const current = ring[index];
-    const prior = ring[previous];
-    if (onSegment(point, prior, current)) return true;
-    const intersects = ((current[1] > point[1]) !== (prior[1] > point[1]))
-      && point[0] < ((prior[0] - current[0]) * (point[1] - current[1])) / (prior[1] - current[1]) + current[0];
-    if (intersects) inside = !inside;
-  }
-  return inside;
-}
-
-function insideMunicipality(point: [number, number]) {
-  const geometry = xativaMunicipalityGeometry as unknown as { type: "MultiPolygon"; coordinates: readonly (readonly (readonly (readonly number[])[])[])[] };
-  return geometry.coordinates.some((polygon) => {
-    const [outer, ...holes] = polygon;
-    return Boolean(outer) && insideRing(point, outer) && !holes.some((hole) => insideRing(point, hole));
-  });
-}
-
-export function evaluateXativaCoverage(point: [number, number]): CoverageDecision {
-  const straightLineDistanceKm = distanceKm(XATIVA_COVERAGE_POLICY.center, point);
-  const withinMunicipality = insideMunicipality(point);
-  const covered = withinMunicipality && straightLineDistanceKm <= XATIVA_COVERAGE_POLICY.maxStraightLineDistanceKm;
-  const outsideMunicipalitySurchargeCents = 0;
-  const deliveryFeeCents = covered ? XATIVA_COVERAGE_POLICY.deliveryBaseFeeCents + outsideMunicipalitySurchargeCents : null;
+const extents = new Map(OPERATIONAL_AREAS.map((area) => [area.slug, extentKm(area.geometry, area.center)]));
+/** Membership is executable, not inferred from a province name or a marketing list. */
+export function evaluateXativaCoverage(point: Coordinate): CoverageDecision {
+  const valid = validCoordinate(point);
+  const area = valid ? nearestCoveredArea(point, OPERATIONAL_AREAS) : null;
+  const covered = Boolean(area);
+  const withinMunicipality = covered || (valid && insideGeometry(point, xativaMunicipalityGeometry as unknown as AreaGeometry));
+  const straightLineDistanceKm = valid ? distanceKm(area?.center || XATIVA_COVERAGE_POLICY.center, point) : 0;
   return {
-    policySlug: XATIVA_COVERAGE_POLICY.slug,
+    policySlug: area?.slug || XATIVA_COVERAGE_POLICY.slug,
     policyVersion: XATIVA_COVERAGE_POLICY.version,
     covered,
+    // Keep the legacy public error code; locality/rule now explain the active scope.
     reason: covered ? "COVERED" : "OUTSIDE_XATIVA_RADIUS",
     straightLineDistanceKm: Math.round(straightLineDistanceKm * 1000) / 1000,
-    maxStraightLineDistanceKm: XATIVA_COVERAGE_POLICY.maxStraightLineDistanceKm,
+    maxStraightLineDistanceKm: area ? (area.operationalRadiusKm || extents.get(area.slug) || 3) : 3,
     withinMunicipality,
     deliveryBaseFeeCents: XATIVA_COVERAGE_POLICY.deliveryBaseFeeCents,
-    outsideMunicipalitySurchargeCents,
-    deliveryFeeCents,
+    outsideMunicipalitySurchargeCents: 0,
+    deliveryFeeCents: covered ? XATIVA_COVERAGE_POLICY.deliveryBaseFeeCents : null,
     serviceFeeCents: covered ? XATIVA_COVERAGE_POLICY.serviceFeeCents : null,
+    localityName: area?.name || null,
+    municipalityCode: area?.municipalityCode || null,
+    coverageRule: area ? (area.coverage === "full" ? "municipal_boundary" : "operational_radius") : "outside",
   };
 }
-
+export function withinSameOperationalCity(origin: unknown, destination: unknown) {
+  return sameUrbanLocality(origin, destination, OPERATIONAL_AREAS);
+}
 export function requiredVehiclesForRoute(routeDistanceKm: number | null): VehicleClass[] {
-  // If the route provider is unavailable, restrict to the robust vehicle set.
-  // This is intentionally conservative: a degraded quote never sends a long
-  // journey to a bicycle or e-scooter rider.
-  // The light-vehicle exception is strictly "less than" 1.5 km, so the
-  // threshold itself must receive the long-route-capable vehicle set.
-  if (routeDistanceKm === null || routeDistanceKm >= XATIVA_COVERAGE_POLICY.routeVehicleThresholdKm) {
-    return [...XATIVA_COVERAGE_POLICY.routeVehicleClasses];
-  }
+  if (routeDistanceKm === null || !Number.isFinite(routeDistanceKm) || routeDistanceKm < 0 || routeDistanceKm >= XATIVA_COVERAGE_POLICY.routeVehicleThresholdKm) return [...XATIVA_COVERAGE_POLICY.routeVehicleClasses];
   return [];
 }
-
 export function isVehicleCompatibleWithRoute(vehicle: VehicleClass, requiredVehicleClasses: readonly VehicleClass[]) {
   return requiredVehicleClasses.length === 0 || requiredVehicleClasses.includes(vehicle);
 }
