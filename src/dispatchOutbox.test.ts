@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { DEFAULT_DISPATCH_LEASE_MS, InMemoryDispatchOutbox, dispatchInitialIdempotencyKey, dispatchRetryDelayMs } from "./dispatchOutbox.js";
+import { DEFAULT_DISPATCH_LEASE_MS, InMemoryDispatchOutbox, dispatchInitialIdempotencyKey, dispatchRequeueIdempotencyKey, dispatchRetryDelayMs } from "./dispatchOutbox.js";
 
 test("dispatch outbox is idempotent for the same order transition", () => {
   const outbox = new InMemoryDispatchOutbox();
@@ -9,6 +9,15 @@ test("dispatch outbox is idempotent for the same order transition", () => {
   const duplicate = outbox.enqueue({ orderId: "507f1f77bcf86cd799439011", idempotencyKey: key, reason: "cash_order_created" });
   assert.equal(first.eventId, duplicate.eventId);
   assert.equal(outbox.size(), 1);
+});
+
+test("Partner status transitions at the same order version have distinct but repeatable dispatch keys", () => {
+  const orderId = "507f1f77bcf86cd799439011";
+  const accepted = dispatchRequeueIdempotencyKey(orderId, 0, "partner_status_accepted");
+  const preparing = dispatchRequeueIdempotencyKey(orderId, 0, "partner_status_preparing");
+  assert.notEqual(accepted, preparing);
+  assert.equal(accepted, dispatchRequeueIdempotencyKey(orderId, 0, "partner_status_accepted"));
+  assert.equal(dispatchRequeueIdempotencyKey(orderId, 0), `dispatch:${orderId}:requeue:0`);
 });
 
 test("a live dispatch lease excludes a second worker from offering the same order", () => {

@@ -1997,7 +1997,7 @@ app.patch("/api/v1/partners/kitchen/orders/:id/status", requireRole("partner"), 
   // pending. A Partner transition needs a fresh outbox key so the Rider offer
   // is created after the order becomes dispatchable.
   if (["accepted", "preparing", "ready_for_pickup"].includes(target)) {
-    void enqueueOrderForDispatch(order._id as mongoose.Types.ObjectId, undefined, "partner_status")
+    void enqueueOrderForDispatch(order._id as mongoose.Types.ObjectId, undefined, `partner_status_${target}`)
       .catch((error) => console.warn("Partner dispatch enqueue failed", error instanceof Error ? error.message : error));
   }
   await publishOrderStatusEvents(order, target).catch((error) => console.warn("Realtime partner status event failed", error instanceof Error ? error.message : error));
@@ -3886,7 +3886,7 @@ app.post("/api/v1/orders/:id/transitions", requireRole("admin", "partner", "ride
   if (["delivered", "cancelled"].includes(parsed.data.status)) await RiderOrderMessage.deleteMany({ orderId: order._id }).exec();
   scheduleCustomerOrderPush(updated, parsed.data.status);
   if (actorRole === "partner" && ["accepted", "preparing", "ready_for_pickup"].includes(parsed.data.status)) {
-    void enqueueOrderForDispatch(id, undefined, "partner_status")
+    void enqueueOrderForDispatch(id, undefined, `partner_status_${parsed.data.status}`)
       .catch((error) => console.warn("Partner dispatch enqueue failed", error instanceof Error ? error.message : error));
   }
   if (["delivered", "cancelled"].includes(parsed.data.status) && order.riderId) {
@@ -4611,7 +4611,7 @@ async function enqueueOrderForDispatch(orderId: mongoose.Types.ObjectId, preferr
   const event = await enqueueDispatchOutbox({
     orderId: order._id,
     tenantId: order.tenantId || null,
-    idempotencyKey: reason === "initial" ? dispatchInitialIdempotencyKey(order._id) : dispatchRequeueIdempotencyKey(order._id, Number((await Order.findById(order._id).select("version").lean().exec() as any)?.version || 0)),
+    idempotencyKey: reason === "initial" ? dispatchInitialIdempotencyKey(order._id) : dispatchRequeueIdempotencyKey(order._id, Number((await Order.findById(order._id).select("version").lean().exec() as any)?.version || 0), reason),
     preferredRiderId,
     reason,
   });

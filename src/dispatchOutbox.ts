@@ -40,8 +40,9 @@ export function dispatchInitialIdempotencyKey(orderId: string | mongoose.Types.O
   return `dispatch:${String(orderId)}:initial`;
 }
 
-export function dispatchRequeueIdempotencyKey(orderId: string | mongoose.Types.ObjectId, version: number) {
-  return `dispatch:${String(orderId)}:requeue:${version}`;
+export function dispatchRequeueIdempotencyKey(orderId: string | mongoose.Types.ObjectId, version: number, transition?: string) {
+  const transitionKey = transition?.trim().replace(/[^a-zA-Z0-9_-]+/g, "_").slice(0, 60);
+  return `dispatch:${String(orderId)}:requeue:${version}${transitionKey ? `:${transitionKey}` : ""}`;
 }
 
 function objectIdOrNull(value: string | mongoose.Types.ObjectId | null | undefined) {
