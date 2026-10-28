@@ -1,11 +1,16 @@
 import { distanceKm } from "./workflow.js";
 
 export const DISPATCH_ALGORITHM_VERSION = "piki-jarvis-v2-proximity-rating";
+export const LIGHT_URBAN_VEHICLES = ["bike", "electric_scooter"] as const;
+export const LONG_ROUTE_VEHICLES = ["electric_bike", "motorcycle", "scooter", "car"] as const;
+export const LIGHT_URBAN_ROUTE_MAX_KM = 1.5;
+
+export type DispatchVehicle = "bike" | "electric_bike" | "electric_scooter" | "motorcycle" | "scooter" | "car";
 
 export type DispatchCandidate = {
   id: string;
   status: "offline" | "available" | "busy" | "paused";
-  vehicle: "bike" | "electric_bike" | "electric_scooter" | "motorcycle" | "scooter" | "car";
+  vehicle: DispatchVehicle;
   location?: { coordinates?: number[] } | null;
   lastLocationAt?: Date | null;
   activeOrderCount?: number;
@@ -15,12 +20,40 @@ export type DispatchCandidate = {
   servicePriority?: number;
 };
 
+export type DispatchVehicleEligibilityInput = {
+  /** Restaurant → customer road distance. It is never inferred from rider → restaurant distance. */
+  routeDistanceKm?: number | null;
+  /** A degraded/unknown route is deliberately unsafe for normal bikes and e-scooters. */
+  routingDegraded?: boolean | null;
+  /** Persisted/geofenced proof that the delivery remains in the authorized municipality or locality. */
+  withinMunicipality?: boolean | null;
+  /** Additional, pre-existing operational restriction persisted with the order. */
+  requiredVehicleClasses?: readonly unknown[] | null;
+};
+
+export type DispatchVehicleEligibilityReason =
+  | "eligible_short_intra_city"
+  | "eligible_long_route_capable_vehicle"
+  | "route_unknown_light_vehicle"
+  | "route_at_or_above_light_limit"
+  | "light_vehicle_requires_verified_intra_city"
+  | "vehicle_not_in_required_classes"
+  | "unknown_vehicle";
+
+export type DispatchVehicleEligibility = {
+  eligible: boolean;
+  reason: DispatchVehicleEligibilityReason;
+  routeDistanceKm: number | null;
+};
+
 export type DispatchInput = {
   restaurantLocation: [number, number];
   customerLocation: [number, number];
   preparationMinutes: number;
   routeDistanceKm?: number | null;
   routeDurationMinutes?: number | null;
+  routingDegraded?: boolean | null;
+  withinMunicipality?: boolean | null;
   requiredVehicleClasses?: DispatchCandidate["vehicle"][];
   now?: Date;
   maxGpsAgeSeconds?: number;
@@ -71,9 +104,54 @@ const speedKmh: Record<DispatchCandidate["vehicle"], number> = {
   electric_bike: 19,
   electric_scooter: 23,
   motorcycle: 28,
+  // "scooter" is the model's motorized-motorcycle value. It is intentionally
+  // not an alias for the electric stand-up scooter (electric_scooter).
   scooter: 22,
   car: 28,
 };
+
+function isDispatchVehicle(value: unknown): value is DispatchVehicle {
+  return typeof value === "string" && (["bike", "electric_bike", "electric_scooter", "motorcycle", "scooter", "car"] as const).includes(value as DispatchVehicle);
+}
+
+function routeDistanceFrom(input: DispatchVehicleEligibilityInput): number | null {
+  const distance = input.routeDistanceKm;
+  if (input.routingDegraded === true || typeof distance !== "number" || !Number.isFinite(distance) || distance < 0) return null;
+  return distance;
+}
+
+/**
+ * Hard vehicle eligibility, shared by auto-dispatch, manual dispatch and offer
+ * acceptance. A road route at exactly 1.5 km is not "less than" 1.5 km.
+ */
+export function evaluateDispatchVehicleEligibility(vehicle: unknown, input: DispatchVehicleEligibilityInput): DispatchVehicleEligibility {
+  const routeDistanceKm = routeDistanceFrom(input);
+  if (!isDispatchVehicle(vehicle)) return { eligible: false, reason: "unknown_vehicle", routeDistanceKm };
+
+  const requiredVehicleClasses = Array.isArray(input.requiredVehicleClasses) ? input.requiredVehicleClasses : [];
+  if (requiredVehicleClasses.length > 0 && !requiredVehicleClasses.includes(vehicle)) {
+    return { eligible: false, reason: "vehicle_not_in_required_classes", routeDistanceKm };
+  }
+
+  const lightUrbanVehicle = (LIGHT_URBAN_VEHICLES as readonly string[]).includes(vehicle);
+  if (routeDistanceKm === null) {
+    return lightUrbanVehicle
+      ? { eligible: false, reason: "route_unknown_light_vehicle", routeDistanceKm: null }
+      : { eligible: true, reason: "eligible_long_route_capable_vehicle", routeDistanceKm: null };
+  }
+
+  if (routeDistanceKm >= LIGHT_URBAN_ROUTE_MAX_KM) {
+    return lightUrbanVehicle
+      ? { eligible: false, reason: "route_at_or_above_light_limit", routeDistanceKm }
+      : { eligible: true, reason: "eligible_long_route_capable_vehicle", routeDistanceKm };
+  }
+
+  if (lightUrbanVehicle && input.withinMunicipality !== true) {
+    return { eligible: false, reason: "light_vehicle_requires_verified_intra_city", routeDistanceKm };
+  }
+
+  return { eligible: true, reason: "eligible_short_intra_city", routeDistanceKm };
+}
 
 function bounded(value: number, fallback: number) {
   return Number.isFinite(value) ? Math.min(1, Math.max(0, value)) : fallback;
@@ -93,19 +171,21 @@ export function scoreDispatchCandidate(candidate: DispatchCandidate, input: Disp
   if (candidate.status !== "available" && candidate.status !== "busy") return null;
   if (!candidate.location?.coordinates || candidate.location.coordinates.length < 2) return null;
   if (freshnessSeconds(candidate, now) > (input.maxGpsAgeSeconds ?? 90)) return null;
+
+  const vehicleEligibility = evaluateDispatchVehicleEligibility(candidate.vehicle, input);
+  if (!vehicleEligibility.eligible) return null;
   const requiredVehicleClasses = input.requiredVehicleClasses || [];
-  if (requiredVehicleClasses.length && !requiredVehicleClasses.includes(candidate.vehicle)) return null;
 
   const riderLocation: [number, number] = [candidate.location.coordinates[0], candidate.location.coordinates[1]];
   const pickupDistanceKm = distanceKm(riderLocation, input.restaurantLocation);
-  // Route distance is persisted at order creation and controls vehicle eligibility.
-  // Haversine remains only as an ETA fallback when the provider was unavailable.
-  const customerDistanceKm = input.routeDistanceKm ?? distanceKm(input.restaurantLocation, input.customerLocation);
-  // En el lanzamiento, los coches quedan reservados para perímetro/recorridos
-  // largos o pedidos voluminosos; el patinete lidera el reparto urbano corto.
-  if (candidate.vehicle === "car" && customerDistanceKm <= 3 && input.orderVolume !== "bulky") return null;
+  // Route distance is persisted from restaurant → customer and controls hard
+  // vehicle eligibility. Haversine is only an ETA/scoring fallback for a
+  // motorized/long-route-capable vehicle when routing is unavailable.
+  const customerDistanceKm = vehicleEligibility.routeDistanceKm ?? distanceKm(input.restaurantLocation, input.customerLocation);
   const pickupEtaMinutes = travelMinutes(pickupDistanceKm, candidate.vehicle);
-  const customerEtaMinutes = input.routeDurationMinutes != null && Number.isFinite(input.routeDurationMinutes) ? Math.max(1, Math.ceil(input.routeDurationMinutes)) : travelMinutes(customerDistanceKm, candidate.vehicle);
+  const customerEtaMinutes = input.routeDurationMinutes != null && Number.isFinite(input.routeDurationMinutes)
+    ? Math.max(1, Math.ceil(input.routeDurationMinutes))
+    : travelMinutes(customerDistanceKm, candidate.vehicle);
   const totalEtaMinutes = input.preparationMinutes + Math.max(input.preparationMinutes, pickupEtaMinutes) + customerEtaMinutes;
   if (input.maxCustomerEtaMinutes && totalEtaMinutes > input.maxCustomerEtaMinutes) return null;
 
@@ -143,7 +223,7 @@ export function scoreDispatchCandidate(candidate: DispatchCandidate, input: Disp
     algorithmVersion: DISPATCH_ALGORITHM_VERSION,
     score: Math.round(score * 100) / 100,
     pickupDistanceKm: Math.round(pickupDistanceKm * 100) / 100,
-    routeDistanceKm: input.routeDistanceKm ?? null,
+    routeDistanceKm: vehicleEligibility.routeDistanceKm,
     requiredVehicleClasses,
     pickupEtaMinutes,
     customerEtaMinutes,
@@ -152,7 +232,8 @@ export function scoreDispatchCandidate(candidate: DispatchCandidate, input: Disp
       `recogida en ${pickupEtaMinutes} min`,
       `entrega estimada en ${totalEtaMinutes} min`,
       `distancia de recogida ${pickupDistanceKm.toFixed(2)} km`,
-      input.routeDistanceKm == null ? "ruta sin proveedor: restricción conservadora aplicada" : `ruta al cliente ${input.routeDistanceKm.toFixed(2)} km`,
+      vehicleEligibility.routeDistanceKm == null ? "ruta sin proveedor: vehículos ligeros excluidos" : `ruta al cliente ${vehicleEligibility.routeDistanceKm.toFixed(2)} km`,
+      `elegibilidad de vehículo: ${vehicleEligibility.reason}`,
       ...(input.routeDurationMinutes != null ? [`duración Google Maps/OSRM ${Math.ceil(input.routeDurationMinutes)} min`] : []),
       ...(requiredVehicleClasses.length ? [`vehículo requerido: ${requiredVehicleClasses.join(" o ")}`] : []),
       ...(customerDistanceKm <= 3 ? [`prioridad urbana de vehículo: ${candidate.vehicle === "electric_scooter" ? "patinete eléctrico" : candidate.vehicle}`] : []),

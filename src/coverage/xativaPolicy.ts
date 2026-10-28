@@ -13,8 +13,9 @@ export const XATIVA_COVERAGE_POLICY = {
   deliveryBaseFeeCents: 299,
   outsideMunicipalitySurchargeCents: 0,
   serviceFeeCents: 79,
-  routeVehicleThresholdKm: 3,
-  routeVehicleClasses: ["motorcycle", "car"] as const,
+  routeVehicleThresholdKm: 1.5,
+  // `scooter` is the persisted motorized vehicle enum, not electric_scooter.
+  routeVehicleClasses: ["electric_bike", "motorcycle", "scooter", "car"] as const,
   municipalityBoundarySource: "OpenStreetMap relation via Nominatim, retrieved 2026-09-26",
   phase2Enabled: false,
 } as const;
@@ -101,7 +102,9 @@ export function requiredVehiclesForRoute(routeDistanceKm: number | null): Vehicl
   // If the route provider is unavailable, restrict to the robust vehicle set.
   // This is intentionally conservative: a degraded quote never sends a long
   // journey to a bicycle or e-scooter rider.
-  if (routeDistanceKm === null || routeDistanceKm > XATIVA_COVERAGE_POLICY.routeVehicleThresholdKm) {
+  // The light-vehicle exception is strictly "less than" 1.5 km, so the
+  // threshold itself must receive the long-route-capable vehicle set.
+  if (routeDistanceKm === null || routeDistanceKm >= XATIVA_COVERAGE_POLICY.routeVehicleThresholdKm) {
     return [...XATIVA_COVERAGE_POLICY.routeVehicleClasses];
   }
   return [];

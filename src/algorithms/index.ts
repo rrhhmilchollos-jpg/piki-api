@@ -5,6 +5,8 @@
  */
 export {
   DISPATCH_ALGORITHM_VERSION,
+  evaluateDispatchVehicleEligibility,
+  LIGHT_URBAN_ROUTE_MAX_KM,
   rankDispatchCandidates,
 } from "../dispatch.js";
 export {
