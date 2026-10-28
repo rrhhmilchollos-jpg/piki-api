@@ -33,15 +33,14 @@ async function contextFor(req: Request, session?: Session) {
   const riders = await db.collection("riders").find({ ...scope, email }, options).project({ _id: 1, riderCode: 1 }).toArray();
   const riderIds = riders.map((rider) => rider._id);
   const linked = { riderId: { $in: riderIds } };
-  const [activeOrders, cash, pendingPayouts, activeReservations, historicalOrders, foreignProfiles] = await Promise.all([
-    db.collection("orders").countDocuments({ ...linked, archivedAt: null, status: { $nin: ["delivered", "cancelled"] } }, options),
-    db.collection("cash_ledger_entries").aggregate([{ $match: linked }, { $group: { _id: null, balance: { $sum: { $cond: [{ $eq: ["$direction", "in"] }, "$amountCents", { $multiply: [-1, "$amountCents"] }] } } } }], options).toArray(),
-    db.collection("rider_payout_batches").countDocuments({ ...linked, status: { $in: ["prepared", "approved", "failed"] } }, options),
-    db.collection("rider_assignment_reservations").countDocuments({ ...linked, status: "reserved" }, options),
-    db.collection("orders").countDocuments(linked, options),
-    db.collection("riders").countDocuments({ email, tenantId: { $ne: employee.tenantId || null } }, options),
-  ]);
-  const dependencies: DeletionDependencies = { activeOrders, unsettledCashCents: Number(cash[0]?.balance || 0), pendingPayouts, activeReservations };
+  // The MongoDB driver does not support parallel operations on one transaction.
+  const activeOrders = await db.collection("orders").countDocuments({ ...linked, archivedAt: null, status: { $nin: ["delivered", "cancelled"] } }, options);
+  const cash = await db.collection("cash_ledger_entries").aggregate([{ $match: linked }, { $group: { _id: "$riderId", balance: { $sum: { $cond: [{ $eq: ["$direction", "in"] }, "$amountCents", { $multiply: [-1, "$amountCents"] }] } } } }], options).toArray();
+  const pendingPayouts = await db.collection("rider_payout_batches").countDocuments({ ...linked, status: { $in: ["prepared", "approved", "failed"] } }, options);
+  const activeReservations = await db.collection("rider_assignment_reservations").countDocuments({ ...linked, status: "reserved" }, options);
+  const historicalOrders = await db.collection("orders").countDocuments(linked, options);
+  const foreignProfiles = await db.collection("riders").countDocuments({ email, tenantId: { $ne: employee.tenantId || null } }, options);
+  const dependencies: DeletionDependencies = { activeOrders, unsettledCashCents: cash.reduce((sum, item) => sum + Math.abs(Number(item.balance || 0)), 0), pendingPayouts, activeReservations };
   const blocker = foreignProfiles ? "PROFILE_TENANT_CONFLICT" : employeeDeletionBlocker(employee as DeletionEmployee, String(req.auth?.employeeId), String(employee.email), dependencies);
   return { employee, email, scope, riderIds, riders, dependencies, historicalOrders, blocker };
 }
