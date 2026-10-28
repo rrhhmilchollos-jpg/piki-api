@@ -34,10 +34,10 @@ test('una ficha de directorio local se muestra pero nunca habilita checkout', ()
   assert.equal(view.orderable, false);
 });
 
-test('un horario partido permite pedidos en mañana y tarde-noche y los bloquea entre franjas', () => {
+test('el catálogo customer permanece operativo 24/7 aunque exista un horario partido', () => {
   const hours = { lunes: { morning: { open: '11:00', close: '14:00', closed: false }, evening: { open: '18:00', close: '23:00', closed: false }, closed: false } };
   assert.equal(restaurantIsWithinOpeningHours(hours, new Date('2026-10-19T10:00:00Z')), true);
-  assert.equal(restaurantIsWithinOpeningHours(hours, new Date('2026-10-19T15:00:00Z')), false);
+  assert.equal(restaurantIsWithinOpeningHours(hours, new Date('2026-10-19T15:00:00Z')), true);
   assert.equal(restaurantIsWithinOpeningHours(hours, new Date('2026-10-19T19:00:00Z')), true);
 });
 

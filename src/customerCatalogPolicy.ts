@@ -1,6 +1,5 @@
 import { isCashPaymentEnabledForRestaurant } from "./paymentPolicy.js";
-import { evaluateOpeningHours } from "./openingHours.js";
-import { customerAvailability } from "./customerAvailability.js";
+import { customerAvailability, CUSTOMER_OPERATING_24_7 } from "./customerAvailability.js";
 
 export const COMING_SOON_SLUGS = ["eleven-burgers-xativa", "nakama-sushi-xativa"] as const;
 export const CUSTOMER_HIDDEN_TEST_SLUGS = ["kfc-xativa-test", "partner-test", "kings-tacos-xativa"] as const;
@@ -14,7 +13,10 @@ export const CUSTOMER_CATALOG_RESTAURANT_FILTER = {
   $or: [CUSTOMER_ORDERABLE_RESTAURANT_FILTER, { slug: { $in: [...COMING_SOON_SLUGS] }, availabilityStatus: "coming_soon", onboardingStatus: { $ne: "rejected" } }, CUSTOMER_DIRECTORY_RESTAURANT_FILTER],
 };
 export function restaurantIsWithinOpeningHours(openingHours: unknown, now = new Date()): boolean {
-  return evaluateOpeningHours(openingHours, now).open;
+  // This helper is shared by the customer catalogue and checkout guard.
+  // Keep the partner schedule for operations, but never reject a customer
+  // order because of it while PIKI runs in 24/7 customer mode.
+  return CUSTOMER_OPERATING_24_7;
 }
 export function customerCatalogRestaurantName(restaurant: { name: string; slug?: string }) { return restaurant.name; }
 export function presentCustomerCatalogRestaurant<T extends { name: string; slug?: string; listingType?: string; goldFounder?: boolean; menu?: any[]; availabilityStatus?: string; upcomingMessage?: string; isActive?: boolean; onboardingStatus?: string; cashPaymentsEnabled?: boolean; partnerProfile?: { openingHours?: unknown } }>(restaurant: T) {
