@@ -21,13 +21,16 @@ export function fleetPublicView(fleet: FleetViewInput, serviceZoneNames: Record<
   const localityName = text(fleet.localityName) || text(fleet.city);
   const provinceName = text(fleet.provinceName);
   const serviceZones = Array.isArray(fleet.serviceZones) ? fleet.serviceZones.filter((slug): slug is string => typeof slug === "string") : [];
+  const zoneNames = [...new Set(serviceZones.map((slug) => serviceZoneNames[slug]).filter(Boolean))];
   const suffix = [localityName, provinceName].filter(Boolean).join(" · ");
+  const geographicFallback = zoneNames.length ? `${zoneNames.slice(0, 3).join(" / ")}${zoneNames.length > 3 ? ` (+${zoneNames.length - 3} zonas)` : ""}` : "sin localidad asignada";
+  const testSuffix = /\b(pruebas|qa|test)\b/i.test(text(fleet.name)) ? " · Pruebas" : "";
   return {
     id: String(fleet._id),
     _id: fleet._id,
     // `name` is retained for old clients; use displayName for non-personal UI.
     name: text(fleet.name),
-    displayName: suffix ? `Flota ${suffix}` : `Flota ${text(fleet.name) || "operativa"}`,
+    displayName: `Flota ${suffix || geographicFallback}${testSuffix}`,
     city: text(fleet.city),
     localityCode: text(fleet.localityCode) || null,
     localityName: localityName || null,
@@ -36,7 +39,7 @@ export function fleetPublicView(fleet: FleetViewInput, serviceZoneNames: Record<
     vehicleTypes: Array.isArray(fleet.vehicleTypes) ? fleet.vehicleTypes : [],
     maxRiders: Number(fleet.maxRiders || 0),
     serviceZones,
-    serviceZoneNames: serviceZones.map((slug) => serviceZoneNames[slug]).filter(Boolean),
+    serviceZoneNames: zoneNames,
     isActive: fleet.isActive === true,
     createdAt: fleet.createdAt || null,
     updatedAt: fleet.updatedAt || null,
