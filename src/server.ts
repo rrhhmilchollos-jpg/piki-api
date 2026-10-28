@@ -2138,6 +2138,22 @@ app.delete("/api/v1/admin/restaurants/:id", requireOwner(), async (req, res) => 
   return res.json({ archived: true, restaurant });
 });
 
+app.patch("/api/v1/admin/restaurants/:id/profile", requireOwner(), async (req, res) => {
+  const idParam = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+  const id = objectId(idParam);
+  if (!id) return res.status(400).json({ error: "INVALID_RESTAURANT_ID" });
+  const parsed = z.object({ image: z.string().url().max(2000), tagline: z.string().trim().max(240).optional() }).safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "INVALID_RESTAURANT_PROFILE", details: parsed.error.flatten() });
+  const restaurant = await Restaurant.findOneAndUpdate(
+    { _id: id, onboardingStatus: "approved" },
+    { $set: { image: parsed.data.image, ...(parsed.data.tagline === undefined ? {} : { tagline: parsed.data.tagline }) } },
+    { new: true },
+  ).select("_id slug name image tagline onboardingStatus isActive").lean().exec() as any;
+  if (!restaurant) return res.status(404).json({ error: "APPROVED_RESTAURANT_NOT_FOUND" });
+  catalogCache.clear();
+  return res.json({ updated: true, restaurant });
+});
+
 app.patch("/api/v1/admin/restaurants/:id/demo-visibility", requireOwner(), async (req, res) => {
   const idParam = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
   const id = objectId(idParam);
