@@ -1993,6 +1993,13 @@ app.patch("/api/v1/partners/kitchen/orders/:id/status", requireRole("partner"), 
   }
   order.statusHistory.push({ status: target, actorRole: "partner", reason: "Actualización desde pantalla de cocina" } as any);
   await order.save();
+  // The payment/intake event may have been consumed while the order was still
+  // pending. A Partner transition needs a fresh outbox key so the Rider offer
+  // is created after the order becomes dispatchable.
+  if (["accepted", "preparing", "ready_for_pickup"].includes(target)) {
+    void enqueueOrderForDispatch(order._id as mongoose.Types.ObjectId, undefined, "partner_status")
+      .catch((error) => console.warn("Partner dispatch enqueue failed", error instanceof Error ? error.message : error));
+  }
   await publishOrderStatusEvents(order, target).catch((error) => console.warn("Realtime partner status event failed", error instanceof Error ? error.message : error));
   scheduleCustomerOrderPush(order, target);
   return res.json({ order });
@@ -3878,6 +3885,10 @@ app.post("/api/v1/orders/:id/transitions", requireRole("admin", "partner", "ride
   }
   if (["delivered", "cancelled"].includes(parsed.data.status)) await RiderOrderMessage.deleteMany({ orderId: order._id }).exec();
   scheduleCustomerOrderPush(updated, parsed.data.status);
+  if (actorRole === "partner" && ["accepted", "preparing", "ready_for_pickup"].includes(parsed.data.status)) {
+    void enqueueOrderForDispatch(id, undefined, "partner_status")
+      .catch((error) => console.warn("Partner dispatch enqueue failed", error instanceof Error ? error.message : error));
+  }
   if (["delivered", "cancelled"].includes(parsed.data.status) && order.riderId) {
     await releaseRiderOrderSlot(order._id, order.riderId);
   }
