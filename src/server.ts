@@ -71,8 +71,8 @@ import { startGoogleBusinessSyncWorker, stopGoogleBusinessSyncWorker, googleBusi
 export const app = express();
 app.set("trust proxy", 1);
 const port = Number(process.env.PORT || 3000);
-const PARTNER_PREPARATION_LIMIT_MINUTES = 30;
-const CUSTOMER_DELIVERY_TARGET_MINUTES = 90;
+const PARTNER_PREPARATION_LIMIT_MINUTES = 1000;
+const CUSTOMER_DELIVERY_TARGET_MINUTES = 3000;
 function configuredRiderPayoutCents() {
   if (String(process.env.PIKI_RIDER_COMPENSATION_MODE || "").trim().toLowerCase() === "founder_partner") return 0;
   const configured = Number(process.env.PIKI_RIDER_PAYOUT_CENTS ?? 350);
