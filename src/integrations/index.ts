@@ -4,6 +4,7 @@
  */
 export {
   createCheckoutSession,
+  createTipCheckoutSession,
   isStripeSignatureError,
   processStripeWebhook,
   stripeConfigured,

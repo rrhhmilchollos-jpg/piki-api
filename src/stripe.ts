@@ -1,7 +1,7 @@
 import Stripe from "stripe";
 import mongoose from "mongoose";
 import { Order, StripeEvent } from "./models.js";
-import { publishOrderIntakeEvents } from "./realtime.js";
+import { publishOrderIntakeEvents, publishRealtimeEvent } from "./realtime.js";
 import { dispatchCustomerOrderById } from "./customerCompat.js";
 import { dispatchInitialIdempotencyKey, enqueueDispatchOutbox } from "./dispatchOutbox.js";
 import {
@@ -64,6 +64,39 @@ export class StripeWebhookProcessingError extends Error {
     super(message, { cause });
     this.name = "StripeWebhookProcessingError";
   }
+}
+
+export async function createTipCheckoutSession(input: {
+  orderId: string;
+  publicCode: string;
+  customerId: string;
+  riderId: string;
+  tipCents: number;
+  origin: string;
+  customerEmail?: string | null;
+}) {
+  if (!stripe) throw new Error("STRIPE_SECRET_KEY no configurada");
+  if (!Number.isInteger(input.tipCents) || input.tipCents < 100 || input.tipCents > 5000) throw new Error("INVALID_TIP_AMOUNT");
+  const metadata = {
+    purpose: "rider_tip",
+    order_id: input.orderId,
+    order_code: input.publicCode,
+    customer_id: input.customerId,
+    rider_id: input.riderId,
+    tip_cents: String(input.tipCents),
+  };
+  return stripe.checkout.sessions.create({
+    mode: "payment",
+    line_items: [{ quantity: 1, price_data: { currency: "eur", product_data: { name: "Propina para tu Rider PIKI" }, unit_amount: input.tipCents } }],
+    locale: "es",
+    payment_method_types: ["card"],
+    customer_email: input.customerEmail || undefined,
+    client_reference_id: input.publicCode,
+    metadata,
+    payment_intent_data: { metadata },
+    success_url: `${input.origin}/?tip=success&order_id=${encodeURIComponent(input.publicCode)}`,
+    cancel_url: `${input.origin}/?tip=cancelled&order_id=${encodeURIComponent(input.publicCode)}`,
+  }, { idempotencyKey: `piki-rider-tip-${input.publicCode}-${input.tipCents}` });
 }
 
 export async function createCheckoutSession(input: {
@@ -246,7 +279,24 @@ export async function processStripeEvent(event: StripeEventLike, dependencies: S
   try {
     const transition = stripePaymentTransition(event.type);
     let activated = false;
-    if (orderCode && transition) {
+    const metadata = object.metadata || {};
+    if (metadata.purpose === "rider_tip" && orderCode && ["checkout.session.completed", "payment_intent.succeeded"].includes(event.type)) {
+      const tipCents = Number(metadata.tip_cents || 0);
+      if (!Number.isInteger(tipCents) || tipCents < 100 || tipCents > 5000) throw new StripeWebhookProcessingError("INVALID_TIP_METADATA");
+      const tipped = await Order.findOneAndUpdate(
+        { publicCode: orderCode, customerId: String(metadata.customer_id || ""), riderId: String(metadata.rider_id || ""), status: "delivered", tipCents: 0 },
+        { $set: { tipCents, tipGivenAt: new Date(), tipNotifiedAt: new Date() }, $inc: { version: 1 } },
+        { new: true },
+      ).lean().exec() as any;
+      if (tipped) {
+        const payload = { orderId: String(tipped._id), publicCode: tipped.publicCode, riderId: String(tipped.riderId), tipCents, message: `Has recibido una propina de ${(tipCents / 100).toLocaleString("es-ES", { minimumFractionDigits: 2 })} € del cliente.` };
+        await Promise.all([
+          publishRealtimeEvent({ channel: "rider", audienceKey: `rider:${String(tipped.riderId)}`, tenantId: tipped.tenantId || null, type: "order.tip_added", payload, dedupeKey: `tip:rider:${String(tipped._id)}:${tipCents}` }),
+          publishRealtimeEvent({ channel: "customer", audienceKey: `customer:${String(tipped.customerId)}`, tenantId: tipped.tenantId || null, type: "order.tip_added", payload: { ...payload, message: "Propina enviada a tu Rider. ¡Gracias por reconocer su trabajo!" }, dedupeKey: `tip:customer:${String(tipped._id)}:${tipCents}` }),
+        ]);
+      }
+      activated = true;
+    } else if (orderCode && transition) {
       const { order } = await dependencies.applyPaymentTransition({ orderCode, paymentState: transition.paymentState, eventType: event.type, object });
       if (shouldPublishOperationalIntake(order, transition)) {
         await dependencies.publishIntake(order);

@@ -23,7 +23,7 @@ import { getVersionPolicy, isPikiSurface, requiresUpdate, setVersionPolicy, sync
 import { publicPushConfig, revokePushSubscription, saveFcmSubscription, savePushSubscription } from "./push.js";
 import { publishOrderStatusEvents, publishOrderIntakeEvents, publishRiderOfferEvent, publishRiderHeadingToPartnerEvent, publishRiderArrivalEvent, publishRiderLocationEvents, publishRiderScheduleEvent, publishRiderCustomerMessageEvent, publishRealtimeEvent, serveRealtimeEvents, startRealtimeRelay, tenantAudienceKey } from "./realtime.js";
 import { listNotifications, markAllNotificationsRead, markNotificationRead, sendDocumentRequestEmail, sendDocumentUploadEmail, startNotificationWorker, stopNotificationWorker, type NotificationPrincipal } from "./notifications.js";
-import { captureStripePaymentIntent, createCheckoutSession, createPartnerStripeOnboardingLink } from "./stripe.js";
+import { captureStripePaymentIntent, createCheckoutSession, createPartnerStripeOnboardingLink, createTipCheckoutSession } from "./stripe.js";
 import { rankDispatchCandidates, evaluateDispatchVehicleEligibility, computeMobilityAdvice, calculateSanctionDecision, defaultSanctionPolicy } from "./algorithms/index.js";
 import { createSessionToken, generateTemporaryPassword, hashPassword, hashSessionToken, verifyPassword } from "./employeeAuth.js";
 import { EmployeePasswordReset } from "./passwordReset.js";
@@ -3419,6 +3419,23 @@ app.post("/api/v1/internal/customer-support/tickets/list", async (req, res) => {
   const tickets = await SupportTicket.find({ $or: [{ customerId }, { customerId: "", reporterEmail: customerEmail }] }).sort({ updatedAt: -1 }).limit(100).lean().exec();
   return res.json({ tickets });
 });
+const tipCheckoutSchema = z.object({ customerId: z.string().trim().min(1).max(160), origin: z.string().url().refine((value) => isAllowedCorsOrigin(value), "INVALID_CHECKOUT_ORIGIN"), tipCents: z.number().int().min(100).max(5000), customerEmail: z.string().email().nullable().optional() });
+app.post("/api/v1/internal/customer-orders/:publicCode/tip-checkout", async (req, res) => {
+  if (!requireCustomerSyncSecret(req, res)) return;
+  const parsed = tipCheckoutSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "INVALID_TIP_CHECKOUT", details: parsed.error.flatten() });
+  const order = await Order.findOne({ publicCode: String(req.params.publicCode), customerId: parsed.data.customerId }).lean().exec() as any;
+  if (!order) return res.status(404).json({ error: "CUSTOMER_ORDER_NOT_FOUND" });
+  if (order.status !== "delivered" || !order.riderId) return res.status(409).json({ error: "TIP_ONLY_AFTER_DELIVERY" });
+  if (Number(order.tipCents || 0) > 0) return res.status(409).json({ error: "TIP_ALREADY_GIVEN" });
+  try {
+    const session = await createTipCheckoutSession({ orderId: String(order._id), publicCode: order.publicCode, customerId: parsed.data.customerId, riderId: String(order.riderId), tipCents: parsed.data.tipCents, origin: parsed.data.origin, customerEmail: parsed.data.customerEmail });
+    return res.status(201).json({ checkoutUrl: session.url, sessionId: session.id, orderId: String(order._id), publicCode: order.publicCode });
+  } catch (error) {
+    console.error(JSON.stringify({ event: "tip_checkout_failed", orderId: String(order._id), errorType: error instanceof Error ? error.name : "UnknownError" }));
+    return res.status(503).json({ error: "STRIPE_TIP_CHECKOUT_UNAVAILABLE", message: "El pago de la propina no está disponible temporalmente." });
+  }
+});
 app.get("/api/v1/internal/customer-orders/:publicCode/tracking", async (req, res) => {
   if (!requireCustomerSyncSecret(req, res)) return;
   const order = await Order.findOne({ publicCode: String(req.params.publicCode) }).lean().exec() as any;
@@ -3430,7 +3447,7 @@ app.get("/api/v1/internal/customer-orders/:publicCode/tracking", async (req, res
   const coordinates = rider?.location?.coordinates;
   const updatedAt = rider?.lastLocationAt ? new Date(rider.lastLocationAt).getTime() : 0;
   const fresh = active && Array.isArray(coordinates) && coordinates.length >= 2 && updatedAt >= Date.now() - 120_000;
-  return res.json({ publicCode: order.publicCode, status: order.status, assignmentState: order.assignmentState, paymentMethod: order.paymentMethod, paymentState: order.paymentState, cashDueAtDelivery: order.paymentMethod === "cash" && order.paymentState !== "paid", riderId: rider?._id ? String(rider._id) : null, riderName: rider?.name || null, riderPhotoUrl: rider?.photoUrl || null, vehicle: rider?.vehicle || null, chatAvailable: active, locationAvailable: fresh, latitude: fresh ? Number(coordinates[1]) : null, longitude: fresh ? Number(coordinates[0]) : null, updatedAt: fresh ? updatedAt : null });
+  return res.json({ publicCode: order.publicCode, status: order.status, assignmentState: order.assignmentState, paymentMethod: order.paymentMethod, paymentState: order.paymentState, cashDueAtDelivery: order.paymentMethod === "cash" && order.paymentState !== "paid", tipCents: Number(order.tipCents || 0), tipGivenAt: order.tipGivenAt || null, riderId: rider?._id ? String(rider._id) : null, riderName: rider?.name || null, riderPhotoUrl: rider?.photoUrl || null, vehicle: rider?.vehicle || null, chatAvailable: active, locationAvailable: fresh, latitude: fresh ? Number(coordinates[1]) : null, longitude: fresh ? Number(coordinates[0]) : null, updatedAt: fresh ? updatedAt : null });
 });
 app.post("/api/v1/internal/customer-orders/:publicCode/messages", async (req, res) => {
   if (!requireCustomerSyncSecret(req, res)) return;
@@ -4980,7 +4997,7 @@ app.get("/api/v1/riders/:id/offers", requireRole("rider"), async (req, res) => {
   const rider = await riderAccessForRequest(riderId, req);
   if (!rider) return res.status(403).json({ error: "RIDER_ACCESS_DENIED" });
   const offers = await Order.find({ riderId, assignmentState: { $in: ["offered", "assigned"] }, status: { $nin: ["delivered", "cancelled"] } })
-.select("_id publicCode displayCode displayCodeDate restaurantId customerId customerName riderId status paymentState paymentMethod partnerPaymentRequired partnerPaymentCents subtotalCents deliveryFeeCents serviceFeeCents totalCents assignmentState assignmentExpiresAt pickupDeadlineAt riderHeadingToPartnerAt riderArrivedAt riderArrivalDistanceMeters partnerPrepDeadlineAt preparationMinutes deliveryAddress deliveryNote deliveryLocation items createdAt")
+.select("_id publicCode displayCode displayCodeDate restaurantId customerId customerName riderId status paymentState paymentMethod partnerPaymentRequired partnerPaymentCents subtotalCents deliveryFeeCents serviceFeeCents totalCents tipCents tipGivenAt assignmentState assignmentExpiresAt pickupDeadlineAt riderHeadingToPartnerAt riderArrivedAt riderArrivalDistanceMeters partnerPrepDeadlineAt preparationMinutes deliveryAddress deliveryNote deliveryLocation items createdAt")
     .sort({ createdAt: -1 }).limit(10).lean().exec() as any[];
   const riderProfile = await Rider.findById(riderId).select("vehicle").lean().exec() as any;
   const restaurantIds = offers.map((offer) => offer.restaurantId).filter(Boolean);
@@ -5018,6 +5035,7 @@ app.get("/api/v1/riders/:id/offers", requireRole("rider"), async (req, res) => {
       deliveryFeeCents: Number(offer.deliveryFeeCents || 0),
       serviceFeeCents: Number(offer.serviceFeeCents || 0),
       totalCents: Number(offer.totalCents || 0),
+      tipCents: Number(offer.tipCents || 0) > 0 ? Number(offer.tipCents) : 0,
       assignmentState: offer.assignmentState,
       assignmentExpiresAt: offer.assignmentExpiresAt,
       pickupDeadlineAt: offer.pickupDeadlineAt,
