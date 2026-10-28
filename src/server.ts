@@ -5576,6 +5576,7 @@ async function ensureMrRoosterOperational() {
     locality: "Xàtiva",
     address: "Avinguda d'Abu Masaifa, 16, 2 bajo, 46800 Xàtiva, Valencia",
     location: { type: "Point", coordinates: [-0.5291041, 38.9887485] },
+    tagline: "Kebabs, hamburguesas y menús preparados al momento.",
     availabilityStatus: "available",
     upcomingMessage: "",
     onboardingStatus: "approved",
