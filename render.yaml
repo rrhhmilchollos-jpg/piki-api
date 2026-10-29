@@ -3,7 +3,7 @@ services:
     name: piki-api
     runtime: docker
     region: frankfurt
-    plan: starter
+    plan: free
     dockerfilePath: ./Dockerfile
     healthCheckPath: /health
     autoDeploy: true
@@ -42,26 +42,7 @@ services:
         value: founder_partner
       - key: PIKI_RIDER_PAYOUT_CENTS
         value: "0"
-
-
-  - type: worker
-    name: piki-dispatch-worker
-    runtime: docker
-    region: frankfurt
-    plan: starter
-    dockerfilePath: ./Dockerfile
-    dockerCommand: node dist/dispatch-worker.js
-    autoDeploy: true
-    envVars:
-      - key: NODE_ENV
-        value: production
-      - key: MONGODB_URI
-        sync: false
-      - key: MONGODB_DB
-        value: piki
-      - key: PIKI_DISPATCH_WORKER_ID
-        value: render-dispatch-worker
-      - key: PIKI_DISPATCH_WORKER_POLL_MS
+      - key: PIKI_INLINE_DISPATCH_WORKER
+        value: "true"
+      - key: PIKI_INLINE_DISPATCH_POLL_MS
         value: "1000"
-      - key: PIKI_DISPATCH_WORKER_BATCH_SIZE
-        value: "25"
