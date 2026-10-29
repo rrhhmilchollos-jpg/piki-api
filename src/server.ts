@@ -5318,7 +5318,7 @@ app.get("/api/v1/fleets", requireRole("admin", "fleet"), async (req, res) => {
   return res.json({ fleets: fleets.map((fleet) => fleetPublicView(fleet, serviceZoneNames)) });
 });
 
-const fleetInputSchema = z.object({ name: z.string().trim().min(2).max(120), localityCode: z.string().regex(/^\d{5}$/).optional(), localityName: z.string().trim().min(2).max(120).optional(), provinceCode: z.string().regex(/^\d{2}$/).optional(), provinceName: z.string().trim().min(2).max(120).optional(), managerName: z.string().trim().min(2).max(120).optional().default(""), managerDni: z.string().trim().min(5).max(20).optional().default(""), contactEmail: z.string().trim().email().or(z.literal("")), contactPhone: z.string().trim().min(6).max(40), address: z.string().trim().min(5).max(240), postalCode: z.string().trim().min(3).max(12), city: z.string().trim().min(2).max(120), vehicleTypes: z.array(z.enum(["bike", "electric_bike", "electric_scooter", "motorcycle", "scooter", "car"])).min(1).max(6), maxRiders: z.coerce.number().int().min(1).max(10000), serviceZones: z.array(z.string().regex(/^[a-z0-9-]+$/)).min(1).max(300), notes: z.string().trim().max(2000).default("") });
+const fleetInputSchema = z.object({ name: z.string().trim().min(2).max(120), localityCode: z.string().regex(/^\d{5}$/).optional(), localityName: z.string().trim().min(2).max(120).optional(), provinceCode: z.string().regex(/^\d{2}$/).optional(), provinceName: z.string().trim().min(2).max(120).optional(), managerName: z.string().trim().min(2).max(120).optional().default(""), managerDni: z.string().trim().min(5).max(20).optional().default(""), managerEmail: z.string().trim().email().or(z.literal("")).optional().default(""), contactEmail: z.string().trim().email().or(z.literal("")), contactPhone: z.string().trim().min(6).max(40), address: z.string().trim().min(5).max(240), postalCode: z.string().trim().min(3).max(12), city: z.string().trim().min(2).max(120), vehicleTypes: z.array(z.enum(["bike", "electric_bike", "electric_scooter", "motorcycle", "scooter", "car"])).min(1).max(6), maxRiders: z.coerce.number().int().min(1).max(10000), serviceZones: z.array(z.string().regex(/^[a-z0-9-]+$/)).min(1).max(300), notes: z.string().trim().max(2000).default("") }).superRefine((value, context) => { if (value.managerName && !value.managerEmail) context.addIssue({ code: z.ZodIssueCode.custom, path: ["managerEmail"], message: "El Fleet Manager necesita un email de acceso." }); });
 app.post("/api/v1/fleets", requireRole("admin", "fleet"), async (req, res) => {
   const parsed = fleetInputSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_FLEET", details: parsed.error.flatten() });
@@ -5331,12 +5331,41 @@ app.post("/api/v1/fleets", requireRole("admin", "fleet"), async (req, res) => {
   if (hasTerritorialSelection && !selection) return res.status(400).json({ error: "INVALID_FLEET_LOCALITY", message: "La localidad territorial debe coincidir con una zona de cobertura activa." });
   const duplicate = await Fleet.exists({ ...tenantScope(req), name: parsed.data.name });
   if (duplicate) return res.status(409).json({ error: "FLEET_NAME_ALREADY_EXISTS", message: "Ya existe una Fleet con ese nombre operativo." });
+  const managerEmail = parsed.data.managerEmail || parsed.data.contactEmail;
+  let createdFleet: any = null;
+  let createdManager: any = null;
   try {
-    const fleet = await Fleet.create({ ...parsed.data, ...tenantScope(req), city: selection?.localityName || parsed.data.city, ...(selection ? { localityCode: selection.localityCode, localityName: selection.localityName, provinceCode: selection.provinceCode, provinceName: selection.provinceName } : { localityName: parsed.data.localityName || "", provinceName: parsed.data.provinceName || "" }), managerDni: parsed.data.managerDni ? parsed.data.managerDni.toUpperCase() : "", createdBy: req.auth?.employeeId ? objectId(req.auth.employeeId) : null, createdByRole: req.auth?.role || null });
+    const fleet = await Fleet.create({ ...parsed.data, managerEmail: undefined, ...tenantScope(req), city: selection?.localityName || parsed.data.city, ...(selection ? { localityCode: selection.localityCode, localityName: selection.localityName, provinceCode: selection.provinceCode, provinceName: selection.provinceName } : { localityName: parsed.data.localityName || "", provinceName: parsed.data.provinceName || "" }), contactEmail: parsed.data.managerEmail || parsed.data.contactEmail, managerDni: parsed.data.managerDni ? parsed.data.managerDni.toUpperCase() : "", createdBy: req.auth?.employeeId ? objectId(req.auth.employeeId) : null, createdByRole: req.auth?.role || null });
+    createdFleet = fleet;
+    if (parsed.data.managerName && managerEmail) {
+      const existing = await EmployeeAccount.findOne({ email: managerEmail.toLowerCase() }).select("_id fleetId").lean().exec() as any;
+      if (existing) {
+        if (existing.fleetId && String(existing.fleetId) !== String(fleet._id)) {
+          await Fleet.deleteOne({ _id: fleet._id }).exec();
+          createdFleet = null;
+          return res.status(409).json({ error: "EMPLOYEE_EMAIL_ALREADY_EXISTS", message: "El email del Fleet Manager ya pertenece a otra Fleet." });
+        }
+        createdManager = await EmployeeAccount.findOneAndUpdate({ _id: existing._id, fleetId: null }, { $set: { fleetId: fleet._id, jobRole: "fleet", apiRole: "fleet", roles: ["fleet"], primaryRole: "fleet", name: parsed.data.managerName, active: true, authorizationStatus: "approved" } }, { new: true }).lean().exec();
+      } else {
+        const employeeId = new mongoose.Types.ObjectId();
+        const temporaryPassword = generateTemporaryPassword();
+        const employee = await EmployeeAccount.create({ _id: employeeId, employeeCode: employeeCodeFor(employeeId), tenantId: (fleet as any).tenantId || null, name: parsed.data.managerName, email: managerEmail.toLowerCase(), jobRole: "fleet", apiRole: "fleet", roles: ["fleet"], primaryRole: "fleet", accessLevel: "subadmin", authorizationStatus: "approved", authorizedAt: new Date(), authorizedBy: req.auth?.employeeId ? objectId(req.auth.employeeId) : null, fleetId: fleet._id, zoneSlugs: parsed.data.serviceZones, passwordHash: hashPassword(temporaryPassword), mustChangePassword: true, active: true });
+        createdManager = employee;
+        await AccessAuthorization.create({ employeeId: employee._id, action: "created", previousStatus: null, nextStatus: "approved", previousRole: null, nextRole: "fleet", accessLevel: "subadmin", actorEmployeeId: objectId(req.auth!.employeeId!), reason: "Fleet Manager creado junto con la Fleet." });
+        const surface = preferredCredentialSurface(employee);
+        if (surface) await sendEmployeePasswordLink(employee, surface, "activation");
+      }
+      await Fleet.updateOne({ _id: fleet._id }, { $set: { managerEmployeeId: createdManager?._id || createdManager?.id || null } }).exec();
+    } else if (req.auth?.role === "fleet" && req.auth.employeeId) {
+      createdManager = await EmployeeAccount.findById(req.auth.employeeId).select("_id").lean().exec();
+      await Fleet.updateOne({ _id: fleet._id }, { $set: { managerEmployeeId: req.auth.employeeId } }).exec();
+    }
     if (req.auth?.role === "fleet" && req.auth.employeeId) await EmployeeAccount.updateOne({ _id: req.auth.employeeId, fleetId: null }, { $set: { fleetId: fleet._id } }).exec();
     const zones = await Zone.find({ ...tenantScope(req), isActive: true, slug: { $in: parsed.data.serviceZones } }).select("slug name").lean().exec() as any[];
-    return res.status(201).json({ created: true, fleet: fleetPublicView(fleet.toObject(), Object.fromEntries(zones.map((zone) => [zone.slug, zone.name]))) });
+    const currentFleet = await Fleet.findById(fleet._id).lean().exec();
+    return res.status(201).json({ created: true, fleet: fleetPublicView(currentFleet || fleet.toObject(), Object.fromEntries(zones.map((zone) => [zone.slug, zone.name]))), manager: createdManager ? { id: String(createdManager._id || createdManager.id), email: createdManager.email || managerEmail, name: createdManager.name || parsed.data.managerName, role: "fleet", fleetId: String(fleet._id), activationRequired: true } : null });
   } catch (error) {
+    if (createdFleet?._id && !createdManager?._id) await Fleet.deleteOne({ _id: createdFleet._id }).exec().catch(() => undefined);
     if ((error as any)?.code === 11000) return res.status(409).json({ error: "FLEET_NAME_ALREADY_EXISTS", message: "Ya existe una Fleet con ese nombre operativo." });
     throw error;
   }
