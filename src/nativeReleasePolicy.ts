@@ -1,9 +1,6 @@
 import { versionPolicySchema, type VersionPolicy } from "./appVersion.js";
 
-/** Legacy Capacitor gates compare web hashes even when forceUpdate is false.
- * Echo a validated installed identity ONLY in the native policy response.
- * Authentication and authorization are unchanged; this is not an access grant.
- */
+/** Native clients keep the server-authoritative compatibility policy. */
 export function nativeReleasePolicy(policy: VersionPolicy, clientVersion?: string, clientBuildId?: string): VersionPolicy {
   const installed = versionPolicySchema.safeParse({
     version: clientVersion,
@@ -11,5 +8,6 @@ export function nativeReleasePolicy(policy: VersionPolicy, clientVersion?: strin
     buildId: clientBuildId,
     forceUpdate: false,
   });
-  return installed.success ? installed.data : { ...policy, minimumVersion: "0.0.0", forceUpdate: false };
+  if (!installed.success) return policy;
+  return { ...policy, buildId: installed.data.buildId };
 }

@@ -637,7 +637,7 @@ app.use("/api/v1", async (req, res, next) => {
   const surface = requestedSurface(req);
   const clientVersion = req.header("x-piki-client-version") || undefined;
   const clientBuildId = req.header("x-piki-client-build") || undefined;
-  if (surface && clientVersion && !isNativeCustomerContainer(req, surface)) {
+  if (surface && clientVersion) {
     const policy = await syncVersionPolicy(surface);
     if (requiresUpdate(policy, clientVersion, clientBuildId, surface)) {
       res.setHeader("Cache-Control", "no-store, max-age=0");
