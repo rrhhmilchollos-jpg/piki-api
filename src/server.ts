@@ -73,7 +73,7 @@ import { startGoogleBusinessSyncWorker, stopGoogleBusinessSyncWorker, googleBusi
 export const app = express();
 app.set("trust proxy", 1);
 const port = Number(process.env.PORT || 3000);
-const PARTNER_PREPARATION_LIMIT_MINUTES = 1000;
+const PARTNER_PREPARATION_LIMIT_MINUTES = 45;
 const CUSTOMER_DELIVERY_TARGET_MINUTES = 3000;
 function configuredRiderPayoutCents() {
   if (String(process.env.PIKI_RIDER_COMPENSATION_MODE || "").trim().toLowerCase() === "founder_partner") return 0;
@@ -2081,7 +2081,7 @@ app.get("/api/v1/partners/kitchen/orders/archive", requireRole("partner"), async
 });
 
 app.patch("/api/v1/partners/kitchen/orders/:id/status", requireRole("partner"), async (req, res) => {
-  const parsed = z.object({ status: z.enum(["accepted", "preparing", "ready_for_pickup", "cancelled"]), preparationMinutes: z.number().int().min(4).max(10).optional() }).safeParse(req.body);
+  const parsed = z.object({ status: z.enum(["accepted", "preparing", "ready_for_pickup", "cancelled"]), preparationMinutes: z.number().int().min(15).max(45).optional() }).safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_KITCHEN_STATUS" });
   const permission: PartnerPermission = parsed.data.status === "cancelled" ? "orders:cancel" : parsed.data.status === "accepted" ? "orders:write" : "orders:prepare";
   const { access, allowed: permissionGranted } = await partnerRequestAccess(req, permission);
@@ -2094,13 +2094,16 @@ app.patch("/api/v1/partners/kitchen/orders/:id/status", requireRole("partner"), 
   if (!order) return res.status(404).json({ error: "ORDER_NOT_FOUND" });
   const current = order.status as any;
   const target = parsed.data.status;
-  const allowedTransitions: Record<string, string[]> = { pending: ["accepted", "cancelled"], accepted: ["preparing", "cancelled"], preparing: ["ready_for_pickup", "cancelled"] };
+  const allowedTransitions: Record<string, string[]> = { pending: ["accepted", "cancelled"], accepted: ["preparing", "ready_for_pickup", "cancelled"], preparing: ["ready_for_pickup", "cancelled"] };
   if (!allowedTransitions[current]?.includes(target)) return res.status(409).json({ error: "INVALID_ORDER_TRANSITION", from: current, to: target });
   if (target === "accepted" && !( ["authorized", "paid"] as string[]).includes(order.paymentState) && order.paymentMethod !== "cash") return res.status(409).json({ error: "PAYMENT_NOT_CONFIRMED" });
   order.status = target as any;
-  if (target === "accepted") order.partnerPrepDeadlineAt = new Date(Date.now() + PARTNER_PREPARATION_LIMIT_MINUTES * 60_000);
+  if (target === "accepted") {
+    order.preparationMinutes = parsed.data.preparationMinutes ?? 20;
+    order.partnerPrepDeadlineAt = new Date(Date.now() + order.preparationMinutes * 60_000);
+  }
   if (target === "preparing") {
-    order.preparationMinutes = parsed.data.preparationMinutes ?? 4;
+    order.preparationMinutes = parsed.data.preparationMinutes ?? order.preparationMinutes ?? 20;
     order.partnerPrepDeadlineAt = new Date(Date.now() + order.preparationMinutes * 60_000);
   }
   if (target === "ready_for_pickup") {
@@ -5213,7 +5216,7 @@ app.get("/api/v1/riders/:id/offers", requireRole("rider"), async (req, res) => {
       riderArrivedAt: offer.riderArrivedAt || null,
       riderArrivalDistanceMeters: offer.riderArrivalDistanceMeters ?? null,
       partnerPrepDeadlineAt: offer.partnerPrepDeadlineAt || null,
-      preparationMinutes: offer.status === "ready_for_pickup" ? 0 : offer.preparationMinutes ?? (offer.partnerPrepDeadlineAt ? Math.max(4, Math.min(10, Math.ceil((new Date(offer.partnerPrepDeadlineAt).getTime() - now) / 60000))) : 4),
+      preparationMinutes: offer.status === "ready_for_pickup" ? 0 : offer.preparationMinutes ?? (offer.partnerPrepDeadlineAt ? Math.max(15, Math.min(45, Math.ceil((new Date(offer.partnerPrepDeadlineAt).getTime() - now) / 60000))) : 20),
       items: (offer.items || []).map((item: any) => ({
         name: item.name || "Producto",
         quantity: Number(item.quantity || 1),
