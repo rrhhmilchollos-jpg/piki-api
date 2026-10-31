@@ -20,6 +20,14 @@ test("dispatch chooses the closest eligible rider to the restaurant before tie-b
   assert.ok((ranked[0]?.pickupDistanceKm ?? Infinity) < (ranked[1]?.pickupDistanceKm ?? -Infinity));
 });
 
+test("ETA counts simultaneous pickup travel and preparation only once", () => {
+  const now = new Date("2026-10-06T00:00:00.000Z");
+  const ranked = rankDispatchCandidates([
+    { id: "rider", status: "available", vehicle: "motorcycle", location: { coordinates: [-0.375, 39.47] }, lastLocationAt: now },
+  ], { restaurantLocation: [-0.375, 39.47], customerLocation: [-0.36, 39.47], preparationMinutes: 15, routeDistanceKm: 1, routeDurationMinutes: 10, now, maxCustomerEtaMinutes: 26 });
+  assert.equal(ranked[0]?.totalEtaMinutes, 25);
+});
+
 test("dispatch allows a busy rider to receive a second order only when capacity is two", () => {
   const now = new Date("2026-10-06T00:00:00.000Z");
   const rider = { id: "rider-1", status: "busy" as const, vehicle: "bike" as const, location: { coordinates: [-0.38, 39.47] }, lastLocationAt: now, activeOrderCount: 1 };

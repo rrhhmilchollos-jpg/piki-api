@@ -1,6 +1,7 @@
 import { nativeReleasePolicy } from "./nativeReleasePolicy.js";
 import { registerEmployeeDeletionRoutes } from "./employeeDeletion.js";
 import { dispatchVehicleInputForOrder } from "./dispatchVehiclePolicy.js";
+import { reserveRiderOrderSlot } from "./dispatchReservation.js";
 import { VEHICLE_CATALOG_VERSION, VEHICLE_TYPES, incompatibleVehicles, uniqueVehicles, vehicleTypeSchema, type VehicleType } from "./vehicleCatalog.js";
 import { registerTerritoryRoutes } from "./coverage/territoryRoutes.js";
 import { operationalZoneInputSchema } from "./coverage/zoneInput.js";
@@ -14,7 +15,7 @@ import cors from "cors";
 import express from "express";
 import mongoose from "mongoose";
 import { z } from "zod";
-import { CashLedgerEntry, CustomerAccount, DispatchDecision, DocumentRequest, EmployeeAccount, AccessAuthorization, Fleet, Order, Restaurant, PartnerAsset, PartnerLocalityGroup, MenuImportDraft, Rider, RiderApplication, PartnerLead, RiderLead, RiderIncident, RiderOrderMessage, RiderSlot, SignatureRequest, Zone, PushSubscription, RealtimeEvent, Notification, Tenant, TenantMembership, RiderAssignmentReservation, SupportTicket, OnboardingRequest, TrackingSession, RiderPayoutBatch, PartnerPayoutBatch, GovernanceAuditEvent, LocationSample, ensureIndexes } from "./models.js";
+import { CashLedgerEntry, CustomerAccount, DispatchDecision, DispatchOutbox, DocumentRequest, EmployeeAccount, AccessAuthorization, Fleet, Order, Restaurant, PartnerAsset, PartnerLocalityGroup, MenuImportDraft, Rider, RiderApplication, PartnerLead, RiderLead, RiderIncident, RiderOrderMessage, RiderSlot, SignatureRequest, Zone, PushSubscription, RealtimeEvent, Notification, Tenant, TenantMembership, RiderAssignmentReservation, SupportTicket, OnboardingRequest, TrackingSession, RiderPayoutBatch, PartnerPayoutBatch, GovernanceAuditEvent, LocationSample, ensureIndexes } from "./models.js";
 import { RiderShiftIncentiveMetric } from "./riderIncentivesModels.js";
 import { normalizeLeadEmail, partnerLeadSubmissionSchema, riderLeadSubmissionSchema, webLeadReviewSchema, webLeadStatusSchema } from "./webLeads.js";
 import { assertTransition, calculateEtaRange, transitionSchema, validateCoordinates } from "./algorithms/index.js";
@@ -56,7 +57,7 @@ import { publishCatalogUpdate, serveCatalogEvents, startCatalogRelay } from "./c
 import { purgeTestDataIfEnabled } from "./purgeTestData.js";
 import { validateDocumentRequestSubmission } from "./onboardingDocumentPolicy.js";
 import { PIKI_PRL_COURSE_SLUG, RiderTrainingAssignment, RiderTrainingCourse, RiderTrainingResponse, ensurePikiPrlCourse, publicTrainingQuestions, scoreTrainingAnswers, trainingToken, trainingTokenHash } from "./riderTraining.js";
-import { dispatchInitialIdempotencyKey, dispatchRequeueIdempotencyKey, enqueueDispatchOutbox, processDispatchOutboxBatch, type DispatchOutboxEvent } from "./dispatchOutbox.js";
+import { deadLetterDispatchError, dispatchInitialIdempotencyKey, dispatchRecoveryIdempotencyKey, dispatchRequeueIdempotencyKey, enqueueDispatchOutbox, isRetryableDispatchState, processDispatchOutboxBatch, type DispatchOutboxEvent } from "./dispatchOutbox.js";
 import { buildFleetEntityScope, buildFleetRiderPickerScope, buildTenantScope } from "./tenantScope.js";
 import { parseRiderListPagination } from "./riderListPagination.js";
 import { authenticationOptions, registrationOptions, verifyAuthentication, verifyRegistration } from "./passkeys.js";
@@ -547,21 +548,6 @@ async function offeredRiderVehicleEligibility(order: any) {
   return { rider, eligibility: evaluateDispatchVehicleEligibility(rider?.vehicle, dispatchVehicleInputForOrder(order)) };
 }
 
-const MAX_RIDER_ACTIVE_ORDERS = 2;
-async function reserveRiderOrderSlot(riderId: mongoose.Types.ObjectId, orderId: mongoose.Types.ObjectId, tenantFilter: Record<string, unknown>, maxOrders = 1, riderFilter = tenantFilter) {
-  const reserved = await RiderAssignmentReservation.countDocuments({ ...tenantFilter, riderId, status: "reserved" });
-  if (reserved >= Math.min(MAX_RIDER_ACTIVE_ORDERS, maxOrders)) return null;
-  const slot = reserved + 1;
-  try {
-    const reservation = await RiderAssignmentReservation.create({ ...tenantFilter, riderId, orderId, slot, mode: reserved ? "saturated" : "normal", status: "reserved", expiresAt: null });
-    const rider = await Rider.findOneAndUpdate({ ...riderFilter, _id: riderId, status: { $in: ["available", "busy"] }, ...(reserved === 0 ? { activeOrderId: null } : {}) }, { $set: { status: "busy", ...(reserved === 0 ? { activeOrderId: orderId } : {}) } }, { new: true }).lean().exec() as any;
-    if (!rider) { await RiderAssignmentReservation.updateOne({ _id: reservation._id }, { $set: { status: "released" } }).exec(); return null; }
-    return { rider, reservation };
-  } catch (error: any) {
-    if (error?.code === 11000) return null;
-    throw error;
-  }
-}
 async function releaseRiderOrderSlot(orderId: mongoose.Types.ObjectId, riderId: mongoose.Types.ObjectId) {
   await RiderAssignmentReservation.updateOne({ orderId, riderId, status: "reserved" }, { $set: { status: "released" } }).exec();
   const remaining = await RiderAssignmentReservation.countDocuments({ riderId, status: "reserved" });
@@ -4858,7 +4844,7 @@ async function assignOrderAutomatically(orderId: mongoose.Types.ObjectId, prefer
     if (!isDispatchablePayment(order.paymentState, order.paymentMethod, Number(order.totalCents)) || !isDispatchableOrderStatus(order.status)) return { state: "not_dispatchable" as const };
     if (order.riderId || order.assignmentState === "assigned" || order.assignmentState === "offered") return { state: "already_assigned" as const, riderId: order.riderId };
     const restaurant = await Restaurant.findOne({ _id: order.restaurantId, ...tenantFilter }).lean().exec() as any;
-    if (!restaurant?.location?.coordinates || !order.deliveryLocation?.coordinates) return { state: "missing_geolocation" as const };
+    if (!validOperationalCoordinates(restaurant?.location?.coordinates) || !validOperationalCoordinates(order.deliveryLocation?.coordinates)) return { state: "missing_geolocation" as const };
     const policy = await dispatchLoadPolicy();
     const freshness = new Date(Date.now() - 90_000);
     const currentRiderIds = await currentSlotRiderIds(tenantFilter);
@@ -4869,7 +4855,10 @@ async function assignOrderAutomatically(orderId: mongoose.Types.ObjectId, prefer
       _id: { $in: currentRiderIds },
       status: { $in: ["available", "busy"] },
       lastLocationAt: { $gte: freshness },
-      location: { $exists: true },
+      // MongoDB's 2dsphere index sorts by distance before the 100-row limit.
+      // The previous unrestricted query could exclude the nearest rider and
+      // offer a job to someone outside the configured pickup radius.
+      location: nearRestaurant(restaurant.location),
     };
     if (preferredRiderId) riderFilter._id = { $in: currentRiderIds.filter((id) => String(id) === String(preferredRiderId)) };
     const riders = await Rider.find(riderFilter).limit(100).lean().exec() as any[];
@@ -5031,23 +5020,36 @@ async function expireStaleOffers() {
   return 0;
 }
 
+let dispatchRecoveryCursor: mongoose.Types.ObjectId | null = null;
 async function runAutomaticDispatchSweep() {
   if (!databaseReady || mongoose.connection.readyState !== 1) { automaticDispatchSweepStats.skippedDatabase += 1; return; }
   const startedAt = Date.now();
   automaticDispatchSweepStats.lastStartedAt = new Date(startedAt).toISOString();
   try {
     const [reassigned, expiredOffers, archivedTerminalOrders] = await Promise.all([reassignLatePickupOrders(), expireStaleOffers(), archivePreviousDayPartnerOrders()]);
-    const candidates = await Order.find({ riderId: null, assignmentState: { $in: ["unassigned", "expired", "rejected"] }, ...dispatchablePaymentFilter, status: { $in: [...dispatchableOrderStatuses] } }).select("_id").sort({ createdAt: 1 }).limit(25).lean().exec();
-    for (const order of candidates) void enqueueOrderForDispatch(order._id as mongoose.Types.ObjectId).catch((error) => console.error("Dispatch outbox enqueue failed", error));
+    // Page through all eligible orders rather than repeatedly looking at the
+    // same first 25. Each version has a stable recovery key, so an exhausted
+    // event cannot create an unbounded stream of replacement events.
+    const candidates = await Order.find({ ...(dispatchRecoveryCursor ? { _id: { $gt: dispatchRecoveryCursor } } : {}), riderId: null, assignmentState: { $in: ["unassigned", "expired", "rejected"] }, ...dispatchablePaymentFilter, status: { $in: [...dispatchableOrderStatuses] } }).select("_id tenantId version isTestOrder qaRiderId").sort({ _id: 1 }).limit(25).lean().exec() as any[];
+    dispatchRecoveryCursor = candidates.length ? candidates[candidates.length - 1]._id : null;
+    let queued = 0;
+    for (const order of candidates) {
+      // Isolated QA orders must never leak into the commercial rider pool.
+      if (order.isTestOrder && !order.qaRiderId) continue;
+      if (await DispatchOutbox.exists({ orderId: order._id, status: { $in: ["pending", "retry", "processing"] } })) continue;
+      await enqueueDispatchOutbox({ orderId: order._id, tenantId: order.tenantId || null, idempotencyKey: dispatchRecoveryIdempotencyKey(order._id, Number(order.version || 0)), preferredRiderId: order.isTestOrder ? order.qaRiderId : undefined, reason: "unassigned_order_recovery" });
+      queued += 1;
+    }
     automaticDispatchSweepStats.runs += 1;
     automaticDispatchSweepStats.reassigned += reassigned;
     automaticDispatchSweepStats.expiredOffers += expiredOffers;
-    automaticDispatchSweepStats.queued += candidates.length;
+    automaticDispatchSweepStats.queued += queued;
     automaticDispatchSweepStats.archivedTerminalOrders += archivedTerminalOrders;
     automaticDispatchSweepStats.lastCompletedAt = new Date().toISOString();
     automaticDispatchSweepStats.lastDurationMs = Date.now() - startedAt;
     automaticDispatchSweepStats.lastError = null;
     if (automaticDispatchSweepStats.runs % 12 === 0) console.log(JSON.stringify({ event: "automatic_dispatch_sweep", intervalSeconds: 5, ...automaticDispatchSweepStats }));
+    return { reassigned, expiredOffers, archivedTerminalOrders, queued };
   } catch (error) {
     automaticDispatchSweepStats.errors += 1;
     automaticDispatchSweepStats.lastError = error instanceof Error ? error.message : String(error);
@@ -5056,11 +5058,9 @@ async function runAutomaticDispatchSweep() {
     throw error;
   }
 }
-/** Called exclusively by the explicit dispatch worker process. */
+/** Called periodically by the dedicated worker and the API fallback. */
 export async function runDispatchMaintenance() {
-  if (mongoose.connection.readyState !== 1) return { reassigned: 0, expiredOffers: 0, archivedTerminalOrders: 0 };
-  const [reassigned, expiredOffers, archivedTerminalOrders] = await Promise.all([reassignLatePickupOrders(), expireStaleOffers(), archivePreviousDayPartnerOrders()]);
-  return { reassigned, expiredOffers, archivedTerminalOrders };
+  return runAutomaticDispatchSweep();
 }
 async function findDispatchOrder(orderId: mongoose.Types.ObjectId, req: express.Request) {
   const scoped = await Order.findOne({ _id: orderId, ...tenantScope(req) }).lean().exec() as any;
@@ -5912,20 +5912,30 @@ async function start() {
   // procesos compiten de forma segura por cada evento y nunca duplican ofertas.
   if (process.env.PIKI_NO_LISTEN !== "true" && process.env.PIKI_INLINE_DISPATCH_WORKER !== "false") {
     const inlineWorkerId = `api-dispatch-${process.pid}-${randomUUID()}`;
+    let inlinePolling = false;
+    let nextMaintenanceAt = 0;
     const pollInlineDispatch = async () => {
-      if (!databaseReady || mongoose.connection.readyState !== 1) return;
+      if (inlinePolling || !databaseReady || mongoose.connection.readyState !== 1) return;
+      inlinePolling = true;
       try {
+        if (Date.now() >= nextMaintenanceAt) {
+          nextMaintenanceAt = Date.now() + 5_000;
+          try { await runDispatchMaintenance(); }
+          catch (error) { console.error(JSON.stringify({ event: "inline_dispatch_maintenance_error", error: error instanceof Error ? error.message : String(error) })); }
+        }
         const result = await processDispatchOutboxBatch(inlineWorkerId, async (event: DispatchOutboxEvent) => {
           const preferredRiderId = event.payload?.preferredRiderId;
           const outcome = await queueAutomaticDispatch(new mongoose.Types.ObjectId(String(event.orderId)), preferredRiderId && mongoose.isValidObjectId(preferredRiderId) ? new mongoose.Types.ObjectId(preferredRiderId) : undefined);
-          if (["no_eligible_rider", "reservation_race", "database_unavailable", "in_progress"].includes(String(outcome.state))) throw new Error(`DISPATCH_${String(outcome.state).toUpperCase()}`);
+          if (isRetryableDispatchState(outcome.state)) throw new Error(`DISPATCH_${String(outcome.state).toUpperCase()}`);
         }, {
           batchSize: 10,
-          deadLetterOnExhaustion: (_event, error) => !String(error instanceof Error ? error.message : error).includes("DISPATCH_NO_ELIGIBLE_RIDER"),
+          deadLetterOnExhaustion: (_event, error) => deadLetterDispatchError(error),
         });
         if (result.processed || result.deadLettered) console.log(JSON.stringify({ event: "inline_dispatch_outbox_batch", workerId: inlineWorkerId, ...result, ...(result.deadLettered ? { deadLetters: result.deadLetters } : {}) }));
       } catch (error) {
         console.error(JSON.stringify({ event: "inline_dispatch_worker_error", workerId: inlineWorkerId, error: error instanceof Error ? error.message : String(error) }));
+      } finally {
+        inlinePolling = false;
       }
     };
     setInterval(() => { void pollInlineDispatch(); }, Math.max(500, Number(process.env.PIKI_INLINE_DISPATCH_POLL_MS || 1_000))).unref();

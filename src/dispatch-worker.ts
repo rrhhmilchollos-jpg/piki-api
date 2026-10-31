@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { createServer, type Server } from "node:http";
 import mongoose from "mongoose";
 import { ensureIndexes } from "./models.js";
-import { processDispatchOutboxBatch, type DispatchOutboxEvent } from "./dispatchOutbox.js";
+import { deadLetterDispatchError, isRetryableDispatchState, processDispatchOutboxBatch, type DispatchOutboxEvent } from "./dispatchOutbox.js";
 
 const databaseName = process.env.MONGODB_DB || "piki";
 const pollMs = Math.max(250, Number(process.env.PIKI_DISPATCH_WORKER_POLL_MS || 1_000));
@@ -58,10 +58,6 @@ function startHealthServer() {
   healthServer.listen(port, host, () => console.log(JSON.stringify({ event: "dispatch_worker_health_listening", host, port })));
 }
 
-function retryableDispatchState(state: unknown) {
-  return ["no_eligible_rider", "reservation_race", "database_unavailable", "in_progress"].includes(String(state));
-}
-
 async function start() {
   const uri = process.env.MONGODB_URI;
   if (!uri) throw new Error("MONGODB_URI is required for the dispatch worker");
@@ -77,22 +73,26 @@ async function start() {
   const handle = async (event: DispatchOutboxEvent) => {
     const preferredRiderId = event.payload?.preferredRiderId;
     const result = await dispatch.queueAutomaticDispatch(new mongoose.Types.ObjectId(String(event.orderId)), preferredRiderId && mongoose.isValidObjectId(preferredRiderId) ? new mongoose.Types.ObjectId(preferredRiderId) : undefined);
-    if (retryableDispatchState(result.state)) throw new Error(`DISPATCH_${String(result.state).toUpperCase()}`);
+    if (isRetryableDispatchState(result.state)) throw new Error(`DISPATCH_${String(result.state).toUpperCase()}`);
   };
 
+  let nextMaintenanceAt = 0;
   const poll = async () => {
     if (stopping) return;
     workerStats.polls += 1;
     workerStats.lastPollAt = new Date().toISOString();
     try {
-      // Expiry and late-pickup recovery are executed in this dedicated worker,
-      // never by a web API interval. Each recovery writes a new outbox event.
-      await dispatch.runDispatchMaintenance();
+      if (Date.now() >= nextMaintenanceAt) {
+        nextMaintenanceAt = Date.now() + 5_000;
+        try { await dispatch.runDispatchMaintenance(); }
+        catch (error) { console.error(JSON.stringify({ event: "dispatch_maintenance_error", error: error instanceof Error ? error.message : String(error) })); }
+      }
       const result = await processDispatchOutboxBatch(workerId, handle, {
         batchSize,
-        deadLetterOnExhaustion: (_event, error) => !String(error instanceof Error ? error.message : error).includes("DISPATCH_NO_ELIGIBLE_RIDER"),
+        deadLetterOnExhaustion: (_event, error) => deadLetterDispatchError(error),
       });
       workerStats.processed += result.processed;
+      workerStats.retried += result.retried;
       workerStats.deadLettered += result.deadLettered;
       workerStats.lastSuccessAt = new Date().toISOString();
       workerStats.lastError = null;

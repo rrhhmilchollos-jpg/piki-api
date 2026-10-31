@@ -41,25 +41,30 @@ export async function quoteDeliveryRoute(origin: [number, number], destination: 
   try {
     const googleKey = String(process.env.GOOGLE_MAPS_API_KEY || "").trim();
     if (googleKey) {
-      const googleUrl = new URL("https://maps.googleapis.com/maps/api/directions/json");
-      googleUrl.searchParams.set("origin", `${origin[1]},${origin[0]}`);
-      googleUrl.searchParams.set("destination", `${destination[1]},${destination[0]}`);
-      googleUrl.searchParams.set("mode", "driving");
-      googleUrl.searchParams.set("language", "es");
-      googleUrl.searchParams.set("region", "es");
-      googleUrl.searchParams.set("key", googleKey);
-      const response = await fetch(googleUrl, { signal: controller.signal, headers: { Accept: "application/json", "User-Agent": "PIKI-Delivery/0.2 routing" } });
-      const payload = await response.json().catch(() => null) as { status?: string; routes?: Array<{ legs?: Array<{ distance?: { value?: number }; duration?: { value?: number } }> }> } | null;
-      const leg = payload?.status === "OK" ? payload.routes?.[0]?.legs?.[0] : undefined;
-      const distanceMeters = Number(leg?.distance?.value);
-      const durationSeconds = Number(leg?.duration?.value);
-      if (Number.isFinite(distanceMeters) && distanceMeters > 0 && Number.isFinite(durationSeconds) && durationSeconds >= 0) {
-        const routeDistanceKm = Math.round((distanceMeters / 1000) * 1000) / 1000;
-        const value: DeliveryRouteQuote = { routeDistanceKm, routeDurationMinutes: Math.max(1, Math.ceil(durationSeconds / 60)), routeProvider: "google_maps", routingDegraded: false, requiredVehicleClasses: requiredVehiclesForRoute(routeDistanceKm) };
-        cache.set(key, { expiresAt: Date.now() + 10 * 60_000, value });
-        return value;
+      try {
+        const googleUrl = new URL("https://maps.googleapis.com/maps/api/directions/json");
+        googleUrl.searchParams.set("origin", `${origin[1]},${origin[0]}`);
+        googleUrl.searchParams.set("destination", `${destination[1]},${destination[0]}`);
+        googleUrl.searchParams.set("mode", "driving");
+        googleUrl.searchParams.set("language", "es");
+        googleUrl.searchParams.set("region", "es");
+        googleUrl.searchParams.set("key", googleKey);
+        const response = await fetch(googleUrl, { signal: controller.signal, headers: { Accept: "application/json", "User-Agent": "PIKI-Delivery/0.2 routing" } });
+        const payload = await response.json().catch(() => null) as { status?: string; routes?: Array<{ legs?: Array<{ distance?: { value?: number }; duration?: { value?: number } }> }> } | null;
+        const leg = response.ok && payload?.status === "OK" ? payload.routes?.[0]?.legs?.[0] : undefined;
+        const distanceMeters = leg?.distance?.value;
+        const durationSeconds = leg?.duration?.value;
+        if (typeof distanceMeters === "number" && Number.isFinite(distanceMeters) && distanceMeters > 0 && typeof durationSeconds === "number" && Number.isFinite(durationSeconds) && durationSeconds >= 0) {
+          const routeDistanceKm = Math.round((distanceMeters / 1000) * 1000) / 1000;
+          const value: DeliveryRouteQuote = { routeDistanceKm, routeDurationMinutes: Math.max(1, Math.ceil(durationSeconds / 60)), routeProvider: "google_maps", routingDegraded: false, requiredVehicleClasses: requiredVehiclesForRoute(routeDistanceKm) };
+          cache.set(key, { expiresAt: Date.now() + 10 * 60_000, value });
+          return value;
+        }
+        console.warn("Google Maps route unavailable; falling back to OSRM", payload?.status || `http_${response.status}`);
+      } catch (error) {
+        // Do not log the exception: a fetch error can contain the URL and API key.
+        console.warn("Google Maps route request failed; falling back to OSRM", error instanceof Error ? error.name : "unknown_error");
       }
-      console.warn("Google Maps route unavailable; falling back to OSRM", payload?.status || "invalid_response");
     }
     clearTimeout(timer);
     controller = new AbortController();
@@ -69,9 +74,9 @@ export async function quoteDeliveryRoute(origin: [number, number], destination: 
     const response = await fetch(url, { signal: controller.signal, headers: { Accept: "application/json", "User-Agent": "PIKI-Delivery/0.2 routing" } });
     const payload = await response.json().catch(() => null) as { code?: string; routes?: Array<{ distance?: number; duration?: number }> } | null;
     const route = response.ok && payload?.code === "Ok" ? payload.routes?.[0] : undefined;
-    const distanceMeters = Number(route?.distance);
-    const durationSeconds = Number(route?.duration);
-    if (!Number.isFinite(distanceMeters) || distanceMeters <= 0 || !Number.isFinite(durationSeconds) || durationSeconds < 0) throw new Error("ROUTING_RESPONSE_INVALID");
+    const distanceMeters = route?.distance;
+    const durationSeconds = route?.duration;
+    if (typeof distanceMeters !== "number" || !Number.isFinite(distanceMeters) || distanceMeters <= 0 || typeof durationSeconds !== "number" || !Number.isFinite(durationSeconds) || durationSeconds < 0) throw new Error("ROUTING_RESPONSE_INVALID");
     const routeDistanceKm = Math.round((distanceMeters / 1000) * 1000) / 1000;
     const value: DeliveryRouteQuote = { routeDistanceKm, routeDurationMinutes: Math.max(1, Math.ceil(durationSeconds / 60)), routeProvider: "osrm", routingDegraded: false, requiredVehicleClasses: requiredVehiclesForRoute(routeDistanceKm) };
     cache.set(key, { expiresAt: Date.now() + 10 * 60_000, value });

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { DEFAULT_DISPATCH_LEASE_MS, InMemoryDispatchOutbox, dispatchInitialIdempotencyKey, dispatchRetryDelayMs } from "./dispatchOutbox.js";
+import { DEFAULT_DISPATCH_LEASE_MS, InMemoryDispatchOutbox, deadLetterDispatchError, dispatchInitialIdempotencyKey, dispatchRecoveryIdempotencyKey, dispatchRetryDelayMs, isRetryableDispatchState } from "./dispatchOutbox.js";
 
 test("dispatch outbox is idempotent for the same order transition", () => {
   const outbox = new InMemoryDispatchOutbox();
@@ -36,4 +36,18 @@ test("dispatch retry backoff is bounded and exponential", () => {
   assert.equal(dispatchRetryDelayMs(1), 1_000);
   assert.equal(dispatchRetryDelayMs(4), 8_000);
   assert.equal(dispatchRetryDelayMs(99), 5 * 60_000);
+});
+
+test("missing GPS and absent riders remain retryable; system faults still dead-letter", () => {
+  assert.equal(isRetryableDispatchState("missing_geolocation"), true);
+  assert.equal(isRetryableDispatchState("no_eligible_rider"), true);
+  assert.equal(deadLetterDispatchError(new Error("DISPATCH_MISSING_GEOLOCATION")), false);
+  assert.equal(deadLetterDispatchError(new Error("DISPATCH_NO_ELIGIBLE_RIDER")), false);
+  assert.equal(deadLetterDispatchError(new Error("DISPATCH_RESERVATION_RACE")), true);
+  assert.equal(isRetryableDispatchState("already_assigned"), false);
+});
+
+test("recovery event keys are stable for the order version", () => {
+  assert.equal(dispatchRecoveryIdempotencyKey("order-1", 2), "dispatch:order-1:recovery:2");
+  assert.notEqual(dispatchRecoveryIdempotencyKey("order-1", 2), dispatchRecoveryIdempotencyKey("order-1", 3));
 });

@@ -15,6 +15,7 @@
     "catalog:import:xativa": "tsx scripts/import-xativa-local-catalog.ts",
     "catalog:verify:xativa": "tsx scripts/verify-xativa-catalog-mapping.ts",
     "catalog:approve:xativa": "tsx scripts/approve-xativa-local-stores.ts",
+    "provision:joar-fleet": "node scripts/provision-joar-fleet.mjs",
     "dispatch:postgis": "node scripts/run-postgis-batch.mjs",
     "seed:staging:qa": "tsx scripts/seed-staging-qa.ts",
     "start:dispatch-worker": "node dist/dispatch-worker.js",

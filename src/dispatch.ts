@@ -188,7 +188,8 @@ export function scoreDispatchCandidate(candidate: DispatchCandidate, input: Disp
   const customerEtaMinutes = input.routeDurationMinutes != null && Number.isFinite(input.routeDurationMinutes)
     ? Math.max(1, Math.ceil(input.routeDurationMinutes))
     : travelMinutes(customerDistanceKm, candidate.vehicle);
-  const totalEtaMinutes = input.preparationMinutes + Math.max(input.preparationMinutes, pickupEtaMinutes) + customerEtaMinutes;
+  // Preparation and the rider's trip to the restaurant run concurrently.
+  const totalEtaMinutes = Math.max(input.preparationMinutes, pickupEtaMinutes) + customerEtaMinutes;
   if (input.maxCustomerEtaMinutes && totalEtaMinutes > input.maxCustomerEtaMinutes) return null;
 
   const activeOrderCount = Math.max(0, candidate.activeOrderCount || 0);

@@ -44,6 +44,22 @@ export function dispatchRequeueIdempotencyKey(orderId: string | mongoose.Types.O
   return `dispatch:${String(orderId)}:requeue:${version}`;
 }
 
+/** One bounded reconciliation attempt per persisted order version. */
+export function dispatchRecoveryIdempotencyKey(orderId: string | mongoose.Types.ObjectId, version: number) {
+  return `dispatch:${String(orderId)}:recovery:${version}`;
+}
+
+export function isRetryableDispatchState(state: unknown) {
+  return ["no_eligible_rider", "reservation_race", "database_unavailable", "in_progress", "missing_geolocation"].includes(String(state));
+}
+
+export function deadLetterDispatchError(error: unknown) {
+  const message = error instanceof Error ? error.message : String(error);
+  // A rider or a valid location may appear later; absence is not a permanent
+  // error. Other repeated failures still go to the dead-letter queue for review.
+  return !["DISPATCH_NO_ELIGIBLE_RIDER", "DISPATCH_MISSING_GEOLOCATION"].includes(message);
+}
+
 function objectIdOrNull(value: string | mongoose.Types.ObjectId | null | undefined) {
   if (!value) return null;
   return value instanceof mongoose.Types.ObjectId ? value : mongoose.isValidObjectId(value) ? new mongoose.Types.ObjectId(value) : null;
@@ -77,11 +93,17 @@ export async function enqueueDispatchOutbox(input: DispatchOutboxEnqueueInput) {
     leaseUntil: null,
     lastError: null,
   };
-  await DispatchOutbox.updateOne(
-    { idempotencyKey: input.idempotencyKey },
-    { $setOnInsert: insert },
-    { upsert: true, ...(input.session ? { session: input.session } : {}) },
-  ).exec();
+  try {
+    await DispatchOutbox.updateOne(
+      { idempotencyKey: input.idempotencyKey },
+      { $setOnInsert: insert },
+      { upsert: true, ...(input.session ? { session: input.session } : {}) },
+    ).exec();
+  } catch (error: any) {
+    // Concurrent non-transactional reconciliation can race on the unique key.
+    // A MongoDB transaction, however, must be retried/aborted by its caller.
+    if (input.session || error?.code !== 11000 || !(await DispatchOutbox.exists({ idempotencyKey: input.idempotencyKey }))) throw error;
+  }
   return DispatchOutbox.findOne({ idempotencyKey: input.idempotencyKey }, null, input.session ? { session: input.session } : undefined).lean().exec() as Promise<DispatchOutboxEvent | null>;
 }
 
@@ -133,12 +155,13 @@ export async function markDispatchOutboxProcessed(event: DispatchOutboxEvent, wo
 export async function rescheduleDispatchOutboxEvent(event: DispatchOutboxEvent, workerId: string, error: unknown, maxAttempts = DEFAULT_DISPATCH_MAX_ATTEMPTS, deadLetterOnExhaustion = true) {
   const message = (error instanceof Error ? error.message : String(error || "DISPATCH_FAILED")).slice(0, 1000);
   const deadLetter = deadLetterOnExhaustion && event.attempts >= maxAttempts;
+  const retryDelay = deadLetterDispatchError(error) ? dispatchRetryDelayMs(event.attempts) : Math.min(30_000, dispatchRetryDelayMs(event.attempts));
   const result = await DispatchOutbox.updateOne(
     { _id: event._id, status: "processing", leaseOwner: workerId },
     {
       $set: deadLetter
         ? { status: "dead_letter", deadLetteredAt: new Date(), leaseOwner: null, leaseUntil: null, lastError: message }
-        : { status: "retry", availableAt: new Date(Date.now() + dispatchRetryDelayMs(event.attempts)), leaseOwner: null, leaseUntil: null, lastError: message },
+        : { status: "retry", availableAt: new Date(Date.now() + retryDelay), leaseOwner: null, leaseUntil: null, lastError: message },
     },
   ).exec();
   return { updated: result.modifiedCount === 1, deadLetter };
@@ -151,6 +174,7 @@ export async function processDispatchOutboxBatch(
 ) {
   let processed = 0;
   let deadLettered = 0;
+  let retried = 0;
   const deadLetters: Array<{ id: string; orderId: string; attempts: number; lastError: string }> = [];
   const batchSize = options.batchSize || 25;
   for (let index = 0; index < batchSize; index += 1) {
@@ -171,10 +195,10 @@ export async function processDispatchOutboxBatch(
           attempts: event.attempts,
           lastError: (error instanceof Error ? error.message : String(error || "DISPATCH_FAILED")).slice(0, 300),
         });
-      }
+      } else if (outcome.updated) retried += 1;
     }
   }
-  return { processed, deadLettered, deadLetters };
+  return { processed, retried, deadLettered, deadLetters };
 }
 
 /**
