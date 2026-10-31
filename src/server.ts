@@ -948,15 +948,18 @@ app.post("/api/v1/admin/employees", requireOwner(), async (req, res) => {
   const roles = parsed.data.roles?.length ? parsed.data.roles : [apiRole];
   const isFleetAccount = apiRole === "fleet" || roles.includes("fleet") || parsed.data.jobRole === "zone_manager";
   if (parsed.data.fleetId && !isFleetAccount) return res.status(400).json({ error: "FLEET_ID_REQUIRES_FLEET_ROLE", message: "Asigna una flota solo a una cuenta con permisos Fleet." });
+  let assignedFleetTenantId: unknown = null;
   if (parsed.data.fleetId) {
-    const fleet = await Fleet.findOne({ _id: objectId(parsed.data.fleetId), isActive: true, ...tenantScope(req) }).select("_id").lean().exec();
+    const fleet = await Fleet.findOne({ _id: objectId(parsed.data.fleetId), isActive: true, ...tenantScope(req) }).select("_id tenantId").lean().exec() as any;
     if (!fleet) return res.status(404).json({ error: "FLEET_NOT_FOUND_OR_INACTIVE", message: "La flota seleccionada no existe o no está activa." });
+    if (!fleet.tenantId) return res.status(409).json({ error: "FLEET_TENANT_REQUIRED", message: "La flota debe estar vinculada a un tenant antes de activar el acceso de su responsable." });
+    assignedFleetTenantId = fleet.tenantId;
   }
   const primaryRole = parsed.data.primaryRole || roles[0];
   const temporaryPassword = generateTemporaryPassword();
   try {
     const employeeId = new mongoose.Types.ObjectId();
-    const employee = await EmployeeAccount.create({ _id: employeeId, employeeCode: employeeCodeFor(employeeId), ...parsed.data, roles, primaryRole, accessLevel: "subadmin", authorizationStatus: "approved", authorizedAt: new Date(), authorizedBy: req.auth?.employeeId ? objectId(req.auth.employeeId) : null, restaurantId: parsed.data.restaurantId ? objectId(parsed.data.restaurantId) : null, fleetId: parsed.data.fleetId ? objectId(parsed.data.fleetId) : null, apiRole, passwordHash: hashPassword(temporaryPassword), mustChangePassword: true, active: true });
+    const employee = await EmployeeAccount.create({ _id: employeeId, employeeCode: employeeCodeFor(employeeId), ...parsed.data, roles, primaryRole, tenantId: assignedFleetTenantId, accessLevel: "subadmin", authorizationStatus: "approved", authorizedAt: new Date(), authorizedBy: req.auth?.employeeId ? objectId(req.auth.employeeId) : null, restaurantId: parsed.data.restaurantId ? objectId(parsed.data.restaurantId) : null, fleetId: parsed.data.fleetId ? objectId(parsed.data.fleetId) : null, apiRole, passwordHash: hashPassword(temporaryPassword), mustChangePassword: true, active: true });
     await AccessAuthorization.create({ employeeId: employee._id, action: "created", previousStatus: null, nextStatus: "approved", previousRole: null, nextRole: apiRole, accessLevel: "subadmin", actorEmployeeId: objectId(req.auth!.employeeId!), reason: "Cuenta creada y autorizada por RRHH superadmin." });
     const surface = preferredCredentialSurface(employee);
     let activationEmail: { sent: boolean; error?: string; surface?: EmployeeCredentialSurface } = { sent: false };
@@ -1092,18 +1095,22 @@ app.patch("/api/v1/admin/employees/:id/authorization", requireOwner(), async (re
     reason: z.string().max(500).default(""),
   }).safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_AUTHORIZATION", details: parsed.error.flatten() });
-  const target = await EmployeeAccount.findById(id).select("email ownerProtected jobRole apiRole roles primaryRole partnerRoles restaurantId restaurantIds accessLevel authorizationStatus fleetId").lean().exec() as any;
+  const target = await EmployeeAccount.findById(id).select("email tenantId ownerProtected jobRole apiRole roles primaryRole partnerRoles restaurantId restaurantIds accessLevel authorizationStatus fleetId").lean().exec() as any;
   if (!target) return res.status(404).json({ error: "EMPLOYEE_NOT_FOUND" });
   if (target.ownerProtected || target.email === ownerEmail) return res.status(403).json({ error: "OWNER_ACCOUNT_PROTECTED" });
   const effectiveRoles = parsed.data.roles || (target.roles?.length ? target.roles : [parsed.data.apiRole || target.apiRole]);
   const effectiveApiRole = parsed.data.apiRole || target.apiRole;
   const effectivePrimaryRole = parsed.data.primaryRole || target.primaryRole || effectiveRoles[0];
   if (!effectiveRoles.includes(effectivePrimaryRole)) return res.status(400).json({ error: "PRIMARY_ROLE_NOT_ASSIGNED" });
+  let assignedFleetTenantId: unknown = null;
   if (parsed.data.fleetId) {
     const isFleetAccount = effectiveApiRole === "fleet" || effectiveRoles.includes("fleet") || parsed.data.jobRole === "zone_manager" || target.jobRole === "zone_manager";
     if (!isFleetAccount) return res.status(400).json({ error: "FLEET_ID_REQUIRES_FLEET_ROLE", message: "Asigna una flota solo a una cuenta con permisos Fleet." });
-    const fleet = await Fleet.findOne({ _id: objectId(parsed.data.fleetId), isActive: true, ...tenantScope(req) }).select("_id").lean().exec();
+    const fleet = await Fleet.findOne({ _id: objectId(parsed.data.fleetId), isActive: true, ...tenantScope(req) }).select("_id tenantId").lean().exec() as any;
     if (!fleet) return res.status(404).json({ error: "FLEET_NOT_FOUND_OR_INACTIVE", message: "La flota seleccionada no existe o no está activa." });
+    if (!fleet.tenantId) return res.status(409).json({ error: "FLEET_TENANT_REQUIRED", message: "La flota seleccionada no tiene un tenant operativo asignado." });
+    if (target.tenantId && String(target.tenantId) !== String(fleet.tenantId)) return res.status(409).json({ error: "EMPLOYEE_TENANT_CONFLICT", message: "La cuenta ya pertenece a otro tenant; requiere revisión de Administración." });
+    assignedFleetTenantId = fleet.tenantId;
   }
   const update: Record<string, unknown> = { authorizationStatus: parsed.data.status, active: parsed.data.status === "approved", authorizedAt: parsed.data.status === "approved" ? new Date() : null, authorizedBy: objectId(req.auth!.employeeId!), authorizationReason: parsed.data.reason };
   if (parsed.data.apiRole) update.apiRole = parsed.data.apiRole;
@@ -1118,12 +1125,15 @@ app.patch("/api/v1/admin/employees/:id/authorization", requireOwner(), async (re
     update.restaurantId = objectId(restaurantIds[0]);
     update.restaurantIds = restaurantIds.map((restaurantId) => objectId(restaurantId));
   }
-  if (parsed.data.fleetId !== undefined) update.fleetId = parsed.data.fleetId ? objectId(parsed.data.fleetId) : null;
+  if (parsed.data.fleetId !== undefined) {
+    update.fleetId = parsed.data.fleetId ? objectId(parsed.data.fleetId) : null;
+    if (parsed.data.fleetId) update.tenantId = assignedFleetTenantId;
+  }
   if (parsed.data.zoneSlugs) update.zoneSlugs = parsed.data.zoneSlugs;
   const accessChanged = Boolean(parsed.data.apiRole || parsed.data.jobRole || parsed.data.roles || parsed.data.primaryRole || parsed.data.partnerRoles || parsed.data.restaurantIds || parsed.data.fleetId !== undefined || parsed.data.status !== "approved");
   if (accessChanged) update.sessionHash = null;
-  const employee = await EmployeeAccount.findByIdAndUpdate(id, { $set: update }, { new: true }).select("name email jobRole apiRole roles primaryRole partnerRoles restaurantId restaurantIds accessLevel authorizationStatus authorizedAt authorizedBy authorizationReason fleetId zoneSlugs active mustChangePassword").lean().exec() as any;
-  await AccessAuthorization.create({ employeeId: id, action: parsed.data.apiRole || parsed.data.jobRole || parsed.data.roles || parsed.data.partnerRoles || parsed.data.restaurantIds || parsed.data.fleetId !== undefined ? "role_changed" : parsed.data.status, previousStatus: target.authorizationStatus || null, nextStatus: parsed.data.status, previousRole: JSON.stringify({ apiRole: target.apiRole, roles: target.roles || [], partnerRoles: target.partnerRoles || [], restaurantIds: assignedRestaurantIds(target), fleetId: target.fleetId || null }), nextRole: JSON.stringify({ apiRole: employee.apiRole, roles: employee.roles || [], partnerRoles: employee.partnerRoles || [], restaurantIds: assignedRestaurantIds(employee), fleetId: employee.fleetId || null }), accessLevel: employee.accessLevel || "subadmin", actorEmployeeId: objectId(req.auth!.employeeId!), reason: parsed.data.reason });
+  const employee = await EmployeeAccount.findByIdAndUpdate(id, { $set: update }, { new: true }).select("name email tenantId jobRole apiRole roles primaryRole partnerRoles restaurantId restaurantIds accessLevel authorizationStatus authorizedAt authorizedBy authorizationReason fleetId zoneSlugs active mustChangePassword").lean().exec() as any;
+  await AccessAuthorization.create({ employeeId: id, action: parsed.data.apiRole || parsed.data.jobRole || parsed.data.roles || parsed.data.partnerRoles || parsed.data.restaurantIds || parsed.data.fleetId !== undefined ? "role_changed" : parsed.data.status, previousStatus: target.authorizationStatus || null, nextStatus: parsed.data.status, previousRole: JSON.stringify({ apiRole: target.apiRole, roles: target.roles || [], partnerRoles: target.partnerRoles || [], restaurantIds: assignedRestaurantIds(target), fleetId: target.fleetId || null, tenantId: target.tenantId || null }), nextRole: JSON.stringify({ apiRole: employee.apiRole, roles: employee.roles || [], partnerRoles: employee.partnerRoles || [], restaurantIds: assignedRestaurantIds(employee), fleetId: employee.fleetId || null, tenantId: employee.tenantId || null }), accessLevel: employee.accessLevel || "subadmin", actorEmployeeId: objectId(req.auth!.employeeId!), reason: parsed.data.reason });
   if (accessChanged) await revokeEmployeeSessions(id);
   return res.json({ employee, authorization: { status: parsed.data.status, persisted: true } });
 });
@@ -5389,14 +5399,24 @@ app.post("/api/v1/fleets", requireRole("admin", "fleet"), async (req, res) => {
     const fleet = await Fleet.create({ ...parsed.data, managerEmail: undefined, ...tenantScope(req), city: selection?.localityName || parsed.data.city, ...(selection ? { localityCode: selection.localityCode, localityName: selection.localityName, provinceCode: selection.provinceCode, provinceName: selection.provinceName } : { localityName: parsed.data.localityName || "", provinceName: parsed.data.provinceName || "" }), contactEmail: parsed.data.managerEmail || parsed.data.contactEmail, managerDni: parsed.data.managerDni ? parsed.data.managerDni.toUpperCase() : "", createdBy: req.auth?.employeeId ? objectId(req.auth.employeeId) : null, createdByRole: req.auth?.role || null });
     createdFleet = fleet;
     if (parsed.data.managerName && managerEmail) {
-      const existing = await EmployeeAccount.findOne({ email: managerEmail.toLowerCase() }).select("_id fleetId").lean().exec() as any;
+      if (!(fleet as any).tenantId) {
+        await Fleet.deleteOne({ _id: fleet._id }).exec();
+        createdFleet = null;
+        return res.status(409).json({ error: "FLEET_TENANT_REQUIRED", message: "La flota debe estar vinculada a un tenant antes de activar el acceso de su responsable." });
+      }
+      const existing = await EmployeeAccount.findOne({ email: managerEmail.toLowerCase() }).select("_id tenantId fleetId").lean().exec() as any;
       if (existing) {
         if (existing.fleetId && String(existing.fleetId) !== String(fleet._id)) {
           await Fleet.deleteOne({ _id: fleet._id }).exec();
           createdFleet = null;
           return res.status(409).json({ error: "EMPLOYEE_EMAIL_ALREADY_EXISTS", message: "El email del Fleet Manager ya pertenece a otra Fleet." });
         }
-        createdManager = await EmployeeAccount.findOneAndUpdate({ _id: existing._id, fleetId: null }, { $set: { fleetId: fleet._id, jobRole: "fleet", apiRole: "fleet", roles: ["fleet"], primaryRole: "fleet", name: parsed.data.managerName, active: true, authorizationStatus: "approved" } }, { new: true }).lean().exec();
+        if (existing.tenantId && String(existing.tenantId) !== String((fleet as any).tenantId)) {
+          await Fleet.deleteOne({ _id: fleet._id }).exec();
+          createdFleet = null;
+          return res.status(409).json({ error: "EMPLOYEE_TENANT_CONFLICT", message: "La cuenta ya pertenece a otro tenant; requiere revisión de Administración." });
+        }
+        createdManager = await EmployeeAccount.findOneAndUpdate({ _id: existing._id, fleetId: null }, { $set: { tenantId: (fleet as any).tenantId, fleetId: fleet._id, zoneSlugs: parsed.data.serviceZones, jobRole: "fleet", apiRole: "fleet", roles: ["fleet"], primaryRole: "fleet", name: parsed.data.managerName, active: true, authorizationStatus: "approved" } }, { new: true }).lean().exec();
       } else {
         const employeeId = new mongoose.Types.ObjectId();
         const temporaryPassword = generateTemporaryPassword();
