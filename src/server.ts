@@ -1,6 +1,7 @@
 import { nativeReleasePolicy } from "./nativeReleasePolicy.js";
 import { registerEmployeeDeletionRoutes } from "./employeeDeletion.js";
 import { dispatchVehicleInputForOrder } from "./dispatchVehiclePolicy.js";
+import { VEHICLE_CATALOG_VERSION, VEHICLE_TYPES, incompatibleVehicles, uniqueVehicles, vehicleTypeSchema, type VehicleType } from "./vehicleCatalog.js";
 import { registerTerritoryRoutes } from "./coverage/territoryRoutes.js";
 import { operationalZoneInputSchema } from "./coverage/zoneInput.js";
 import { missingPartnerDocumentTypes, missingRiderDocumentTypes, type RiderVehicle } from "./manualOnboardingPolicy.js";
@@ -300,6 +301,35 @@ const stripeWebhookHandler = async (req: express.Request, res: express.Response)
   }
 };
 app.post(["/api/v1/payments/webhook", "/api/webhooks/stripe"], express.raw({ type: "application/json" }), stripeWebhookHandler);
+
+const vercelWebhookSecret = String(process.env.VERCEL_WEBHOOK_SECRET || "").trim();
+function validVercelWebhookSignature(rawBody: Buffer, supplied: string): boolean {
+  if (!vercelWebhookSecret || !supplied) return false;
+  const signatures = ["sha1", "sha256"].map((algorithm) => createHmac(algorithm, vercelWebhookSecret).update(rawBody).digest("hex"));
+  return signatures.some((expected) => expected.length === supplied.length && timingSafeEqual(Buffer.from(expected), Buffer.from(supplied)));
+}
+app.post("/api/v1/integrations/vercel/webhook", express.raw({ type: "application/json" }), async (req, res) => {
+  const rawBody = Buffer.isBuffer(req.body) ? req.body : Buffer.from("");
+  const signature = String(req.header("x-vercel-signature") || "").trim();
+  if (!validVercelWebhookSignature(rawBody, signature)) return res.status(401).json({ error: "INVALID_VERCEL_WEBHOOK_SIGNATURE" });
+  let payload: any;
+  try { payload = JSON.parse(rawBody.toString("utf8")); } catch { return res.status(400).json({ error: "INVALID_VERCEL_WEBHOOK_PAYLOAD" }); }
+  const eventType = String(req.header("x-vercel-event") || payload.type || payload.event || "unknown").trim();
+  const deployment = payload.payload?.deployment || payload.deployment || {};
+  const project = payload.payload?.project || payload.project || {};
+  const deploymentId = String(deployment.id || payload.deploymentId || "").trim();
+  const projectName = String(deployment.name || project.name || payload.name || "unknown").trim();
+  const blockedOrFailed = ["deployment.blocked", "deployment.error", "deployment-error", "deployment.canceled"].includes(eventType);
+  await GovernanceAuditEvent.create({ actorEmployeeId: null, actorRole: "system", action: `vercel_${eventType.replace(/[^a-z0-9]+/gi, "_").toLowerCase()}`, targetType: "system", targetId: null, after: { eventType, deploymentId, projectName, url: deployment.url || null, target: deployment.target || payload.target || null, commit: deployment.meta?.githubCommitSha || null, error: payload.error || payload.payload?.error || null }, reason: "Alerta recibida desde Vercel." });
+  if (blockedOrFailed) {
+    const recipients = [...new Set([String(process.env.PIKI_OWNER_EMAIL || "rrhh.milchollos@gmail.com"), ...String(process.env.PIKI_VERCEL_ALERT_EMAILS || "").split(",")].map((email) => email.trim().toLowerCase()).filter((email) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)))];
+    const subject = `PIKI · Vercel ${eventType} · ${projectName}`;
+    const text = [`Vercel ha generado una alerta de despliegue.`, `Evento: ${eventType}`, `Proyecto: ${projectName}`, `Deployment: ${deploymentId || "no indicado"}`, `Commit: ${deployment.meta?.githubCommitSha || "no indicado"}`, `URL: ${deployment.url || "no indicada"}`, `Revisa el panel de Vercel para consultar el detalle.`].join("\n");
+    for (const recipientEmail of recipients) await sendCorporateEmail({ recipientEmail, subject, text, html: `<p>${text.replace(/\n/g, "<br>")}</p>`, idempotencyKey: `piki-vercel-${eventType}-${deploymentId || projectName}`.slice(0, 240) });
+    console.warn(`[VERCEL_DEPLOYMENT_ALERT] ${JSON.stringify({ eventType, projectName, deploymentId })}`);
+  }
+  return res.status(200).json({ received: true, eventType, deploymentId });
+});
 app.use(express.json({ limit: "20mb" }));
 
 // Signed Customer -> API/Admin bridge. It accepts profile metadata only;
@@ -5325,14 +5355,28 @@ app.get("/api/v1/fleets", requireRole("admin", "fleet"), async (req, res) => {
   return res.json({ fleets: fleets.map((fleet) => fleetPublicView(fleet, serviceZoneNames)) });
 });
 
-const fleetInputSchema = z.object({ name: z.string().trim().min(2).max(120), localityCode: z.string().regex(/^\d{5}$/).optional(), localityName: z.string().trim().min(2).max(120).optional(), provinceCode: z.string().regex(/^\d{2}$/).optional(), provinceName: z.string().trim().min(2).max(120).optional(), managerName: z.string().trim().min(2).max(120).optional().default(""), managerDni: z.string().trim().min(5).max(20).optional().default(""), managerEmail: z.string().trim().email().or(z.literal("")).optional().default(""), contactEmail: z.string().trim().email().or(z.literal("")), contactPhone: z.string().trim().min(6).max(40), address: z.string().trim().min(5).max(240), postalCode: z.string().trim().min(3).max(12), city: z.string().trim().min(2).max(120), vehicleTypes: z.array(z.enum(["bike", "electric_bike", "electric_scooter", "motorcycle", "scooter", "car"])).min(1).max(6), maxRiders: z.coerce.number().int().min(1).max(10000), serviceZones: z.array(z.string().regex(/^[a-z0-9-]+$/)).min(1).max(300), notes: z.string().trim().max(2000).default("") }).superRefine((value, context) => { if (value.managerName && !value.managerEmail) context.addIssue({ code: z.ZodIssueCode.custom, path: ["managerEmail"], message: "El Fleet Manager necesita un email de acceso." }); });
+const fleetInputSchema = z.object({
+  name: z.string().trim().min(2).max(120), localityCode: z.string().regex(/^\d{5}$/).optional(), localityName: z.string().trim().min(2).max(120).optional(), provinceCode: z.string().regex(/^\d{2}$/).optional(), provinceName: z.string().trim().min(2).max(120).optional(), managerName: z.string().trim().min(2).max(120).optional().default(""), managerDni: z.string().trim().min(5).max(20).optional().default(""), managerEmail: z.string().trim().email().or(z.literal("")).optional().default(""), contactEmail: z.string().trim().email().or(z.literal("")), contactPhone: z.string().trim().min(6).max(40), address: z.string().trim().min(5).max(240), postalCode: z.string().trim().min(3).max(12), city: z.string().trim().min(2).max(120), vehicleTypes: z.array(vehicleTypeSchema).min(1).max(VEHICLE_TYPES.length), maxRiders: z.coerce.number().int().min(1).max(10000), serviceZones: z.array(z.string().regex(/^[a-z0-9-]+$/)).min(1).max(300), notes: z.string().trim().max(2000).default("")
+}).superRefine((value, context) => {
+  if (value.managerName && !value.managerEmail) context.addIssue({ code: z.ZodIssueCode.custom, path: ["managerEmail"], message: "El Fleet Manager necesita un email de acceso." });
+  if (new Set(value.serviceZones).size !== value.serviceZones.length) context.addIssue({ code: z.ZodIssueCode.custom, path: ["serviceZones"], message: "No se pueden repetir zonas de servicio." });
+  if (new Set(value.vehicleTypes).size !== value.vehicleTypes.length) context.addIssue({ code: z.ZodIssueCode.custom, path: ["vehicleTypes"], message: "No se pueden repetir tipos de vehículo." });
+});
 app.post("/api/v1/fleets", requireRole("admin", "fleet"), async (req, res) => {
   const parsed = fleetInputSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_FLEET", details: parsed.error.flatten() });
   const employee = await employeeScope(req);
   if (req.auth?.role === "fleet" && employee?.fleetId) return res.status(409).json({ error: "FLEET_ALREADY_ASSIGNED", message: "Tu cuenta ya está vinculada a una Fleet y no puede crear otra." });
-  const zoneCount = await Zone.countDocuments({ ...tenantScope(req), slug: { $in: parsed.data.serviceZones }, isActive: true });
-  if (zoneCount !== parsed.data.serviceZones.length) return res.status(400).json({ error: "INVALID_FLEET_ZONES", message: "Una o más zonas no existen o no están activas." });
+  const selectedZones = [...new Set(parsed.data.serviceZones)];
+  if (selectedZones.length !== parsed.data.serviceZones.length) return res.status(400).json({ error: "DUPLICATE_FLEET_ZONES", message: "No se pueden repetir zonas de servicio." });
+  const zones = await Zone.find({ ...tenantScope(req), slug: { $in: selectedZones }, isActive: true }).select("slug allowedVehicleTypes vehicleCatalogVersion").lean().exec() as unknown as Array<{ slug: string; allowedVehicleTypes?: VehicleType[]; vehicleCatalogVersion?: number }>;
+  if (zones.length !== selectedZones.length) return res.status(400).json({ error: "INVALID_FLEET_ZONES", message: "Una o más zonas no existen o no están activas." });
+  const allowedForEveryZone = zones.reduce<Set<VehicleType> | null>((current, zone) => {
+    const allowed = new Set<VehicleType>((zone.allowedVehicleTypes?.length ? zone.allowedVehicleTypes : VEHICLE_TYPES) as VehicleType[]);
+    return current ? new Set([...current].filter((vehicle) => allowed.has(vehicle))) : allowed;
+  }, null) || new Set<VehicleType>();
+  const incompatible = incompatibleVehicles(parsed.data.vehicleTypes as VehicleType[], [...allowedForEveryZone]);
+  if (incompatible.length) return res.status(400).json({ error: "INCOMPATIBLE_FLEET_VEHICLES", message: "Uno o más vehículos no están permitidos en todas las zonas seleccionadas.", details: { vehicleTypes: incompatible, catalogVersion: VEHICLE_CATALOG_VERSION } });
   const hasTerritorialSelection = Boolean(parsed.data.localityCode || parsed.data.provinceCode || parsed.data.localityName || parsed.data.provinceName);
   const selection = resolveRecruitmentSelection({ city: parsed.data.localityName || parsed.data.city, localityCode: parsed.data.localityCode, provinceCode: parsed.data.provinceCode, requestedZoneSlug: hasTerritorialSelection ? (parsed.data.serviceZones.length === 1 ? parsed.data.serviceZones[0] : undefined) : undefined });
   if (hasTerritorialSelection && !selection) return res.status(400).json({ error: "INVALID_FLEET_LOCALITY", message: "La localidad territorial debe coincidir con una zona de cobertura activa." });
