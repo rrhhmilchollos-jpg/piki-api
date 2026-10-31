@@ -1,6 +1,6 @@
 import "dotenv/config";
 
-const api = String(process.env.PIKI_API_ORIGIN || "https://api.pikidelivery.com").replace(/\/$/, "");
+const api = String(process.env.PIKI_API_ORIGIN || "https://piki-api-37nr.onrender.com").replace(/\/$/, "");
 const token = String(process.env.PIKI_ADMIN_TOKEN || "").trim();
 const confirm = process.env.PIKI_CONFIRM === "CREATE";
 const managerEmail = "paduanyjoar9@gmail.com";
@@ -69,7 +69,7 @@ for (const area of missing) {
   }) });
 }
 
-const fleetResponse = await request("/api/v1/fleets", { method: "POST", body: JSON.stringify({
+const fleetInput = {
   name: "Fleet Joar Daniel Paduany",
   managerName,
   managerEmail,
@@ -86,7 +86,17 @@ const fleetResponse = await request("/api/v1/fleets", { method: "POST", body: JS
   maxRiders: 30,
   serviceZones: zoneSlugs,
   notes: "Fleet operativa Xàtiva y corona territorial validada por PIKI.",
-}) });
+};
+let fleetResponse;
+try {
+  fleetResponse = await request("/api/v1/fleets", { method: "POST", body: JSON.stringify(fleetInput) });
+} catch (error) {
+  if (!String(error).includes("FLEET_NAME_ALREADY_EXISTS")) throw error;
+  const fleetsPayload = await request("/api/v1/fleets");
+  const existingFleet = (fleetsPayload.fleets || []).find((fleet) => fleet.name === fleetInput.name);
+  if (!existingFleet) throw new Error("La API indicó que la Fleet existe, pero no se pudo localizar con el mismo nombre.");
+  fleetResponse = { fleet: existingFleet, reused: true };
+}
 const fleetId = fleetResponse.fleet?.id || fleetResponse.fleet?._id;
 if (!fleetId) throw new Error("La API creó la Fleet pero no devolvió su id.");
 
