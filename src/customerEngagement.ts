@@ -55,6 +55,14 @@ const recommendationProfileSchema = new Schema({
   modelVersion: { type: String, default: "rules-v1" },
 }, { timestamps: true, collection: "customer_recommendation_profiles" });
 
+const customerDeliverySavingSchema = new Schema({
+  customerId: { type: String, required: true, index: true },
+  orderId: { type: Schema.Types.ObjectId, ref: "Order", required: true, unique: true, index: true },
+  savedOnDeliveryCents: { type: Number, required: true, min: 0 },
+  source: { type: String, enum: ["piki_pass", "delivery_promotion", "credit"] , required: true },
+  recordedAt: { type: Date, default: Date.now },
+}, { timestamps: true, collection: "customer_delivery_savings" });
+customerDeliverySavingSchema.index({ customerId: 1, recordedAt: -1 });
 const customerOrderCompletionSchema = new Schema({
   customerId: { type: String, required: true, index: true },
   orderId: { type: Schema.Types.ObjectId, ref: "Order", required: true, unique: true, index: true },
@@ -68,6 +76,7 @@ export const PikiPassSubscription = mongoose.models.PikiPassSubscription || mong
 export const ReferralReward = mongoose.models.ReferralReward || mongoose.model("ReferralReward", referralRewardSchema);
 export const RecommendationProfile = mongoose.models.RecommendationProfile || mongoose.model("RecommendationProfile", recommendationProfileSchema);
 export const CustomerOrderCompletion = mongoose.models.CustomerOrderCompletion || mongoose.model("CustomerOrderCompletion", customerOrderCompletionSchema);
+export const CustomerDeliverySaving = mongoose.models.CustomerDeliverySaving || mongoose.model("CustomerDeliverySaving", customerDeliverySavingSchema);
 
 export const DEFAULT_BADGES = [
   { slug: "first-order", name: "Primer pedido", description: "Has completado tu primer pedido en PIKI.", criterion: "completed_orders", threshold: 1 },
@@ -140,7 +149,7 @@ export async function recommendationProfileForCustomer(customerId: string) {
 }
 
 export async function ensureCustomerEngagementIndexes() {
-  await Promise.all([UserStreak.init(), Badge.init(), CustomerBadge.init(), PikiPassSubscription.init(), ReferralReward.init(), RecommendationProfile.init(), CustomerOrderCompletion.init()]);
+  await Promise.all([UserStreak.init(), Badge.init(), CustomerBadge.init(), PikiPassSubscription.init(), ReferralReward.init(), RecommendationProfile.init(), CustomerOrderCompletion.init(), CustomerDeliverySaving.init()]);
   await Badge.bulkWrite(DEFAULT_BADGES.map((badge) => ({ updateOne: { filter: { slug: badge.slug }, update: { $setOnInsert: badge }, upsert: true } })), { ordered: false });
 }
 
@@ -164,4 +173,18 @@ export async function consumeCustomerCredits(customerId: string, maximumCents: n
 export async function restoreCustomerCredits(customerId: string, cents: number, expiresAt?: Date | null) {
   if (!customerId || cents <= 0) return;
   await CustomerAccount.updateOne({ _id: customerId }, { $inc: { pikiCreditsCents: Math.floor(cents) }, $set: { pikiCreditsExpiresAt: expiresAt || new Date(Date.now() + 48 * 60 * 60 * 1000) } }).exec();
+}
+
+export async function syncCustomerDeliverySavings(customerId: string) {
+  if (!customerId) return { savedOnDeliveryCents: 0, orders: 0 };
+  const orders = await Order.find({ customerId, status: "delivered", $or: [{ creditAppliedCents: { $gt: 0 } }, { deliveryFeeCents: 0 }] }).select("_id deliveryFeeCents creditAppliedCents").lean().exec() as any[];
+  const records = orders.map((order) => {
+    const credit = Math.max(0, Number(order.creditAppliedCents || 0));
+    const delivery = Math.max(0, Number(order.deliveryFeeCents || 0));
+    const saved = Math.min(delivery || credit, credit || delivery);
+    return { updateOne: { filter: { orderId: order._id }, update: { $set: { customerId, savedOnDeliveryCents: saved, source: delivery && saved === delivery ? "piki_pass" : "credit", recordedAt: new Date() } }, upsert: true } };
+  }).filter((row) => row.updateOne.update.$set.savedOnDeliveryCents > 0);
+  if (records.length) await CustomerDeliverySaving.bulkWrite(records, { ordered: false });
+  const [summary] = await CustomerDeliverySaving.aggregate([{ $match: { customerId } }, { $group: { _id: null, savedOnDeliveryCents: { $sum: "$savedOnDeliveryCents" }, orders: { $sum: 1 } } }]);
+  return { savedOnDeliveryCents: Number(summary?.savedOnDeliveryCents || 0), orders: Number(summary?.orders || 0) };
 }

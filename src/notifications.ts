@@ -448,6 +448,24 @@ export async function processNotificationPushBatch(batchSize = 20): Promise<numb
   return processed;
 }
 
+
+export async function processExpiringCustomerCreditNotifications() {
+  if (mongoose.connection.readyState !== 1) return 0;
+  const now = Date.now(); let created = 0;
+  for (const hours of [24, 4]) {
+    const from = new Date(now + (hours * 60 - 5) * 60_000);
+    const to = new Date(now + (hours * 60 + 5) * 60_000);
+    const accounts = await CustomerAccount.find({ pikiCreditsCents: { $gt: 0 }, pikiCreditsExpiresAt: { $gte: from, $lte: to } }).select("_id tenantId pikiCreditsCents pikiCreditsExpiresAt").lean().exec() as any[];
+    for (const account of accounts) {
+      const expiry = new Date(account.pikiCreditsExpiresAt);
+      const dedupeKey = `credits-expiry:${account._id}:${hours}:${expiry.toISOString().slice(0, 13)}`;
+      const result = await Notification.updateOne({ dedupeKey }, { $setOnInsert: { tenantId: account.tenantId || null, surface: "customer", ownerType: "customer", ownerId: account._id, category: "credits", title: hours === 24 ? "Tus créditos caducan mañana" : "Tus créditos caducan pronto", body: `Te quedan ${(Number(account.pikiCreditsCents) / 100).toFixed(2).replace(".", ",")} € en créditos PIKI. Úsalos antes de que caduquen.`, url: "/", entityType: "credits", entityId: String(account._id), dedupeKey, pushStatus: "pending", pushNextAttemptAt: new Date(), pushAttempts: 0, pushLockUntil: null } }, { upsert: true });
+      if (result.upsertedCount) created += 1;
+    }
+  }
+  return created;
+}
+
 let notificationWorkerStarted = false;
 export function startNotificationWorker() {
   if (notificationWorkerStarted) return;

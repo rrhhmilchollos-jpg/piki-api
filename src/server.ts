@@ -25,7 +25,7 @@ import { isStripeSignatureError, processStripeWebhook, stripeConfigured, createS
 import { getVersionPolicy, isPikiSurface, requiresUpdate, setVersionPolicy, syncVersionPolicy, versionPolicySchema, type PikiSurface } from "./appVersion.js";
 import { publicPushConfig, revokePushSubscription, saveFcmSubscription, savePushSubscription } from "./push.js";
 import { publishOrderStatusEvents, publishOrderIntakeEvents, publishRiderOfferEvent, publishRiderHeadingToPartnerEvent, publishRiderArrivalEvent, publishRiderLocationEvents, publishRiderScheduleEvent, publishRiderCustomerMessageEvent, publishRealtimeEvent, serveRealtimeEvents, startRealtimeRelay, tenantAudienceKey } from "./realtime.js";
-import { listNotifications, markAllNotificationsRead, markNotificationRead, sendDocumentRequestEmail, sendDocumentUploadEmail, startNotificationWorker, stopNotificationWorker, type NotificationPrincipal } from "./notifications.js";
+import { listNotifications, markAllNotificationsRead, markNotificationRead, sendDocumentRequestEmail, sendDocumentUploadEmail, startNotificationWorker, stopNotificationWorker, processExpiringCustomerCreditNotifications, type NotificationPrincipal } from "./notifications.js";
 import { captureStripePaymentIntent, createCheckoutSession, createPartnerStripeOnboardingLink, createTipCheckoutSession } from "./stripe.js";
 import { rankDispatchCandidates, evaluateDispatchVehicleEligibility, computeMobilityAdvice, calculateSanctionDecision, defaultSanctionPolicy } from "./algorithms/index.js";
 import { createSessionToken, generateTemporaryPassword, hashPassword, hashSessionToken, verifyPassword } from "./employeeAuth.js";
@@ -72,7 +72,7 @@ import { prepareTrackingBatch } from "./riderLocationPolicy.js";
 import { activeRecruitmentProvinces, resolveRecruitmentSelection } from "./recruitmentAreas.js";
 import { startGoogleBusinessSyncWorker, stopGoogleBusinessSyncWorker, googleBusinessSyncSettings, googleBusinessHoursChanged } from "./googleBusinessSyncWorker.js";
 import { resolveRiderGeofence } from "./riderGeofence.js";
-import { Badge, CustomerBadge, PikiPassSubscription, ReferralReward, UserStreak, calculatePriceBreakdown, consumeCustomerCredits, ensureCustomerEngagementIndexes, recommendationProfileForCustomer, recordCompletedCustomerOrder, resolveWheelReward, restoreCustomerCredits } from "./customerEngagement.js";
+import { Badge, CustomerBadge, CustomerDeliverySaving, PikiPassSubscription, ReferralReward, UserStreak, calculatePriceBreakdown, consumeCustomerCredits, ensureCustomerEngagementIndexes, recommendationProfileForCustomer, recordCompletedCustomerOrder, resolveWheelReward, restoreCustomerCredits, syncCustomerDeliverySavings } from "./customerEngagement.js";
 
 export const app = express();
 app.set("trust proxy", 1);
@@ -160,7 +160,7 @@ async function reversePhoton(latitude: number, longitude: number) {
   const label = [address.road, [address.postcode, address.locality].filter(Boolean).join(" ")].filter(Boolean).join(", ");
   return { label: label || `Ubicación GPS ${latitude.toFixed(5)}, ${longitude.toFixed(5)}`, latitude, longitude, locality: address.locality || null, address: properties };
 }
-mongoose.connection.on("connected", () => { databaseReady = true; startRealtimeRelay(); startCatalogRelay(); startGoogleBusinessSyncWorker(); void syncPublicIds().catch((error) => console.error("Public ID sync failed", error)); void ensurePikiPrlCourse().catch((error) => console.error("PIKI PRL course seed failed", error)); });
+mongoose.connection.on("connected", () => { databaseReady = true; startRealtimeRelay(); startCatalogRelay(); startGoogleBusinessSyncWorker(); void processExpiringCustomerCreditNotifications().catch((error) => console.warn("Credit expiry worker failed", error)); setInterval(() => void processExpiringCustomerCreditNotifications().catch((error) => console.warn("Credit expiry worker failed", error)), 15 * 60_000).unref(); void syncPublicIds().catch((error) => console.error("Public ID sync failed", error)); void ensurePikiPrlCourse().catch((error) => console.error("PIKI PRL course seed failed", error)); });
 mongoose.connection.on("disconnected", () => { databaseReady = false; console.warn("MongoDB disconnected; API entering not-ready state"); });
 mongoose.connection.on("error", (error) => { databaseReady = false; console.error("MongoDB connection error", error instanceof Error ? error.message : error); });
 
@@ -3578,10 +3578,30 @@ app.get("/api/v1/customer/engagement", async (req, res) => {
   const customer = await currentCustomer(req) as any;
   if (!customer) return res.status(401).json({ error: "AUTH_REQUIRED" });
   const customerId = String(customer._id);
-  const [streak, badges, pass, profile] = await Promise.all([UserStreak.findOne({ customerId }).lean().exec(), CustomerBadge.find({ customerId }).sort({ awardedAt: -1 }).lean().exec(), PikiPassSubscription.findOne({ customerId, status: "active", expiresAt: { $gt: new Date() } }).lean().exec(), recommendationProfileForCustomer(customerId)]);
-  return res.json({ streak: streak || { currentStreak: 0, longestStreak: 0, completedOrders: 0 }, badges, pass, recommendations: profile });
+  const [streak, badges, pass, profile, savings] = await Promise.all([UserStreak.findOne({ customerId }).lean().exec(), CustomerBadge.find({ customerId }).sort({ awardedAt: -1 }).lean().exec(), PikiPassSubscription.findOne({ customerId, status: "active", expiresAt: { $gt: new Date() } }).lean().exec(), recommendationProfileForCustomer(customerId), syncCustomerDeliverySavings(customerId)]);
+  return res.json({ streak: streak || { currentStreak: 0, longestStreak: 0, completedOrders: 0 }, badges, pass, savings: { ...savings, savedOnDelivery: savings.savedOnDeliveryCents / 100 }, recommendations: profile });
 });
 
+app.get("/feed/home", async (req, res) => {
+  const customer = await currentCustomer(req) as any;
+  const favoriteIds = String(req.query.favoriteIds || "").split(",").map((id) => id.trim()).filter((id) => mongoose.isValidObjectId(id)).map((id) => new mongoose.Types.ObjectId(id));
+  const now = new Date();
+  const rows = await Restaurant.aggregate([
+    { $match: { isActive: true, onboardingStatus: "approved", listingType: { $ne: "local_directory" } } },
+    { $addFields: {
+      favoriteScore: { $cond: [{ $in: ["$_id", favoriteIds] }, 1000, 0] },
+      availabilityScore: { $cond: [{ $eq: ["$availabilityStatus", "available"] }, 100, 0] },
+      qualityScore: { $add: [{ $multiply: [{ $ifNull: ["$rating", 0] }, 10] }, { $ifNull: ["$reviews", 0] }] },
+      scheduleRank: { $cond: [{ $eq: ["$promoted", true] }, 20, 0] },
+    } },
+    { $addFields: { feedScore: { $add: ["$favoriteScore", "$availabilityScore", "$qualityScore", "$scheduleRank"] } } },
+    { $sort: { feedScore: -1, promoted: -1, rating: -1, reviews: -1, _id: 1 } },
+    { $limit: 50 },
+  ]).exec();
+  const restaurants = rows.map((row: any) => ({ id: String(row._id), slug: row.slug, name: row.name, cuisine: row.cuisine, category: row.category, rating: row.rating || 0, reviews: row.reviews || 0, promoted: Boolean(row.promoted), isFavorite: favoriteIds.some((id) => String(id) === String(row._id)), isOpen: restaurantIsWithinOpeningHours(row.partnerProfile?.openingHours, now), eta: `${row.etaMinutes?.[0] || 20}–${row.etaMinutes?.[1] || 35} min`, image: row.image || "", menu: Array.isArray(row.menu) ? row.menu : [] }));
+  restaurants.sort((a: any, b: any) => Number(b.isOpen) - Number(a.isOpen) || Number(b.isFavorite) - Number(a.isFavorite));
+  return res.json({ restaurants, customerId: customer ? String(customer._id) : null, generatedAt: now.toISOString() });
+});
 app.get("/api/v1/customer/checkout/price-breakdown", async (req, res) => {
   const customer = await currentCustomer(req) as any;
   if (!customer) return res.status(401).json({ error: "AUTH_REQUIRED" });
