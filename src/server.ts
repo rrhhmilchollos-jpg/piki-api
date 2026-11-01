@@ -3565,6 +3565,7 @@ app.post("/api/v1/orders/:id/spin", rateLimit(10, 60_000, "customer-wheel-spin")
   const since = new Date(Date.now() - 30 * 86_400_000);
   const spin = resolveWheelSpin(randomInt(0, 1_000_000) / 1_000_000, {
     subtotalCents: Number(order.subtotalCents || 0),
+    commissionCents: Number(order.marketplaceCommissionCents || Math.round(Number(order.subtotalCents || 0) * 0.18)),
     history: {
       spinsSinceJackpot: jackpotIndex >= 0 ? jackpotIndex : spins.length,
       jackpotLastAt: jackpotIndex >= 0 ? spins[jackpotIndex].wheelSpunAt : null,
