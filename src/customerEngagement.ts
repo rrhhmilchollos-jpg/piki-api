@@ -171,11 +171,11 @@ export const REWARD_BUDGET_30D_CENTS = 1_000;
  * spins without it. Every weight is re-balanced at spin time by `wheelWeights`.
  */
 const BASE_WHEEL_WEIGHTS: Record<WheelPrizeKey, number> = {
-  credit: 46,
-  coupon_low: 24,
-  free_delivery: 19,
+  credit: 52,
+  coupon_low: 28,
+  free_delivery: 8,
   coupon_high: 9,
-  challenge: 3,
+  challenge: 2,
   free_order: 1,
 };
 
