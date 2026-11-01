@@ -10,6 +10,7 @@
     "start": "node dist/server.js",
     "check": "tsc --noEmit",
     "test": "tsx --test src/*.test.ts",
+    "test:coverage": "c8 --all --reporter=text --reporter=html pnpm test",
     "migrate:tenants": "tsx scripts/migrate-tenants.ts",
     "migrate:authorizations": "tsx scripts/migrate-legacy-authorizations.ts",
     "catalog:import:xativa": "tsx scripts/import-xativa-local-catalog.ts",
@@ -41,6 +42,7 @@
     "@types/express": "^5.0.4",
     "@types/node": "^22.19.3",
     "@types/nodemailer": "^8.0.2",
+    "c8": "^10.1.3",
     "esbuild": "^0.25.12",
     "tsx": "^4.21.0",
     "typescript": "~5.9.3"

@@ -107,17 +107,32 @@ export async function createCheckoutSession(input: {
   items: Array<{ name: string; quantity: number; unitPriceCents: number }>;
   deliveryFeeCents: number;
   serviceFeeCents: number;
+  discountCents?: number;
   /** Stripe dynamic methods remain managed in Dashboard; this records Customer intent. */
   preferredPaymentMethod?: "stripe" | "bizum";
 }) {
   if (!stripe) throw new Error("STRIPE_SECRET_KEY no configurada");
-  const metadata = { order_id: input.orderId, order_code: input.publicCode, customer_payment_choice: input.preferredPaymentMethod || "stripe" };
-  const lineItems: Stripe.Checkout.SessionCreateParams.LineItem[] = input.items.map((item) => ({
-    quantity: item.quantity,
-    price_data: { currency: "eur", product_data: { name: item.name }, unit_amount: item.unitPriceCents },
-  }));
-  if (input.deliveryFeeCents > 0) lineItems.push({ quantity: 1, price_data: { currency: "eur", product_data: { name: "Entrega PIKI" }, unit_amount: input.deliveryFeeCents } });
-  if (input.serviceFeeCents > 0) lineItems.push({ quantity: 1, price_data: { currency: "eur", product_data: { name: "Tasa de servicio PIKI" }, unit_amount: input.serviceFeeCents } });
+  const discountCents = Math.max(0, Math.floor(input.discountCents || 0));
+  const metadata = { order_id: input.orderId, order_code: input.publicCode, customer_payment_choice: input.preferredPaymentMethod || "stripe", piki_credit_cents: String(discountCents) };
+  let remainingDiscount = discountCents;
+  const discountedDelivery = Math.max(0, input.deliveryFeeCents - Math.min(input.deliveryFeeCents, remainingDiscount));
+  remainingDiscount -= Math.min(input.deliveryFeeCents, remainingDiscount);
+  const discountedService = Math.max(0, input.serviceFeeCents - Math.min(input.serviceFeeCents, remainingDiscount));
+  remainingDiscount -= Math.min(input.serviceFeeCents, remainingDiscount);
+  const lineItems: Stripe.Checkout.SessionCreateParams.LineItem[] = [];
+  for (const item of input.items) {
+    const total = item.quantity * item.unitPriceCents;
+    const deduction = Math.min(total, remainingDiscount);
+    remainingDiscount -= deduction;
+    if (!deduction) { lineItems.push({ quantity: item.quantity, price_data: { currency: "eur", product_data: { name: item.name }, unit_amount: item.unitPriceCents } }); continue; }
+    if (item.quantity === 1) { lineItems.push({ quantity: 1, price_data: { currency: "eur", product_data: { name: item.name }, unit_amount: item.unitPriceCents - deduction } }); continue; }
+    const fullUnits = Math.floor((total - deduction) / item.unitPriceCents);
+    if (fullUnits > 0) lineItems.push({ quantity: fullUnits, price_data: { currency: "eur", product_data: { name: item.name }, unit_amount: item.unitPriceCents } });
+    const remainderUnits = item.quantity - fullUnits;
+    if (remainderUnits > 0) lineItems.push({ quantity: remainderUnits, price_data: { currency: "eur", product_data: { name: item.name }, unit_amount: Math.max(0, Math.floor((total - deduction - fullUnits * item.unitPriceCents) / remainderUnits)) } });
+  }
+  if (discountedDelivery > 0) lineItems.push({ quantity: 1, price_data: { currency: "eur", product_data: { name: "Entrega PIKI" }, unit_amount: discountedDelivery } });
+  if (discountedService > 0) lineItems.push({ quantity: 1, price_data: { currency: "eur", product_data: { name: "Tasa de servicio PIKI" }, unit_amount: discountedService } });
   return stripe.checkout.sessions.create({
     mode: "payment",
     line_items: lineItems,

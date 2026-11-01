@@ -72,6 +72,7 @@ import { prepareTrackingBatch } from "./riderLocationPolicy.js";
 import { activeRecruitmentProvinces, resolveRecruitmentSelection } from "./recruitmentAreas.js";
 import { startGoogleBusinessSyncWorker, stopGoogleBusinessSyncWorker, googleBusinessSyncSettings, googleBusinessHoursChanged } from "./googleBusinessSyncWorker.js";
 import { resolveRiderGeofence } from "./riderGeofence.js";
+import { Badge, CustomerBadge, PikiPassSubscription, ReferralReward, UserStreak, calculatePriceBreakdown, consumeCustomerCredits, ensureCustomerEngagementIndexes, recommendationProfileForCustomer, recordCompletedCustomerOrder, resolveWheelReward, restoreCustomerCredits } from "./customerEngagement.js";
 
 export const app = express();
 app.set("trust proxy", 1);
@@ -3538,7 +3539,75 @@ app.post("/api/v1/orders", rateLimit(20, 60_000, "orders-create"), async (req, r
     await Promise.all([dispatch, publishOrderIntakeEvents(order, { settlement: "cash_due", message: "Contrarreembolso: el Rider cobrará en efectivo al entregar." })]);
   }
   res.status(201).json({ order: { id: order.id, publicCode, displayCode: order.displayCode, displayCodeDate: order.displayCodeDate, status: order.status, paymentState: parsed.data.paymentMethod === "cash" ? "pending_cash_collection" : order.paymentState, paymentMethod: parsed.data.paymentMethod, cashDueAtDelivery: parsed.data.paymentMethod === "cash", subtotalCents, deliveryFeeCents, serviceFeeCents, totalCents,
-    marketplace: { commissionRateBps: marketplace.commissionRateBps, commissionCents: marketplace.platformCommissionCents, partnerPayoutCents: marketplace.partnerPayoutCents, riderEarningsCents: marketplace.riderEarningsCents, platformNetBeforeProcessingCents: marketplace.platformNetBeforeProcessingCents }, freeDeliveryApplied: freeDelivery.eligible, freeDeliveryOrdersRemaining: freeDelivery.remaining, coverage, route, partnerPreparationLimitMinutes: PARTNER_PREPARATION_LIMIT_MINUTES, customerDeliveryTargetMinutes: CUSTOMER_DELIVERY_TARGET_MINUTES, etaMinutes: calculateEtaRange([PARTNER_PREPARATION_LIMIT_MINUTES, PARTNER_PREPARATION_LIMIT_MINUTES], [5, 15]) } });
+    marketplace: { commissionRateBps: marketplace.commissionRateBps, commissionCents: marketplace.platformCommissionCents, partnerPayoutCents: marketplace.partnerPayoutCents, riderEarningsCents: marketplace.riderEarningsCents, platformNetBeforeProcessingCents: marketplace.platformNetBeforeProcessingCents }, priceBreakdown: calculatePriceBreakdown({ subtotalCents, deliveryFeeCents, serviceFeeCents }), freeDeliveryApplied: freeDelivery.eligible, freeDeliveryOrdersRemaining: freeDelivery.remaining, coverage, route, partnerPreparationLimitMinutes: PARTNER_PREPARATION_LIMIT_MINUTES, customerDeliveryTargetMinutes: CUSTOMER_DELIVERY_TARGET_MINUTES, etaMinutes: calculateEtaRange([PARTNER_PREPARATION_LIMIT_MINUTES, PARTNER_PREPARATION_LIMIT_MINUTES], [5, 15]) } });
+});
+
+app.post("/api/v1/orders/:id/spin", rateLimit(10, 60_000, "customer-wheel-spin"), async (req, res) => {
+  const customer = await currentCustomer(req) as any;
+  if (!customer) return res.status(401).json({ error: "AUTH_REQUIRED" });
+  const rawId = String(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
+  const order = await Order.findOne({ $or: [{ publicCode: rawId }, ...(objectId(rawId) ? [{ _id: objectId(rawId) }] : [])], customerId: String(customer._id) }).exec() as any;
+  if (!order) return res.status(404).json({ error: "ORDER_NOT_FOUND" });
+  if (order.status !== "delivered") return res.status(409).json({ error: "ORDER_NOT_DELIVERED" });
+  if (order.hasSpun) return res.status(409).json({ error: "ORDER_ALREADY_SPUN", message: "Este pedido ya ha utilizado su giro." });
+  const rewardCents = resolveWheelReward(randomInt(0, 1_000_000) / 1_000_000);
+  const now = new Date();
+  const spinSession = await mongoose.startSession();
+  let updated: any = null;
+  let newBalance = 0;
+  try {
+    await spinSession.withTransaction(async () => {
+      updated = await Order.findOneAndUpdate({ _id: order._id, customerId: String(customer._id), status: "delivered", $or: [{ hasSpun: { $exists: false } }, { hasSpun: false }] }, { $set: { hasSpun: true, wheelReward: rewardCents ? "1.50_CREDIT" : "NO_REWARD", wheelRewardCents: rewardCents, wheelSpunAt: now } }, { new: true, session: spinSession }).lean().exec();
+      if (!updated) return;
+      if (rewardCents) {
+        const expired = await CustomerAccount.findOne({ _id: customer._id, pikiCreditsExpiresAt: { $lte: now } }).select("pikiCreditsCents").session(spinSession).lean().exec() as any;
+        if (expired?.pikiCreditsCents) await CustomerAccount.updateOne({ _id: customer._id }, { $set: { pikiCreditsCents: 0, pikiCreditsExpiresAt: null } }, { session: spinSession }).exec();
+        await CustomerAccount.updateOne({ _id: customer._id }, { $inc: { pikiCreditsCents: rewardCents }, $set: { pikiCreditsExpiresAt: new Date(now.getTime() + 48 * 60 * 60 * 1000) } }, { session: spinSession }).exec();
+      }
+      const wallet = await CustomerAccount.findById(customer._id).select("pikiCreditsCents").session(spinSession).lean().exec() as any;
+      newBalance = Number(wallet?.pikiCreditsCents || 0);
+    });
+  } finally {
+    await spinSession.endSession();
+  }
+  if (!updated) return res.status(409).json({ error: "ORDER_ALREADY_SPUN" });
+  return res.json({ success: true, rewardType: rewardCents ? "credit" : "none", amount: rewardCents / 100, message: rewardCents ? "¡Enhorabuena! Has ganado 1,50€ para tu próximo pedido. Válido durante 48 horas." : "Esta vez no ha habido premio. ¡Sigue participando!", newBalance: newBalance / 100 });
+});
+
+app.get("/api/v1/customer/engagement", async (req, res) => {
+  const customer = await currentCustomer(req) as any;
+  if (!customer) return res.status(401).json({ error: "AUTH_REQUIRED" });
+  const customerId = String(customer._id);
+  const [streak, badges, pass, profile] = await Promise.all([UserStreak.findOne({ customerId }).lean().exec(), CustomerBadge.find({ customerId }).sort({ awardedAt: -1 }).lean().exec(), PikiPassSubscription.findOne({ customerId, status: "active", expiresAt: { $gt: new Date() } }).lean().exec(), recommendationProfileForCustomer(customerId)]);
+  return res.json({ streak: streak || { currentStreak: 0, longestStreak: 0, completedOrders: 0 }, badges, pass, recommendations: profile });
+});
+
+app.get("/api/v1/customer/checkout/price-breakdown", async (req, res) => {
+  const customer = await currentCustomer(req) as any;
+  if (!customer) return res.status(401).json({ error: "AUTH_REQUIRED" });
+  const subtotalCents = Number(req.query.subtotalCents || 0); const deliveryFeeCents = Number(req.query.deliveryFeeCents || 0); const serviceFeeCents = Number(req.query.serviceFeeCents || 0); const discountCents = Number(req.query.discountCents || 0); const tipCents = Number(req.query.tipCents || 0);
+  if (![subtotalCents, deliveryFeeCents, serviceFeeCents, discountCents, tipCents].every(Number.isFinite)) return res.status(400).json({ error: "INVALID_PRICE_BREAKDOWN" });
+  return res.json({ priceBreakdown: calculatePriceBreakdown({ subtotalCents, deliveryFeeCents, serviceFeeCents, discountCents, tipCents }) });
+});
+
+app.get("/api/v1/customer/pass", async (req, res) => {
+  const customer = await currentCustomer(req) as any;
+  if (!customer) return res.status(401).json({ error: "AUTH_REQUIRED" });
+  const subscription = await PikiPassSubscription.findOne({ customerId: String(customer._id), status: "active", expiresAt: { $gt: new Date() } }).lean().exec();
+  return res.json({ active: Boolean(subscription), subscription, plans: [{ plan: "monthly", durationDays: 30 }, { plan: "annual", durationDays: 365 }] });
+});
+
+app.post("/api/v1/customer/referrals/claim", async (req, res) => {
+  const customer = await currentCustomer(req) as any;
+  if (!customer) return res.status(401).json({ error: "AUTH_REQUIRED" });
+  const code = String(req.body?.code || "").trim().toUpperCase();
+  const inviter = await CustomerAccount.findOne({ referralCode: code }).select("_id").lean().exec() as any;
+  if (!code || !inviter || String(inviter._id) === String(customer._id)) return res.status(400).json({ error: "INVALID_REFERRAL_CODE" });
+  const existing = await ReferralReward.findOne({ invitedCustomerId: String(customer._id) }).lean().exec();
+  if (existing) return res.status(409).json({ error: "REFERRAL_ALREADY_CLAIMED", referral: existing });
+  const referral = await ReferralReward.create({ inviterCustomerId: String(inviter._id), invitedCustomerId: String(customer._id), referralCode: code, rewardCents: 150, status: "pending" });
+  await CustomerAccount.updateOne({ _id: customer._id, referredByCode: { $in: [null, ""] } }, { $set: { referredByCode: code } }).exec();
+  return res.status(201).json({ referral });
 });
 
 const customerOrderSyncSchema = z.object({ publicCode: z.string().trim().min(6).max(64), restaurantSlug: z.string().trim().min(1).max(120), customerId: z.string().nullable().optional(), customerName: z.string().trim().max(160).nullable().optional(), deliveryAddress: z.string().trim().min(5).max(1000), deliveryNote: z.string().trim().max(500).default(""), deliveryLocation: z.object({ latitude: z.number().finite(), longitude: z.number().finite() }).nullable().optional(), items: z.array(z.object({ itemId: z.string().min(1), name: z.string().min(1), quantity: z.number().int().min(1).max(20), unitPriceCents: z.number().int().min(0), totalCents: z.number().int().min(0).optional() })).min(1), subtotalCents: z.number().int().min(0), deliveryFeeCents: z.number().int().min(0), serviceFeeCents: z.number().int().min(0), totalCents: z.number().int().min(0), paymentMethod: z.enum(["stripe", "cash", "bizum_manual"]).default("stripe"), paymentState: z.enum(["pending", "authorized", "paid", "failed", "refunded"]).default("pending"), stripeCheckoutSessionId: z.string().nullable().optional(), stripePaymentIntentId: z.string().nullable().optional() });
@@ -3685,7 +3754,9 @@ app.post("/api/v1/payments/checkout", rateLimit(20, 60_000, "payments-checkout")
   if (!checkoutTokenIsValid(order.publicCode, parsed.data.checkoutToken)) return res.status(403).json({ error: "INVALID_CHECKOUT_TOKEN" });
   if (order.paymentMethod !== "stripe") return res.status(409).json({ error: "ORDER_USES_CASH", message: "Este pedido está configurado para pago en efectivo." });
   if (["authorized", "paid"].includes(order.paymentState)) return res.status(409).json({ error: "ORDER_ALREADY_PAID" });
+  let creditAppliedCents = 0;
   try {
+    creditAppliedCents = await consumeCustomerCredits(String(order.customerId || ""), Number(order.totalCents || 0));
     const session = await createCheckoutSession({
       orderId: String(order._id),
       publicCode: order.publicCode,
@@ -3694,11 +3765,13 @@ app.post("/api/v1/payments/checkout", rateLimit(20, 60_000, "payments-checkout")
       items: (order.items || []).map((item: any) => ({ name: item.name, quantity: Number(item.quantity), unitPriceCents: Number(item.unitPriceCents) })),
       deliveryFeeCents: Number(order.deliveryFeeCents || 0),
       serviceFeeCents: Number(order.serviceFeeCents || 0),
+      discountCents: creditAppliedCents,
       preferredPaymentMethod: "stripe",
     });
-    await Order.updateOne({ _id: order._id, paymentState: "pending" }, { $set: { stripeCheckoutSessionId: session.id }, $inc: { version: 1 } }).exec();
-    return res.status(201).json({ checkoutUrl: session.url, sessionId: session.id, orderId: String(order._id), publicCode: order.publicCode });
+    await Order.updateOne({ _id: order._id, paymentState: "pending" }, { $set: { stripeCheckoutSessionId: session.id, creditAppliedCents, totalCents: Number(order.totalCents || 0) - creditAppliedCents }, $inc: { version: 1 } }).exec();
+    return res.status(201).json({ checkoutUrl: session.url, sessionId: session.id, orderId: String(order._id), publicCode: order.publicCode, creditAppliedCents, priceBreakdown: calculatePriceBreakdown({ subtotalCents: Number(order.subtotalCents || 0), deliveryFeeCents: Number(order.deliveryFeeCents || 0), serviceFeeCents: Number(order.serviceFeeCents || 0), discountCents: creditAppliedCents }) });
   } catch (error) {
+    await restoreCustomerCredits(String(order.customerId || ""), creditAppliedCents).catch(() => undefined);
     console.error(JSON.stringify({ event: "stripe_checkout_failed", orderId: String(order._id), errorType: error instanceof Error ? error.name : "UnknownError" }));
     return res.status(503).json({ error: "STRIPE_CHECKOUT_UNAVAILABLE", message: "El pago online no está disponible temporalmente." });
   }
@@ -4332,6 +4405,7 @@ app.post("/api/v1/riders/:riderId/orders/:orderId/confirm-delivery", requireRole
   }
   const deliveredOrder = updated as any;
   await postMarketplaceOrderLedger(deliveredOrder).catch((error) => console.error("Marketplace ledger posting failed", error instanceof Error ? error.message : error));
+  await recordCompletedCustomerOrder({ customerId: deliveredOrder.customerId, orderId, completedAt: deliveredAt }).catch((error) => console.error("Customer streak update failed", error instanceof Error ? error.message : error));
   await RiderOrderMessage.deleteMany({ orderId, riderId }).exec();
   await releaseRiderOrderSlot(orderId, riderId);
   if (!confirmedOrder.isTestOrder) await awardRiderRecruitmentMilestones(riderId).catch((error) => console.error("Rider referral milestone evaluation failed", error instanceof Error ? error.message : error));
@@ -5907,6 +5981,7 @@ async function start() {
     await ensureExpiresAtTtlIndex("employee_sessions");
     await ensureExpiresAtTtlIndex("employee_password_resets");
     await ensureIndexes();
+    await ensureCustomerEngagementIndexes();
     await backfillEmployeeCodes();
     startRealtimeRelay();
     startNotificationWorker();

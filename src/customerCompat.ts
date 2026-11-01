@@ -14,6 +14,7 @@ import { dispatchInitialIdempotencyKey, enqueueDispatchOutbox } from "./dispatch
 import { SupportTicket } from "./models.js";
 import { customerSupportCreateSchema, customerSupportTicketNumber, customerSupportTicketView } from "./customerSupportPolicy.js";
 import { checkoutOrigin } from "./checkoutOrigin.js";
+import { Badge, CustomerBadge, PikiPassSubscription, RecommendationProfile, UserStreak, calculatePriceBreakdown, consumeCustomerCredits, restoreCustomerCredits } from "./customerEngagement.js";
 
 const COOKIE = "piki_customer_session";
 let dispatchCustomerOrder: ((orderId: string) => Promise<unknown>) | null = null;
@@ -233,6 +234,18 @@ async function handleCustomerTrpcSingle(req: Request, res: Response) {
       return reply(res, row ? restaurantView(row) : null);
     }
     if (procedure === "auth.me") { const user = await currentCustomer(req) as any; if (user) user.referralCode = await ensureReferralCode(user); return reply(res, publicUser(user)); }
+    if (procedure === "customer.engagement.get") {
+      const user = await currentCustomer(req) as any;
+      if (!user) return fail(res, "Inicia sesión para consultar tu progreso.", "AUTH_REQUIRED");
+      const customerId = String(user._id);
+      const [streak, badges, pass, recommendations] = await Promise.all([UserStreak.findOne({ customerId }).lean().exec(), CustomerBadge.find({ customerId }).sort({ awardedAt: -1 }).lean().exec(), PikiPassSubscription.findOne({ customerId, status: "active", expiresAt: { $gt: new Date() } }).lean().exec(), RecommendationProfile.findOne({ customerId }).lean().exec()]);
+      return reply(res, { streak: streak || { currentStreak: 0, longestStreak: 0, completedOrders: 0 }, badges, pass, recommendations });
+    }
+    if (procedure === "customer.priceBreakdown") {
+      const user = await currentCustomer(req) as any;
+      if (!user) return fail(res, "Inicia sesión para consultar el checkout.", "AUTH_REQUIRED");
+      return reply(res, { priceBreakdown: calculatePriceBreakdown({ subtotalCents: Number(input?.subtotalCents || 0), deliveryFeeCents: Number(input?.deliveryFeeCents || 0), serviceFeeCents: Number(input?.serviceFeeCents || 0), discountCents: Number(input?.discountCents || 0), tipCents: Number(input?.tipCents || 0) }) });
+    }
     if (procedure === "customer.profile.get" || procedure === "customer.profile.update") {
       const user = await currentCustomer(req) as any;
       if (!user) return fail(res, "Inicia sesión para consultar tu perfil.", "AUTH_REQUIRED");
@@ -447,18 +460,21 @@ async function handleCustomerTrpcSingle(req: Request, res: Response) {
         await orderSession.endSession();
       }
       let checkoutUrl: string | null = null;
+      let creditAppliedCents = 0;
       if (procedure === "order.checkout" && paymentMethod === "stripe") {
         try {
-          const session = await createCheckoutSession({ orderId: String(order._id), publicCode: code, origin: checkoutOrigin(input.origin), customerEmail: user.email, items: normalized.map((item) => ({ name: item.name, quantity: item.quantity, unitPriceCents: item.unitPriceCents })), deliveryFeeCents: deliveryCents, serviceFeeCents: serviceCents, preferredPaymentMethod: "stripe" });
+          creditAppliedCents = await consumeCustomerCredits(String(user._id), totalCents);
+          const session = await createCheckoutSession({ orderId: String(order._id), publicCode: code, origin: checkoutOrigin(input.origin), customerEmail: user.email, items: normalized.map((item) => ({ name: item.name, quantity: item.quantity, unitPriceCents: item.unitPriceCents })), deliveryFeeCents: deliveryCents, serviceFeeCents: serviceCents, discountCents: creditAppliedCents, preferredPaymentMethod: "stripe" });
           checkoutUrl = session.url;
-          await Order.updateOne({ _id: order._id }, { $set: { stripeCheckoutSessionId: session.id }, $inc: { version: 1 } }).exec();
+          await Order.updateOne({ _id: order._id }, { $set: { stripeCheckoutSessionId: session.id, creditAppliedCents, totalCents: totalCents - creditAppliedCents }, $inc: { version: 1 } }).exec();
         } catch (error) {
+          await restoreCustomerCredits(String(user._id), creditAppliedCents).catch(() => undefined);
           console.error(`[customerCompat] stripe checkout`, error instanceof Error ? error.message : error);
           return fail(res, "El pago online no está disponible temporalmente.", "STRIPE_UNAVAILABLE");
         }
       }
       if (paymentMethod === "cash") await publishOrderIntakeEvents(order, { settlement: "cash_due", message: "Pedido a contrarreembolso: el Rider cobrará en efectivo al entregar." });
-      return reply(res, { orderId: code, checkoutUrl, totalCents, paymentMethod, paymentState: paymentMethod === "cash" ? "pending_cash_collection" : "pending", cashDueAtDelivery: paymentMethod === "cash", coverage, route });
+      return reply(res, { orderId: code, checkoutUrl, totalCents: totalCents - creditAppliedCents, paymentMethod, paymentState: paymentMethod === "cash" ? "pending_cash_collection" : "pending", cashDueAtDelivery: paymentMethod === "cash", creditAppliedCents, priceBreakdown: calculatePriceBreakdown({ subtotalCents, deliveryFeeCents: deliveryCents, serviceFeeCents: serviceCents, discountCents: creditAppliedCents }), coverage, route });
     }
     return fail(res, `Procedimiento no soportado: ${procedure}`, "NOT_FOUND");
   } catch (error) { console.error(`[customerCompat] ${procedure}`, error); return fail(res, "Error interno de la plataforma", "INTERNAL_SERVER_ERROR"); }
