@@ -12,6 +12,7 @@ import {
   type StripePaymentState,
   type StripeWebhookObject,
 } from "./stripeWebhookPolicy.js";
+import { applyPikiPassEvent } from "./pikiPassBilling.js";
 
 const stripeSecretKey = process.env.STRIPE_SECRET_KEY;
 export const stripe = stripeSecretKey ? new Stripe(stripeSecretKey) : null;
@@ -318,8 +319,12 @@ export async function processStripeEvent(event: StripeEventLike, dependencies: S
         activated = true;
       }
     }
+    // PIKI Pass lives in the same saga so a Stripe redelivery cannot bill a
+    // subscription twice or resurrect a cancelled Pass. Order events return
+    // `handled: false` here and keep their previous behaviour untouched.
+    const pass = await applyPikiPassEvent(event as unknown as { id: string; type: string; data: { object: any } });
     await dependencies.markProcessed(event.id);
-    return { duplicate: false, eventType: event.type, orderCode, activated };
+    return { duplicate: false, eventType: event.type, orderCode, activated, pikiPass: pass };
   } catch (error) {
     try {
       await dependencies.markFailed(event.id, error);

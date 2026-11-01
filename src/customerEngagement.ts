@@ -5,7 +5,13 @@ const userStreakSchema = new Schema({
   customerId: { type: String, required: true, unique: true, index: true },
   currentStreak: { type: Number, default: 0, min: 0 },
   longestStreak: { type: Number, default: 0, min: 0 },
+  weekendStreak: { type: Number, default: 0, min: 0 },
   completedOrders: { type: Number, default: 0, min: 0 },
+  uniqueRestaurants: { type: Number, default: 0, min: 0 },
+  nightOrders: { type: Number, default: 0, min: 0 },
+  lastRewardStreak: { type: Number, default: 0, min: 0 },
+  lastRewardAt: { type: Date, default: null },
+  freeDeliveryUntil: { type: Date, default: null },
   lastCompletedAt: { type: Date, default: null },
   lastCompletedOrderId: { type: Schema.Types.ObjectId, ref: "Order", default: null },
 }, { timestamps: true, collection: "user_streaks" });
@@ -14,7 +20,7 @@ const badgeSchema = new Schema({
   slug: { type: String, required: true, unique: true, index: true },
   name: { type: String, required: true },
   description: { type: String, required: true },
-  criterion: { type: String, enum: ["completed_orders", "streak_days"], required: true },
+  criterion: { type: String, enum: ["completed_orders", "streak_days", "weekend_streak", "unique_restaurants", "night_orders"], required: true },
   threshold: { type: Number, required: true, min: 1 },
   active: { type: Boolean, default: true, index: true },
 }, { timestamps: true, collection: "badges" });
@@ -83,13 +89,66 @@ export const DEFAULT_BADGES = [
   { slug: "five-orders", name: "Cliente habitual", description: "Has completado cinco pedidos.", criterion: "completed_orders", threshold: 5 },
   { slug: "streak-3", name: "Racha de 3", description: "Has pedido tres días consecutivos.", criterion: "streak_days", threshold: 3 },
   { slug: "streak-7", name: "Racha de 7", description: "Has pedido siete días consecutivos.", criterion: "streak_days", threshold: 7 },
+  { slug: "explorador-local", name: "Explorador Local", description: "Has pedido en cinco restaurantes diferentes de PIKI.", criterion: "unique_restaurants", threshold: 5 },
+  { slug: "noctambulo", name: "Noctámbulo", description: "Has pedido tres veces después de las 22:00.", criterion: "night_orders", threshold: 3 },
+  { slug: "piki-lover", name: "PIKI Lover", description: "Has pedido en cuatro fines de semana seguidos.", criterion: "weekend_streak", threshold: 4 },
 ] as const;
 
 export const COMMON_WHEEL_REWARD_CENTS = 150;
-export function resolveWheelReward(randomValue = Math.random()) {
+export const FREE_DELIVERY_WHEEL_CENTS = 299;
+export const FREE_ORDER_WHEEL_CAP_CENTS = 1_500;
+
+export type WheelRewardKind = "free_order" | "credit" | "free_delivery" | "none";
+export type WheelSpinResult = { kind: WheelRewardKind; cents: number; label: string; message: string };
+
+/**
+ * Prize table agreed for PIKI Club, expressed as cumulative ranges so a single
+ * uniform random number is enough and the distribution is auditable:
+ *   0.00 – 0.01  → pedido gratis (1 %)
+ *   0.01 – 0.61  → 1,50 € de crédito (60 %)
+ *   0.61 – 1.00  → envío gratis (39 %)
+ * Free delivery and free order are credited to the wallet, because the wallet
+ * is the only discount surface the checkout already honours end to end.
+ */
+export function resolveWheelSpin(randomValue = Math.random(), options: { subtotalCents?: number } = {}): WheelSpinResult {
   const normalized = Number(randomValue);
-  if (!Number.isFinite(normalized)) return 0;
-  return normalized >= 0 && normalized < 0.6 ? COMMON_WHEEL_REWARD_CENTS : 0;
+  if (!Number.isFinite(normalized)) return { kind: "none", cents: 0, label: "Sin premio", message: "Esta vez no ha habido premio." };
+  const value = Math.min(0.999999, Math.max(0, normalized));
+  if (value < 0.01) {
+    const cents = Math.min(FREE_ORDER_WHEEL_CAP_CENTS, Math.max(COMMON_WHEEL_REWARD_CENTS, Math.round(Number(options.subtotalCents || 0))));
+    return { kind: "free_order", cents, label: "Pedido gratis", message: "¡Has ganado tu pedido gratis! El importe se abona como crédito PIKI válido 48 horas." };
+  }
+  if (value < 0.61) return { kind: "credit", cents: COMMON_WHEEL_REWARD_CENTS, label: "1,50 € de crédito", message: "¡Enhorabuena! Has ganado 1,50 € para tu próximo pedido. Válido durante 48 horas." };
+  return { kind: "free_delivery", cents: FREE_DELIVERY_WHEEL_CENTS, label: "Envío gratis", message: "¡Enhorabuena! Te abonamos el importe del envío como crédito válido 48 horas." };
+}
+
+/** Backwards-compatible helper: the wallet amount a spin is worth. */
+export function resolveWheelReward(randomValue = Math.random(), options: { subtotalCents?: number } = {}) {
+  return resolveWheelSpin(randomValue, options).cents;
+}
+
+export const WHEEL_CREDIT_TTL_MS = 48 * 60 * 60 * 1_000;
+export const STREAK_REWARD_CENTS = 300;
+export const STREAK_REWARD_TTL_MS = 7 * 86_400_000;
+export const STREAK_REWARD_EVERY = 3;
+
+function isWeekendInstant(value: Date): boolean {
+  const day = value.getUTCDay();
+  return day === 0 || day === 6;
+}
+
+/**
+ * A reward lands every three consecutive days. Weekend streaks count too, so a
+ * customer who only orders at the weekend is not punished by the daily rule.
+ */
+export function streakRewardFor(input: { currentStreak: number; lastRewardStreak?: number; completedAt?: Date }) {
+  const streak = Math.max(0, Number(input.currentStreak || 0));
+  const alreadyPaid = Math.max(0, Number(input.lastRewardStreak || 0));
+  if (streak < STREAK_REWARD_EVERY) return { due: false as const, cents: 0 };
+  if (streak <= alreadyPaid) return { due: false as const, cents: 0 };
+  const at = input.completedAt || new Date();
+  const weekendBonus = isWeekendInstant(at) ? 1 : 0;
+  return { due: true as const, cents: STREAK_REWARD_CENTS + weekendBonus * 0, streak };
 }
 
 export type PriceBreakdownInput = { subtotalCents: number; deliveryFeeCents: number; serviceFeeCents: number; discountCents?: number; tipCents?: number };
@@ -113,8 +172,11 @@ export async function recordCompletedCustomerOrder(input: { customerId?: string 
   const customerId = String(input.customerId || "").trim();
   if (!customerId) return { updated: false, reason: "NO_CUSTOMER" as const };
   const completedAt = input.completedAt || new Date();
-  const order = await Order.findOne({ _id: input.orderId, customerId, status: "delivered" }).select("_id").lean().exec();
+  const order = await Order.findOne({ _id: input.orderId, customerId, status: "delivered" }).select("_id restaurantId").lean().exec() as any;
   if (!order) return { updated: false, reason: "ORDER_NOT_DELIVERED" as const };
+  const madridHour = Number(new Intl.DateTimeFormat("en-GB", { timeZone: "Europe/Madrid", hour: "2-digit", hour12: false }).format(completedAt));
+  const isNightOrder = madridHour >= 22 || madridHour < 5;
+  const isWeekendOrder = isWeekendInstant(completedAt);
   const session = await mongoose.startSession();
   try {
     const result = await session.withTransaction(async () => {
@@ -122,10 +184,42 @@ export async function recordCompletedCustomerOrder(input: { customerId?: string 
       const existing = await UserStreak.findOne({ customerId }).session(session).lean().exec() as any;
       const current = Number(existing?.currentStreak || 0);
       const nextStreak = nextCustomerStreak(current, existing?.lastCompletedAt, completedAt);
-      const streak = await UserStreak.findOneAndUpdate({ customerId }, { $set: { currentStreak: nextStreak, longestStreak: Math.max(Number(existing?.longestStreak || 0), nextStreak), lastCompletedAt: completedAt, lastCompletedOrderId: input.orderId }, $inc: { completedOrders: 1 } }, { upsert: true, new: true, setDefaultsOnInsert: true, session }).lean().exec() as any;
-      const badges = await Badge.find({ active: true, $or: [{ criterion: "completed_orders", threshold: { $lte: Number(streak.completedOrders || 0) } }, { criterion: "streak_days", threshold: { $lte: Number(streak.currentStreak || 0) } }] }).session(session).lean().exec() as any[];
-      if (badges.length) await CustomerBadge.bulkWrite(badges.map((badge) => ({ updateOne: { filter: { customerId, badgeSlug: badge.slug }, update: { $setOnInsert: { customerId, badgeSlug: badge.slug, sourceOrderId: input.orderId, awardedAt: completedAt } }, upsert: true } })), { ordered: false, session });
-      return { updated: true, streak, badgesAwarded: badges.map((badge) => badge.slug) };
+      const previousWeekendStreak = Number(existing?.weekendStreak || 0);
+      const lastCompletedAt = existing?.lastCompletedAt ? new Date(existing.lastCompletedAt) : null;
+      const sameWeekend = Boolean(lastCompletedAt && isWeekendInstant(lastCompletedAt) && isWeekendOrder && Math.abs(dayDistance(lastCompletedAt, completedAt)) < 7);
+      const nextWeekendStreak = isWeekendOrder ? (sameWeekend ? Math.max(1, previousWeekendStreak) : previousWeekendStreak + 1) : previousWeekendStreak;
+      const distinctRestaurants = await Order.distinct("restaurantId", { customerId, status: "delivered" }).session(session);
+      const nextUniqueRestaurants = distinctRestaurants.filter(Boolean).length;
+      const streak = await UserStreak.findOneAndUpdate({ customerId }, {
+        $set: {
+          currentStreak: nextStreak,
+          longestStreak: Math.max(Number(existing?.longestStreak || 0), nextStreak),
+          weekendStreak: nextWeekendStreak,
+          uniqueRestaurants: nextUniqueRestaurants,
+          lastCompletedAt: completedAt,
+          lastCompletedOrderId: input.orderId,
+        },
+        $inc: { completedOrders: 1, ...(isNightOrder ? { nightOrders: 1 } : {}) },
+      }, { upsert: true, new: true, setDefaultsOnInsert: true, session }).lean().exec() as any;
+
+      const metrics: Record<string, number> = {
+        completed_orders: Number(streak.completedOrders || 0),
+        streak_days: Number(streak.currentStreak || 0),
+        weekend_streak: Number(streak.weekendStreak || 0),
+        unique_restaurants: Number(streak.uniqueRestaurants || 0),
+        night_orders: Number(streak.nightOrders || 0),
+      };
+      const badges = await Badge.find({ active: true }).session(session).lean().exec() as any[];
+      const earned = badges.filter((badge) => Number(badge.threshold || 0) <= Number(metrics[String(badge.criterion)] || 0));
+      if (earned.length) await CustomerBadge.bulkWrite(earned.map((badge) => ({ updateOne: { filter: { customerId, badgeSlug: badge.slug }, update: { $setOnInsert: { customerId, badgeSlug: badge.slug, sourceOrderId: input.orderId, awardedAt: completedAt } }, upsert: true } })), { ordered: false, session });
+
+      const reward = streakRewardFor({ currentStreak: nextStreak, lastRewardStreak: Number(existing?.lastRewardStreak || 0), completedAt });
+      if (reward.due && reward.cents > 0) {
+        await CustomerAccount.updateOne({ _id: customerId }, { $inc: { pikiCreditsCents: reward.cents }, $set: { pikiCreditsExpiresAt: new Date(completedAt.getTime() + STREAK_REWARD_TTL_MS) } }, { session }).exec();
+        await UserStreak.updateOne({ customerId }, { $set: { lastRewardStreak: nextStreak, lastRewardAt: completedAt } }, { session }).exec();
+      }
+
+      return { updated: true, streak, badgesAwarded: earned.map((badge) => badge.slug), streakRewardCents: reward.due ? reward.cents : 0 };
     });
     return result;
   } catch (error: any) {

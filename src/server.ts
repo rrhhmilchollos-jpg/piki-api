@@ -72,7 +72,10 @@ import { prepareTrackingBatch } from "./riderLocationPolicy.js";
 import { activeRecruitmentProvinces, resolveRecruitmentSelection } from "./recruitmentAreas.js";
 import { startGoogleBusinessSyncWorker, stopGoogleBusinessSyncWorker, googleBusinessSyncSettings, googleBusinessHoursChanged } from "./googleBusinessSyncWorker.js";
 import { resolveRiderGeofence } from "./riderGeofence.js";
-import { Badge, CustomerBadge, CustomerDeliverySaving, PikiPassSubscription, ReferralReward, UserStreak, calculatePriceBreakdown, consumeCustomerCredits, ensureCustomerEngagementIndexes, recommendationProfileForCustomer, recordCompletedCustomerOrder, resolveWheelReward, restoreCustomerCredits, syncCustomerDeliverySavings } from "./customerEngagement.js";
+import { Badge, CustomerBadge, CustomerDeliverySaving, PikiPassSubscription, ReferralReward, UserStreak, WHEEL_CREDIT_TTL_MS, calculatePriceBreakdown, consumeCustomerCredits, ensureCustomerEngagementIndexes, recommendationProfileForCustomer, recordCompletedCustomerOrder, resolveWheelSpin, restoreCustomerCredits, syncCustomerDeliverySavings } from "./customerEngagement.js";
+import { createPassCheckoutSession, createPassOneOffSession, createPassPortalSession, passDeliveryBenefit, pikiPassConfigured, pikiPassPayload } from "./pikiPassBilling.js";
+import { runZombieOrderMaintenance } from "./zombieOrders.js";
+import { adjustEtaLabel, currentWeather, distanceKm } from "./weather.js";
 
 export const app = express();
 app.set("trust proxy", 1);
@@ -3512,7 +3515,11 @@ app.post("/api/v1/orders", rateLimit(20, 60_000, "orders-create"), async (req, r
   const route = await quoteDeliveryRoute([Number(restaurantPoint[0]), Number(restaurantPoint[1])], deliveryPoint);
   const subtotalCents = normalizedItems.reduce((sum, item) => sum + item.unitPriceCents * item.quantity, 0);
   const freeDelivery = await freeDeliveryState(restaurant);
-  const deliveryFeeCents = freeDelivery.eligible ? 0 : coverage.deliveryFeeCents;
+  const authenticatedCustomer = await currentCustomer(req) as any;
+  // PIKI Pass removes the delivery fee on the server, never from a client flag,
+  // and the original fee stays recorded so the savings ledger is auditable.
+  const passBenefit = await passDeliveryBenefit({ customerId: authenticatedCustomer?._id ? String(authenticatedCustomer._id) : null, subtotalCents, deliveryFeeCents: coverage.deliveryFeeCents });
+  const deliveryFeeCents = freeDelivery.eligible || passBenefit.applied ? 0 : coverage.deliveryFeeCents;
   const serviceFeeCents = coverage.serviceFeeCents;
   const totalCents = subtotalCents + deliveryFeeCents + serviceFeeCents;
   const marketplace = calculateMarketplaceBreakdown({
@@ -3526,7 +3533,6 @@ app.post("/api/v1/orders", rateLimit(20, 60_000, "orders-create"), async (req, r
   if (!isCashOrderWithinLimit(parsed.data.paymentMethod, totalCents)) return res.status(422).json(cashOrderLimitError(totalCents));
   const publicCode = await createRandomOrderCode();
   const dailyCode = await createDailyDisplayCode();
-  const authenticatedCustomer = await currentCustomer(req) as any;
   const order = await Order.create({ tenantId: restaurant.tenantId || null, publicCode, ...dailyCode, restaurantId: restaurant._id, customerId: authenticatedCustomer?._id || null, customerName: String(authenticatedCustomer?.name || "").trim(), items: normalizedItems, deliveryAddress: parsed.data.deliveryAddress, deliveryNote: parsed.data.deliveryNote, deliveryLocation: { type: "Point", coordinates: deliveryPoint }, pickupLocation: restaurant.location || undefined, coveragePolicySlug: coverage.policySlug, coveragePolicyVersion: coverage.policyVersion, coverageDecision: coverage.reason, straightLineDistanceKm: coverage.straightLineDistanceKm, withinMunicipality: withinSameOperationalCity(restaurant.location?.coordinates, deliveryPoint), deliveryBaseFeeCents: coverage.deliveryBaseFeeCents, outsideMunicipalitySurchargeCents: coverage.outsideMunicipalitySurchargeCents, routeDistanceKm: route.routeDistanceKm, routeDurationMinutes: route.routeDurationMinutes, routeProvider: route.routeProvider, routingDegraded: route.routingDegraded, requiredVehicleClasses: route.requiredVehicleClasses, subtotalCents, deliveryFeeCents, serviceFeeCents, totalCents,
     marketplaceCommissionRateBps: marketplace.commissionRateBps,
     marketplaceCommissionCents: marketplace.platformCommissionCents,
@@ -3550,19 +3556,20 @@ app.post("/api/v1/orders/:id/spin", rateLimit(10, 60_000, "customer-wheel-spin")
   if (!order) return res.status(404).json({ error: "ORDER_NOT_FOUND" });
   if (order.status !== "delivered") return res.status(409).json({ error: "ORDER_NOT_DELIVERED" });
   if (order.hasSpun) return res.status(409).json({ error: "ORDER_ALREADY_SPUN", message: "Este pedido ya ha utilizado su giro." });
-  const rewardCents = resolveWheelReward(randomInt(0, 1_000_000) / 1_000_000);
+  const spin = resolveWheelSpin(randomInt(0, 1_000_000) / 1_000_000, { subtotalCents: Number(order.subtotalCents || 0) });
+  const rewardCents = spin.cents;
   const now = new Date();
   const spinSession = await mongoose.startSession();
   let updated: any = null;
   let newBalance = 0;
   try {
     await spinSession.withTransaction(async () => {
-      updated = await Order.findOneAndUpdate({ _id: order._id, customerId: String(customer._id), status: "delivered", $or: [{ hasSpun: { $exists: false } }, { hasSpun: false }] }, { $set: { hasSpun: true, wheelReward: rewardCents ? "1.50_CREDIT" : "NO_REWARD", wheelRewardCents: rewardCents, wheelSpunAt: now } }, { new: true, session: spinSession }).lean().exec();
+      updated = await Order.findOneAndUpdate({ _id: order._id, customerId: String(customer._id), status: "delivered", $or: [{ hasSpun: { $exists: false } }, { hasSpun: false }] }, { $set: { hasSpun: true, wheelReward: spin.kind.toUpperCase(), wheelRewardCents: rewardCents, wheelSpunAt: now } }, { new: true, session: spinSession }).lean().exec();
       if (!updated) return;
       if (rewardCents) {
         const expired = await CustomerAccount.findOne({ _id: customer._id, pikiCreditsExpiresAt: { $lte: now } }).select("pikiCreditsCents").session(spinSession).lean().exec() as any;
         if (expired?.pikiCreditsCents) await CustomerAccount.updateOne({ _id: customer._id }, { $set: { pikiCreditsCents: 0, pikiCreditsExpiresAt: null } }, { session: spinSession }).exec();
-        await CustomerAccount.updateOne({ _id: customer._id }, { $inc: { pikiCreditsCents: rewardCents }, $set: { pikiCreditsExpiresAt: new Date(now.getTime() + 48 * 60 * 60 * 1000) } }, { session: spinSession }).exec();
+        await CustomerAccount.updateOne({ _id: customer._id }, { $inc: { pikiCreditsCents: rewardCents }, $set: { pikiCreditsExpiresAt: new Date(now.getTime() + WHEEL_CREDIT_TTL_MS) } }, { session: spinSession }).exec();
       }
       const wallet = await CustomerAccount.findById(customer._id).select("pikiCreditsCents").session(spinSession).lean().exec() as any;
       newBalance = Number(wallet?.pikiCreditsCents || 0);
@@ -3571,7 +3578,7 @@ app.post("/api/v1/orders/:id/spin", rateLimit(10, 60_000, "customer-wheel-spin")
     await spinSession.endSession();
   }
   if (!updated) return res.status(409).json({ error: "ORDER_ALREADY_SPUN" });
-  return res.json({ success: true, rewardType: rewardCents ? "credit" : "none", amount: rewardCents / 100, message: rewardCents ? "¡Enhorabuena! Has ganado 1,50€ para tu próximo pedido. Válido durante 48 horas." : "Esta vez no ha habido premio. ¡Sigue participando!", newBalance: newBalance / 100 });
+  return res.json({ success: true, rewardType: spin.kind, rewardLabel: spin.label, amount: rewardCents / 100, message: spin.message, newBalance: newBalance / 100, expiresInHours: 48 });
 });
 
 app.get("/api/v1/customer/engagement", async (req, res) => {
@@ -3580,6 +3587,79 @@ app.get("/api/v1/customer/engagement", async (req, res) => {
   const customerId = String(customer._id);
   const [streak, badges, pass, profile, savings] = await Promise.all([UserStreak.findOne({ customerId }).lean().exec(), CustomerBadge.find({ customerId }).sort({ awardedAt: -1 }).lean().exec(), PikiPassSubscription.findOne({ customerId, status: "active", expiresAt: { $gt: new Date() } }).lean().exec(), recommendationProfileForCustomer(customerId), syncCustomerDeliverySavings(customerId)]);
   return res.json({ streak: streak || { currentStreak: 0, longestStreak: 0, completedOrders: 0 }, badges, pass, savings: { ...savings, savedOnDelivery: savings.savedOnDeliveryCents / 100 }, recommendations: profile });
+});
+
+app.get("/api/v1/customer/credits", async (req, res) => {
+  const customer = await currentCustomer(req) as any;
+  if (!customer) return res.status(401).json({ error: "AUTH_REQUIRED" });
+  const wallet = await CustomerAccount.findById(customer._id).select("pikiCreditsCents pikiCreditsExpiresAt").lean().exec() as any;
+  const now = new Date();
+  const expiresAt = wallet?.pikiCreditsExpiresAt ? new Date(wallet.pikiCreditsExpiresAt) : null;
+  const valid = Boolean(expiresAt && expiresAt.getTime() > now.getTime());
+  const cents = valid ? Math.max(0, Number(wallet?.pikiCreditsCents || 0)) : 0;
+  return res.json({ creditsCents: cents, credits: cents / 100, expiresAt: valid ? expiresAt?.toISOString() : null, expired: Boolean(wallet?.pikiCreditsCents) && !valid });
+});
+
+/**
+ * Prize wheel state for the Customer app: the newest delivered order that has
+ * not been spun yet, plus the published prize table so the UI never invents
+ * probabilities that differ from the server.
+ */
+app.get("/api/v1/customer/wheel", async (req, res) => {
+  const customer = await currentCustomer(req) as any;
+  if (!customer) return res.status(401).json({ error: "AUTH_REQUIRED" });
+  const order = await Order.findOne({ customerId: String(customer._id), status: "delivered", $or: [{ hasSpun: { $exists: false } }, { hasSpun: false }] }).sort({ deliveredAt: -1, createdAt: -1 }).select("_id publicCode subtotalCents deliveredAt").lean().exec() as any;
+  const wallet = await CustomerAccount.findById(customer._id).select("pikiCreditsCents pikiCreditsExpiresAt").lean().exec() as any;
+  return res.json({
+    canSpin: Boolean(order),
+    order: order ? { id: String(order._id), publicCode: order.publicCode, subtotalCents: Number(order.subtotalCents || 0), deliveredAt: order.deliveredAt } : null,
+    prizes: [
+      { kind: "free_order", weight: 1, label: "Pedido gratis" },
+      { kind: "credit", weight: 60, label: "1,50 € de crédito" },
+      { kind: "free_delivery", weight: 39, label: "Envío gratis" },
+    ],
+    creditsCents: Number(wallet?.pikiCreditsCents || 0),
+    creditsExpiresAt: wallet?.pikiCreditsExpiresAt || null,
+  });
+});
+
+app.get("/api/v1/customer/pass/summary", async (req, res) => {
+  const customer = await currentCustomer(req) as any;
+  if (!customer) return res.status(401).json({ error: "AUTH_REQUIRED" });
+  return res.json({ pass: await pikiPassPayload(String(customer._id)) });
+});
+
+app.post("/api/v1/customer/pass/checkout", rateLimit(10, 60_000, "customer-pass-checkout"), async (req, res) => {
+  const customer = await currentCustomer(req) as any;
+  if (!customer) return res.status(401).json({ error: "AUTH_REQUIRED" });
+  if (!pikiPassConfigured()) return res.status(503).json({ error: "PASS_BILLING_NOT_CONFIGURED" });
+  const plan = String(req.body?.plan || "monthly") === "annual" ? "annual" : "monthly";
+  const origin = String(req.body?.origin || req.header("origin") || "https://app.pikidelivery.com").replace(/\/$/, "");
+  const mode = String(req.body?.mode || "subscription");
+  try {
+    const session = mode === "one_off"
+      ? await createPassOneOffSession({ customerId: String(customer._id), customerEmail: customer.email, plan, origin })
+      : await createPassCheckoutSession({ customerId: String(customer._id), customerEmail: customer.email, plan, origin });
+    return res.status(201).json({ checkoutUrl: session.url, sessionId: session.id, plan, mode });
+  } catch (error) {
+    console.error(JSON.stringify({ event: "piki_pass_checkout_error", error: error instanceof Error ? error.message : String(error) }));
+    return res.status(502).json({ error: "PASS_CHECKOUT_FAILED" });
+  }
+});
+
+app.post("/api/v1/customer/pass/portal", rateLimit(10, 60_000, "customer-pass-portal"), async (req, res) => {
+  const customer = await currentCustomer(req) as any;
+  if (!customer) return res.status(401).json({ error: "AUTH_REQUIRED" });
+  const subscription = await PikiPassSubscription.findOne({ customerId: String(customer._id) }).lean().exec() as any;
+  if (!subscription?.stripeCustomerId) return res.status(409).json({ error: "PASS_NOT_SUBSCRIBED" });
+  const origin = String(req.body?.origin || req.header("origin") || "https://app.pikidelivery.com").replace(/\/$/, "");
+  try {
+    const portal = await createPassPortalSession({ stripeCustomerId: String(subscription.stripeCustomerId), origin });
+    return res.json({ url: portal.url });
+  } catch (error) {
+    console.error(JSON.stringify({ event: "piki_pass_portal_error", error: error instanceof Error ? error.message : String(error) }));
+    return res.status(502).json({ error: "PASS_PORTAL_FAILED" });
+  }
 });
 
 app.get("/feed/home", async (req, res) => {
@@ -3598,9 +3678,38 @@ app.get("/feed/home", async (req, res) => {
     { $sort: { feedScore: -1, promoted: -1, rating: -1, reviews: -1, _id: 1 } },
     { $limit: 50 },
   ]).exec();
-  const restaurants = rows.map((row: any) => ({ id: String(row._id), slug: row.slug, name: row.name, cuisine: row.cuisine, category: row.category, rating: row.rating || 0, reviews: row.reviews || 0, promoted: Boolean(row.promoted), isFavorite: favoriteIds.some((id) => String(id) === String(row._id)), isOpen: restaurantIsWithinOpeningHours(row.partnerProfile?.openingHours, now), eta: `${row.etaMinutes?.[0] || 20}–${row.etaMinutes?.[1] || 35} min`, image: row.image || "", menu: Array.isArray(row.menu) ? row.menu : [] }));
-  restaurants.sort((a: any, b: any) => Number(b.isOpen) - Number(a.isOpen) || Number(b.isFavorite) - Number(a.isFavorite));
-  return res.json({ restaurants, customerId: customer ? String(customer._id) : null, generatedAt: now.toISOString() });
+  // Weather: rain or wind reorders by proximity and stretches the ETA. The
+  // snapshot is cached for 10 minutes and fails open, so a slow provider can
+  // never delay the feed.
+  const lat = Number(req.query.lat ?? req.query.latitude);
+  const lon = Number(req.query.lng ?? req.query.lon ?? req.query.longitude);
+  const hasPoint = Number.isFinite(lat) && Number.isFinite(lon);
+  const weather = await currentWeather(hasPoint ? lat : 38.9908, hasPoint ? lon : -0.5185);
+  const restaurants = rows.map((row: any) => {
+    const coords = row.location?.coordinates;
+    const distance = hasPoint && Array.isArray(coords) && coords.length >= 2 ? distanceKm({ lat, lon }, { lat: Number(coords[1]), lon: Number(coords[0]) }) : null;
+    const baseEta = `${row.etaMinutes?.[0] || 20}–${row.etaMinutes?.[1] || 35} min`;
+    return { id: String(row._id), slug: row.slug, name: row.name, cuisine: row.cuisine, category: row.category, rating: row.rating || 0, reviews: row.reviews || 0, promoted: Boolean(row.promoted), isFavorite: favoriteIds.some((id) => String(id) === String(row._id)), isOpen: restaurantIsWithinOpeningHours(row.partnerProfile?.openingHours, now), eta: adjustEtaLabel(baseEta, weather.etaExtraMinutes), distanceKm: distance === null ? null : Math.round(distance * 10) / 10, image: row.image || "", menu: Array.isArray(row.menu) ? row.menu : [] };
+  });
+  restaurants.sort((a: any, b: any) => {
+    // Nearby first only while the weather is bad; on a clear day quality wins.
+    if (weather.preferNearby && a.distanceKm !== null && b.distanceKm !== null && a.distanceKm !== b.distanceKm) return a.distanceKm - b.distanceKm;
+    return Number(b.isOpen) - Number(a.isOpen) || Number(b.isFavorite) - Number(a.isFavorite);
+  });
+  return res.json({ restaurants, customerId: customer ? String(customer._id) : null, generatedAt: now.toISOString(), weather });
+});
+
+/**
+ * Public weather endpoint. The Customer app calls it once at boot to decide
+ * whether to show the transparency banner; no authentication, no PII, and the
+ * response is cached upstream for 10 minutes.
+ */
+app.get("/api/v1/weather/current", async (req, res) => {
+  const lat = Number(req.query.lat ?? req.query.latitude ?? 38.9908);
+  const lon = Number(req.query.lng ?? req.query.lon ?? req.query.longitude ?? -0.5185);
+  const weather = await currentWeather(lat, lon);
+  res.setHeader("Cache-Control", "public, max-age=300");
+  return res.json({ weather });
 });
 app.get("/api/v1/customer/checkout/price-breakdown", async (req, res) => {
   const customer = await currentCustomer(req) as any;
@@ -3613,8 +3722,8 @@ app.get("/api/v1/customer/checkout/price-breakdown", async (req, res) => {
 app.get("/api/v1/customer/pass", async (req, res) => {
   const customer = await currentCustomer(req) as any;
   if (!customer) return res.status(401).json({ error: "AUTH_REQUIRED" });
-  const subscription = await PikiPassSubscription.findOne({ customerId: String(customer._id), status: "active", expiresAt: { $gt: new Date() } }).lean().exec();
-  return res.json({ active: Boolean(subscription), subscription, plans: [{ plan: "monthly", durationDays: 30 }, { plan: "annual", durationDays: 365 }] });
+  const pass = await pikiPassPayload(String(customer._id));
+  return res.json({ ...pass, subscription: pass.active ? pass : null });
 });
 
 app.post("/api/v1/customer/referrals/claim", async (req, res) => {
@@ -4877,6 +4986,9 @@ const automaticDispatchSweepStats = {
   expiredOffers: 0,
   queued: 0,
   archivedTerminalOrders: 0,
+  closedZombieOrders: 0,
+  zombieCandidates: 0,
+  zombieMode: "dry_run" as "dry_run" | "enforce",
   lastStartedAt: null as string | null,
   lastCompletedAt: null as string | null,
   lastDurationMs: null as number | null,
@@ -5130,7 +5242,7 @@ async function runAutomaticDispatchSweep() {
   const startedAt = Date.now();
   automaticDispatchSweepStats.lastStartedAt = new Date(startedAt).toISOString();
   try {
-    const [reassigned, expiredOffers, archivedTerminalOrders] = await Promise.all([reassignLatePickupOrders(), expireStaleOffers(), archivePreviousDayPartnerOrders()]);
+    const [reassigned, expiredOffers, archivedTerminalOrders, zombie] = await Promise.all([reassignLatePickupOrders(), expireStaleOffers(), archivePreviousDayPartnerOrders(), runZombieOrderMaintenance()]);
     // Page through all eligible orders rather than repeatedly looking at the
     // same first 25. Each version has a stable recovery key, so an exhausted
     // event cannot create an unbounded stream of replacement events.
@@ -5149,6 +5261,9 @@ async function runAutomaticDispatchSweep() {
     automaticDispatchSweepStats.expiredOffers += expiredOffers;
     automaticDispatchSweepStats.queued += queued;
     automaticDispatchSweepStats.archivedTerminalOrders += archivedTerminalOrders;
+    automaticDispatchSweepStats.zombieCandidates = zombie.zombieCandidates;
+    automaticDispatchSweepStats.closedZombieOrders += zombie.closedZombieOrders;
+    automaticDispatchSweepStats.zombieMode = zombie.zombieMode;
     automaticDispatchSweepStats.lastCompletedAt = new Date().toISOString();
     automaticDispatchSweepStats.lastDurationMs = Date.now() - startedAt;
     automaticDispatchSweepStats.lastError = null;
