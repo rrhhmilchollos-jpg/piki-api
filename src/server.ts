@@ -1842,11 +1842,19 @@ app.get("/api/v1/partners/profile", requireRole("partner"), async (req, res) => 
   if (!access || !partnerCan(access.roles, "store:write")) return res.status(403).json({ error: "PARTNER_PERMISSION_DENIED", permission: "store:write" });
   const restaurantId = await employeeRestaurant(req, access);
   if (!restaurantId) return res.status(403).json({ error: "PARTNER_RESTAURANT_NOT_ASSIGNED" });
-  const restaurant = await Restaurant.findOne({ _id: objectId(restaurantId), ...tenantScope(req) }).select("_id partnerCode name email phone address locality partnerProfile.commissionRateBps").lean().exec() as any;
+  const restaurant = await Restaurant.findOne({ _id: objectId(restaurantId), ...tenantScope(req) }).select("_id partnerCode name email phone address locality cuisine category deliveryFeeCents promoted availabilityStatus isActive partnerProfile.commissionRateBps").lean().exec() as any;
   if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
-  return res.json({ profile: { id: String(restaurant._id), partnerCode: restaurant.partnerCode || publicPartnerCode(restaurant._id), name: restaurant.name, email: restaurant.email, phone: restaurant.phone, address: restaurant.address, locality: restaurant.locality, commissionRateBps: Math.round(customerCommissionRate(restaurant) * 10_000), commissionPercent: Number(restaurant.partnerProfile?.commissionRateBps ?? DEFAULT_PARTNER_COMMISSION_BPS) / 100 } });
+  return res.json({ profile: { id: String(restaurant._id), partnerCode: restaurant.partnerCode || publicPartnerCode(restaurant._id), name: restaurant.name, email: restaurant.email, phone: restaurant.phone, address: restaurant.address, locality: restaurant.locality, cuisine: restaurant.cuisine, category: restaurant.category, deliveryFeeCents: Number(restaurant.deliveryFeeCents || 0), promoted: Boolean(restaurant.promoted), availabilityStatus: restaurant.availabilityStatus, isOpen: Boolean(restaurant.isActive), commissionRateBps: Math.round(customerCommissionRate(restaurant) * 10_000), commissionPercent: Number(restaurant.partnerProfile?.commissionRateBps ?? DEFAULT_PARTNER_COMMISSION_BPS) / 100 } });
 });
-const partnerBasicProfileSchema = z.object({ email: z.union([z.string().email().max(254), z.literal("")]).optional(), phone: z.string().trim().max(40).optional() }).strict();
+const partnerBasicProfileSchema = z.object({
+  name: z.string().trim().min(1).max(160).optional(),
+  email: z.union([z.string().email().max(254), z.literal("")]).optional(),
+  phone: z.string().trim().max(40).optional(),
+  address: z.string().trim().max(280).optional(),
+  locality: z.string().trim().max(120).optional(),
+  cuisine: z.string().trim().min(1).max(120).optional(),
+  category: z.string().trim().min(1).max(120).optional(),
+}).strict();
 app.patch("/api/v1/partners/profile", requireRole("partner"), async (req, res) => {
   const access = await partnerAccessForRequest(req);
   if (!access || !partnerCan(access.roles, "store:write")) return res.status(403).json({ error: "PARTNER_PERMISSION_DENIED", permission: "store:write" });
@@ -1854,15 +1862,24 @@ app.patch("/api/v1/partners/profile", requireRole("partner"), async (req, res) =
   const parsed = partnerBasicProfileSchema.safeParse(req.body);
   if (!restaurantId || !parsed.success || !Object.keys(parsed.data).length) return res.status(400).json({ error: "INVALID_PARTNER_PROFILE", details: parsed.success ? undefined : parsed.error.flatten() });
   const scope = { _id: objectId(restaurantId), ...tenantScope(req) };
-  const restaurant = await Restaurant.findOne(scope).select("_id partnerCode name email phone address locality partnerProfile.commissionRateBps").lean().exec() as any;
+  const restaurant = await Restaurant.findOne(scope).select("_id partnerCode name email phone address locality cuisine category deliveryFeeCents promoted availabilityStatus isActive partnerProfile.commissionRateBps").lean().exec() as any;
   if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
   const email = parsed.data.email?.trim().toLowerCase();
   if (email && email !== String(restaurant.email || "").toLowerCase() && await EmployeeAccount.exists({ email, _id: { $ne: access.employee._id } })) return res.status(409).json({ error: "EMAIL_ALREADY_IN_USE" });
   if (email) await EmployeeAccount.updateOne({ _id: access.employee._id, ...tenantScope(req) }, { $set: { email } }).exec();
-  const updated = await Restaurant.findOneAndUpdate(scope, { $set: { ...(email ? { email } : {}), ...(parsed.data.phone !== undefined ? { phone: parsed.data.phone } : {}) } }, { new: true }).select("_id name email phone address locality").lean().exec() as any;
+  const update: Record<string, unknown> = {
+    ...(parsed.data.name !== undefined ? { name: parsed.data.name } : {}),
+    ...(email ? { email } : {}),
+    ...(parsed.data.phone !== undefined ? { phone: parsed.data.phone } : {}),
+    ...(parsed.data.address !== undefined ? { address: parsed.data.address } : {}),
+    ...(parsed.data.locality !== undefined ? { locality: parsed.data.locality } : {}),
+    ...(parsed.data.cuisine !== undefined ? { cuisine: parsed.data.cuisine } : {}),
+    ...(parsed.data.category !== undefined ? { category: parsed.data.category } : {}),
+  };
+  const updated = await Restaurant.findOneAndUpdate(scope, { $set: update }, { new: true }).select("_id partnerCode name email phone address locality cuisine category deliveryFeeCents promoted availabilityStatus isActive partnerProfile.commissionRateBps").lean().exec() as any;
   await AccessAuthorization.create({ employeeId: access.employee._id, action: "profile_updated", previousStatus: "approved", nextStatus: "approved", previousRole: "partner", nextRole: "partner", accessLevel: "subadmin", actorEmployeeId: access.employee._id, reason: "El Partner actualizó sus datos básicos de contacto." });
-  await recordGovernanceEvent({ actor: { employeeId: access.employee._id, role: "partner", tenantId: (req.auth as any)?.tenantId }, action: "partner_basic_profile_updated", targetType: "restaurant", targetId: restaurant._id, before: { email: restaurant.email, phone: restaurant.phone }, after: { email: updated.email, phone: updated.phone }, reason: "Cambio básico permitido al partner; sin acceso a comisión, KYB ni configuración crítica." });
-  return res.json({ updated: true, profile: { id: String(updated._id), partnerCode: updated.partnerCode || publicPartnerCode(updated._id), name: updated.name, email: updated.email, phone: updated.phone, address: updated.address, locality: updated.locality, commissionRateBps: Number(updated.partnerProfile?.commissionRateBps ?? DEFAULT_PARTNER_COMMISSION_BPS), commissionPercent: Number(updated.partnerProfile?.commissionRateBps ?? DEFAULT_PARTNER_COMMISSION_BPS) / 100 } });
+  await recordGovernanceEvent({ actor: { employeeId: access.employee._id, role: "partner", tenantId: (req.auth as any)?.tenantId }, action: "partner_basic_profile_updated", targetType: "restaurant", targetId: restaurant._id, before: { name: restaurant.name, email: restaurant.email, phone: restaurant.phone, address: restaurant.address, locality: restaurant.locality, cuisine: restaurant.cuisine, category: restaurant.category }, after: { name: updated.name, email: updated.email, phone: updated.phone, address: updated.address, locality: updated.locality, cuisine: updated.cuisine, category: updated.category }, reason: "El Partner actualizó sus datos básicos del establecimiento; sin acceso a comisión, tarifa, promoción ni estado comercial." });
+  return res.json({ updated: true, profile: { id: String(updated._id), partnerCode: updated.partnerCode || publicPartnerCode(updated._id), name: updated.name, email: updated.email, phone: updated.phone, address: updated.address, locality: updated.locality, cuisine: updated.cuisine, category: updated.category, deliveryFeeCents: Number(updated.deliveryFeeCents || 0), promoted: Boolean(updated.promoted), availabilityStatus: updated.availabilityStatus, isOpen: Boolean(updated.isActive), commissionRateBps: Number(updated.partnerProfile?.commissionRateBps ?? DEFAULT_PARTNER_COMMISSION_BPS), commissionPercent: Number(updated.partnerProfile?.commissionRateBps ?? DEFAULT_PARTNER_COMMISSION_BPS) / 100 } });
 });
 app.patch("/api/v1/partners/store/status", requireRole("partner"), async (req, res) => {
   const { access, allowed } = await partnerRequestAccess(req, "store:write");
