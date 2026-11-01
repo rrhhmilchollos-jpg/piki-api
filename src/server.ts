@@ -3556,12 +3556,30 @@ app.post("/api/v1/orders/:id/spin", rateLimit(10, 60_000, "customer-wheel-spin")
   if (!order) return res.status(404).json({ error: "ORDER_NOT_FOUND" });
   if (order.status !== "delivered") return res.status(409).json({ error: "ORDER_NOT_DELIVERED" });
   if (order.hasSpun) return res.status(409).json({ error: "ORDER_ALREADY_SPUN", message: "Este pedido ya ha utilizado su giro." });
-  const spin = resolveWheelSpin(randomInt(0, 1_000_000) / 1_000_000, { subtotalCents: Number(order.subtotalCents || 0) });
+  const [spinHistory, streakRow] = await Promise.all([
+    Order.find({ customerId: String(customer._id), hasSpun: true }).select("wheelReward wheelRewardCents wheelSpunAt").sort({ wheelSpunAt: -1 }).limit(120).lean().exec() as any,
+    UserStreak.findOne({ customerId: String(customer._id) }).select("completedOrders").lean().exec() as any,
+  ]);
+  const spins = Array.isArray(spinHistory) ? spinHistory : [];
+  const jackpotIndex = spins.findIndex((row: any) => String(row.wheelReward || "").toUpperCase() === "FREE_ORDER");
+  const since = new Date(Date.now() - 30 * 86_400_000);
+  const spin = resolveWheelSpin(randomInt(0, 1_000_000) / 1_000_000, {
+    subtotalCents: Number(order.subtotalCents || 0),
+    history: {
+      spinsSinceJackpot: jackpotIndex >= 0 ? jackpotIndex : spins.length,
+      jackpotLastAt: jackpotIndex >= 0 ? spins[jackpotIndex].wheelSpunAt : null,
+      completedOrders: Number(streakRow?.completedOrders || 0),
+      lastPrize: spins[0]?.wheelReward || null,
+      rewardCentsLast30Days: spins.filter((row: any) => row.wheelSpunAt && new Date(row.wheelSpunAt) >= since).reduce((sum: number, row: any) => sum + Math.max(0, Number(row.wheelRewardCents || 0)), 0),
+    },
+  });
   const rewardCents = spin.cents;
   const now = new Date();
   const spinSession = await mongoose.startSession();
   let updated: any = null;
   let newBalance = 0;
+  let issuedCoupon: any = null;
+  let issuedChallenge: any = null;
   try {
     await spinSession.withTransaction(async () => {
       updated = await Order.findOneAndUpdate({ _id: order._id, customerId: String(customer._id), status: "delivered", $or: [{ hasSpun: { $exists: false } }, { hasSpun: false }] }, { $set: { hasSpun: true, wheelReward: spin.kind.toUpperCase(), wheelRewardCents: rewardCents, wheelSpunAt: now } }, { new: true, session: spinSession }).lean().exec();
@@ -3573,12 +3591,29 @@ app.post("/api/v1/orders/:id/spin", rateLimit(10, 60_000, "customer-wheel-spin")
       }
       const wallet = await CustomerAccount.findById(customer._id).select("pikiCreditsCents").session(spinSession).lean().exec() as any;
       newBalance = Number(wallet?.pikiCreditsCents || 0);
+      if (spin.kind === "coupon" && spin.coupon) {
+        const issued = await issueCustomerCoupon(String(customer._id), spin.coupon, { source: `wheel:${String(order._id)}`, now });
+        issuedCoupon = issued;
+      }
+      if (spin.kind === "challenge" && spin.challenge) {
+        issuedChallenge = await createShareChallenge(String(customer._id), spin.challenge, { orderId: String(order._id), now });
+      }
     });
   } finally {
     await spinSession.endSession();
   }
   if (!updated) return res.status(409).json({ error: "ORDER_ALREADY_SPUN" });
-  return res.json({ success: true, rewardType: spin.kind, rewardLabel: spin.label, amount: rewardCents / 100, message: spin.message, newBalance: newBalance / 100, expiresInHours: 48 });
+  return res.json({
+    success: true,
+    rewardType: spin.kind,
+    rewardLabel: spin.label,
+    amount: rewardCents / 100,
+    message: spin.message,
+    newBalance: newBalance / 100,
+    expiresInHours: spin.kind === "coupon" ? 24 * 7 : 48,
+    coupon: issuedCoupon ? { id: String(issuedCoupon._id), label: issuedCoupon.label, percent: Number(issuedCoupon.percentBps) / 100, maxDiscount: Number(issuedCoupon.maxDiscountCents) / 100, minSubtotal: Number(issuedCoupon.minSubtotalCents) / 100, expiresAt: issuedCoupon.expiresAt } : null,
+    challenge: issuedChallenge ? { id: String(issuedChallenge._id), token: issuedChallenge.token, prizeLabel: issuedChallenge.prizeLabel, rewardCents: Number(issuedChallenge.rewardCents), invitesRequired: Number(issuedChallenge.invitesRequired), invitesDone: Number(issuedChallenge.invitesDone || 0), expiresAt: issuedChallenge.expiresAt, shareUrl: `https://app.pikidelivery.com/piki-club?invita=${issuedChallenge.token}` } : null,
+  });
 });
 
 app.get("/api/v1/customer/engagement", async (req, res) => {
@@ -3586,7 +3621,70 @@ app.get("/api/v1/customer/engagement", async (req, res) => {
   if (!customer) return res.status(401).json({ error: "AUTH_REQUIRED" });
   const customerId = String(customer._id);
   const [streak, badges, pass, profile, savings] = await Promise.all([UserStreak.findOne({ customerId }).lean().exec(), CustomerBadge.find({ customerId }).sort({ awardedAt: -1 }).lean().exec(), PikiPassSubscription.findOne({ customerId, status: "active", expiresAt: { $gt: new Date() } }).lean().exec(), recommendationProfileForCustomer(customerId), syncCustomerDeliverySavings(customerId)]);
-  return res.json({ streak: streak || { currentStreak: 0, longestStreak: 0, completedOrders: 0 }, badges, pass, savings: { ...savings, savedOnDelivery: savings.savedOnDeliveryCents / 100 }, recommendations: profile });
+  const [coupons, challenges] = await Promise.all([activeCustomerCoupons(customerId), activeShareChallenges(customerId)]);
+  return res.json({
+    streak: streak || { currentStreak: 0, longestStreak: 0, completedOrders: 0 },
+    badges,
+    pass,
+    savings: { ...savings, savedOnDelivery: savings.savedOnDeliveryCents / 100 },
+    recommendations: profile,
+    coupons: coupons.map((coupon: any) => ({ id: String(coupon._id), label: coupon.label, percent: Number(coupon.percentBps) / 100, maxDiscount: Number(coupon.maxDiscountCents) / 100, minSubtotal: Number(coupon.minSubtotalCents) / 100, expiresAt: coupon.expiresAt })),
+    challenges: challenges.map((challenge: any) => ({ id: String(challenge._id), token: challenge.token, prizeLabel: challenge.prizeLabel, rewardCents: Number(challenge.rewardCents || 0), invitesRequired: Number(challenge.invitesRequired || 0), invitesDone: Number(challenge.invitesDone || 0), expiresAt: challenge.expiresAt, shareUrl: `https://app.pikidelivery.com/piki-club?invita=${challenge.token}` })),
+  });
+});
+
+app.get("/api/v1/customer/share-challenges", async (req, res) => {
+  const customer = await currentCustomer(req) as any;
+  if (!customer) return res.status(401).json({ error: "AUTH_REQUIRED" });
+  const challenges = await activeShareChallenges(String(customer._id));
+  return res.json({
+    challenges: challenges.map((challenge: any) => ({
+      id: String(challenge._id),
+      token: challenge.token,
+      prizeLabel: challenge.prizeLabel,
+      rewardCents: Number(challenge.rewardCents || 0),
+      invitesRequired: Number(challenge.invitesRequired || 0),
+      invitesDone: Number(challenge.invitesDone || 0),
+      expiresAt: challenge.expiresAt,
+      shareUrl: `https://app.pikidelivery.com/piki-club?invita=${challenge.token}`,
+    })),
+  });
+});
+
+app.post("/api/v1/share/:token/visit", rateLimit(30, 60_000, "share-visit"), async (req, res) => {
+  const token = String(Array.isArray(req.params.token) ? req.params.token[0] : req.params.token || "").trim();
+  const forwarded = String(req.headers["x-forwarded-for"] || "").split(",")[0].trim();
+  const fingerprint = shareFingerprint(forwarded || req.ip, req.headers["user-agent"]);
+  const result = await registerShareVisit(token, fingerprint);
+  if (!result.found) return res.status(404).json({ error: "CHALLENGE_NOT_FOUND" });
+  return res.json({ counted: Boolean(result.counted), invitesDone: result.invitesDone, invitesRequired: result.invitesRequired, completed: Boolean(result.completed), rewardCents: Number(result.rewardCents || 0) });
+});
+
+app.post("/api/v1/customer/share-challenges/:id/claim", async (req, res) => {
+  const customer = await currentCustomer(req) as any;
+  if (!customer) return res.status(401).json({ error: "AUTH_REQUIRED" });
+  const id = String(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id || "");
+  const challenge = await CustomerShareChallenge.findOne({ _id: objectId(id) || null, customerId: String(customer._id) }).lean().exec() as any;
+  if (!challenge) return res.status(404).json({ error: "CHALLENGE_NOT_FOUND" });
+  const claim = await claimShareChallenge(String(challenge._id));
+  if (!claim.claimed) return res.status(409).json({ error: "CHALLENGE_NOT_READY", invitesDone: Number(challenge.invitesDone || 0), invitesRequired: Number(challenge.invitesRequired || 0) });
+  return res.json({ claimed: true, rewardCents: claim.rewardCents });
+});
+
+app.get("/api/v1/customer/coupons", async (req, res) => {
+  const customer = await currentCustomer(req) as any;
+  if (!customer) return res.status(401).json({ error: "AUTH_REQUIRED" });
+  const coupons = await activeCustomerCoupons(String(customer._id));
+  return res.json({
+    coupons: coupons.map((coupon: any) => ({
+      id: String(coupon._id),
+      label: coupon.label,
+      percent: Number(coupon.percentBps) / 100,
+      maxDiscount: Number(coupon.maxDiscountCents) / 100,
+      minSubtotal: Number(coupon.minSubtotalCents) / 100,
+      expiresAt: coupon.expiresAt,
+    })),
+  });
 });
 
 app.get("/api/v1/customer/credits", async (req, res) => {
@@ -3884,8 +3982,14 @@ app.post("/api/v1/payments/checkout", rateLimit(20, 60_000, "payments-checkout")
   if (order.paymentMethod !== "stripe") return res.status(409).json({ error: "ORDER_USES_CASH", message: "Este pedido está configurado para pago en efectivo." });
   if (["authorized", "paid"].includes(order.paymentState)) return res.status(409).json({ error: "ORDER_ALREADY_PAID" });
   let creditAppliedCents = 0;
+  let couponAppliedCents = 0;
+  let appliedCouponId: string | null = null;
   try {
-    creditAppliedCents = await consumeCustomerCredits(String(order.customerId || ""), Number(order.totalCents || 0));
+    const bestCoupon = await redeemBestCoupon(String(order.customerId || ""), Number(order.subtotalCents || 0), String(order._id));
+    couponAppliedCents = bestCoupon.discountCents;
+    appliedCouponId = bestCoupon.coupon ? String(bestCoupon.coupon._id) : null;
+    const afterCouponCents = Math.max(0, Number(order.totalCents || 0) - couponAppliedCents);
+    creditAppliedCents = await consumeCustomerCredits(String(order.customerId || ""), afterCouponCents);
     const session = await createCheckoutSession({
       orderId: String(order._id),
       publicCode: order.publicCode,
@@ -3894,13 +3998,14 @@ app.post("/api/v1/payments/checkout", rateLimit(20, 60_000, "payments-checkout")
       items: (order.items || []).map((item: any) => ({ name: item.name, quantity: Number(item.quantity), unitPriceCents: Number(item.unitPriceCents) })),
       deliveryFeeCents: Number(order.deliveryFeeCents || 0),
       serviceFeeCents: Number(order.serviceFeeCents || 0),
-      discountCents: creditAppliedCents,
+      discountCents: creditAppliedCents + couponAppliedCents,
       preferredPaymentMethod: "stripe",
     });
-    await Order.updateOne({ _id: order._id, paymentState: "pending" }, { $set: { stripeCheckoutSessionId: session.id, creditAppliedCents, totalCents: Number(order.totalCents || 0) - creditAppliedCents }, $inc: { version: 1 } }).exec();
-    return res.status(201).json({ checkoutUrl: session.url, sessionId: session.id, orderId: String(order._id), publicCode: order.publicCode, creditAppliedCents, priceBreakdown: calculatePriceBreakdown({ subtotalCents: Number(order.subtotalCents || 0), deliveryFeeCents: Number(order.deliveryFeeCents || 0), serviceFeeCents: Number(order.serviceFeeCents || 0), discountCents: creditAppliedCents }) });
+    await Order.updateOne({ _id: order._id, paymentState: "pending" }, { $set: { stripeCheckoutSessionId: session.id, creditAppliedCents, couponAppliedCents, appliedCouponId, totalCents: Number(order.totalCents || 0) - creditAppliedCents - couponAppliedCents }, $inc: { version: 1 } }).exec();
+    return res.status(201).json({ checkoutUrl: session.url, sessionId: session.id, orderId: String(order._id), publicCode: order.publicCode, creditAppliedCents, couponAppliedCents, priceBreakdown: calculatePriceBreakdown({ subtotalCents: Number(order.subtotalCents || 0), deliveryFeeCents: Number(order.deliveryFeeCents || 0), serviceFeeCents: Number(order.serviceFeeCents || 0), discountCents: creditAppliedCents + couponAppliedCents }) });
   } catch (error) {
     await restoreCustomerCredits(String(order.customerId || ""), creditAppliedCents).catch(() => undefined);
+    await restoreCustomerCoupon(appliedCouponId).catch(() => undefined);
     console.error(JSON.stringify({ event: "stripe_checkout_failed", orderId: String(order._id), errorType: error instanceof Error ? error.name : "UnknownError" }));
     return res.status(503).json({ error: "STRIPE_CHECKOUT_UNAVAILABLE", message: "El pago online no está disponible temporalmente." });
   }
@@ -6185,3 +6290,4 @@ async function start() {
 }
 
 if (process.env.PIKI_NO_LISTEN !== "true") start().catch((error) => { console.error("Unable to start PIKI API", error); process.exit(1); });
+import { activeCustomerCoupons, activeShareChallenges, claimShareChallenge, createShareChallenge, CustomerCoupon, CustomerShareChallenge, issueCustomerCoupon, redeemBestCoupon, registerShareVisit, restoreCustomerCoupon, shareFingerprint } from "./customerEngagement.js";

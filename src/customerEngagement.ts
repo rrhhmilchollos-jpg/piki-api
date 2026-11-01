@@ -1,3 +1,4 @@
+import { createHash, randomBytes } from "node:crypto";
 import mongoose, { Schema } from "mongoose";
 import { CustomerAccount, Order } from "./models.js";
 
@@ -69,6 +70,32 @@ const customerDeliverySavingSchema = new Schema({
   recordedAt: { type: Date, default: Date.now },
 }, { timestamps: true, collection: "customer_delivery_savings" });
 customerDeliverySavingSchema.index({ customerId: 1, recordedAt: -1 });
+const customerCouponSchema = new Schema({
+  customerId: { type: String, required: true, index: true },
+  percentBps: { type: Number, required: true, min: 1, max: 500 },
+  maxDiscountCents: { type: Number, required: true, min: 0 },
+  minSubtotalCents: { type: Number, default: 0, min: 0 },
+  label: { type: String, default: "Cupón PIKI" },
+  source: { type: String, default: "wheel" },
+  expiresAt: { type: Date, required: true, index: true },
+  usedAt: { type: Date, default: null },
+  usedOrderId: { type: String, default: null },
+}, { timestamps: true });
+customerCouponSchema.index({ customerId: 1, usedAt: 1, expiresAt: 1 });
+const customerShareChallengeSchema = new Schema({
+  customerId: { type: String, required: true, index: true },
+  token: { type: String, required: true, unique: true, index: true },
+  prizeLabel: { type: String, required: true },
+  rewardCents: { type: Number, required: true, min: 0 },
+  invitesRequired: { type: Number, required: true, min: 1 },
+  invitesDone: { type: Number, default: 0, min: 0 },
+  visitors: { type: [String], default: [] },
+  sourceOrderId: { type: String, default: null },
+  expiresAt: { type: Date, required: true, index: true },
+  completedAt: { type: Date, default: null },
+  claimedAt: { type: Date, default: null },
+}, { timestamps: true });
+customerShareChallengeSchema.index({ customerId: 1, claimedAt: 1 });
 const customerOrderCompletionSchema = new Schema({
   customerId: { type: String, required: true, index: true },
   orderId: { type: Schema.Types.ObjectId, ref: "Order", required: true, unique: true, index: true },
@@ -94,36 +121,159 @@ export const DEFAULT_BADGES = [
   { slug: "piki-lover", name: "PIKI Lover", description: "Has pedido en cuatro fines de semana seguidos.", criterion: "weekend_streak", threshold: 4 },
 ] as const;
 
-export const COMMON_WHEEL_REWARD_CENTS = 150;
+export const COMMON_WHEEL_REWARD_CENTS = 100;
 export const FREE_DELIVERY_WHEEL_CENTS = 299;
-export const FREE_ORDER_WHEEL_CAP_CENTS = 1_500;
+/** A free order is never paid in full: it is capped so a single spin cannot cost more than 5 €. */
+export const FREE_ORDER_WHEEL_CAP_CENTS = 500;
+/** Coupons are hard-capped at 5 %, both by percentage and by an absolute ceiling. */
+export const WHEEL_COUPON_PERCENT_BPS = 500;
+export const WHEEL_COUPON_HIGH_CAP_CENTS = 200;
+export const WHEEL_COUPON_LOW_CAP_CENTS = 100;
+export const WHEEL_COUPON_MIN_SUBTOTAL_CENTS = 800;
+export const WHEEL_COUPON_TTL_MS = 7 * 86_400_000;
 
-export type WheelRewardKind = "free_order" | "credit" | "free_delivery" | "none";
-export type WheelSpinResult = { kind: WheelRewardKind; cents: number; label: string; message: string };
+export type WheelRewardKind = "free_order" | "credit" | "free_delivery" | "coupon" | "challenge" | "none";
+export type WheelCouponSpec = {
+  percentBps: number;
+  maxDiscountCents: number;
+  minSubtotalCents: number;
+  label: string;
+  ttlMs: number;
+};
+export type WheelChallengeSpec = { prizeLabel: string; rewardCents: number; invitesRequired: number; ttlMs: number };
+export type WheelSpinResult = { kind: WheelRewardKind; cents: number; label: string; message: string; coupon?: WheelCouponSpec | null; challenge?: WheelChallengeSpec | null };
+
+export type WheelPrizeKey = "credit" | "coupon_low" | "free_delivery" | "coupon_high" | "challenge" | "free_order";
+
+export type WheelHistory = {
+  /** Orders delivered and spun since the last free-order prize. */
+  spinsSinceJackpot?: number;
+  /** When the customer last won the free-order prize. */
+  jackpotLastAt?: Date | null;
+  /** Delivered orders of this customer, used to unlock the top prize. */
+  completedOrders?: number;
+  /** Prize key of the previous spin, used to avoid repeats. */
+  lastPrize?: string | null;
+  /** Reward money already given to this customer in the last 30 days. */
+  rewardCentsLast30Days?: number;
+};
+
+/** The top prize is deliberately hard: it unlocks late and only once every two months. */
+export const JACKPOT_MIN_COMPLETED_ORDERS = 5;
+export const JACKPOT_MIN_SPINS_WITHOUT = 25;
+export const JACKPOT_COOLDOWN_DAYS = 60;
+/** Hard budget per customer and rolling month, so the wheel can never cost real money. */
+export const REWARD_BUDGET_30D_CENTS = 1_000;
 
 /**
- * Prize table agreed for PIKI Club, expressed as cumulative ranges so a single
- * uniform random number is enough and the distribution is auditable:
- *   0.00 – 0.01  → pedido gratis (1 %)
- *   0.01 – 0.61  → 1,50 € de crédito (60 %)
- *   0.61 – 1.00  → envío gratis (39 %)
- * Free delivery and free order are credited to the wallet, because the wallet
- * is the only discount surface the checkout already honours end to end.
+ * Base odds, in weights. The cheap credit is by far the most common; the 5 €
+ * free order is a rare event that only becomes possible after a long streak of
+ * spins without it. Every weight is re-balanced at spin time by `wheelWeights`.
  */
-export function resolveWheelSpin(randomValue = Math.random(), options: { subtotalCents?: number } = {}): WheelSpinResult {
+const BASE_WHEEL_WEIGHTS: Record<WheelPrizeKey, number> = {
+  credit: 46,
+  coupon_low: 24,
+  free_delivery: 19,
+  coupon_high: 9,
+  challenge: 3,
+  free_order: 1,
+};
+
+export function wheelWeights(history: WheelHistory = {}): Record<WheelPrizeKey, number> {
+  const weights: Record<WheelPrizeKey, number> = { ...BASE_WHEEL_WEIGHTS };
+  const spins = Math.max(0, Number(history.spinsSinceJackpot || 0));
+  const orders = Math.max(0, Number(history.completedOrders || 0));
+  const spent = Math.max(0, Number(history.rewardCentsLast30Days || 0));
+  const lastJackpot = history.jackpotLastAt ? new Date(history.jackpotLastAt).getTime() : 0;
+  const cooldownPassed = !lastJackpot || Date.now() - lastJackpot > JACKPOT_COOLDOWN_DAYS * 86_400_000;
+  const jackpotUnlocked = orders >= JACKPOT_MIN_COMPLETED_ORDERS && spins >= JACKPOT_MIN_SPINS_WITHOUT && cooldownPassed;
+  if (!jackpotUnlocked) {
+    // Redistribute the jackpot weight into the everyday credit: the wheel still
+    // feels alive, but a newcomer cannot take 5 € on their first spins.
+    weights.credit += weights.free_order;
+    weights.free_order = 0;
+  }
+  // Anti-repeat: two free deliveries in a row would feel rigged the wrong way.
+  if (String(history.lastPrize || "").toUpperCase() === "FREE_DELIVERY") {
+    const moved = weights.free_delivery * 0.5;
+    weights.free_delivery -= moved;
+    weights.credit += moved;
+  }
+  // Monthly budget guard: once the customer has taken 10 €, only small prizes remain.
+  if (spent >= REWARD_BUDGET_30D_CENTS) {
+    weights.credit += weights.free_delivery + weights.coupon_high;
+    weights.free_delivery = 0;
+    weights.coupon_high = 0;
+    weights.free_order = 0;
+    weights.challenge = 0;
+  }
+  return weights;
+}
+
+/** Temu-style sealed envelope: the big prize is real but it is paid with invites, never for free. */
+export const SHARE_CHALLENGE_TTL_MS = 7 * 86_400_000;
+export const SHARE_CHALLENGE_POOL = [
+  { prizeLabel: "10 € en tu monedero PIKI", rewardCents: 1_000, invitesRequired: 4, weight: 70 },
+  { prizeLabel: "15 € en tu monedero PIKI", rewardCents: 1_500, invitesRequired: 6, weight: 25 },
+  { prizeLabel: "25 € en tu monedero PIKI", rewardCents: 2_500, invitesRequired: 10, weight: 5 },
+] as const;
+
+export function pickShareChallengePrize(randomValue = Math.random()): WheelChallengeSpec {
+  const total = SHARE_CHALLENGE_POOL.reduce((sum, tier) => sum + tier.weight, 0);
+  const value = Math.min(0.999999, Math.max(0, Number.isFinite(Number(randomValue)) ? Number(randomValue) : 0)) * total;
+  let cursor = value;
+  for (const tier of SHARE_CHALLENGE_POOL) {
+    cursor -= tier.weight;
+    if (cursor < 0) return { prizeLabel: tier.prizeLabel, rewardCents: tier.rewardCents, invitesRequired: tier.invitesRequired, ttlMs: SHARE_CHALLENGE_TTL_MS };
+  }
+  const fallback = SHARE_CHALLENGE_POOL[0];
+  return { prizeLabel: fallback.prizeLabel, rewardCents: fallback.rewardCents, invitesRequired: fallback.invitesRequired, ttlMs: SHARE_CHALLENGE_TTL_MS };
+}
+
+function prizeForKey(key: WheelPrizeKey, subtotalCents: number): WheelSpinResult {
+  if (key === "free_order") {
+    const subtotal = Math.max(0, Math.round(Number(subtotalCents || 0)));
+    const cents = Math.min(FREE_ORDER_WHEEL_CAP_CENTS, Math.max(COMMON_WHEEL_REWARD_CENTS, subtotal));
+    return { kind: "free_order", cents, label: `Pedido gratis hasta ${(cents / 100).toFixed(2).replace(".", ",")} €`, message: `¡Has ganado tu pedido gratis hasta ${(cents / 100).toFixed(2).replace(".", ",")} €! Se abona como crédito PIKI válido 48 horas.` };
+  }
+  if (key === "coupon_high") {
+    return { kind: "coupon", cents: 0, label: "Cupón 5 %", message: "¡Has ganado un cupón del 5 % para tu próximo pedido (máximo 2 €). Válido 7 días.", coupon: { percentBps: WHEEL_COUPON_PERCENT_BPS, maxDiscountCents: WHEEL_COUPON_HIGH_CAP_CENTS, minSubtotalCents: WHEEL_COUPON_MIN_SUBTOTAL_CENTS, label: "Cupón 5 % (máx. 2 €)", ttlMs: WHEEL_COUPON_TTL_MS } };
+  }
+  if (key === "coupon_low") {
+    return { kind: "coupon", cents: 0, label: "Cupón 5 %", message: "¡Has ganado un cupón del 5 % para tu próximo pedido (máximo 1 €). Válido 7 días.", coupon: { percentBps: WHEEL_COUPON_PERCENT_BPS, maxDiscountCents: WHEEL_COUPON_LOW_CAP_CENTS, minSubtotalCents: WHEEL_COUPON_MIN_SUBTOTAL_CENTS, label: "Cupón 5 % (máx. 1 €)", ttlMs: WHEEL_COUPON_TTL_MS } };
+  }
+  if (key === "challenge") {
+    const challenge = pickShareChallengePrize(Math.random());
+    return { kind: "challenge", cents: 0, label: "Sobre sorpresa", message: `Has desbloqueado un sobre con ${challenge.prizeLabel}: comparte PIKI con ${challenge.invitesRequired} amigos y se abonará en tu monedero.`, challenge };
+  }
+  if (key === "free_delivery") {
+    return { kind: "free_delivery", cents: FREE_DELIVERY_WHEEL_CENTS, label: "Envío gratis", message: "¡Enhorabuena! Te abonamos el importe del envío como crédito válido 48 horas." };
+  }
+  return { kind: "credit", cents: COMMON_WHEEL_REWARD_CENTS, label: "1,00 € de crédito", message: "¡Enhorabuena! Has ganado 1,00 € para tu próximo pedido. Válido durante 48 horas." };
+}
+
+/**
+ * Weighted draw. Deterministic for a given random value and history, which keeps
+ * the distribution auditable and testable: the cheap credit lands roughly four
+ * out of five times and the free order is a rare, late-game event.
+ */
+export function resolveWheelSpin(randomValue = Math.random(), options: { subtotalCents?: number; history?: WheelHistory } = {}): WheelSpinResult {
   const normalized = Number(randomValue);
   if (!Number.isFinite(normalized)) return { kind: "none", cents: 0, label: "Sin premio", message: "Esta vez no ha habido premio." };
-  const value = Math.min(0.999999, Math.max(0, normalized));
-  if (value < 0.01) {
-    const cents = Math.min(FREE_ORDER_WHEEL_CAP_CENTS, Math.max(COMMON_WHEEL_REWARD_CENTS, Math.round(Number(options.subtotalCents || 0))));
-    return { kind: "free_order", cents, label: "Pedido gratis", message: "¡Has ganado tu pedido gratis! El importe se abona como crédito PIKI válido 48 horas." };
+  const weights = wheelWeights(options.history || {});
+  const order: WheelPrizeKey[] = ["free_order", "challenge", "coupon_high", "free_delivery", "coupon_low", "credit"];
+  const total = order.reduce((sum, key) => sum + Math.max(0, weights[key]), 0);
+  if (total <= 0) return prizeForKey("credit", Number(options.subtotalCents || 0));
+  let cursor = Math.min(0.999999, Math.max(0, normalized)) * total;
+  for (const key of order) {
+    cursor -= Math.max(0, weights[key]);
+    if (cursor < 0) return prizeForKey(key, Number(options.subtotalCents || 0));
   }
-  if (value < 0.61) return { kind: "credit", cents: COMMON_WHEEL_REWARD_CENTS, label: "1,50 € de crédito", message: "¡Enhorabuena! Has ganado 1,50 € para tu próximo pedido. Válido durante 48 horas." };
-  return { kind: "free_delivery", cents: FREE_DELIVERY_WHEEL_CENTS, label: "Envío gratis", message: "¡Enhorabuena! Te abonamos el importe del envío como crédito válido 48 horas." };
+  return prizeForKey("credit", Number(options.subtotalCents || 0));
 }
 
 /** Backwards-compatible helper: the wallet amount a spin is worth. */
-export function resolveWheelReward(randomValue = Math.random(), options: { subtotalCents?: number } = {}) {
+export function resolveWheelReward(randomValue = Math.random(), options: { subtotalCents?: number; history?: WheelHistory } = {}) {
   return resolveWheelSpin(randomValue, options).cents;
 }
 
@@ -243,8 +393,127 @@ export async function recommendationProfileForCustomer(customerId: string) {
 }
 
 export async function ensureCustomerEngagementIndexes() {
-  await Promise.all([UserStreak.init(), Badge.init(), CustomerBadge.init(), PikiPassSubscription.init(), ReferralReward.init(), RecommendationProfile.init(), CustomerOrderCompletion.init(), CustomerDeliverySaving.init()]);
+  await Promise.all([UserStreak.init(), Badge.init(), CustomerBadge.init(), PikiPassSubscription.init(), ReferralReward.init(), RecommendationProfile.init(), CustomerOrderCompletion.init(), CustomerDeliverySaving.init(), CustomerCoupon.init(), CustomerShareChallenge.init()]);
   await Badge.bulkWrite(DEFAULT_BADGES.map((badge) => ({ updateOne: { filter: { slug: badge.slug }, update: { $setOnInsert: badge }, upsert: true } })), { ordered: false });
+}
+
+/** Issues a wheel coupon. Percentage and ceiling are clamped so no coupon can ever beat 5 % or its cap. */
+export async function issueCustomerCoupon(customerId: string, spec: WheelCouponSpec, options: { source?: string; now?: Date } = {}) {
+  const id = String(customerId || "").trim();
+  if (!id) return null;
+  const now = options.now || new Date();
+  const percentBps = Math.max(1, Math.min(WHEEL_COUPON_PERCENT_BPS, Math.round(Number(spec.percentBps || 0))));
+  const maxDiscountCents = Math.max(0, Math.min(WHEEL_COUPON_HIGH_CAP_CENTS, Math.round(Number(spec.maxDiscountCents || 0))));
+  const minSubtotalCents = Math.max(0, Math.round(Number(spec.minSubtotalCents || 0)));
+  const coupon = await CustomerCoupon.create({ customerId: id, percentBps, maxDiscountCents, minSubtotalCents, label: spec.label || "Cupón PIKI", source: options.source || "wheel", expiresAt: new Date(now.getTime() + (spec.ttlMs || WHEEL_COUPON_TTL_MS)) });
+  return coupon.toObject();
+}
+
+export async function activeCustomerCoupons(customerId: string, now = new Date()) {
+  const id = String(customerId || "").trim();
+  if (!id) return [] as any[];
+  return CustomerCoupon.find({ customerId: id, usedAt: null, expiresAt: { $gt: now } }).sort({ maxDiscountCents: -1, expiresAt: 1 }).lean().exec() as any;
+}
+
+/** Discount a coupon would produce on a given subtotal, never above its own ceiling. */
+export function couponDiscountCents(coupon: any, subtotalCents: number) {
+  const subtotal = Math.max(0, Math.round(Number(subtotalCents || 0)));
+  if (!coupon) return 0;
+  if (coupon.usedAt) return 0;
+  if (coupon.expiresAt && new Date(coupon.expiresAt).getTime() <= Date.now()) return 0;
+  if (subtotal < Number(coupon.minSubtotalCents || 0)) return 0;
+  const percent = Math.max(0, Math.min(WHEEL_COUPON_PERCENT_BPS, Number(coupon.percentBps || 0)));
+  const raw = Math.floor((subtotal * percent) / 10_000);
+  return Math.max(0, Math.min(Math.round(Number(coupon.maxDiscountCents || 0)), raw));
+}
+
+/** Picks the coupon that saves the most for this order and marks it as used atomically. */
+export async function redeemBestCoupon(customerId: string, subtotalCents: number, orderId?: string | null) {
+  const coupons = await activeCustomerCoupons(customerId);
+  const scored = (coupons as any[])
+    .map((coupon: any) => ({ coupon, discountCents: couponDiscountCents(coupon, subtotalCents) }))
+    .filter((row: { discountCents: number }) => row.discountCents > 0)
+    .sort((a: { discountCents: number }, b: { discountCents: number }) => b.discountCents - a.discountCents);
+  const best = scored[0];
+  if (!best) return { coupon: null as any, discountCents: 0 };
+  const updated = await CustomerCoupon.findOneAndUpdate({ _id: best.coupon._id, usedAt: null }, { $set: { usedAt: new Date(), usedOrderId: orderId ? String(orderId) : null } }, { new: true }).lean().exec();
+  if (!updated) return { coupon: null as any, discountCents: 0 };
+  return { coupon: updated as any, discountCents: best.discountCents };
+}
+
+function shareToken() {
+  return randomBytes(9).toString("base64url");
+}
+
+/** Stable-ish fingerprint so the same friend cannot be counted twice from the same device. */
+export function shareFingerprint(ip?: string | null, userAgent?: string | null) {
+  return createHash("sha256").update(`${String(ip || "")}|${String(userAgent || "")}`).digest("hex").slice(0, 32);
+}
+
+export async function createShareChallenge(customerId: string, spec: WheelChallengeSpec, options: { orderId?: string | null; now?: Date } = {}) {
+  const id = String(customerId || "").trim();
+  if (!id) return null;
+  const now = options.now || new Date();
+  const challenge = await CustomerShareChallenge.create({
+    customerId: id,
+    token: shareToken(),
+    prizeLabel: spec.prizeLabel,
+    rewardCents: Math.max(0, Math.round(Number(spec.rewardCents || 0))),
+    invitesRequired: Math.max(1, Math.round(Number(spec.invitesRequired || 1))),
+    invitesDone: 0,
+    visitors: [],
+    sourceOrderId: options.orderId ? String(options.orderId) : null,
+    expiresAt: new Date(now.getTime() + (spec.ttlMs || SHARE_CHALLENGE_TTL_MS)),
+  });
+  return challenge.toObject();
+}
+
+export async function activeShareChallenges(customerId: string, now = new Date()) {
+  const id = String(customerId || "").trim();
+  if (!id) return [] as any[];
+  return CustomerShareChallenge.find({ customerId: id, claimedAt: null, expiresAt: { $gt: now } }).sort({ createdAt: -1 }).lean().exec() as any;
+}
+
+/** Counts one share visit. When the goal is reached the prize is paid automatically. */
+export async function registerShareVisit(token: string, fingerprint: string, now = new Date()) {
+  const cleanToken = String(token || "").trim();
+  if (!cleanToken) return { found: false as const };
+  const challenge = await CustomerShareChallenge.findOne({ token: cleanToken, claimedAt: null, expiresAt: { $gt: now } }).lean().exec() as any;
+  if (!challenge) return { found: false as const };
+  if ((challenge.visitors || []).includes(fingerprint)) {
+    return { found: true as const, counted: false, invitesDone: Number(challenge.invitesDone || 0), invitesRequired: Number(challenge.invitesRequired || 0), completed: Boolean(challenge.completedAt) };
+  }
+  const updated = await CustomerShareChallenge.findOneAndUpdate(
+    { _id: challenge._id, claimedAt: null, expiresAt: { $gt: now } },
+    { $push: { visitors: fingerprint }, $inc: { invitesDone: 1 } },
+    { new: true },
+  ).lean().exec() as any;
+  if (!updated) return { found: false as const };
+  const goalReached = Number(updated.invitesDone || 0) >= Number(updated.invitesRequired || 0);
+  if (!goalReached) {
+    return { found: true as const, counted: true, invitesDone: Number(updated.invitesDone || 0), invitesRequired: Number(updated.invitesRequired || 0), completed: false };
+  }
+  const paid = await claimShareChallenge(String(updated._id), now);
+  return { found: true as const, counted: true, invitesDone: Number(updated.invitesDone || 0), invitesRequired: Number(updated.invitesRequired || 0), completed: true, rewardCents: paid.rewardCents };
+}
+
+/** Pays a completed envelope once. Safe to call twice: the second call returns nothing. */
+export async function claimShareChallenge(challengeId: string, now = new Date()) {
+  if (!mongoose.Types.ObjectId.isValid(String(challengeId))) return { claimed: false as const, rewardCents: 0 };
+  const challenge = await CustomerShareChallenge.findOne({ _id: challengeId, claimedAt: null }).lean().exec() as any;
+  if (!challenge) return { claimed: false as const, rewardCents: 0 };
+  if (Number(challenge.invitesDone || 0) < Number(challenge.invitesRequired || 0)) return { claimed: false as const, rewardCents: 0 };
+  const locked = await CustomerShareChallenge.findOneAndUpdate({ _id: challengeId, claimedAt: null }, { $set: { claimedAt: now, completedAt: challenge.completedAt || now } }, { new: true }).lean().exec() as any;
+  if (!locked) return { claimed: false as const, rewardCents: 0 };
+  const cents = Math.max(0, Number(locked.rewardCents || 0));
+  if (cents > 0) await restoreCustomerCredits(String(locked.customerId), cents, new Date(now.getTime() + SHARE_CHALLENGE_TTL_MS));
+  return { claimed: true as const, rewardCents: cents };
+}
+
+export async function restoreCustomerCoupon(couponId?: string | null) {
+  const id = String(couponId || "").trim();
+  if (!id || !mongoose.Types.ObjectId.isValid(id)) return;
+  await CustomerCoupon.updateOne({ _id: id }, { $set: { usedAt: null, usedOrderId: null } }).exec();
 }
 
 export async function consumeCustomerCredits(customerId: string, maximumCents: number) {
@@ -282,3 +551,5 @@ export async function syncCustomerDeliverySavings(customerId: string) {
   const [summary] = await CustomerDeliverySaving.aggregate([{ $match: { customerId } }, { $group: { _id: null, savedOnDeliveryCents: { $sum: "$savedOnDeliveryCents" }, orders: { $sum: 1 } } }]);
   return { savedOnDeliveryCents: Number(summary?.savedOnDeliveryCents || 0), orders: Number(summary?.orders || 0) };
 }
+export const CustomerCoupon = mongoose.models.CustomerCoupon || mongoose.model("CustomerCoupon", customerCouponSchema);
+export const CustomerShareChallenge = mongoose.models.CustomerShareChallenge || mongoose.model("CustomerShareChallenge", customerShareChallengeSchema);
