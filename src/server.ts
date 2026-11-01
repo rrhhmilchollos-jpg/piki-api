@@ -45,6 +45,7 @@ import { KINGS_TACOS_COVER_IMAGE } from "./kingsTacosMenu.js";
 import { ALIBABA_KEBAB_COVER_IMAGE } from "./alibabaKebabMenu.js";
 import { mrRoosterMenu } from "./mrRoosterMenu.js";
 import { configuredPartnerRestaurantUpsert } from "./partnerRepairPolicy.js";
+import { partnerBasicProfileSchema } from "./partnerProfilePolicy.js";
 import { quoteMenuItem, usesReferenceAddOns } from "./menuModifiers.js";
 import { pointDistanceMeters } from "./pickupPolicy.js";
 import { buildLegacyRiderSupportTicketFilter, buildRiderSupportTicketFilter } from "./supportTicketScope.js";
@@ -1846,15 +1847,6 @@ app.get("/api/v1/partners/profile", requireRole("partner"), async (req, res) => 
   if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
   return res.json({ profile: { id: String(restaurant._id), partnerCode: restaurant.partnerCode || publicPartnerCode(restaurant._id), name: restaurant.name, email: restaurant.email, phone: restaurant.phone, address: restaurant.address, locality: restaurant.locality, cuisine: restaurant.cuisine, category: restaurant.category, deliveryFeeCents: Number(restaurant.deliveryFeeCents || 0), promoted: Boolean(restaurant.promoted), availabilityStatus: restaurant.availabilityStatus, isOpen: Boolean(restaurant.isActive), commissionRateBps: Math.round(customerCommissionRate(restaurant) * 10_000), commissionPercent: Number(restaurant.partnerProfile?.commissionRateBps ?? DEFAULT_PARTNER_COMMISSION_BPS) / 100 } });
 });
-const partnerBasicProfileSchema = z.object({
-  name: z.string().trim().min(1).max(160).optional(),
-  email: z.union([z.string().email().max(254), z.literal("")]).optional(),
-  phone: z.string().trim().max(40).optional(),
-  address: z.string().trim().max(280).optional(),
-  locality: z.string().trim().max(120).optional(),
-  cuisine: z.string().trim().min(1).max(120).optional(),
-  category: z.string().trim().min(1).max(120).optional(),
-}).strict();
 app.patch("/api/v1/partners/profile", requireRole("partner"), async (req, res) => {
   const access = await partnerAccessForRequest(req);
   if (!access || !partnerCan(access.roles, "store:write")) return res.status(403).json({ error: "PARTNER_PERMISSION_DENIED", permission: "store:write" });
