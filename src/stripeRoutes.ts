@@ -454,6 +454,41 @@ export function mountStripeRoutes(app: Express): void {
     },
   );
 
+  // Últimos pedidos con su estado de pago, sin filtro de tenant: sirve para
+  // comprobar de un vistazo si el tráfico real entra como retención o como cobro.
+  app.get(
+    "/api/v1/admin/payment-audit",
+    requireRole("admin"),
+    async (request: Request, response: Response) => {
+      const limit = Math.max(1, Math.min(100, Number(request.query.limit ?? 25) || 25));
+      const orders = await Order.find({})
+        .sort({ createdAt: -1 })
+        .limit(limit)
+        .select("publicCode displayCode status assignmentState paymentMethod paymentState totalCents paymentCapturedCents paymentCapturedAt cashCollectedAt riderId isTestOrder createdAt stripePaymentIntentId")
+        .lean()
+        .exec() as any[];
+      response.json({
+        count: orders.length,
+        orders: orders.map((order) => ({
+          publicCode: order.publicCode ?? null,
+          displayCode: order.displayCode ?? null,
+          status: order.status,
+          assignmentState: order.assignmentState ?? null,
+          paymentMethod: order.paymentMethod ?? null,
+          paymentState: order.paymentState ?? null,
+          totalCents: order.totalCents ?? null,
+          capturedCents: order.paymentCapturedCents ?? null,
+          capturedAt: order.paymentCapturedAt ?? null,
+          cashCollectedAt: order.cashCollectedAt ?? null,
+          riderId: order.riderId ? String(order.riderId) : null,
+          isTestOrder: order.isTestOrder ?? false,
+          paymentIntentId: order.stripePaymentIntentId ?? null,
+          createdAt: order.createdAt,
+        })),
+      });
+    },
+  );
+
   // Auditoría de un pedido concreto: qué se retuvo, qué se cobró y en qué
   // estado está el pago en el banco. Solo lectura y solo con el token de
   // plataforma, para poder responder «¿esto es una retención o un cargo?».
