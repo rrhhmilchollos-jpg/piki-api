@@ -20,8 +20,8 @@ test("acepta contratos de 10, 20, 30 y 40 horas", () => {
 });
 
 test("un plan no puede superar las horas contratadas", () => {
-  const abusivo = { ...plan, weeklyHours: 10 as const };
-  assert.equal(plannedMinutes(abusivo), 480);
+  const abusivo = { ...plan, weeklyHours: 10 as const, shifts: [...plan.shifts, { weekday: 5, start: "12:00", end: "16:00" }] };
+  assert.equal(plannedMinutes(abusivo), 720);
   assert.equal(planFitsContract(abusivo), false);
 });
 
@@ -49,7 +49,7 @@ test("al agotar las horas contratadas se le corta aunque este en tramo", () => {
 });
 
 test("los minutos restantes nunca superan lo que queda de tramo", () => {
-  const lunes = new Date("2026-11-02T15:30:00Z");
+  const lunes = new Date("2026-11-02T14:30:00Z");
   const d = evaluateShift(plan, 0, lunes);
   assert.equal(d.minutesRemaining, 30);
 });
