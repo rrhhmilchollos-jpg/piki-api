@@ -39,8 +39,12 @@ export function calculateSettlement(orders: SettlementOrder[], options?: { partn
   const riderBaseCents = options?.riderBaseCents ?? 250;
   const riderPerKmCents = options?.riderPerKmCents ?? 60;
   const lines = orders.map((order): SettlementLine => {
-    const partnerCommissionCents = cents(order.subtotalCents * partnerCommissionRate);
-    const partnerNetCents = Math.max(0, order.subtotalCents - partnerCommissionCents);
+    // Si el precio de venta ya lleva la comision incluida, el local cobra el
+    // precio base (subtotal / (1 + comision)); si no, se descuenta del subtotal.
+    const partnerNetCents = (order as SettlementOrder & { priceIncludesCommission?: boolean }).priceIncludesCommission
+      ? cents(order.subtotalCents / (1 + partnerCommissionRate))
+      : Math.max(0, order.subtotalCents - cents(order.subtotalCents * partnerCommissionRate));
+    const partnerCommissionCents = Math.max(0, order.subtotalCents - partnerNetCents);
     const riderDistanceCents = cents(order.distanceKm * riderPerKmCents);
     const riderIncentiveCents = cents(order.incentiveCents || 0);
     const riderTipCents = cents(order.tipCents || 0);
