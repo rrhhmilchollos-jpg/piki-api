@@ -13,6 +13,7 @@ import type { Express, Request, Response } from "express";
 import mongoose from "mongoose";
 import { Order } from "./models.js";
 import { requireRole } from "./auth.js";
+import { currentCustomer } from "./customerCompat.js";
 import { presentForCustomer, sanitizePing, isFresh } from "./riderLocation.js";
 import { ensureLocationIndexes, readPing, savePing, riderOwnsOrder, type LocationCollection } from "./riderLocationStore.js";
 
@@ -72,6 +73,29 @@ export function mountRiderTracking(app: Express): void {
       });
     }
   );
+  mountCustomerTracking(app);
+}
+
+
+function mountCustomerTracking(app: Express): void {
+  app.get("/api/v1/customer/orders/:publicCode/location", async (request: Request, response: Response) => {
+    const customer = await currentCustomer(request as any);
+    if (!customer) return response.status(401).json({ error: "AUTHENTICATION_REQUIRED" });
+    const order = await Order.findOne({ publicCode: String(request.params.publicCode), customerId: (customer as any)._id })
+      .select("publicCode riderId deliveryLocation status")
+      .lean()
+      .exec() as any;
+    if (!order) return response.status(404).json({ error: "ORDER_NOT_FOUND" });
+    const ping = await readPing(collection(), order.publicCode);
+    const destino = destinationOf(order);
+    const vista = destino ? presentForCustomer(ping as any, destino) : { visible: false as const, status: "sin_senal" as const };
+    return response.json({
+      orderId: order.publicCode,
+      orderStatus: order.status,
+      rider: ping && isFresh(ping.at) ? { latitude: ping.latitude, longitude: ping.longitude, headingDegrees: ping.headingDegrees, at: ping.at } : null,
+      ...vista,
+    });
+  });
 }
 
 export async function ensureTrackingIndexes(): Promise<void> {
