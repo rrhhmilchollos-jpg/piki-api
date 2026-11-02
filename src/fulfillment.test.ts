@@ -21,10 +21,9 @@ test("la compra por encargo exige prepago y emite tarjeta", () => {
   assert.equal(decision.ok === true && decision.requiresPrepayment, true);
 });
 
-test("el efectivo sigue bloqueado sin habilitación explícita", () => {
-  const restaurant = { name: "Forno Rossi", cashPaymentsEnabled: false };
-  const decision = paymentDecision(restaurant, "cash");
-  assert.equal(decision.ok, false);
+test("el efectivo está disponible en todos los comercios", () => {
+  const sinBandera = { name: "Local", slug: "local-x", cashPaymentsEnabled: false };
+  assert.equal(isCashPaymentEnabledForRestaurant(sinBandera), true);
 });
 
 test("la referencia de bizum es corta y única por pedido", () => {

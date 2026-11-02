@@ -22,10 +22,9 @@ test("dispatch bloquea efectivo legacy fuera de límite pero no afecta pago onli
   assert.equal(isDispatchablePayment("authorized", "stripe", 50_000), true);
 });
 
-test("efectivo requiere autorización expresa y Alibaba queda solo online", () => {
-  assert.equal(isCashPaymentEnabledForRestaurant({ slug: "mr-rooster-xativa", cashPaymentsEnabled: false }), false);
-  assert.equal(isCashPaymentEnabledForRestaurant({ slug: "mr-rooster-xativa", cashPaymentsEnabled: true }), true);
-  assert.equal(isCashPaymentEnabledForRestaurant({ slug: "alibaba-kebab-xativa", cashPaymentsEnabled: true }), false);
+test("el efectivo se acepta en todos los comercios, Alibaba incluido", () => {
+  assert.equal(isCashPaymentEnabledForRestaurant({ name: "Alibaba", slug: "alibaba-kebab-xativa", cashPaymentsEnabled: false }), true);
+  assert.equal(isCashPaymentEnabledForRestaurant({ name: "Cualquiera", slug: "otro-local" }), true);
 });
 
 test("Mr Rooster Xàtiva queda habilitado para contrareembolso con su slug operativo", () => {
