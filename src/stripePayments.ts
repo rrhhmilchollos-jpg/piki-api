@@ -122,6 +122,25 @@ export async function authorizeCodOrder(
     setup_future_usage: "off_session",
   });
 
+  // Blindaje: una garantía NUNCA puede cobrar. Si por configuración, clave o
+  // una versión anterior el intent se captura al confirmarse, el cliente ve un
+  // cargo real en su banco y no pagará en efectivo. Se devuelve el dinero en el
+  // acto y se falla en voz alta para que quede en los logs.
+  if (String(intent.status) === "succeeded") {
+    await stripe.refunds
+      .create({ payment_intent: intent.id, reason: "requested_by_customer" })
+      .catch((error: unknown) => {
+        console.error(
+          JSON.stringify({
+            event: "cod_authorization_refund_failed",
+            paymentIntentId: intent.id,
+            error: error instanceof Error ? error.message : String(error),
+          }),
+        );
+      });
+    throw new Error("COD_AUTHORIZATION_CAPTURED: la garantía se cobró; se ha devuelto el importe");
+  }
+
   return {
     paymentIntentId: intent.id,
     clientSecret: intent.client_secret ?? null,
