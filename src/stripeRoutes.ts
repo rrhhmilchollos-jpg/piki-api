@@ -604,7 +604,8 @@ export function mountStripeRoutes(app: Express): void {
         reference,
         order: order
           ? {
-              orderId: order.orderId,
+              orderId: (order as any).orderId ?? null,
+              mongoId: (order as any).mongoId ?? (order as any)._id ?? null,
               publicCode: order.publicCode || order.reference,
               status: order.status,
               paymentMethod: (order as any).paymentMethod ?? null,

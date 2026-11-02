@@ -5217,7 +5217,18 @@ async function enqueueOrderForDispatch(orderId: mongoose.Types.ObjectId, preferr
  * para pedidos QA internos y nunca se expone a Customer/Partner.
  */
 async function assignOrderAutomatically(orderId: mongoose.Types.ObjectId, preferredRiderId?: mongoose.Types.ObjectId) {
-  if (!databaseReady || mongoose.connection.readyState !== 1) return { state: "database_unavailable" as const };
+  if (!databaseReady || mongoose.connection.readyState !== 1) {
+    // El indicador puede quedarse en falso tras un corte que ya se ha recuperado
+    // y, con él, todos los repartos se van a carta muerta sin motivo. Se
+    // comprueba la conexión de verdad antes de darse por caído.
+    const reachable = await mongoose.connection.db
+      ?.admin()
+      .ping()
+      .then(() => true)
+      .catch(() => false);
+    if (!reachable) return { state: "database_unavailable" as const };
+    databaseReady = true;
+  }
   const key = String(orderId);
   if (automaticDispatchInFlight.has(key)) return { state: "in_progress" as const };
   automaticDispatchInFlight.add(key);
