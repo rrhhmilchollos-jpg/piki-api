@@ -29,9 +29,12 @@ export const DEFAULT_PAYMENT_METHODS: PaymentMethod[] = ["stripe", "cash"];
 /** Métodos permitidos según la configuración del local. `bizumOnly` gana siempre. */
 export function allowedPaymentMethods(restaurant: FulfillmentRestaurant | null | undefined): PaymentMethod[] {
   if (!restaurant) return DEFAULT_PAYMENT_METHODS;
-  if (restaurant.bizumOnly === true) return ["bizum"];
+  // El contra reembolso esta disponible en todos los comercios, sin excepcion.
+  const withCash = (methods: PaymentMethod[]): PaymentMethod[] =>
+    methods.includes("cash") ? methods : [...methods, "cash"];
+  if (restaurant.bizumOnly === true) return withCash(["bizum"]);
   const configured = Array.isArray(restaurant.paymentMethods) ? restaurant.paymentMethods.filter(isMethod) : [];
-  return configured.length ? configured : DEFAULT_PAYMENT_METHODS;
+  return withCash(configured.length ? configured : DEFAULT_PAYMENT_METHODS);
 }
 
 export function isRiderPurchase(restaurant: FulfillmentRestaurant | null | undefined): boolean {
