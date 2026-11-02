@@ -3386,6 +3386,104 @@ app.patch("/api/v1/admin/riders/:id/lifecycle", requireRole("admin"), async (req
   return res.json({ rider });
 });
 
+// Listado de expedientes sin ámbito de tenant, para tareas de mantenimiento
+// hechas con el token de administración de entorno.
+app.get("/api/v1/admin/maintenance/rider-applications", requireRole("admin"), async (_req, res) => {
+  const applications = await RiderApplication.find({}).sort({ createdAt: -1 }).limit(100).lean().exec() as any[];
+  return res.json({
+    count: applications.length,
+    applications: applications.map((application) => ({
+      id: String(application._id),
+      name: application.name,
+      email: application.email,
+      city: application.city,
+      status: application.status,
+      source: application.source || null,
+      documents: (application.documents || []).length,
+      pendingDocs: (application.documents || []).filter((doc: any) => doc.status !== "approved").length,
+      createdAt: application.createdAt,
+    })),
+  });
+});
+// Aprobación de un expediente de rider desde mantenimiento. Se usa cuando la
+// cuenta de administración no tiene empleado asociado (token de entorno) y por
+// tanto no puede pasar por el flujo normal con ámbito de tenant.
+app.post("/api/v1/admin/maintenance/rider-applications/:id/approve", requireRole("admin"), async (req, res) => {
+  const id = objectId(String(req.params.id));
+  if (!id) return res.status(400).json({ error: "INVALID_APPLICATION_ID" });
+  const apply = req.query.apply === "1" || req.body?.apply === true;
+  const application = await RiderApplication.findById(id).lean().exec() as any;
+  if (!application) return res.status(404).json({ error: "APPLICATION_NOT_FOUND" });
+  const pendingDocs = (application.documents || []).filter((doc: any) => doc.status !== "approved").length;
+  if (!apply) {
+    return res.json({
+      apply: false,
+      application: {
+        id: String(application._id),
+        name: application.name,
+        email: application.email,
+        city: application.city,
+        status: application.status,
+        documents: (application.documents || []).length,
+        pendingDocs,
+      },
+    });
+  }
+  const now = new Date();
+  const documents = (application.documents || []).map((doc: any) => ({ ...doc, status: "approved", reviewNotes: doc.reviewNotes || "Verificado en mantenimiento.", reviewedAt: now }));
+  await RiderApplication.updateOne(
+    { _id: application._id },
+    { $set: { documents, status: "approved", identityVerificationStatus: "approved", approvedAt: now, reviewedAt: now, reviewNotes: "Aprobado desde mantenimiento." } },
+  ).exec();
+  const tenantId = application.tenantId || null;
+  const existingRider = await Rider.findOne({ email: application.email }).select("_id riderCode").lean().exec() as any;
+  const rider = await Rider.findOneAndUpdate(
+    { email: application.email },
+    {
+      $set: {
+        tenantId,
+        ...buildApprovedRiderOperationalProfile(application),
+        fleetId: application.assignedFleetId || null,
+        status: "offline",
+        lifecycleStatus: "active",
+      },
+      $setOnInsert: { riderCode: existingRider?.riderCode || (await nextRiderCode()) },
+    },
+    { upsert: true, new: true, setDefaultsOnInsert: true },
+  ).lean().exec() as any;
+  const employee = await EmployeeAccount.findOneAndUpdate(
+    { email: application.email },
+    {
+      $set: {
+        tenantId,
+        name: application.name,
+        jobRole: "rider",
+        apiRole: "rider",
+        roles: ["rider"],
+        primaryRole: "rider",
+        accessLevel: "subadmin",
+        authorizationStatus: "approved",
+        authorizedAt: now,
+        active: true,
+        mustChangePassword: true,
+        fleetId: application.assignedFleetId || null,
+      },
+      $setOnInsert: {
+        employeeCode: `PIKI-E-${String(rider?._id || application._id).replace(/[^a-z0-9]/gi, "").slice(-8).toUpperCase()}`,
+        passwordHash: hashPassword(generateTemporaryPassword()),
+      },
+    },
+    { upsert: true, new: true, setDefaultsOnInsert: true },
+  ).lean().exec() as any;
+  return res.json({
+    approved: true,
+    riderCode: rider?.riderCode ?? null,
+    riderId: rider?._id ? String(rider._id) : null,
+    employeeId: employee?._id ? String(employee._id) : null,
+    email: application.email,
+    documentsApproved: documents.length,
+  });
+});
 // Limpieza de riders de prueba creados por QA. Solo toca cuentas marcadas como
 // test o con el correo de QA, y nunca con pedidos vivos encima.
 app.post("/api/v1/admin/riders/purge-qa", requireRole("admin"), async (req, res) => {

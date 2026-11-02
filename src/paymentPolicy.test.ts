@@ -16,10 +16,14 @@ test("el límite de efectivo se aplica al total final, incluyendo los bordes 4.8
   });
 });
 
-test("dispatch bloquea efectivo legacy fuera de límite pero no afecta pago online", () => {
-  assert.equal(isDispatchablePayment("pending", "cash", 4_899), true);
+test("sin retención viva ningún pedido sale a reparto, tampoco el efectivo", () => {
+  // El efectivo ya no se reparte con la promesa de cobrar en la puerta: primero
+  // el cliente deja la tarjeta retenida y después el pedido sale al rider.
+  assert.equal(isDispatchablePayment("pending", "cash", 4_899), false);
   assert.equal(isDispatchablePayment("pending", "cash", 4_900), false);
+  assert.equal(isDispatchablePayment("authorized", "cash", 4_899), true);
   assert.equal(isDispatchablePayment("authorized", "stripe", 50_000), true);
+  assert.equal(isDispatchablePayment("paid", "stripe", 50_000), true);
 });
 
 test("el efectivo se acepta en todos los comercios, Alibaba incluido", () => {
