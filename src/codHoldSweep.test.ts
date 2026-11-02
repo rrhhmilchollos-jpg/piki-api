@@ -53,7 +53,7 @@ test("una retención recién creada no se toca", () => {
   assert.equal(decision.reason, "espera_turno");
 });
 
-test("se libera con doce horas de margen antes de caducar", () => {
+test("no se libera por proximidad del plazo: solo avisa para revisión", () => {
   const marginStart = new Date(EXPIRES.getTime() - COD_RELEASE_MARGIN_MS);
   const justBefore = new Date(marginStart.getTime() - 60_000);
   const [early] = planCodHoldSweep({
@@ -68,7 +68,7 @@ test("se libera con doce horas de margen antes de caducar", () => {
     holds: [hold()],
     orders: new Map(),
   });
-  assert.equal(atMargin.action, "release");
+  assert.equal(atMargin.action, "review");
   assert.equal(atMargin.reason, "retencion_a_punto_de_caducar");
 });
 
@@ -109,14 +109,20 @@ test("entregado sin cobro no se captura solo: queda en revisión", () => {
   assert.equal(tallyCodHoldDecisions([decision]).needsReview, 1);
 });
 
-test("si el plazo se agota en un pedido entregado sin cobro, se libera con el motivo escrito", () => {
+test("entregado sin cobro sigue en revisión aunque pase el plazo: no se libera solo", () => {
   const [decision] = planCodHoldSweep({
     now: EXPIRES,
     holds: [hold()],
     orders: new Map([["MW7GLU1", order({ status: "delivered", deliveredAt: NOW, paymentState: "pending" })]]),
   });
-  assert.equal(decision.action, "release");
+  assert.equal(decision.action, "review");
   assert.equal(decision.reason, "entregado_sin_cobro");
+});
+
+test("la garantía se suelta cuando el rider confirma la entrega en efectivo", () => {
+  const [decision] = plan([hold()], [order({ status: "delivered", deliveredAt: NOW, paymentState: "paid", cashCollectedAt: NOW })]);
+  assert.equal(decision.action, "release");
+  assert.equal(decision.reason, "pedido_cobrado_en_efectivo");
 });
 
 test("una garantía huérfana no se adelanta por defecto", () => {

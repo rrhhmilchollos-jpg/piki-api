@@ -181,37 +181,32 @@ export function planCodHoldSweep(input: PlanCodHoldSweepInput): CodHoldDecision[
         );
       }
       // Entregado sin cobro: hay motivo para capturar, pero eso lo decide una
-      // persona. Marcamos la garantía para revisión y, si el plazo se agota, se
-      // libera dejando el motivo escrito.
-      if (order.deliveredAt && !shouldRelease) {
+      // persona. La garantía no se suelta sola mientras el pedido siga vivo.
+      if (order.deliveredAt) {
         return decide(
           "review",
           "entregado_sin_cobro",
           `el pedido ${order.reference} se entregó sin cobro; capturar a mano está a un clic`,
         );
       }
-      if (order.deliveredAt && shouldRelease) {
-        return decide(
-          "release",
-          "entregado_sin_cobro",
-          `el pedido ${order.reference} se entregó sin cobro y la garantía ha llegado a su plazo`,
-        );
-      }
     }
 
-    // 2) Plazos de la autorización.
+    // 2) Plazos de la autorización. Regla de negocio: la garantía solo se suelta
+    // cuando el rider confirma la entrega o el pedido se anula. Si llega al
+    // plazo la suelta el banco; aquí solo se concilia el estado real.
+    if (overdue) {
+      return decide(
+        "release",
+        "retencion_vencida",
+        `vencida hace ${hoursBetween(expiresAt, now)} h; se concilia con el estado real del banco`,
+      );
+    }
     if (shouldRelease) {
-      return overdue
-        ? decide(
-            "release",
-            "retencion_vencida",
-            `vencida hace ${hoursBetween(expiresAt, now)} h; se concilia con el estado real del banco`,
-          )
-        : decide(
-            "release",
-            "retencion_a_punto_de_caducar",
-            `caduca en ${hoursBetween(now, expiresAt)} h; se libera con margen de seguridad`,
-          );
+      return decide(
+        "review",
+        "retencion_a_punto_de_caducar",
+        `caduca en ${hoursBetween(now, expiresAt)} h y el pedido sigue vivo: no se libera sin la confirmación del rider`,
+      );
     }
 
     // 3) Garantías huérfanas: la referencia no tiene pedido local. Solo se
