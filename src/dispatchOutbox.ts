@@ -107,6 +107,31 @@ export async function enqueueDispatchOutbox(input: DispatchOutboxEnqueueInput) {
   return DispatchOutbox.findOne({ idempotencyKey: input.idempotencyKey }, null, input.session ? { session: input.session } : undefined).lean().exec() as Promise<DispatchOutboxEvent | null>;
 }
 
+/**
+ * Errores que no significan «este pedido no se puede repartir», sino «ahora
+ * mismo no había hueco». Cuando la causa se repara (por ejemplo, una reserva
+ * colgada), la carta muerta tiene que poder volver a la cola; si no, el pedido
+ * se queda sin rider para siempre aunque todo lo demás esté bien.
+ */
+const REARMABLE_DISPATCH_ERRORS = [/reservation_race/i, /no_eligible_rider/i, /database_unavailable/i, /missing_geolocation/i, /in_progress/i];
+
+export function dispatchErrorIsRearmable(lastError: unknown) {
+  const text = String(lastError ?? "");
+  return REARMABLE_DISPATCH_ERRORS.some((pattern) => pattern.test(text));
+}
+
+/** Devuelve a la cola un evento en carta muerta por una causa reparable. */
+export async function rearmDeadLetterDispatchEvent(idempotencyKey: string, now = new Date()) {
+  const event = await DispatchOutbox.findOne({ idempotencyKey, status: "dead_letter" }).select("_id lastError").lean().exec() as { _id: unknown; lastError?: string } | null;
+  if (!event || !dispatchErrorIsRearmable(event.lastError)) return false;
+  const updated = await DispatchOutbox.findOneAndUpdate(
+    { _id: event._id, status: "dead_letter" },
+    { $set: { status: "pending", availableAt: now, attempts: 0, leaseOwner: null, leaseUntil: null } },
+    { new: true },
+  ).lean().exec();
+  return Boolean(updated);
+}
+
 export function dispatchOutboxClaimFilter(now: Date) {
   return {
     status: { $in: ["pending", "retry", "processing"] },

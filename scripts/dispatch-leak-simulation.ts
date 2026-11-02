@@ -12,7 +12,8 @@
 import "dotenv/config";
 import assert from "node:assert/strict";
 import mongoose from "mongoose";
-import { Order, Rider, RiderAssignmentReservation, Restaurant } from "../src/models.js";
+import { DispatchOutbox, Order, Rider, RiderAssignmentReservation, Restaurant } from "../src/models.js";
+import { dispatchRecoveryIdempotencyKey, rearmDeadLetterDispatchEvent } from "../src/dispatchOutbox.js";
 import { reserveRiderOrderSlot } from "../src/dispatchReservation.js";
 import { reconcileDispatchState } from "../src/dispatchReconciliation.js";
 
@@ -158,7 +159,41 @@ async function main() {
   const riderAAssigned = await Rider.findById(seed1.riderA._id).lean().exec() as any;
   assert.equal(String(riderAAssigned.activeOrderId), String(seed1.newOrder._id));
 
-  console.log("5) Segunda pasada: idempotente y sin efectos");
+  console.log("5) Carta muerta reparable: el pedido vuelve a la cola");
+  await DispatchOutbox.deleteMany({});
+  const recoveryKey = dispatchRecoveryIdempotencyKey(seed1.newOrder._id, 0);
+  await DispatchOutbox.create({
+    eventId: "sim-dead-1",
+    orderId: seed1.newOrder._id,
+    type: "dispatch.order.ready",
+    payloadVersion: 1,
+    payload: {},
+    idempotencyKey: recoveryKey,
+    availableAt: new Date(now.getTime() - HOUR),
+    attempts: 8,
+    status: "dead_letter",
+    lastError: "DISPATCH_RESERVATION_RACE",
+  });
+  const unrecoverable = await DispatchOutbox.create({
+    eventId: "sim-dead-2",
+    orderId: seed1.newOrder._id,
+    type: "dispatch.order.ready",
+    payloadVersion: 1,
+    payload: {},
+    idempotencyKey: "dispatch:sim:invalid",
+    availableAt: new Date(now.getTime() - HOUR),
+    attempts: 8,
+    status: "dead_letter",
+    lastError: "DISPATCH_INVALID_ORDER",
+  });
+  assert.equal(await rearmDeadLetterDispatchEvent("dispatch:sim:invalid"), false, "un error no reparable no revive");
+  assert.equal(await rearmDeadLetterDispatchEvent(recoveryKey), true, "la falta de hueco sí revive");
+  const revived = await DispatchOutbox.findOne({ idempotencyKey: recoveryKey }).lean().exec() as any;
+  assert.equal(revived.status, "pending");
+  assert.equal(revived.attempts, 0);
+  assert.equal((await DispatchOutbox.findById(unrecoverable._id).lean().exec() as any).status, "dead_letter");
+
+  console.log("6) Segunda pasada: idempotente y sin efectos");
   const again = await reconcileDispatchState();
   assert.equal(again.releasedOrphanReservations + again.releasedStaleReservations, 0);
   assert.equal(again.clearedRiderLocks, 0);
@@ -168,6 +203,7 @@ async function main() {
   console.log("- 2 reservas colgadas liberadas y 2 bloqueos de rider limpiados");
   console.log("- 0 pedidos perdidos: el pedido nuevo pasa a oferta con reserva concedida");
   console.log("- la segunda pasada no rompe la reserva legítima");
+  console.log("- 1 carta muerta reparable vuelve a la cola; la no reparable se queda");
 
   await mongoose.disconnect();
 }

@@ -64,7 +64,7 @@ import { publishCatalogUpdate, serveCatalogEvents, startCatalogRelay } from "./c
 import { purgeTestDataIfEnabled } from "./purgeTestData.js";
 import { validateDocumentRequestSubmission } from "./onboardingDocumentPolicy.js";
 import { PIKI_PRL_COURSE_SLUG, RiderTrainingAssignment, RiderTrainingCourse, RiderTrainingResponse, ensurePikiPrlCourse, publicTrainingQuestions, scoreTrainingAnswers, trainingToken, trainingTokenHash } from "./riderTraining.js";
-import { deadLetterDispatchError, dispatchInitialIdempotencyKey, dispatchRecoveryIdempotencyKey, dispatchRequeueIdempotencyKey, enqueueDispatchOutbox, isRetryableDispatchState, processDispatchOutboxBatch, type DispatchOutboxEvent } from "./dispatchOutbox.js";
+import { deadLetterDispatchError, dispatchInitialIdempotencyKey, dispatchRecoveryIdempotencyKey, dispatchRequeueIdempotencyKey, enqueueDispatchOutbox, isRetryableDispatchState, processDispatchOutboxBatch, rearmDeadLetterDispatchEvent, type DispatchOutboxEvent } from "./dispatchOutbox.js";
 import { buildFleetEntityScope, buildFleetRiderPickerScope, buildTenantScope } from "./tenantScope.js";
 import { parseRiderListPagination } from "./riderListPagination.js";
 import { authenticationOptions, registrationOptions, verifyAuthentication, verifyRegistration } from "./passkeys.js";
@@ -5133,6 +5133,7 @@ const automaticDispatchInFlight = new Set<string>();
 let nextDispatchReconciliationAt = 0;
 const dispatchReconciliationStats = { runs: 0, releasedReservations: 0, clearedRiderLocks: 0, reopenedOffers: 0, lastReportAt: null as string | null };
 const automaticDispatchSweepStats = {
+  requeuedDeadLetters: 0,
   runs: 0,
   skippedDatabase: 0,
   errors: 0,
@@ -5446,17 +5447,26 @@ async function runAutomaticDispatchSweep() {
     const candidates = await Order.find({ ...(dispatchRecoveryCursor ? { _id: { $gt: dispatchRecoveryCursor } } : {}), riderId: null, assignmentState: { $in: ["unassigned", "expired", "rejected"] }, ...dispatchablePaymentFilter, status: { $in: [...dispatchableOrderStatuses] } }).select("_id tenantId version isTestOrder qaRiderId").sort({ _id: 1 }).limit(25).lean().exec() as any[];
     dispatchRecoveryCursor = candidates.length ? candidates[candidates.length - 1]._id : null;
     let queued = 0;
+    let requeuedDeadLetters = 0;
     for (const order of candidates) {
       // Isolated QA orders must never leak into the commercial rider pool.
       if (order.isTestOrder && !order.qaRiderId) continue;
       if (await DispatchOutbox.exists({ orderId: order._id, status: { $in: ["pending", "retry", "processing"] } })) continue;
-      await enqueueDispatchOutbox({ orderId: order._id, tenantId: order.tenantId || null, idempotencyKey: dispatchRecoveryIdempotencyKey(order._id, Number(order.version || 0)), preferredRiderId: order.isTestOrder ? order.qaRiderId : undefined, reason: "unassigned_order_recovery" });
+      const recoveryKey = dispatchRecoveryIdempotencyKey(order._id, Number(order.version || 0));
+      // Una carta muerta por falta de hueco tiene que poder volver a la cola
+      // cuando el hueco se arregla; si no, el pedido queda sin rider para siempre.
+      if (await rearmDeadLetterDispatchEvent(recoveryKey)) {
+        requeuedDeadLetters += 1;
+        continue;
+      }
+      await enqueueDispatchOutbox({ orderId: order._id, tenantId: order.tenantId || null, idempotencyKey: recoveryKey, preferredRiderId: order.isTestOrder ? order.qaRiderId : undefined, reason: "unassigned_order_recovery" });
       queued += 1;
     }
     automaticDispatchSweepStats.runs += 1;
     automaticDispatchSweepStats.reassigned += reassigned;
     automaticDispatchSweepStats.expiredOffers += expiredOffers;
     automaticDispatchSweepStats.queued += queued;
+    automaticDispatchSweepStats.requeuedDeadLetters += requeuedDeadLetters;
     automaticDispatchSweepStats.archivedTerminalOrders += archivedTerminalOrders;
     automaticDispatchSweepStats.zombieCandidates = zombie.zombieCandidates;
     automaticDispatchSweepStats.closedZombieOrders += zombie.closedZombieOrders;
