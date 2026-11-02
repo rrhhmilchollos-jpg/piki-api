@@ -30,6 +30,7 @@ import {
   type CodHoldStatus,
 } from "./codHolds.js";
 import { Order } from "./models.js";
+import { importStripeGuarantees } from "./codHoldImport.js";
 import { mapOrdersByReference, type OrderSnapshot } from "./orderReferences.js";
 import {
   COD_RELEASE_MARGIN_MS,
@@ -289,6 +290,7 @@ export interface CodHoldSweepReport {
   skipped: number;
   needsReview: number;
   orphans: number;
+  importedFromStripe: number;
   releasedCents: number;
   errors: string[];
   decisions: CodHoldDecision[];
@@ -323,6 +325,7 @@ const sweepRunSchema = new mongoose.Schema(
     skipped: { type: Number, default: 0 },
     needsReview: { type: Number, default: 0 },
     orphans: { type: Number, default: 0 },
+    importedFromStripe: { type: Number, default: 0 },
     releasedCents: { type: Number, default: 0 },
     // `errors` es una ruta reservada de Mongoose (errores de validación).
     errorList: { type: [String], default: [] },
@@ -351,6 +354,7 @@ async function recordRun(report: CodHoldSweepReport, actorId?: string | null) {
     skipped: report.skipped,
     needsReview: report.needsReview,
     orphans: report.orphans,
+    importedFromStripe: report.importedFromStripe,
     releasedCents: report.releasedCents,
     errorList: report.errors,
     decisions: report.decisions.slice(0, 200),
@@ -515,6 +519,20 @@ export async function runCodHoldSweep(options: RunCodHoldSweepOptions): Promise<
   const orphanReleaseHours = Math.max(0, options.orphanReleaseHours ?? numberFromEnv("PIKI_COD_ORPHAN_RELEASE_HOURS", DEFAULT_COD_ORPHAN_RELEASE_HOURS));
   const reconcileAfterHours = Math.max(0, options.reconcileAfterHours ?? numberFromEnv("PIKI_COD_RECONCILE_AFTER_HOURS", DEFAULT_COD_RECONCILE_AFTER_HOURS));
   const adapter = options.stripe ?? defaultCodHoldStripeAdapter();
+
+  // Antes de planificar: dar de alta las garantías que solo viven en Stripe.
+  // Sin esto, una retención creada justo cuando falló el guardado local no la ve
+  // nadie: ni el barrido, ni Fleet, ni contabilidad.
+  let importedFromStripe = 0;
+  if (apply) {
+    try {
+      const imported = await importStripeGuarantees();
+      importedFromStripe = imported.imported;
+      if (imported.errors.length) console.error(JSON.stringify({ event: "cod_hold_import_errors", errors: imported.errors }));
+    } catch (error) {
+      console.error(JSON.stringify({ event: "cod_hold_import_failed", error: error instanceof Error ? error.message : String(error) }));
+    }
+  }
 
   // Dos motivos para mirar una retención: que se le acabe el plazo, o que ya
   // tenga edad suficiente para cruzarla con el pedido y con Stripe.
@@ -686,6 +704,7 @@ export async function runCodHoldSweep(options: RunCodHoldSweepOptions): Promise<
     skipped,
     needsReview: decisions.filter((decision) => decision.action === "review").length,
     orphans: decisions.filter((decision) => decision.orphan).length,
+    importedFromStripe,
     releasedCents,
     errors,
     decisions,

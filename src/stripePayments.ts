@@ -195,6 +195,36 @@ export async function refundGuaranteeCapture(paymentIntentId: string | null): Pr
   }
 }
 
+export interface StripeGuaranteeSnapshot {
+  paymentIntentId: string;
+  amountCents: number;
+  status: string;
+  createdAt: Date;
+  expiresAt: Date;
+  reference: string | null;
+  orderId: string | null;
+}
+
+/** Garantías vivas en Stripe, para detectar las que no tienen registro local. */
+export async function listGuaranteeIntents(limit = 100): Promise<StripeGuaranteeSnapshot[]> {
+  const stripe = stripeClient();
+  const intents = await stripe.paymentIntents.list({ limit });
+  return intents.data
+    .filter((intent) => intent.metadata?.flow === "cod_guarantee")
+    .map((intent) => {
+      const created = new Date(intent.created * 1000);
+      return {
+        paymentIntentId: intent.id,
+        amountCents: intent.amount,
+        status: String(intent.status),
+        createdAt: created,
+        expiresAt: new Date(created.getTime() + COD_AUTHORIZATION_TTL_MS),
+        reference: intent.metadata?.reference ?? null,
+        orderId: intent.metadata?.orderId ?? null,
+      };
+    });
+}
+
 export interface AuthorizationSnapshot {
   paymentIntentId: string;
   status: string;

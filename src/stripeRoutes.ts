@@ -466,9 +466,13 @@ export function mountStripeRoutes(app: Express): void {
       try {
         const intents = await stripeClient().paymentIntents.list({ limit });
         response.json({
-          mode: String(process.env.STRIPE_SECRET_KEY || "").startsWith("sk_live") ? "live" : "test",
+          // La clave puede traer espacios al copiarla; el modo real manda desde
+          // cada objeto de Stripe, que es la fuente de verdad.
+          keyPrefix: String(process.env.STRIPE_SECRET_KEY || "").trim().slice(0, 8),
+          livemode: intents.data.some((intent: Record<string, any>) => intent.livemode === true),
           paymentIntents: intents.data.map((intent: Record<string, any>) => ({
             id: intent.id,
+            livemode: intent.livemode === true,
             created: new Date(intent.created * 1000).toISOString(),
             amountCents: intent.amount,
             amountReceivedCents: intent.amount_received ?? 0,
