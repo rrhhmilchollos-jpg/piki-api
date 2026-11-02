@@ -37,6 +37,11 @@ export async function resolveRole(request: Request): Promise<{ role: ApiRole; em
   // environment token has no persisted employee/rider binding, so it can
   // never authenticate the Rider surface.
   if (match?.[0] === "rider") return null;
+  // El token de entorno de administración es la credencial de emergencia del
+  // propietario: no lleva empleado asociado, así que se marca como superadmin
+  // de plataforma para que las vistas de mantenimiento no se queden vacías por
+  // falta de tenant. El resto de roles de entorno siguen sin ámbito.
+  if (match?.[0] === "admin") return { role: "admin", isRootOwner: true };
   if (match?.[0]) return { role: match[0] };
   const scoped = await resolveEmployeeSession(token);
   if (scoped) return { ...scoped, role: scoped.role as ApiRole };
