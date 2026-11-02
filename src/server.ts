@@ -22,7 +22,8 @@ import { normalizeLeadEmail, partnerLeadSubmissionSchema, riderLeadSubmissionSch
 import { assertTransition, calculateEtaRange, transitionSchema, validateCoordinates } from "./algorithms/index.js";
 import { configuredAuthRoles, requireOwner, requireRole, resolveRole } from "./auth.js";
 import { mountRiderTracking, ensureTrackingIndexes } from "./riderTrackingRoutes.js";
-import { mountShiftSweep } from "./shiftRoutes.js";
+import { mountShiftRoutes } from "./shiftRoutes.js";
+import { shiftSweepWorkerStatus, startShiftSweepWorker } from "./shiftSweepWorker.js";
 import { EmployeeSession, issueEmployeeSession, revokeEmployeeSessions, sessionRole } from "./employeeSessions.js";
 import { isStripeSignatureError, processStripeWebhook, stripeConfigured, createSignaturitSignature, signaturitBaseUrl, signaturitConfigured, signaturitMode, signatureWebhookUrl, webhookDigest, handleCustomerTrpc, currentCustomer, issueCustomerSession, setCustomerOrderDispatcher } from "./integrations/index.js";
 import { getVersionPolicy, isPikiSurface, requiresUpdate, setVersionPolicy, syncVersionPolicy, versionPolicySchema, type PikiSurface } from "./appVersion.js";
@@ -83,7 +84,7 @@ import { adjustEtaLabel, currentWeather, distanceKm } from "./weather.js";
 
 export const app = express();
 mountRiderTracking(app);
-mountShiftSweep(app);
+mountShiftRoutes(app);
 app.set("trust proxy", 1);
 const port = Number(process.env.PORT || 3000);
 const PARTNER_PREPARATION_LIMIT_MINUTES = 45;
@@ -172,7 +173,7 @@ async function reversePhoton(latitude: number, longitude: number) {
   const label = [address.road, [address.postcode, address.locality].filter(Boolean).join(" ")].filter(Boolean).join(", ");
   return { label: label || `Ubicación GPS ${latitude.toFixed(5)}, ${longitude.toFixed(5)}`, latitude, longitude, locality: address.locality || null, address: properties };
 }
-mongoose.connection.on("connected", () => { databaseReady = true; startRealtimeRelay(); startCatalogRelay(); startGoogleBusinessSyncWorker(); void processExpiringCustomerCreditNotifications().catch((error) => console.warn("Credit expiry worker failed", error)); setInterval(() => void processExpiringCustomerCreditNotifications().catch((error) => console.warn("Credit expiry worker failed", error)), 15 * 60_000).unref(); void syncPublicIds().catch((error) => console.error("Public ID sync failed", error)); void ensurePikiPrlCourse().catch((error) => console.error("PIKI PRL course seed failed", error)); });
+mongoose.connection.on("connected", () => { databaseReady = true; startShiftSweepWorker(); startRealtimeRelay(); startCatalogRelay(); startGoogleBusinessSyncWorker(); void processExpiringCustomerCreditNotifications().catch((error) => console.warn("Credit expiry worker failed", error)); setInterval(() => void processExpiringCustomerCreditNotifications().catch((error) => console.warn("Credit expiry worker failed", error)), 15 * 60_000).unref(); void syncPublicIds().catch((error) => console.error("Public ID sync failed", error)); void ensurePikiPrlCourse().catch((error) => console.error("PIKI PRL course seed failed", error)); });
 mongoose.connection.on("disconnected", () => { databaseReady = false; console.warn("MongoDB disconnected; API entering not-ready state"); });
 mongoose.connection.on("error", (error) => { databaseReady = false; console.error("MongoDB connection error", error instanceof Error ? error.message : error); });
 
