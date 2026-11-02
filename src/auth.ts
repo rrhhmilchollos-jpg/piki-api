@@ -29,7 +29,10 @@ export async function resolveRole(request: Request): Promise<{ role: ApiRole; em
   const header = request.header("authorization") || "";
   const [scheme, token] = header.split(" ");
   if (scheme?.toLowerCase() !== "bearer" || !token) return null;
-  const match = tokenEntries.find(([, configured]) => configured && configured === token);
+  // Un salto de línea o un espacio al pegar la variable en Render deja el token
+  // inservible sin que se note. Se comparan ambos lados sin espacios.
+  const presented = token.trim();
+  const match = tokenEntries.find(([, configured]) => configured && configured.trim() === presented);
   // Rider resources contain personal location and delivery data. A shared
   // environment token has no persisted employee/rider binding, so it can
   // never authenticate the Rider surface.
