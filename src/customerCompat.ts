@@ -5,7 +5,7 @@ import { Order, Restaurant, CustomerAccount, RiderOrderMessage } from "./models.
 import { publishOrderIntakeEvents } from "./realtime.js";
 import { evaluateXativaCoverage } from "./coverage/xativaPolicy.js";
 import { quoteDeliveryRoute } from "./coverage/routing.js";
-import { CUSTOMER_CATALOG_RESTAURANT_FILTER, CUSTOMER_ORDERABLE_RESTAURANT_FILTER, customerCatalogRestaurantName, menuItemIsAvailable, restaurantIsWithinOpeningHours } from "./customerCatalogPolicy.js";
+import { CUSTOMER_CATALOG_RESTAURANT_FILTER, CUSTOMER_ORDERABLE_RESTAURANT_FILTER, customerMenuForRestaurant, customerCatalogRestaurantName, menuItemIsAvailable, restaurantIsWithinOpeningHours } from "./customerCatalogPolicy.js";
 import { customerAvailability } from "./customerAvailability.js";
 import { modifierGroupsForItem, quoteMenuItem, usesReferenceAddOns } from "./menuModifiers.js";
 import { cashOrderLimitError, cashPaymentDisabledError, isCashOrderWithinLimit, isCashPaymentEnabledForRestaurant } from "./paymentPolicy.js";
@@ -405,10 +405,11 @@ async function handleCustomerTrpcSingle(req: Request, res: Response) {
       const restaurant = await Restaurant.findOne({ _id: input?.restaurantId, ...CUSTOMER_ORDERABLE_RESTAURANT_FILTER }).lean().exec() as any;
       if (!restaurant) return fail(res, "Restaurante no encontrado", "NOT_FOUND");
       const requested = Array.isArray(input?.items) ? input.items : [];
+      const customerMenu = customerMenuForRestaurant(restaurant);
       const useReferenceFallback = usesReferenceAddOns(restaurant);
       let subtotalCents = 0;
       for (const line of requested) {
-        const item = (restaurant.menu || []).find((candidate: any) => candidate.id === line?.id);
+        const item = customerMenu.find((candidate: any) => candidate.id === line?.id);
         if (!item) return fail(res, "Un producto de tu cesta ya no está en la carta", "PRODUCT_UNAVAILABLE");
         const quantity = Number(line.quantity);
         if (!Number.isInteger(quantity) || quantity < 1) return fail(res, "Cantidad no válida", "BAD_REQUEST");
@@ -444,12 +445,13 @@ async function handleCustomerTrpcSingle(req: Request, res: Response) {
       if (!restaurant) return fail(res, "Restaurante no encontrado", "NOT_FOUND");
       if (!restaurantIsWithinOpeningHours(restaurant.partnerProfile?.openingHours)) return fail(res, "Este establecimiento está cerrado ahora. Elige otro horario para realizar el pedido.", "PARTNER_CLOSED");
       const requested = Array.isArray(input?.items) ? input.items : [];
-      if (requested.some((line: any) => restaurant.menu.some((item: any) => item.id === line.id && !menuItemIsAvailable(item)))) {
+      if (requested.some((line: any) => (restaurant.menu || []).some((item: any) => item.id === line.id && !menuItemIsAvailable(item)))) {
         return fail(res, "Un producto de tu cesta ya no está disponible. Actualiza la carta antes de continuar.", "PRODUCT_UNAVAILABLE");
       }
+      const customerMenu = customerMenuForRestaurant(restaurant);
       const useReferenceFallback = usesReferenceAddOns(restaurant);
       const items = requested.map((line: any) => {
-        const item = restaurant.menu.find((candidate: any) => candidate.id === line.id);
+        const item = customerMenu.find((candidate: any) => candidate.id === line.id);
         if (!item) return null;
         try {
           const quote = quoteMenuItem(item, line.selections, useReferenceFallback);
