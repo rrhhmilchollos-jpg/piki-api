@@ -24,6 +24,31 @@ import {
   verifyStripeWebhook,
 } from "./stripePayments.js";
 
+/**
+ * Límite sencillo por IP para la autorización pública del cliente.
+ * Evita que alguien machaque el endpoint creando retenciones en bucle.
+ */
+const codAttempts = new Map<string, { count: number; resetAt: number }>();
+const COD_WINDOW_MS = 10 * 60 * 1000;
+const COD_MAX_ATTEMPTS = 8;
+
+function codAuthorizationLimiter(request: Request, response: Response, next: () => void): void {
+  const key = request.ip ?? "desconocida";
+  const now = Date.now();
+  const entry = codAttempts.get(key);
+  if (!entry || now > entry.resetAt) {
+    codAttempts.set(key, { count: 1, resetAt: now + COD_WINDOW_MS });
+    next();
+    return;
+  }
+  entry.count += 1;
+  if (entry.count > COD_MAX_ATTEMPTS) {
+    response.status(429).json({ error: "demasiados intentos, espera unos minutos" });
+    return;
+  }
+  next();
+}
+
 const authorizeSchema = z.object({
   paymentMethodId: z.string().min(3).optional(),
   customerId: z.string().min(3).optional(),
@@ -68,9 +93,14 @@ export function mountStripeRoutes(app: Express): void {
   );
 
   // El cliente acepta la retención al elegir contra­rreembolso.
+  //
+  // Es la única ruta del módulo abierta sin rol de empleado, porque quien la
+  // llama es el cliente desde la web. Se protege por estado del pedido y por
+  // límite de peticiones: solo se puede retener un pedido a contra­rreembolso
+  // recién creado y sin retención previa, y la tarjeta siempre es del solicitante.
   app.post(
     "/api/v1/orders/:id/cod-authorization",
-    requireRole("admin", "fleet", "support"),
+    codAuthorizationLimiter,
     async (request: Request, response: Response) => {
       const orderId = orderIdFrom(request);
       if (!orderId) {
@@ -89,6 +119,11 @@ export function mountStripeRoutes(app: Express): void {
       }
       if (order.paymentMethod !== "cash") {
         response.status(409).json({ error: "el pedido no es contra­rreembolso" });
+        return;
+      }
+      const createdAt = (order as unknown as { createdAt?: Date }).createdAt;
+      if (createdAt && Date.now() - createdAt.getTime() > 6 * 60 * 60 * 1000) {
+        response.status(409).json({ error: "este pedido ya no admite garantía de tarjeta" });
         return;
       }
       if (order.paymentStatus === "authorized" || order.paymentStatus === "paid") {
