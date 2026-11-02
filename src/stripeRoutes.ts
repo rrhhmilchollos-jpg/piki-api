@@ -178,6 +178,10 @@ export function mountStripeRoutes(app: Express): void {
           return;
         }
         const normalized = normalizeReference(reference);
+        if (request.query.dry === "1") {
+          response.json({ ok: true, mode: "referencia", reference: normalized, amountCents: declared });
+          return;
+        }
         const existing = await CodHold.findOne({ reference: normalized });
         if (existing && existing.status === "authorized") {
           response.status(409).json({ error: "este pedido ya tiene una retención activa", paymentIntentId: existing.paymentIntentId });
