@@ -25,7 +25,7 @@ import {
   type Shift,
   type ShiftDecision,
 } from "./shiftEnforcement.js";
-import { ABANDONED_AFTER_MINUTES, isReleasable, planSweep, type AssignedOrder, type SweepAction } from "./shiftSweep.js";
+import { ABANDONED_AFTER_MINUTES, isReleasable, isStaleInRoute, planSweep, type AssignedOrder, type SweepAction } from "./shiftSweep.js";
 
 /** Zona horaria de referencia del centro de operaciones de PIKI. */
 export const OPERATIONS_TIME_ZONE = "Europe/Madrid";
@@ -502,13 +502,20 @@ export async function releaseOrderFromRider(input: {
   publicCode: string;
   reason: string;
   now?: Date;
+  /** Pedido ya en ruta (picked_up/on_the_way) que lleva horas sin entregarse. */
+  fromInProgress?: boolean;
 }): Promise<boolean> {
   const now = input.now ?? new Date();
   if (!mongoose.isValidObjectId(input.orderId)) return false;
+  const statuses = input.fromInProgress ? ["picked_up", "on_the_way"] : ["assigned", "accepted", "preparing", "ready_for_pickup"];
+  const statusFields = input.fromInProgress
+    ? { status: "ready_for_pickup", riderArrivedAt: null, riderArrivalDistanceMeters: null, pickupDeadlineAt: null }
+    : {};
   const updated = (await Order.findOneAndUpdate(
-    { _id: input.orderId, riderId: input.riderId, status: { $in: ["assigned", "accepted", "preparing", "ready_for_pickup"] } },
+    { _id: input.orderId, riderId: input.riderId, status: { $in: statuses } },
     {
       $set: {
+        ...statusFields,
         assignmentState: "expired",
         offerId: null,
         assignmentExpiresAt: null,
@@ -517,6 +524,16 @@ export async function releaseOrderFromRider(input: {
       },
       $unset: { riderId: "" },
       $inc: { version: 1 },
+      $push: {
+        statusHistory: {
+          status: "ready_for_pickup",
+          actorRole: "system",
+          at: now,
+          reason: input.fromInProgress
+            ? "El rider no completó la entrega en el tiempo máximo. PIKI devuelve el pedido a la cola para reasignarlo."
+            : "Jornada finalizada: el pedido vuelve a la cola para reasignarse.",
+        },
+      },
     },
     { new: true },
   )
@@ -604,9 +621,9 @@ export async function runShiftSweep(options: {
 
   const activeOrders = (await Order.find({
     riderId: { $exists: true, $ne: null },
-    status: { $in: ["assigned", "accepted", "preparing", "ready_for_pickup"] },
+    status: { $in: ["assigned", "accepted", "preparing", "ready_for_pickup", "picked_up", "on_the_way"] },
   })
-    .select("publicCode riderId status assignedAt createdAt")
+    .select("publicCode riderId status assignedAt createdAt riderArrivedAt")
     .lean()
     .exec()) as any[];
 
@@ -642,7 +659,8 @@ export async function runShiftSweep(options: {
       plan: rider.plan,
       workedMinutesThisWeek: workedByRider.get(rider.riderId) ?? 0,
     })),
-    orders,
+    // Los pedidos ya en ruta los resuelve la pasada de "en ruta abandonado".
+    orders: orders.filter((order) => isReleasable(order.status)),
   });
 
   const details = new Map<string, ShiftSweepDetail>();
@@ -709,6 +727,27 @@ export async function runShiftSweep(options: {
       const message = error instanceof Error ? error.message : String(error);
       detail.errors.push(message);
       errors.push(`release ${action.publicCode}: ${message}`);
+    }
+  }
+
+  // Pedidos que el rider ya recogió y nunca entregó. El barrido no los toca al
+  // minuto (puede ir en ruta), pero pasadas unas horas el pedido está muerto y
+  // el rider bloqueado: se devuelve a la cola con motivo registrado.
+  const staleInRoute = activeOrders.filter((order) => isStaleInRoute(order, now));
+  for (const order of staleInRoute) {
+    const riderId = String(order.riderId);
+    const detail = details.get(riderId) ?? { riderId, riderName: riderNames.get(riderId), reason: "pedido_abandonado", orders: [], sessionRevoked: false, errors: [] };
+    if (!detail.orders.includes(order.publicCode)) detail.orders.push(order.publicCode);
+    details.set(riderId, detail);
+    result.released += 1;
+    if (!options.apply) continue;
+    try {
+      const released = await releaseOrderFromRider({ orderId: String(order._id), riderId, publicCode: order.publicCode, reason: "pedido_abandonado_en_ruta", now, fromInProgress: true });
+      if (released) applied += 1;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      detail.errors.push(message);
+      errors.push(`release ${order.publicCode}: ${message}`);
     }
   }
 

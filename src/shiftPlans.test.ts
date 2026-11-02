@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { operationsClock, validateShiftPlan, weekStart, workedMinutesFromSlots } from "./shiftPlans.js";
+import { isStaleInRoute } from "./shiftSweep.js";
 
 test("el contrato solo admite 10, 20, 30 o 40 horas", () => {
   const result = validateShiftPlan({ weeklyHours: 25, shifts: [{ weekday: 1, start: "10:00", end: "14:00" }] });
@@ -112,4 +113,19 @@ test("los turnos de otro rider no contaminan el cómputo", () => {
     "r1",
   );
   assert.equal(worked, 3 * 60);
+});
+
+test("un pedido recogido hace diez horas se da por abandonado", () => {
+  const now = new Date("2026-11-02T05:11:00Z");
+  assert.equal(isStaleInRoute({ status: "on_the_way", riderArrivedAt: "2026-11-01T18:11:00Z" }, now), true);
+});
+
+test("un pedido que acaba de salir del local no se toca", () => {
+  const now = new Date("2026-11-02T05:11:00Z");
+  assert.equal(isStaleInRoute({ status: "on_the_way", riderArrivedAt: "2026-11-02T05:00:00Z" }, now), false);
+});
+
+test("el pedido que aún no se ha recogido no entra por esta regla", () => {
+  const now = new Date("2026-11-02T05:11:00Z");
+  assert.equal(isStaleInRoute({ status: "ready_for_pickup", assignedAt: "2026-11-01T18:11:00Z" }, now), false);
 });

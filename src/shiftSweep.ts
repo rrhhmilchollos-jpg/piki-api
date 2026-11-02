@@ -32,6 +32,15 @@ export type SweepResult = {
 /** Un pedido asignado más de 90 minutos sin moverse está claramente atascado. */
 export const ABANDONED_AFTER_MINUTES = 90;
 
+/** Estados en los que el rider ya lleva el pedido encima y va de camino. */
+export const IN_PROGRESS_STATUSES: string[] = ["picked_up", "on_the_way"];
+
+/**
+ * Un pedido recogido que lleva cuatro horas sin entregarse no está «en ruta»:
+ * el rider lo abandonó. Se devuelve a la cola para que otro lo recoja.
+ */
+export const IN_PROGRESS_ABANDON_AFTER_MINUTES = 240;
+
 /**
  * Decide las acciones del barrido sin tocar la base de datos, para poder
  * probarlo con casos concretos.
@@ -93,4 +102,21 @@ export const RELEASABLE_STATUSES = ["assigned", "accepted", "preparing", "ready_
 
 export function isReleasable(status: string): boolean {
   return (RELEASABLE_STATUSES as readonly string[]).includes(status);
+}
+
+/**
+ * ¿El pedido lleva demasiado tiempo en ruta? Solo aplica a pedidos ya
+ * recogidos: si aún no han salido del local, basta con reasignarlos.
+ */
+export function isStaleInRoute(
+  order: { status?: string | null; riderArrivedAt?: Date | string | null; assignedAt?: Date | string | null; createdAt?: Date | string | null },
+  now: Date = new Date(),
+  thresholdMinutes: number = IN_PROGRESS_ABANDON_AFTER_MINUTES,
+): boolean {
+  if (!order || !IN_PROGRESS_STATUSES.includes(String(order.status))) return false;
+  const since = order.riderArrivedAt || order.assignedAt || order.createdAt;
+  if (!since) return false;
+  const startedAt = new Date(since);
+  if (Number.isNaN(startedAt.getTime())) return false;
+  return (now.getTime() - startedAt.getTime()) / 60_000 >= thresholdMinutes;
 }
