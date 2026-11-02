@@ -20,7 +20,7 @@ test("catalog update whitelists only public ids and reason", () => {
 });
 
 test("hidden, paused and deleted restaurants invalidate without leaking identifiers", () => {
-  for (const hidden of [null, { ...restaurant, internalDemo: true }, { ...restaurant, slug: "kings-tacos-xativa" }, { ...restaurant, isActive: false }, { ...restaurant, onboardingStatus: "rejected" }]) {
+  for (const hidden of [null, { ...restaurant, internalDemo: true }, { ...restaurant, slug: "kfc-xativa-test" }, { ...restaurant, isActive: false }, { ...restaurant, onboardingStatus: "rejected" }]) {
     assert.deepEqual(publicCatalogUpdate(hidden).payload, { reason: "restaurant.updated" });
   }
 });
