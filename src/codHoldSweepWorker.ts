@@ -21,6 +21,7 @@ let running = false;
 let lastReport: CodHoldSweepReport | null = null;
 let lastError: string | null = null;
 let runs = 0;
+let announcedFirstRun = false;
 
 export function codHoldSweepWorkerStatus() {
   return {
@@ -48,6 +49,25 @@ export async function runCodHoldSweepOnce(): Promise<CodHoldSweepReport | null> 
     lastReport = report;
     lastError = null;
     runs += 1;
+    // La primera pasada se anuncia siempre: es la prueba de que el barrido ha
+    // arrancado y de con cuánto dinero se encontró al desplegar.
+    if (!announcedFirstRun) {
+      announcedFirstRun = true;
+      console.log(
+        JSON.stringify({
+          event: "cod_hold_sweep_first_run",
+          inspected: report.inspected,
+          released: report.released,
+          expired: report.expired,
+          captured: report.captured,
+          needsReview: report.needsReview,
+          orphans: report.orphans,
+          activeHolds: report.liability.activeHolds,
+          activeCents: report.liability.activeCents,
+          errors: report.errors.slice(0, 3),
+        }),
+      );
+    }
     if (report.released || report.expired || report.captured || report.errors.length) {
       console.log(
         JSON.stringify({
