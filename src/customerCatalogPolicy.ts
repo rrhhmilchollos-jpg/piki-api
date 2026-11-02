@@ -2,7 +2,7 @@ import { isCashPaymentEnabledForRestaurant } from "./paymentPolicy.js";
 import { customerAvailability, CUSTOMER_OPERATING_24_7 } from "./customerAvailability.js";
 
 export const COMING_SOON_SLUGS = ["eleven-burgers-xativa", "nakama-sushi-xativa"] as const;
-export const CUSTOMER_HIDDEN_TEST_SLUGS = ["kfc-xativa-test", "partner-test", "kings-tacos-xativa"] as const;
+export const CUSTOMER_HIDDEN_TEST_SLUGS = ["kfc-xativa-test", "partner-test"] as const;
 export const CUSTOMER_ORDERABLE_RESTAURANT_FILTER = {
   slug: { $nin: [...CUSTOMER_HIDDEN_TEST_SLUGS] }, internalDemo: { $ne: true }, isActive: true, onboardingStatus: "approved", availabilityStatus: "available", "menu.0": { $exists: true },
 };
