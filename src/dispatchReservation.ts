@@ -1,7 +1,22 @@
 import mongoose from "mongoose";
-import { Rider, RiderAssignmentReservation } from "./models.js";
+import { Order, Rider, RiderAssignmentReservation } from "./models.js";
 
 const MAX_RIDER_ACTIVE_ORDERS = 2;
+const TERMINAL_ORDER_STATUSES = ["delivered", "cancelled"];
+
+/**
+ * Un Rider puede quedarse con `activeOrderId` apuntando a un pedido que ya se
+ * entregó o se canceló (por ejemplo si el proceso murió justo al cerrar). Con
+ * ese bloqueo puesto, toda reserva falla y el pedido no llega nunca a ofrecerse.
+ * Se comprueba y se suelta aquí mismo para no esperar al reconciliador.
+ */
+async function clearStaleRiderLock(riderId: mongoose.Types.ObjectId, activeOrderId: unknown) {
+  if (!activeOrderId) return false;
+  const order = await Order.findById(activeOrderId).select("status").lean().exec() as { status?: string } | null;
+  if (order && !TERMINAL_ORDER_STATUSES.includes(String(order.status))) return false;
+  await Rider.updateOne({ _id: riderId, activeOrderId }, { $set: { activeOrderId: null, status: "available" } }).exec();
+  return true;
+}
 
 /**
  * There is exactly one reservation document per order. Reuse it after release
@@ -31,11 +46,21 @@ export async function reserveRiderOrderSlot(
         { upsert: true, new: true, runValidators: true },
       ).lean().exec() as any;
       if (!reservation) continue;
-      const rider = await Rider.findOneAndUpdate(
+      let rider = await Rider.findOneAndUpdate(
         { ...riderFilter, _id: riderId, status: { $in: ["available", "busy"] }, ...(existing.length === 0 ? { activeOrderId: null } : {}) },
         { $set: { status: "busy", ...(existing.length === 0 ? { activeOrderId: orderId } : {}) } },
         { new: true },
       ).lean().exec() as any;
+      if (!rider && existing.length === 0) {
+        const current = await Rider.findOne({ ...riderFilter, _id: riderId }).select("activeOrderId").lean().exec() as any;
+        if (current?.activeOrderId && (await clearStaleRiderLock(riderId, current.activeOrderId))) {
+          rider = await Rider.findOneAndUpdate(
+            { ...riderFilter, _id: riderId, status: { $in: ["available", "busy"] }, activeOrderId: null },
+            { $set: { status: "busy", activeOrderId: orderId } },
+            { new: true },
+          ).lean().exec() as any;
+        }
+      }
       if (!rider) {
         await RiderAssignmentReservation.updateOne({ _id: reservation._id, orderId, riderId, slot, status: "reserved" }, { $set: { status: "released" } }).exec();
         return null;

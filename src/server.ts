@@ -82,6 +82,7 @@ import { resolveRiderGeofence } from "./riderGeofence.js";
 import { Badge, CustomerBadge, CustomerDeliverySaving, PikiPassSubscription, ReferralReward, UserStreak, WHEEL_CREDIT_TTL_MS, calculatePriceBreakdown, consumeCustomerCredits, ensureCustomerEngagementIndexes, recommendationProfileForCustomer, recordCompletedCustomerOrder, resolveWheelSpin, restoreCustomerCredits, syncCustomerDeliverySavings } from "./customerEngagement.js";
 import { createPassCheckoutSession, createPassOneOffSession, createPassPortalSession, passDeliveryBenefit, pikiPassConfigured, pikiPassPayload } from "./pikiPassBilling.js";
 import { runZombieOrderMaintenance } from "./zombieOrders.js";
+import { reconcileDispatchState } from "./dispatchReconciliation.js";
 import { adjustEtaLabel, currentWeather, distanceKm } from "./weather.js";
 
 export const app = express();
@@ -5129,6 +5130,8 @@ app.get("/api/v1/riders/:id/sanction-status", requireRole("admin", "fleet", "rid
 });
 
 const automaticDispatchInFlight = new Set<string>();
+let nextDispatchReconciliationAt = 0;
+const dispatchReconciliationStats = { runs: 0, releasedReservations: 0, clearedRiderLocks: 0, reopenedOffers: 0, lastReportAt: null as string | null };
 const automaticDispatchSweepStats = {
   runs: 0,
   skippedDatabase: 0,
@@ -5417,6 +5420,25 @@ async function runAutomaticDispatchSweep() {
   const startedAt = Date.now();
   automaticDispatchSweepStats.lastStartedAt = new Date(startedAt).toISOString();
   try {
+    // Cada minuto se limpia el estado de reparto que ya no sostiene nada: una
+    // reserva colgada de un pedido entregado bloquea al Rider para siempre y el
+    // pedido siguiente nunca llega a ofrecerse (DISPATCH_RESERVATION_RACE).
+    if (Date.now() >= nextDispatchReconciliationAt) {
+      nextDispatchReconciliationAt = Date.now() + 60_000;
+      try {
+        const repaired = await reconcileDispatchState();
+        dispatchReconciliationStats.runs += 1;
+        dispatchReconciliationStats.releasedReservations += repaired.releasedOrphanReservations + repaired.releasedStaleReservations;
+        dispatchReconciliationStats.clearedRiderLocks += repaired.clearedRiderLocks;
+        dispatchReconciliationStats.reopenedOffers += repaired.reopenedOffers;
+        dispatchReconciliationStats.lastReportAt = new Date().toISOString();
+        if (repaired.releasedOrphanReservations || repaired.releasedStaleReservations || repaired.clearedRiderLocks || repaired.reopenedOffers) {
+          console.log(JSON.stringify({ event: "dispatch_state_repaired", ...repaired }));
+        }
+      } catch (error) {
+        console.error(JSON.stringify({ event: "dispatch_state_reconcile_error", error: error instanceof Error ? error.message : String(error) }));
+      }
+    }
     const [reassigned, expiredOffers, archivedTerminalOrders, zombie] = await Promise.all([reassignLatePickupOrders(), expireStaleOffers(), archivePreviousDayPartnerOrders(), runZombieOrderMaintenance()]);
     // Page through all eligible orders rather than repeatedly looking at the
     // same first 25. Each version has a stable recovery key, so an exhausted

@@ -11,7 +11,7 @@ import express, { type Express, type Request, type Response } from "express";
 import mongoose from "mongoose";
 import { z } from "zod";
 import { requireRole } from "./auth.js";
-import { Order } from "./models.js";
+import { EmployeeAccount, Order, Rider } from "./models.js";
 import { CodHold, codHoldLiability, normalizeReference } from "./codHolds.js";
 import { findOrderByReference } from "./orderReferences.js";
 import { listCodHoldSweepRuns, listOpenCodHolds, runCodHoldSweep } from "./codHoldSweep.js";
@@ -84,6 +84,21 @@ export function mountStripeWebhook(app: Express): void {
       }
     },
   );
+}
+
+
+/**
+ * El rider que entrega es quien cobra o libera en la puerta. Puede hacerlo con
+ * su propia sesión, pero solo sobre el pedido que tiene asignado: sin esta
+ * comprobación cualquier rider podría capturar la garantía de otro.
+ */
+async function riderOwnsOrder(request: Request, order: { riderId?: unknown } | null) {
+  if (request.auth?.role !== "rider") return true;
+  const employeeId = request.auth?.employeeId;
+  if (!employeeId || !order?.riderId) return false;
+  const employee = await EmployeeAccount.findById(employeeId).select("email").lean().exec() as { email?: string } | null;
+  if (!employee?.email) return false;
+  return Boolean(await Rider.exists({ _id: order.riderId, email: employee.email }));
 }
 
 export function mountStripeRoutes(app: Express): void {
@@ -259,7 +274,7 @@ export function mountStripeRoutes(app: Express): void {
   // El rider no pudo cobrar: se captura la retención.
   app.post(
     "/api/v1/admin/orders/:id/cod-capture",
-    requireRole("admin", "finance", "fleet"),
+    requireRole("admin", "finance", "fleet", "rider"),
     async (request: Request, response: Response) => {
       const reference = String(request.params.id ?? "").trim();
       if (!reference) {
@@ -267,6 +282,10 @@ export function mountStripeRoutes(app: Express): void {
         return;
       }
       const order = await findOrderByReference(reference);
+      if (request.auth?.role === "rider" && !(await riderOwnsOrder(request, order))) {
+        response.status(403).json({ error: "este pedido no está asignado a tu rider" });
+        return;
+      }
       if (!order || !order.stripePaymentIntentId) {
         const hold = await CodHold.findOne({ reference: normalizeReference(reference), status: "authorized" });
         if (!hold) {
@@ -305,7 +324,7 @@ export function mountStripeRoutes(app: Express): void {
   // Cobró en efectivo: se libera la retención y el cliente no ve ningún cargo.
   app.post(
     "/api/v1/admin/orders/:id/cod-release",
-    requireRole("admin", "finance", "fleet"),
+    requireRole("admin", "finance", "fleet", "rider"),
     async (request: Request, response: Response) => {
       const reference = String(request.params.id ?? "").trim();
       if (!reference) {
@@ -314,6 +333,10 @@ export function mountStripeRoutes(app: Express): void {
       }
       const order = await findOrderByReference(reference);
       const reasonInput = String((request.body ?? {}).reason ?? "paid_in_cash");
+      if (request.auth?.role === "rider" && !(await riderOwnsOrder(request, order))) {
+        response.status(403).json({ error: "este pedido no está asignado a tu rider" });
+        return;
+      }
       if (!order || !order.stripePaymentIntentId) {
         const hold = await CodHold.findOne({ reference: normalizeReference(reference), status: "authorized" });
         if (!hold) {
