@@ -386,6 +386,11 @@ export function mountStripeRoutes(app: Express): void {
         }
         try {
           const result = await releaseCodOrder(hold.paymentIntentId, reasonInput);
+          const orderRef = order as any;
+          if (orderRef && !orderRef.cashCollectedAt && reasonInput === "paid_in_cash") {
+            orderRef.set({ cashCollectedAt: new Date(), paymentState: "paid", paymentReleasedAt: new Date(), paymentReleaseReason: reasonInput });
+            await orderRef.save().catch(() => undefined);
+          }
           hold.set({
             status: "released",
             resolvedAt: new Date(),
@@ -403,16 +408,25 @@ export function mountStripeRoutes(app: Express): void {
       const reason = String((request.body ?? {}).reason ?? "paid_in_cash");
       try {
         const result = await releaseCodOrder(order.stripePaymentIntentId, reason);
-        // Si cobró en efectivo, el pedido está cobrado: ponerlo como caducado
-        // dejaría la caja descuadrada justo en el caso normal.
+        // Un solo gesto del rider cierra todo: libera el dinero retenido del
+        // cliente y deja el pedido como cobrado en efectivo por su importe
+        // completo. Antes había que hacerlo en dos pasos y el segundo se olvidaba.
         const paidInCash = Boolean(order.cashCollectedAt) || reason === "paid_in_cash";
         order.set({
           paymentState: paidInCash ? "paid" : "expired",
           paymentReleasedAt: new Date(),
           paymentReleaseReason: reason,
+          ...(paidInCash && !order.cashCollectedAt
+            ? { cashCollectedAt: new Date(), cashCollectedByRiderId: request.auth?.employeeId ?? null }
+            : {}),
         });
         await order.save();
-        response.json({ status: result.status });
+        // El libro de garantías y el pedido tienen que contar lo mismo.
+        await CodHold.updateOne(
+          { paymentIntentId: order.stripePaymentIntentId, status: "authorized" },
+          { $set: { status: "released", resolvedAt: new Date(), reason, lastSweepReason: reason, stripeStatus: "canceled" } },
+        ).catch(() => undefined);
+        response.json({ status: result.status, releasedCents: authorizationAmountCents(order) });
       } catch (error) {
         response.status(502).json({ error: (error as Error).message });
       }
