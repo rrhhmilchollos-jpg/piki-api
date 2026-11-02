@@ -8,8 +8,11 @@ export type CashPaymentPartner = { slug?: string | null; name?: string | null; c
  * inferred from a legacy order or from a client-provided payment method.
  * Alibaba Kebab Xàtiva is permanently online-only by the partner's request.
  */
-export function isCashPaymentEnabledForRestaurant(restaurant: CashPaymentPartner): boolean {
-  return restaurant.cashPaymentsEnabled === true && String(restaurant.slug || "") !== "alibaba-kebab-xativa";
+export function isCashPaymentEnabledForRestaurant(_restaurant: CashPaymentPartner): boolean {
+  // Todos los partners aceptan contra reembolso, sin excepciones por local.
+  // La proteccion frente a impagos es el bloqueo en tarjeta del pedido, no la
+  // restriccion del metodo de pago.
+  return true;
 }
 
 export function cashPaymentDisabledError(restaurant: CashPaymentPartner) {
