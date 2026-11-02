@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { isCashPaymentEnabledForRestaurant } from "./paymentPolicy.js";
 import { allowedPaymentMethods, paymentDecision, bizumReferenceFor, canChargeCard, remainingCardCents } from "./fulfillment.js";
 
 test("un local bizumOnly solo acepta bizum", () => {
