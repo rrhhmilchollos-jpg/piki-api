@@ -156,6 +156,11 @@ export async function captureCodOrder(
   amountCents?: number,
 ): Promise<{ status: string; capturedCents: number }> {
   const stripe = stripeClient();
+  // Deja constancia de que esta captura es deliberada: el webhook solo acepta
+  // como cobro legítimo una retención con esta marca.
+  await stripe.paymentIntents
+    .update(paymentIntentId, { metadata: { capturedBy: "rider" } })
+    .catch(() => undefined);
   const intent = await stripe.paymentIntents.capture(
     paymentIntentId,
     typeof amountCents === "number" ? { amount_to_capture: Math.round(amountCents) } : undefined,
@@ -164,6 +169,30 @@ export async function captureCodOrder(
     status: intent.status,
     capturedCents: intent.amount_received ?? intent.amount ?? 0,
   };
+}
+
+/**
+ * Devuelve un cobro que nunca debió existir sobre una garantía.
+ * Idempotente: si Stripe dice que ya está devuelto, se da por bueno.
+ */
+export async function refundGuaranteeCapture(paymentIntentId: string | null): Promise<boolean> {
+  if (!paymentIntentId) return false;
+  try {
+    const stripe = stripeClient();
+    const refunds = await stripe.refunds.list({ payment_intent: paymentIntentId, limit: 1 });
+    if (refunds.data.some((refund) => ["succeeded", "pending"].includes(String(refund.status)))) return true;
+    await stripe.refunds.create({ payment_intent: paymentIntentId, reason: "requested_by_customer" });
+    return true;
+  } catch (error) {
+    console.error(
+      JSON.stringify({
+        event: "cod_guarantee_refund_failed",
+        paymentIntentId,
+        error: error instanceof Error ? error.message : String(error),
+      }),
+    );
+    return false;
+  }
 }
 
 export interface AuthorizationSnapshot {
@@ -328,7 +357,32 @@ export async function handleStripeEvent(event: {
       });
       summary.handled = true;
       break;
-    case "payment_intent.succeeded":
+    case "payment_intent.succeeded": {
+      const isGuarantee = object.metadata?.flow === "cod_guarantee";
+      const capturedOnPurpose = Boolean(object.metadata?.capturedBy);
+      if (isGuarantee && !capturedOnPurpose) {
+        // Una garantía NUNCA debe cobrarse. Si el banco confirma un cobro, se
+        // devuelve en el acto y el pedido sigue pendiente de cobro en efectivo:
+        // el cliente no puede ver un cargo por un pedido que paga en mano.
+        const refunded = await refundGuaranteeCapture(paymentIntentId);
+        console.error(
+          JSON.stringify({
+            event: "cod_guarantee_charged",
+            paymentIntentId,
+            orderId,
+            amount: object.amount_received ?? null,
+            refunded,
+          }),
+        );
+        order.set({
+          paymentState: "pending",
+          paymentCapturedAt: null,
+          paymentCapturedCents: 0,
+          stripePaymentIntentId: paymentIntentId,
+        });
+        summary.handled = true;
+        break;
+      }
       order.set({
         paymentState: "paid",
         paymentCapturedAt: new Date(),
@@ -336,6 +390,7 @@ export async function handleStripeEvent(event: {
       });
       summary.handled = true;
       break;
+    }
     case "payment_intent.canceled":
       order.set({ paymentState: "expired", paymentReleasedAt: new Date() });
       summary.handled = true;
