@@ -85,6 +85,8 @@ import { runZombieOrderMaintenance } from "./zombieOrders.js";
 import { reconcileDispatchState } from "./dispatchReconciliation.js";
 import { reclaimStaleDispatchEvents } from "./dispatchOutbox.js";
 import { releaseCodHoldAfterCashPayment } from "./codHoldSweep.js";
+import { CodHold } from "./codHolds.js";
+import { releaseCodOrder } from "./stripePayments.js";
 import { adjustEtaLabel, currentWeather, distanceKm } from "./weather.js";
 
 export const app = express();
@@ -4336,6 +4338,62 @@ app.post("/api/v1/admin/orders/cleanup-test-data", requireOwner(), async (_req, 
     Order.deleteMany({ _id: { $in: orderIds }, isTestOrder: true }).exec(),
   ]);
   return res.json({ deleted: true, orderCodes: testOrders.map((order) => order.displayCode || order.publicCode), counts: { orders: orders.deletedCount, messages: messages.deletedCount, dispatchDecisions: dispatchDecisions.deletedCount, reservations: reservations.deletedCount, supportTickets: supportTickets.deletedCount, cashEntries: cashEntries.deletedCount, realtimeEvents: realtimeEvents.deletedCount, notifications: notifications.deletedCount } });
+});
+// Borrado de pedidos concretos, para limpiar pruebas de producción.
+// Primero simula; solo borra de verdad con ?apply=1 o {"apply": true}.
+app.post("/api/v1/admin/orders/purge", requireRole("admin"), async (req, res) => {
+  const raw = Array.isArray(req.body?.references) ? (req.body.references as unknown[]) : [];
+  const references = raw.map((value) => String(value).trim()).filter(Boolean);
+  if (!references.length) return res.status(400).json({ error: "REFERENCES_REQUIRED" });
+  const ids = references.map((value) => objectId(value)).filter(Boolean);
+  const orders = (await Order.find({
+    $or: [
+      { publicCode: { $in: references } },
+      { displayCode: { $in: references } },
+      ...(ids.length ? [{ _id: { $in: ids } }] : []),
+    ],
+  })
+    .select("_id publicCode displayCode status paymentState stripePaymentIntentId riderId totalCents cashCollectedAt")
+    .lean()
+    .exec()) as any[];
+  const preview = orders.map((order) => ({
+    code: order.publicCode,
+    status: order.status,
+    paymentState: order.paymentState,
+    totalCents: order.totalCents,
+    hasHold: Boolean(order.stripePaymentIntentId),
+  }));
+  const apply = req.query.apply === "1" || req.body?.apply === true;
+  if (!apply) return res.json({ apply: false, found: orders.length, orders: preview });
+
+  const deleted: string[] = [];
+  for (const order of orders) {
+    // Nunca dejar dinero retenido en una tarjeta por borrar el pedido.
+    if (order.stripePaymentIntentId) {
+      await releaseCodOrder(String(order.stripePaymentIntentId), "test_order_cleanup").catch(() => undefined);
+    }
+    const orderIdFilter = { orderId: order._id };
+    await Promise.all([
+      CodHold.deleteMany({
+        $or: [
+          { orderId: order._id },
+          ...(order.stripePaymentIntentId ? [{ paymentIntentId: order.stripePaymentIntentId }] : []),
+        ],
+      }).catch(() => undefined),
+      RiderOrderMessage.deleteMany(orderIdFilter).catch(() => undefined),
+      DispatchDecision.deleteMany(orderIdFilter).catch(() => undefined),
+      RiderAssignmentReservation.deleteMany(orderIdFilter).catch(() => undefined),
+      SupportTicket.deleteMany(orderIdFilter).catch(() => undefined),
+      CashLedgerEntry.deleteMany(orderIdFilter).catch(() => undefined),
+      RealtimeEvent.deleteMany({ "payload.orderId": String(order._id) }).catch(() => undefined),
+      Notification.deleteMany({ entityType: "order", entityId: String(order._id) }).catch(() => undefined),
+      DispatchOutbox.deleteMany(orderIdFilter).catch(() => undefined),
+    ]);
+    if (order.riderId) await releaseRiderOrderSlot(order._id, order.riderId).catch(() => undefined);
+    await Order.deleteOne({ _id: order._id }).exec();
+    deleted.push(String(order.publicCode || order._id));
+  }
+  return res.json({ apply: true, found: orders.length, deleted, orders: preview });
 });
 app.get("/api/v1/orders", requireRole("admin", "partner", "rider", "fleet"), async (req, res) => {
   const filter: Record<string, unknown> = { ...tenantScope(req) };

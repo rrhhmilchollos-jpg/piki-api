@@ -426,10 +426,19 @@ export async function handleStripeEvent(event: {
       summary.handled = true;
       break;
     }
-    case "payment_intent.canceled":
-      order.set({ paymentState: "expired", paymentReleasedAt: new Date() });
+    case "payment_intent.canceled": {
+      // Cuando la retención se cancela porque el cliente pagó en efectivo, el
+      // webhook llega después de que el rider pulse "Cobrado en efectivo".
+      // Si aquí se escribiera "expired" se borraría el cobro real: el pedido
+      // volvería a la cola como impagado y la caja quedaría descuadrada.
+      const paidInCash = Boolean((order as any).cashCollectedAt);
+      order.set({
+        paymentState: paidInCash ? "paid" : "expired",
+        paymentReleasedAt: (order as any).paymentReleasedAt ?? new Date(),
+      });
       summary.handled = true;
       break;
+    }
     case "payment_intent.payment_failed":
       order.set({ paymentState: "failed" });
       summary.handled = true;
