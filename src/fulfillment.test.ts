@@ -3,9 +3,9 @@ import test from "node:test";
 import { isCashPaymentEnabledForRestaurant } from "./paymentPolicy.js";
 import { allowedPaymentMethods, paymentDecision, bizumReferenceFor, canChargeCard, remainingCardCents } from "./fulfillment.js";
 
-test("un local bizumOnly solo acepta bizum", () => {
+test("un local bizumOnly acepta bizum y contra reembolso", () => {
   const restaurant = { name: "Kings Tacos Xàtiva", bizumOnly: true };
-  assert.deepEqual(allowedPaymentMethods(restaurant), ["bizum"]);
+  assert.deepEqual(allowedPaymentMethods(restaurant), ["bizum", "cash"]);
   const blocked = paymentDecision(restaurant, "stripe");
   assert.equal(blocked.ok, false);
   assert.equal(blocked.ok === false && blocked.error, "PAYMENT_METHOD_NOT_ALLOWED");
