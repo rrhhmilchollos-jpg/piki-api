@@ -83,8 +83,6 @@ import { runZombieOrderMaintenance } from "./zombieOrders.js";
 import { adjustEtaLabel, currentWeather, distanceKm } from "./weather.js";
 
 export const app = express();
-mountRiderTracking(app);
-mountShiftRoutes(app);
 app.set("trust proxy", 1);
 const port = Number(process.env.PORT || 3000);
 const PARTNER_PREPARATION_LIMIT_MINUTES = 45;
@@ -350,6 +348,11 @@ app.post("/api/v1/integrations/vercel/webhook", express.raw({ type: "application
   return res.status(200).json({ received: true, eventType, deploymentId });
 });
 app.use(express.json({ limit: "20mb" }));
+
+// Se montan después de CORS y del parseo de JSON: si van antes, el navegador
+// bloquea las llamadas desde Fleet con "Failed to fetch".
+mountRiderTracking(app);
+mountShiftRoutes(app);
 
 // Signed Customer -> API/Admin bridge. It accepts profile metadata only;
 // password material and session cookies never cross this boundary.
