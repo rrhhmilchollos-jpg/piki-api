@@ -12,6 +12,7 @@ import { createHash, createHmac, randomBytes, randomInt, randomUUID, timingSafeE
 import { MalwareDetectedError, MalwareScannerUnavailableError, DOCUMENT_UPLOAD_MIME_TYPES, normalizeDocumentUpload, sanitizePdfFileName, sanitizeUploadFileName, scanUploadBuffer, scanUploadBuffers } from "./fileSecurity.js";
 import { fileURLToPath } from "node:url";
 import cors from "cors";
+import { waitlistRouter } from "./waitlist.js";
 import express from "express";
 import mongoose from "mongoose";
 import { z } from "zod";
@@ -181,6 +182,7 @@ app.use((_req, res, next) => {
   next();
 });
 app.use(cors(corsOptions));
+app.use(waitlistRouter);
 app.options("*", cors(corsOptions));
 
 const requestBuckets = new Map<string, { startedAt: number; count: number }>();
