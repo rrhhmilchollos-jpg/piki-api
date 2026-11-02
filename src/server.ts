@@ -101,7 +101,10 @@ const managedPikiVercelOrigin = /^https:\/\/piki-(?:customer|partner|admin|fleet
 // pikidelivery.com y cualquier subdominio real (app., riders., fleet., admin., partners.)
 // Deben estar permitidos en CORS o el arranque de la app se queda en la pantalla de carga.
 const pikiApexOrigin = /^https:\/\/([a-z0-9-]+\.)?pikidelivery\.com$/i;
-const isAllowedCorsOrigin = (origin?: string) => !origin || allowedOrigins.has(origin) || managedPikiVercelOrigin.test(origin) || pikiApexOrigin.test(origin);
+// Los servicios de PIKI desplegados en Render (fleet, riders, admin, support)
+// también son superficies oficiales: sin ellos el navegador bloquea el login.
+const pikiRenderOrigin = /^https:\/\/piki-[a-z0-9-]+\.onrender\.com$/i;
+const isAllowedCorsOrigin = (origin?: string) => !origin || allowedOrigins.has(origin) || managedPikiVercelOrigin.test(origin) || pikiApexOrigin.test(origin) || pikiRenderOrigin.test(origin);
 const corsOptions = { origin: (origin: string | undefined, callback: (error: Error | null, allowed?: boolean) => void) => callback(null, isAllowedCorsOrigin(origin)), credentials: true };
 const databaseName = process.env.MONGODB_DB || "piki";
 let databaseReady = false;
