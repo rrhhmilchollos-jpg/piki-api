@@ -13,6 +13,10 @@ import { z } from "zod";
 import { requireRole } from "./auth.js";
 import { Order } from "./models.js";
 import {
+  CodHold,
+  normalizeReference,
+} from "./codHolds.js";
+import {
   authorizationAmountCents,
   authorizationExpiry,
   authorizeCodOrder,
@@ -54,6 +58,7 @@ const authorizeSchema = z.object({
   customerId: z.string().min(3).optional(),
   email: z.string().email().optional(),
   orderCode: z.string().min(3).max(40).optional(),
+  amountCents: z.number().int().min(50).max(500000).optional(),
   shortOrderNumber: z.string().min(1).max(40).optional(),
 });
 
@@ -163,8 +168,51 @@ export function mountStripeRoutes(app: Express): void {
       }
       const bodyCode = (request.body ?? {}) as { orderCode?: string; shortOrderNumber?: string };
       const order = await findOrderByReference(reference, bodyCode.orderCode ?? bodyCode.shortOrderNumber ?? null);
+
+      // El pedido puede vivir solo en la base del servidor de Customer; en ese
+      // caso la retención se registra por referencia y no se pierde la garantía.
       if (!order) {
-        response.status(404).json({ error: "pedido no encontrado", referencia: reference });
+        const declared = parsed.data.amountCents;
+        if (!declared) {
+          response.status(404).json({ error: "pedido no encontrado", referencia: reference });
+          return;
+        }
+        const normalized = normalizeReference(reference);
+        const existing = await CodHold.findOne({ reference: normalized });
+        if (existing && existing.status === "authorized") {
+          response.status(409).json({ error: "este pedido ya tiene una retención activa", paymentIntentId: existing.paymentIntentId });
+          return;
+        }
+        if (existing && existing.status === "captured") {
+          response.status(409).json({ error: "este pedido ya está cobrado" });
+          return;
+        }
+        try {
+          const created = await authorizeCodOrder({
+            orderId: normalized,
+            amountCents: declared,
+            paymentMethodId: parsed.data.paymentMethodId ?? null,
+            customerId: parsed.data.customerId ?? null,
+            email: parsed.data.email ?? null,
+          });
+          await CodHold.create({
+            reference: normalized,
+            amountCents: declared,
+            status: "authorized",
+            paymentIntentId: created.paymentIntentId,
+            clientSecret: created.clientSecret,
+            expiresAt: created.expiresAt,
+          });
+          response.status(201).json({
+            paymentIntentId: created.paymentIntentId,
+            clientSecret: created.clientSecret,
+            requiresAction: created.requiresAction,
+            amountCents: declared,
+            expiresAt: created.expiresAt.toISOString(),
+          });
+        } catch (error) {
+          response.status(502).json({ error: (error as Error).message });
+        }
         return;
       }
       const orderId = String(order._id);
@@ -247,7 +295,19 @@ export function mountStripeRoutes(app: Express): void {
       }
       const order = await findOrderByReference(reference);
       if (!order || !order.stripePaymentIntentId) {
-        response.status(404).json({ error: "pedido sin retención" });
+        const hold = await CodHold.findOne({ reference: normalizeReference(reference), status: "authorized" });
+        if (!hold) {
+          response.status(404).json({ error: "pedido sin retención" });
+          return;
+        }
+        try {
+          const result = await captureCodOrder(hold.paymentIntentId, (request.body ?? {}).amountCents ?? undefined);
+          hold.set({ status: "captured", capturedCents: result.capturedCents, resolvedAt: new Date() });
+          await hold.save();
+          response.json({ status: result.status, capturedCents: result.capturedCents });
+        } catch (error) {
+          response.status(502).json({ error: (error as Error).message });
+        }
         return;
       }
       const partial = Number((request.body ?? {}).amountCents);
@@ -280,8 +340,21 @@ export function mountStripeRoutes(app: Express): void {
         return;
       }
       const order = await findOrderByReference(reference);
+      const reasonInput = String((request.body ?? {}).reason ?? "paid_in_cash");
       if (!order || !order.stripePaymentIntentId) {
-        response.status(404).json({ error: "pedido sin retención" });
+        const hold = await CodHold.findOne({ reference: normalizeReference(reference), status: "authorized" });
+        if (!hold) {
+          response.status(404).json({ error: "pedido sin retención" });
+          return;
+        }
+        try {
+          const result = await releaseCodOrder(hold.paymentIntentId, reasonInput);
+          hold.set({ status: "released", resolvedAt: new Date(), reason: reasonInput });
+          await hold.save();
+          response.json({ status: result.status });
+        } catch (error) {
+          response.status(502).json({ error: (error as Error).message });
+        }
         return;
       }
       const reason = String((request.body ?? {}).reason ?? "paid_in_cash");
