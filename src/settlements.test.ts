@@ -1,3 +1,7 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import { calculateSettlement } from "./settlements.js";
+
 
 test("con precio con comision incluida el local cobra el precio base", () => {
   const base = { publicCode: "PIKI-1", subtotalCents: 1800, deliveryFeeCents: 299, serviceFeeCents: 79, distanceKm: 1, tipCents: 0, incentiveCents: 0 };
