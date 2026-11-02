@@ -25,7 +25,7 @@ import {
   type Shift,
   type ShiftDecision,
 } from "./shiftEnforcement.js";
-import { isReleasable, planSweep, type AssignedOrder, type SweepAction } from "./shiftSweep.js";
+import { ABANDONED_AFTER_MINUTES, isReleasable, planSweep, type AssignedOrder, type SweepAction } from "./shiftSweep.js";
 
 /** Zona horaria de referencia del centro de operaciones de PIKI. */
 export const OPERATIONS_TIME_ZONE = "Europe/Madrid";
@@ -631,8 +631,13 @@ export async function runShiftSweep(options: {
   const details = new Map<string, ShiftSweepDetail>();
   const errors: string[] = [];
   const riderNames = new Map<string, string>();
-  if (riders.length) {
-    const docs = (await Rider.find({ _id: { $in: riders.map((rider) => new mongoose.Types.ObjectId(rider.riderId)) } })
+  // Un rider con pedido encima entra en el barrido aunque no tenga contrato
+  // guardado: un pedido abandonado no puede quedarse muerto por papeleo.
+  const ridersWithOrders = [...new Set(orders.map((order) => order.riderId))];
+  const ridersWithoutPlan = ridersWithOrders.filter((riderId) => !riders.some((rider) => rider.riderId === riderId));
+  const allRiderIds = [...new Set([...riders.map((rider) => rider.riderId), ...ridersWithOrders])].filter((id) => mongoose.isValidObjectId(id));
+  if (allRiderIds.length) {
+    const docs = (await Rider.find({ _id: { $in: allRiderIds.map((riderId) => new mongoose.Types.ObjectId(riderId)) } })
       .select("_id name email")
       .lean()
       .exec()) as any[];
@@ -640,6 +645,11 @@ export async function runShiftSweep(options: {
   }
 
   let applied = 0;
+  const abandonedActions: SweepAction[] = orders
+    .filter((order) => ridersWithoutPlan.includes(order.riderId) && order.assignedMinutes >= ABANDONED_AFTER_MINUTES && isReleasable(order.status))
+    .map((order) => ({ kind: "release_order" as const, riderId: order.riderId, publicCode: order.publicCode, reason: "pedido_abandonado" as const }));
+  result.actions.push(...abandonedActions);
+  result.released += abandonedActions.length;
   for (const action of result.actions) {
     const detail = details.get(action.riderId) ?? {
       riderId: action.riderId,
