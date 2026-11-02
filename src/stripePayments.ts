@@ -37,7 +37,16 @@ export function stripeClient(): Stripe {
   const key = process.env.STRIPE_SECRET_KEY;
   if (!key) throw new Error("STRIPE_SECRET_KEY no configurada");
   if (!cachedClient) {
-    cachedClient = new Stripe(key, { apiVersion: "2024-06-20" as never });
+    // STRIPE_API_BASE permite apuntar a un Stripe simulado en pruebas locales.
+    const base = process.env.STRIPE_API_BASE;
+    const options: Record<string, unknown> = { apiVersion: "2024-06-20" };
+    if (base) {
+      const parsed = new URL(base);
+      options.host = parsed.hostname;
+      options.port = parsed.port || (parsed.protocol === "https:" ? 443 : 80);
+      options.protocol = parsed.protocol.replace(":", "") as "http" | "https";
+    }
+    cachedClient = new Stripe(key, options as never);
   }
   return cachedClient;
 }
@@ -147,14 +156,18 @@ export async function releaseCodOrder(
   const intent = await stripe.paymentIntents.cancel(paymentIntentId, {
     cancellation_reason: "abandoned",
   });
-  const order = await Order.findOne({ stripePaymentIntentId: paymentIntentId });
-  if (order) {
-    order.set({
-      paymentStatus: "expired",
-      paymentReleasedAt: new Date(),
-      paymentReleaseReason: reason,
-    });
-    await order.save();
+  try {
+    const order = await Order.findOne({ stripePaymentIntentId: paymentIntentId });
+    if (order) {
+      order.set({
+        paymentStatus: "expired",
+        paymentReleasedAt: new Date(),
+        paymentReleaseReason: reason,
+      });
+      await order.save();
+    }
+  } catch {
+    // Si el pedido no se puede actualizar, la retención ya está liberada en Stripe.
   }
   return { status: intent.status };
 }
