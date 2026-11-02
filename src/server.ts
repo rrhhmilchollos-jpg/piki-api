@@ -22,6 +22,7 @@ import { normalizeLeadEmail, partnerLeadSubmissionSchema, riderLeadSubmissionSch
 import { assertTransition, calculateEtaRange, transitionSchema, validateCoordinates } from "./algorithms/index.js";
 import { configuredAuthRoles, requireOwner, requireRole, resolveRole } from "./auth.js";
 import { mountRiderTracking, ensureTrackingIndexes } from "./riderTrackingRoutes.js";
+import { mountStripeRoutes, mountStripeWebhook } from "./stripeRoutes.js";
 import { mountShiftRoutes } from "./shiftRoutes.js";
 import { shiftSweepWorkerStatus, startShiftSweepWorker } from "./shiftSweepWorker.js";
 import { EmployeeSession, issueEmployeeSession, revokeEmployeeSessions, sessionRole } from "./employeeSessions.js";
@@ -347,11 +348,13 @@ app.post("/api/v1/integrations/vercel/webhook", express.raw({ type: "application
   }
   return res.status(200).json({ received: true, eventType, deploymentId });
 });
+mountStripeWebhook(app);
 app.use(express.json({ limit: "20mb" }));
 
 // Se montan después de CORS y del parseo de JSON: si van antes, el navegador
 // bloquea las llamadas desde Fleet con "Failed to fetch".
 mountRiderTracking(app);
+mountStripeRoutes(app);
 mountShiftRoutes(app);
 
 // Signed Customer -> API/Admin bridge. It accepts profile metadata only;

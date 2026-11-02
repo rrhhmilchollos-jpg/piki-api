@@ -407,6 +407,15 @@ orderSchema.add({
   bizumConfirmedBy: { type: String, default: null },
   virtualCardId: { type: Schema.Types.ObjectId, ref: "RiderVirtualCard", default: null },
 });
+orderSchema.add({
+  paymentAuthorizedAt: { type: Date, default: null },
+  paymentAuthorizationExpiresAt: { type: Date, default: null, index: true },
+  paymentHoldCents: { type: Number, default: null, min: 0 },
+  paymentCapturedAt: { type: Date, default: null },
+  paymentCapturedCents: { type: Number, default: null, min: 0 },
+  paymentReleasedAt: { type: Date, default: null },
+  paymentReleaseReason: { type: String, default: null },
+});
 orderSchema.index({ status: 1, createdAt: -1 });
 orderSchema.index({ tenantId: 1, restaurantId: 1, archivedAt: -1 });
 orderSchema.index({ displayCodeDate: 1, displayCode: 1 }, { unique: true, partialFilterExpression: { displayCodeDate: { $type: "string" }, displayCode: { $type: "string" } } });
