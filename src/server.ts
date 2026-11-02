@@ -574,6 +574,17 @@ app.get("/", (_req, res) => {
   res.setHeader("Content-Security-Policy", "default-src 'self'; style-src 'unsafe-inline'; img-src 'self'; frame-ancestors 'none'; base-uri 'self'");
   res.type("html").send(`<!doctype html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="application-name" content="Pikidelivery.com"><link rel="icon" type="image/webp" href="/favicon.webp"><title>PIKI Delivery API</title><style>html,body{margin:0;min-height:100%;background:#ffd72e;font-family:Arial,sans-serif;color:#172238}body{display:grid;place-items:center;min-height:100dvh;overflow:hidden}.splash{text-align:center}.splash img{display:block;width:min(92vw,930px);height:min(74dvh,620px);object-fit:contain}.splash strong{display:block;font-size:clamp(18px,3vw,28px);letter-spacing:.12em;text-transform:uppercase}.api{display:none;margin-top:1rem;font-size:14px}.api a{color:#172238;font-weight:700}</style></head><body><main class="splash" role="status" aria-label="PIKI Delivery API"><img src="/piki-splash.webp" alt="PIKI Delivery"><strong>Pikidelivery.com</strong><p class="api">API activa · <a href="/health">comprobar estado</a></p></main><script>window.setTimeout(()=>{document.querySelector('.api').style.display='block'},5000)</script></body></html>`);
 });
+app.post("/api/v1/release/ack", async (req, res) => {
+  // Acuse de actualización de la app: lo envía el cliente cuando el build que
+  // corre coincide ya con el que sirve el servidor.
+  const from = typeof req.body?.from === "string" ? req.body.from.slice(0, 40) : "";
+  const to = typeof req.body?.to === "string" ? req.body.to.slice(0, 40) : "";
+  const surface = typeof req.body?.surface === "string" ? req.body.surface.slice(0, 20) : "customer";
+  if (!to) return res.status(400).json({ ok: false, error: "build requerido" });
+  console.log(JSON.stringify({ event: "release.ack", surface, from, to, at: new Date().toISOString() }));
+  return res.json({ ok: true, from, to, surface });
+});
+
 app.get("/health", (_req, res) => res.json({ service: "piki-api", status: "ok" }));
 app.get("/ready", (_req, res) => {
   if (!databaseReady || mongoose.connection.readyState !== 1) return res.status(503).json({ service: "piki-api", status: "not_ready" });
