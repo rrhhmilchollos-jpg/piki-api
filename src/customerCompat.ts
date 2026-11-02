@@ -10,6 +10,7 @@ import { customerAvailability } from "./customerAvailability.js";
 import { modifierGroupsForItem, quoteMenuItem, usesReferenceAddOns } from "./menuModifiers.js";
 import { cashOrderLimitError, cashPaymentDisabledError, isCashOrderWithinLimit, isCashPaymentEnabledForRestaurant } from "./paymentPolicy.js";
 import { createCheckoutSession } from "./stripe.js";
+import { paymentDecision, bizumReferenceFor, issueVirtualCard } from "./fulfillment.js";
 import { dispatchInitialIdempotencyKey, enqueueDispatchOutbox } from "./dispatchOutbox.js";
 import { SupportTicket } from "./models.js";
 import { customerSupportCreateSchema, customerSupportTicketNumber, customerSupportTicketView } from "./customerSupportPolicy.js";
@@ -421,12 +422,9 @@ async function handleCustomerTrpcSingle(req: Request, res: Response) {
       });
       if (!items.length || items.some((item: any) => !item || !Number.isInteger(item.quantity) || item.quantity < 1)) return fail(res, "La cesta no es válida");
       const normalized = items as Array<{itemId: string; name: string; quantity: number; unitPriceCents: number; selectedOptions: Array<{ groupId: string; groupName: string; optionId: string; optionName: string; unitPriceCents: number }>}>;
-      const paymentMethod = customerPaymentMethod(input?.paymentMethod);
-      if (!paymentMethod) return fail(res, "Selecciona tarjeta o efectivo para continuar.", "PAYMENT_METHOD_UNAVAILABLE");
-      if (paymentMethod === "cash" && !isCashPaymentEnabledForRestaurant(restaurant)) {
-        const error = cashPaymentDisabledError(restaurant);
-        return res.status(409).json(error);
-      }
+      const decision = paymentDecision(restaurant as any, input?.paymentMethod);
+      if (!decision.ok) return res.status(decision.status).json({ error: decision.error, message: decision.message, allowedPaymentMethods: decision.allowed });
+      const paymentMethod = decision.method;
       const latitude = Number(input?.deliveryLocation?.latitude); const longitude = Number(input?.deliveryLocation?.longitude);
       if (!Number.isFinite(latitude) || latitude < -90 || latitude > 90 || !Number.isFinite(longitude) || longitude < -180 || longitude > 180) return fail(res, "Selecciona una dirección válida de la lista antes de confirmar el pedido.", "DELIVERY_LOCATION_REQUIRED");
       const deliveryPoint: [number, number] = [longitude, latitude];
@@ -443,7 +441,7 @@ async function handleCustomerTrpcSingle(req: Request, res: Response) {
       const orderSession = await mongoose.startSession();
       try {
         await orderSession.withTransaction(async () => {
-      const orderPayload = { publicCode: code, tenantId: restaurant.tenantId || null, restaurantId: restaurant._id, customerId: String(user._id), items: normalized, deliveryAddress: String(input.address || "").trim(), deliveryLocation: { type: "Point", coordinates: deliveryPoint }, coveragePolicySlug: coverage.policySlug, coveragePolicyVersion: coverage.policyVersion, coverageDecision: coverage.reason, straightLineDistanceKm: coverage.straightLineDistanceKm, withinMunicipality: coverage.withinMunicipality, deliveryBaseFeeCents: coverage.deliveryBaseFeeCents, outsideMunicipalitySurchargeCents: coverage.outsideMunicipalitySurchargeCents, routeDistanceKm: route.routeDistanceKm, routeDurationMinutes: route.routeDurationMinutes, routeProvider: route.routeProvider, routingDegraded: route.routingDegraded, requiredVehicleClasses: route.requiredVehicleClasses, subtotalCents, deliveryFeeCents: deliveryCents, serviceFeeCents: serviceCents, totalCents, paymentMethod, paymentState: "pending", statusHistory: [{ status: "pending", actorRole: "customer", reason: paymentMethod === "cash" ? "Pedido a contrarreembolso; cobro pendiente hasta la entrega" : "Pedido pendiente de confirmación del pago online" }]  };
+      const orderPayload = { publicCode: code, fulfillmentModel: decision.riderPurchase ? "rider_purchase" : "partner_managed", bizumReference: decision.method === "bizum" ? bizumReferenceFor(code) : null, tenantId: restaurant.tenantId || null, restaurantId: restaurant._id, customerId: String(user._id), items: normalized, deliveryAddress: String(input.address || "").trim(), deliveryLocation: { type: "Point", coordinates: deliveryPoint }, coveragePolicySlug: coverage.policySlug, coveragePolicyVersion: coverage.policyVersion, coverageDecision: coverage.reason, straightLineDistanceKm: coverage.straightLineDistanceKm, withinMunicipality: coverage.withinMunicipality, deliveryBaseFeeCents: coverage.deliveryBaseFeeCents, outsideMunicipalitySurchargeCents: coverage.outsideMunicipalitySurchargeCents, routeDistanceKm: route.routeDistanceKm, routeDurationMinutes: route.routeDurationMinutes, routeProvider: route.routeProvider, routingDegraded: route.routingDegraded, requiredVehicleClasses: route.requiredVehicleClasses, subtotalCents, deliveryFeeCents: deliveryCents, serviceFeeCents: serviceCents, totalCents, paymentMethod, paymentState: "pending", statusHistory: [{ status: "pending", actorRole: "customer", reason: paymentMethod === "cash" ? "Pedido a contrarreembolso; cobro pendiente hasta la entrega" : "Pedido pendiente de confirmación del pago online" }]  };
           const created = await Order.create([orderPayload], { session: orderSession });
           order = created[0];
           if (paymentMethod === "cash") {
@@ -458,6 +456,10 @@ async function handleCustomerTrpcSingle(req: Request, res: Response) {
         });
       } finally {
         await orderSession.endSession();
+      }
+      if (decision.riderPurchase && order) {
+        const card = await issueVirtualCard({ orderId: order._id, publicCode: code, restaurantId: restaurant._id, budgetCents: subtotalCents });
+        if (card) await Order.updateOne({ _id: order._id }, { $set: { virtualCardId: (card as any)._id } }).exec();
       }
       let checkoutUrl: string | null = null;
       let creditAppliedCents = 0;
@@ -474,7 +476,7 @@ async function handleCustomerTrpcSingle(req: Request, res: Response) {
         }
       }
       if (paymentMethod === "cash") await publishOrderIntakeEvents(order, { settlement: "cash_due", message: "Pedido a contrarreembolso: el Rider cobrará en efectivo al entregar." });
-      return reply(res, { orderId: code, checkoutUrl, totalCents: totalCents - creditAppliedCents, paymentMethod, paymentState: paymentMethod === "cash" ? "pending_cash_collection" : "pending", cashDueAtDelivery: paymentMethod === "cash", creditAppliedCents, priceBreakdown: calculatePriceBreakdown({ subtotalCents, deliveryFeeCents: deliveryCents, serviceFeeCents: serviceCents, discountCents: creditAppliedCents }), coverage, route });
+      return reply(res, { orderId: code, checkoutUrl, totalCents: totalCents - creditAppliedCents, paymentMethod, paymentState: decision.paymentState, cashDueAtDelivery: paymentMethod === "cash", creditAppliedCents, priceBreakdown: calculatePriceBreakdown({ subtotalCents, deliveryFeeCents: deliveryCents, serviceFeeCents: serviceCents, discountCents: creditAppliedCents }), coverage, route });
     }
     return fail(res, `Procedimiento no soportado: ${procedure}`, "NOT_FOUND");
   } catch (error) { console.error(`[customerCompat] ${procedure}`, error); return fail(res, "Error interno de la plataforma", "INTERNAL_SERVER_ERROR"); }
