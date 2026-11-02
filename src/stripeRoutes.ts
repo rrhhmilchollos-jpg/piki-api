@@ -12,10 +12,10 @@ import mongoose from "mongoose";
 import { z } from "zod";
 import { requireRole } from "./auth.js";
 import { Order } from "./models.js";
-import {
-  CodHold,
-  normalizeReference,
-} from "./codHolds.js";
+import { CodHold, codHoldLiability, normalizeReference } from "./codHolds.js";
+import { findOrderByReference } from "./orderReferences.js";
+import { listCodHoldSweepRuns, listOpenCodHolds, runCodHoldSweep } from "./codHoldSweep.js";
+import { codHoldSweepWorkerStatus } from "./codHoldSweepWorker.js";
 import {
   authorizationAmountCents,
   authorizationExpiry,
@@ -61,53 +61,6 @@ const authorizeSchema = z.object({
   amountCents: z.number().int().min(50).max(500000).optional(),
   shortOrderNumber: z.string().min(1).max(40).optional(),
 });
-
-/**
- * El seguimiento del cliente identifica el pedido por su código visible
- * (PIKI-XXXX), no por el ObjectId. Aceptamos las dos formas.
- */
-async function findOrderByReference(reference: string, extraCode?: string | null) {
-  const candidates = new Set<string>();
-  const push = (value?: string | null) => {
-    if (!value) return;
-    const raw = String(value).trim();
-    if (!raw) return;
-    candidates.add(raw);
-    candidates.add(raw.toUpperCase());
-    candidates.add(raw.replace(/^PIKI-?/i, "").toUpperCase());
-    candidates.add(`PIKI-${raw.replace(/^PIKI-?/i, "").toUpperCase()}`);
-  };
-  push(reference);
-  push(extraCode);
-
-  if (mongoose.isValidObjectId(reference)) {
-    const byId = await Order.findById(reference);
-    if (byId) return byId;
-  }
-  const list = [...candidates];
-  const exact = await Order.findOne({
-    $or: [
-      { displayCode: { $in: list } },
-      { shortOrderNumber: { $in: list } },
-      { orderCode: { $in: list } },
-      { code: { $in: list } },
-    ],
-  });
-  if (exact) return exact;
-
-  // Último recurso: comparación sin distinguir mayúsculas ni el prefijo PIKI-.
-  const bare = String(reference).trim().replace(/^PIKI-?/i, "");
-  if (!bare) return null;
-  const pattern = new RegExp(`^\\s*(PIKI-?)?${bare.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*$`, "i");
-  return Order.findOne({
-    $or: [
-      { displayCode: pattern },
-      { shortOrderNumber: pattern },
-      { orderCode: pattern },
-      { code: pattern },
-    ],
-  });
-}
 
 function orderIdFrom(request: Request): string | null {
   const id = request.params.id;
@@ -199,14 +152,30 @@ export function mountStripeRoutes(app: Express): void {
             customerId: parsed.data.customerId ?? null,
             email: parsed.data.email ?? null,
           });
-          await CodHold.create({
-            reference: normalized,
-            amountCents: declared,
-            status: "authorized",
-            paymentIntentId: created.paymentIntentId,
-            clientSecret: created.clientSecret,
-            expiresAt: created.expiresAt,
-          });
+          // Si la referencia ya tuvo una retención resuelta (liberada, caducada
+          // o fallida), se reutiliza el registro: el índice es único y crear
+          // otro dejaría al cliente sin garantía por un duplicado.
+          await CodHold.findOneAndUpdate(
+            { reference: normalized },
+            {
+              $set: {
+                amountCents: declared,
+                status: "authorized",
+                paymentIntentId: created.paymentIntentId,
+                clientSecret: created.clientSecret,
+                expiresAt: created.expiresAt,
+                capturedCents: null,
+                resolvedAt: null,
+                reason: null,
+                stripeStatus: created.status,
+                sweepClaimedUntil: null,
+                lastSweepAt: null,
+                lastSweepReason: null,
+              },
+              $setOnInsert: { reference: normalized },
+            },
+            { upsert: true, new: true, setDefaultsOnInsert: true },
+          );
           response.status(201).json({
             paymentIntentId: created.paymentIntentId,
             clientSecret: created.clientSecret,
@@ -233,10 +202,10 @@ export function mountStripeRoutes(app: Express): void {
         response.status(409).json({ error: "este pedido ya no admite garantía de tarjeta" });
         return;
       }
-      if (order.paymentStatus === "authorized" || order.paymentStatus === "paid") {
+      if (order.paymentState === "authorized" || order.paymentState === "paid") {
         response.status(409).json({
           error: "el pedido ya tiene una retención activa o está cobrado",
-          paymentStatus: order.paymentStatus,
+          paymentState: order.paymentState,
           paymentIntentId: order.stripePaymentIntentId,
         });
         return;
@@ -249,7 +218,7 @@ export function mountStripeRoutes(app: Express): void {
           orderId,
           reference,
           amountCents,
-          paymentStatus: order.paymentStatus,
+          paymentState: order.paymentState,
           paymentMethod: order.paymentMethod,
         });
         return;
@@ -268,7 +237,7 @@ export function mountStripeRoutes(app: Express): void {
         });
         order.set({
           stripePaymentIntentId: result.paymentIntentId,
-          paymentStatus: result.status === "requires_capture" ? "authorized" : "pending",
+          paymentState: result.status === "requires_capture" ? "authorized" : "pending",
           paymentAuthorizedAt: result.status === "requires_capture" ? new Date() : null,
           paymentAuthorizationExpiresAt: authorizationExpiry(),
           paymentHoldCents: amountCents,
@@ -321,7 +290,7 @@ export function mountStripeRoutes(app: Express): void {
           Number.isFinite(partial) && partial > 0 ? partial : undefined,
         );
         order.set({
-          paymentStatus: "paid",
+          paymentState: "paid",
           paymentCapturedAt: new Date(),
           paymentCapturedCents: result.capturedCents,
         });
@@ -353,7 +322,13 @@ export function mountStripeRoutes(app: Express): void {
         }
         try {
           const result = await releaseCodOrder(hold.paymentIntentId, reasonInput);
-          hold.set({ status: "released", resolvedAt: new Date(), reason: reasonInput });
+          hold.set({
+            status: "released",
+            resolvedAt: new Date(),
+            reason: reasonInput,
+            lastSweepReason: reasonInput,
+            stripeStatus: "canceled",
+          });
           await hold.save();
           response.json({ status: result.status });
         } catch (error) {
@@ -364,8 +339,11 @@ export function mountStripeRoutes(app: Express): void {
       const reason = String((request.body ?? {}).reason ?? "paid_in_cash");
       try {
         const result = await releaseCodOrder(order.stripePaymentIntentId, reason);
+        // Si cobró en efectivo, el pedido está cobrado: ponerlo como caducado
+        // dejaría la caja descuadrada justo en el caso normal.
+        const paidInCash = Boolean(order.cashCollectedAt) || reason === "paid_in_cash";
         order.set({
-          paymentStatus: "expired",
+          paymentState: paidInCash ? "paid" : "expired",
           paymentReleasedAt: new Date(),
           paymentReleaseReason: reason,
         });
@@ -378,17 +356,77 @@ export function mountStripeRoutes(app: Express): void {
   );
 
   // Barrido: libera lo que va a caducar. Simulación por defecto, ?apply=1 ejecuta.
+  //
+  // Hace las dos cosas: las retenciones colgadas del pedido y las que solo
+  // existen por referencia (`CodHold`). Las segundas son las que se quedaban
+  // huérfanas, porque nada las miraba.
   app.post(
     "/api/v1/admin/cod-sweep",
     requireRole("admin", "finance"),
     async (request: Request, response: Response) => {
       const apply = request.query.apply === "1" || request.body?.apply === true;
+      const actorId = request.auth?.employeeId ?? null;
       try {
-        const result = await sweepExpiringCodAuthorizations(new Date(), { apply });
-        response.json({ apply, ...result });
+        const [orders, holds] = await Promise.all([
+          sweepExpiringCodAuthorizations(new Date(), { apply }),
+          runCodHoldSweep({ apply, source: "manual", actorId }),
+        ]);
+        response.json({
+          apply,
+          // Campos de siempre (retenciones ligadas a un pedido).
+          inspected: orders.inspected,
+          released: orders.released,
+          failed: orders.failed,
+          errors: [...orders.errors, ...holds.errors],
+          // Garantías por referencia.
+          holds,
+        });
       } catch (error) {
         response.status(502).json({ error: (error as Error).message });
       }
+    },
+  );
+
+  // Estado del barrido automático: si el worker está vivo y qué hizo la última vez.
+  app.get(
+    "/api/v1/admin/cod-sweep/status",
+    requireRole("admin", "finance", "fleet"),
+    async (_request: Request, response: Response) => {
+      const [liability, runs] = await Promise.all([codHoldLiability(), listCodHoldSweepRuns(1)]);
+      response.json({
+        worker: codHoldSweepWorkerStatus(),
+        stripeConfigured: stripeConfigured(),
+        liability,
+        lastRun: runs[0] ?? null,
+      });
+    },
+  );
+
+  // Historial de pasadas, para auditar qué se liberó y cuándo.
+  app.get(
+    "/api/v1/admin/cod-sweep/runs",
+    requireRole("admin", "finance", "fleet"),
+    async (request: Request, response: Response) => {
+      const limit = Math.max(1, Math.min(100, Number(request.query.limit ?? 10) || 10));
+      response.json({ runs: await listCodHoldSweepRuns(limit) });
+    },
+  );
+
+  // Garantías vivas con su antigüedad: la lista que contabilidad revisa.
+  app.get(
+    "/api/v1/admin/cod-holds",
+    requireRole("admin", "finance", "fleet"),
+    async (request: Request, response: Response) => {
+      const limit = Math.max(1, Math.min(200, Number(request.query.limit ?? 50) || 50));
+      response.json({ holds: await listOpenCodHolds(limit) });
+    },
+  );
+
+  app.get(
+    "/api/v1/admin/cod-holds/summary",
+    requireRole("admin", "finance", "fleet"),
+    async (_request: Request, response: Response) => {
+      response.json(await codHoldLiability());
     },
   );
 }

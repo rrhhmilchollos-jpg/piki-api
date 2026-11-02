@@ -25,6 +25,7 @@ import { mountRiderTracking, ensureTrackingIndexes } from "./riderTrackingRoutes
 import { mountStripeRoutes, mountStripeWebhook } from "./stripeRoutes.js";
 import { mountShiftRoutes } from "./shiftRoutes.js";
 import { shiftSweepWorkerStatus, startShiftSweepWorker } from "./shiftSweepWorker.js";
+import { startCodHoldSweepWorker, stopCodHoldSweepWorker } from "./codHoldSweepWorker.js";
 import { EmployeeSession, issueEmployeeSession, revokeEmployeeSessions, sessionRole } from "./employeeSessions.js";
 import { isStripeSignatureError, processStripeWebhook, stripeConfigured, createSignaturitSignature, signaturitBaseUrl, signaturitConfigured, signaturitMode, signatureWebhookUrl, webhookDigest, handleCustomerTrpc, currentCustomer, issueCustomerSession, setCustomerOrderDispatcher } from "./integrations/index.js";
 import { getVersionPolicy, isPikiSurface, requiresUpdate, setVersionPolicy, syncVersionPolicy, versionPolicySchema, type PikiSurface } from "./appVersion.js";
@@ -175,7 +176,7 @@ async function reversePhoton(latitude: number, longitude: number) {
   const label = [address.road, [address.postcode, address.locality].filter(Boolean).join(" ")].filter(Boolean).join(", ");
   return { label: label || `Ubicación GPS ${latitude.toFixed(5)}, ${longitude.toFixed(5)}`, latitude, longitude, locality: address.locality || null, address: properties };
 }
-mongoose.connection.on("connected", () => { databaseReady = true; startShiftSweepWorker(); startRealtimeRelay(); startCatalogRelay(); startGoogleBusinessSyncWorker(); void processExpiringCustomerCreditNotifications().catch((error) => console.warn("Credit expiry worker failed", error)); setInterval(() => void processExpiringCustomerCreditNotifications().catch((error) => console.warn("Credit expiry worker failed", error)), 15 * 60_000).unref(); void syncPublicIds().catch((error) => console.error("Public ID sync failed", error)); void ensurePikiPrlCourse().catch((error) => console.error("PIKI PRL course seed failed", error)); });
+mongoose.connection.on("connected", () => { databaseReady = true; startShiftSweepWorker(); startCodHoldSweepWorker(); startRealtimeRelay(); startCatalogRelay(); startGoogleBusinessSyncWorker(); void processExpiringCustomerCreditNotifications().catch((error) => console.warn("Credit expiry worker failed", error)); setInterval(() => void processExpiringCustomerCreditNotifications().catch((error) => console.warn("Credit expiry worker failed", error)), 15 * 60_000).unref(); void syncPublicIds().catch((error) => console.error("Public ID sync failed", error)); void ensurePikiPrlCourse().catch((error) => console.error("PIKI PRL course seed failed", error)); });
 mongoose.connection.on("disconnected", () => { databaseReady = false; console.warn("MongoDB disconnected; API entering not-ready state"); });
 mongoose.connection.on("error", (error) => { databaseReady = false; console.error("MongoDB connection error", error instanceof Error ? error.message : error); });
 
@@ -6293,6 +6294,7 @@ async function start() {
     await ensureCustomerEngagementIndexes();
     await backfillEmployeeCodes();
     startRealtimeRelay();
+    startCodHoldSweepWorker();
     startNotificationWorker();
     startGoogleBusinessSyncWorker();
     await repairConfiguredPartnerAccess();
@@ -6350,7 +6352,7 @@ async function start() {
   // `npm run start:dispatch-worker` as a separate service to consume the
   // persistent dispatch_outbox with atomic leases and retry/backoff.
   const shutdown = () => {
-    stopGoogleBusinessSyncWorker(); stopNotificationWorker(); databaseReady = false;
+    stopGoogleBusinessSyncWorker(); stopNotificationWorker(); stopCodHoldSweepWorker(); databaseReady = false;
     server.close(() => { void mongoose.disconnect().finally(() => process.exit(0)); });
     setTimeout(() => process.exit(0), 25_000).unref();
   };

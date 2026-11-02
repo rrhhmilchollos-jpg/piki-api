@@ -110,6 +110,17 @@ Stripe usa captura automática para tarjeta y Bizum. Con `STRIPE_BIZUM_ENABLED=t
 - Antes de habilitar pagos online a clientes, validar mediante un ensayo aislado el webhook firmado, autorizaciones, captura automática, reintentos, replays y eventos fuera de orden. La configuración de métodos de pago y cualquier cambio de producción requieren aprobación separada.
 - La entrega tolera que `payment_intent.succeeded` llegue después de que Stripe confirme la sesión: el webhook no toca el estado operacional y el cierre condiciona `on_the_way`/rider/asignación. Sigue pendiente una saga o conciliación para el caso de caída del proceso después de la confirmación de Stripe y antes de persistir el estado final, y para hacer atómico el ledger de efectivo con la entrega.
 
+## Barrido de garantías de contrarreembolso
+Las garantías de tarjeta viven en dos sitios: el pedido (`paymentState=authorized`) y, cuando el pedido aún no está sincronizado, el registro `CodHold` indexado por la referencia visible. Un barrido automático dentro de la API (`codHoldSweepWorker`) revisa ambos cada 15 minutos con `PIKI_COD_SWEEP_INTERVAL_MS` y deja cada pasada registrada en `cod_hold_sweep_runs`.
+
+Reglas, en orden de prioridad:
+1. Si el pedido consta cobrado en efectivo, anulado o reembolsado, la retención se libera sin esperar al plazo.
+2. Si el banco ya la soltó, se marca `expired`; si se cobró por otra vía, `captured`; solo se cancela de verdad cuando Stripe sigue devolviendo `requires_capture`.
+3. Se libera con 12 h de margen sobre los 7 días de vigencia, antes de que el emisor la suelte solo.
+4. Nunca se captura automáticamente: un pedido entregado sin cobro queda marcado para revisión humana.
+
+Variables: `PIKI_COD_SWEEP_ENABLED` (por defecto `1`), `PIKI_COD_SWEEP_INTERVAL_MS` (900000), `PIKI_COD_ORPHAN_RELEASE_HOURS` (0, desactivado por defecto) y `PIKI_COD_RECONCILE_AFTER_HOURS` (6, antigüedad con la que una retención entra en el barrido aunque le quede plazo). Endpoints de lectura y ejecución manual: `GET /api/v1/admin/cod-sweep/status`, `GET /api/v1/admin/cod-sweep/runs`, `GET /api/v1/admin/cod-holds`, `POST /api/v1/admin/cod-sweep` (simula por defecto; `?apply=1` ejecuta). La simulación de extremo a extremo se ejecuta con `MONGODB_URI=... npx tsx scripts/cod-hold-sweep-simulation.ts`.
+
 ## Sincronización del catálogo Partners → Customers
 
 `GET /api/v1/catalog/events` es un stream SSE público, separado del stream autenticado de pedidos. Solo comunica `catalog.updated` con una razón y, cuando el restaurante ya es público, identificadores públicos; nunca envía cartas completas, contactos, documentos, pedidos ni datos de empleados. El evento `ready` obliga a Customers a consultar de nuevo el catálogo al conectar/reconectar.

@@ -147,6 +147,47 @@ export async function captureCodOrder(
   };
 }
 
+export interface AuthorizationSnapshot {
+  paymentIntentId: string;
+  status: string;
+  amountCents: number;
+  capturedCents: number;
+}
+
+/**
+ * Lee el estado real de la autorización en Stripe.
+ *
+ * Es la fuente de verdad del dinero: la base de datos puede decir «autorizada»
+ * mientras el banco ya la soltó, o al contrario. El barrido siempre pregunta
+ * antes de tocar nada.
+ */
+export async function retrieveAuthorization(paymentIntentId: string): Promise<AuthorizationSnapshot> {
+  const intent = await stripeClient().paymentIntents.retrieve(paymentIntentId);
+  return {
+    paymentIntentId: intent.id,
+    status: intent.status,
+    amountCents: intent.amount ?? 0,
+    capturedCents: intent.amount_received ?? 0,
+  };
+}
+
+/**
+ * ¿El error de Stripe significa «esto ya está resuelto»?
+ *
+ * Al liberar una autorización que el banco ya había soltado, Stripe responde
+ * con un error de estado, no con éxito. Para el barrido no es un fallo: es
+ * precisamente la conciliación que buscábamos.
+ */
+export function isAlreadyResolvedStripeError(error: unknown): boolean {
+  const candidate = error as { code?: string; message?: string; raw?: { code?: string; message?: string } };
+  const code = String(candidate?.code ?? candidate?.raw?.code ?? "");
+  const message = String(candidate?.message ?? candidate?.raw?.message ?? "").toLowerCase();
+  if (code === "payment_intent_unexpected_state" || code === "resource_missing") return true;
+  return /already (been )?(cancel|expired|succeeded|captured)|has been canceled|cannot cancel|canceled paymentintent|no such payment_intent/.test(
+    message,
+  );
+}
+
 /** Libera la retención. Es lo que se hace cuando el cliente paga en efectivo. */
 export async function releaseCodOrder(
   paymentIntentId: string,
@@ -159,8 +200,12 @@ export async function releaseCodOrder(
   try {
     const order = await Order.findOne({ stripePaymentIntentId: paymentIntentId });
     if (order) {
+      // `paymentState` es el campo del esquema. Si el cliente ya había pagado en
+      // efectivo, el pedido está cobrado, no caducado: marcarlo al revés dejaría
+      // la caja descuadrada.
+      const paidInCash = Boolean((order as unknown as { cashCollectedAt?: Date | null }).cashCollectedAt);
       order.set({
-        paymentStatus: "expired",
+        paymentState: paidInCash ? "paid" : "expired",
         paymentReleasedAt: new Date(),
         paymentReleaseReason: reason,
       });
@@ -190,7 +235,7 @@ export async function sweepExpiringCodAuthorizations(
   const apply = options.apply === true;
   const candidates = await Order.find({
     paymentMethod: "cash",
-    paymentStatus: "authorized",
+    paymentState: "authorized",
     stripePaymentIntentId: { $type: "string" },
     archivedAt: null,
   })
@@ -257,7 +302,7 @@ export async function handleStripeEvent(event: {
   switch (event.type) {
     case "payment_intent.amount_capturable_updated":
       order.set({
-        paymentStatus: "authorized",
+        paymentState: "authorized",
         paymentAuthorizedAt: new Date(),
         paymentAuthorizationExpiresAt: authorizationExpiry(),
         stripePaymentIntentId: paymentIntentId,
@@ -266,18 +311,18 @@ export async function handleStripeEvent(event: {
       break;
     case "payment_intent.succeeded":
       order.set({
-        paymentStatus: "paid",
+        paymentState: "paid",
         paymentCapturedAt: new Date(),
         paymentCapturedCents: object.amount_received ?? order.totalCents,
       });
       summary.handled = true;
       break;
     case "payment_intent.canceled":
-      order.set({ paymentStatus: "expired", paymentReleasedAt: new Date() });
+      order.set({ paymentState: "expired", paymentReleasedAt: new Date() });
       summary.handled = true;
       break;
     case "payment_intent.payment_failed":
-      order.set({ paymentStatus: "failed" });
+      order.set({ paymentState: "failed" });
       summary.handled = true;
       break;
     default:
