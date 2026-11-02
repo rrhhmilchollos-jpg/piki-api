@@ -83,6 +83,7 @@ import { Badge, CustomerBadge, CustomerDeliverySaving, PikiPassSubscription, Ref
 import { createPassCheckoutSession, createPassOneOffSession, createPassPortalSession, passDeliveryBenefit, pikiPassConfigured, pikiPassPayload } from "./pikiPassBilling.js";
 import { runZombieOrderMaintenance } from "./zombieOrders.js";
 import { reconcileDispatchState } from "./dispatchReconciliation.js";
+import { releaseCodHoldAfterCashPayment } from "./codHoldSweep.js";
 import { adjustEtaLabel, currentWeather, distanceKm } from "./weather.js";
 
 export const app = express();
@@ -4668,6 +4669,16 @@ app.post("/api/v1/riders/:riderId/orders/:orderId/confirm-delivery", requireRole
   }
   if (confirmedOrder.paymentMethod === "cash") {
     const cashEntry = await recordCashCollection(confirmedOrder, riderId, "rider");
+    // El cliente ya ha pagado en efectivo: se suelta la garantía en el acto para
+    // que no siga viendo el importe retenido en el banco tras la entrega.
+    void releaseCodHoldAfterCashPayment({
+      orderId: String(confirmedOrder._id),
+      reference: String(confirmedOrder.publicCode || ""),
+      stripePaymentIntentId: confirmedOrder.stripePaymentIntentId || null,
+    }).then((result) => {
+      if (result.released) console.log(JSON.stringify({ event: "cod_hold_released_on_delivery", order: String(confirmedOrder.publicCode || "") }));
+      else if (result.reason !== "sin_retencion") console.log(JSON.stringify({ event: "cod_hold_release_skipped", order: String(confirmedOrder.publicCode || ""), reason: result.reason }));
+    }).catch((error) => console.warn("No se pudo liberar la garantía al entregar", error instanceof Error ? error.message : String(error)));
     if (cashEntry) await publishCashWalletEvent({ riderId, amountCents: Number(confirmedOrder.totalCents || 0), type: "cash.wallet_changed", reference: String(confirmedOrder.publicCode || "") });
   }
   // Stripe may emit payment_intent.succeeded between capture() and this write.

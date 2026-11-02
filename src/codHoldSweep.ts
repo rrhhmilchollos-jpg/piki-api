@@ -451,6 +451,51 @@ async function reconcileOrder(
   }
 }
 
+/**
+ * Suelta la garantía en cuanto el rider cobra en efectivo.
+ *
+ * El barrido periódico también lo haría, pero tardaría hasta la siguiente
+ * pasada y el cliente vería el importe retenido en su banco después de haber
+ * pagado. Se ejecuta en segundo plano para no retrasar la confirmación de la
+ * entrega; si falla, el barrido lo recoge más tarde.
+ */
+export async function releaseCodHoldAfterCashPayment(
+  input: { orderId?: string | null; reference?: string | null; stripePaymentIntentId?: string | null },
+): Promise<{ released: boolean; reason: string }> {
+  const adapter = defaultCodHoldStripeAdapter();
+  if (!adapter.configured) return { released: false, reason: "sin_stripe" };
+  const filters: Record<string, unknown>[] = [];
+  if (input.orderId && mongoose.isValidObjectId(input.orderId)) filters.push({ orderId: new mongoose.Types.ObjectId(input.orderId) });
+  if (input.reference) filters.push({ reference: normalizeReference(input.reference) });
+  if (!filters.length) return { released: false, reason: "sin_referencia" };
+
+  const hold = await CodHold.findOne({ status: "authorized", $or: filters })
+    .sort({ createdAt: -1 })
+    .lean()
+    .exec() as Record<string, any> | null;
+  const paymentIntentId = String(hold?.paymentIntentId ?? input.stripePaymentIntentId ?? "");
+  if (!paymentIntentId) return { released: false, reason: "sin_retencion" };
+  if (hold && !(await claimHold(String(hold.reference), new Date()))) return { released: false, reason: "ocupada" };
+
+  try {
+    const snapshot = await adapter.retrieve(paymentIntentId);
+    if (snapshot.status === "canceled") {
+      if (hold) await resolveHold(String(hold.reference), "expired", "caducada_en_banco", new Date(), { stripeStatus: snapshot.status });
+      return { released: false, reason: "ya_caducada" };
+    }
+    if (snapshot.status !== "requires_capture") {
+      if (hold) await releaseClaim(String(hold.reference));
+      return { released: false, reason: `estado_${snapshot.status}` };
+    }
+    await adapter.release(paymentIntentId, "paid_in_cash");
+    if (hold) await resolveHold(String(hold.reference), "released", "pedido_cobrado_en_efectivo", new Date(), { stripeStatus: "canceled" });
+    return { released: true, reason: "liberada" };
+  } catch (error) {
+    if (hold) await releaseClaim(String(hold.reference));
+    return { released: false, reason: error instanceof Error ? error.message : String(error) };
+  }
+}
+
 export interface RunCodHoldSweepOptions {
   apply: boolean;
   source?: CodHoldSweepSource;
