@@ -83,6 +83,7 @@ import { Badge, CustomerBadge, CustomerDeliverySaving, PikiPassSubscription, Ref
 import { createPassCheckoutSession, createPassOneOffSession, createPassPortalSession, passDeliveryBenefit, pikiPassConfigured, pikiPassPayload } from "./pikiPassBilling.js";
 import { runZombieOrderMaintenance } from "./zombieOrders.js";
 import { reconcileDispatchState } from "./dispatchReconciliation.js";
+import { reclaimStaleDispatchEvents } from "./dispatchOutbox.js";
 import { releaseCodHoldAfterCashPayment } from "./codHoldSweep.js";
 import { adjustEtaLabel, currentWeather, distanceKm } from "./weather.js";
 
@@ -5462,7 +5463,7 @@ async function runAutomaticDispatchSweep() {
         console.error(JSON.stringify({ event: "dispatch_state_reconcile_error", error: error instanceof Error ? error.message : String(error) }));
       }
     }
-    const [reassigned, expiredOffers, archivedTerminalOrders, zombie] = await Promise.all([reassignLatePickupOrders(), expireStaleOffers(), archivePreviousDayPartnerOrders(), runZombieOrderMaintenance()]);
+    const [reclaimedDispatchEvents, reassigned, expiredOffers, archivedTerminalOrders, zombie] = await Promise.all([reclaimStaleDispatchEvents(), reassignLatePickupOrders(), expireStaleOffers(), archivePreviousDayPartnerOrders(), runZombieOrderMaintenance()]);
     // Page through all eligible orders rather than repeatedly looking at the
     // same first 25. Each version has a stable recovery key, so an exhausted
     // event cannot create an unbounded stream of replacement events.
@@ -5488,7 +5489,7 @@ async function runAutomaticDispatchSweep() {
     automaticDispatchSweepStats.reassigned += reassigned;
     automaticDispatchSweepStats.expiredOffers += expiredOffers;
     automaticDispatchSweepStats.queued += queued;
-    automaticDispatchSweepStats.requeuedDeadLetters += requeuedDeadLetters;
+    automaticDispatchSweepStats.requeuedDeadLetters += requeuedDeadLetters + reclaimedDispatchEvents;
     automaticDispatchSweepStats.archivedTerminalOrders += archivedTerminalOrders;
     automaticDispatchSweepStats.zombieCandidates = zombie.zombieCandidates;
     automaticDispatchSweepStats.closedZombieOrders += zombie.closedZombieOrders;

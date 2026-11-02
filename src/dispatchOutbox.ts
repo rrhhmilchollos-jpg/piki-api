@@ -271,3 +271,28 @@ export class InMemoryDispatchOutbox {
 
   size() { return this.events.size; }
 }
+
+/**
+ * Rescata eventos que quedaron "processing" con la reserva caducada (proceso
+ * muerto a mitad de la asignación). Sin esto el pedido se queda esperando para
+ * siempre: el barrido lo salta porque "ya hay un evento suyo" y el proceso que
+ * lo tomó no existe. Se devuelven a la cola y se les da otra pasada.
+ */
+export async function reclaimStaleDispatchEvents(now = new Date(), staleAfterMs = 120_000): Promise<number> {
+  const cutoff = new Date(now.getTime() - staleAfterMs);
+  const stale = await DispatchOutbox.find({
+    status: "processing",
+    $or: [{ leaseUntil: null }, { leaseUntil: { $lte: now } }, { leaseUntil: { $exists: false } }],
+    updatedAt: { $lte: cutoff },
+  })
+    .select("_id")
+    .limit(50)
+    .lean()
+    .exec() as Array<{ _id: unknown }>;
+  if (!stale.length) return 0;
+  const result = await DispatchOutbox.updateMany(
+    { _id: { $in: stale.map((event) => event._id) }, status: "processing" },
+    { $set: { status: "pending", availableAt: now, leaseOwner: null, leaseUntil: null } },
+  );
+  return Number(result.modifiedCount || 0);
+}
