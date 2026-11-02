@@ -176,6 +176,18 @@ export function mountStripeRoutes(app: Express): void {
         return;
       }
       const amountCents = authorizationAmountCents(order);
+      // ?dry=1 resuelve el pedido y devuelve el importe sin crear ninguna retención.
+      if (request.query.dry === "1") {
+        response.json({
+          ok: true,
+          orderId,
+          reference,
+          amountCents,
+          paymentStatus: order.paymentStatus,
+          paymentMethod: order.paymentMethod,
+        });
+        return;
+      }
       if (amountCents <= 0) {
         response.status(409).json({ error: "el pedido no tiene importe que retener" });
         return;
