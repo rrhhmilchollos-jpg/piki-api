@@ -389,7 +389,10 @@ app.post("/api/v1/internal/customer-sync", async (req, res) => {
 
 const objectId = (value: string) => mongoose.isValidObjectId(value) ? new mongoose.Types.ObjectId(value) : null;
 function hasExplicitPlatformSuperadminScope(req: express.Request): boolean {
-  return req.auth?.role === "admin" && req.auth?.isRootOwner === true && Boolean(req.auth.employeeId);
+  // El propietario con sesión de empleado y el token de administración de
+  // entorno (sin empleado asociado) son las dos únicas identidades con ámbito
+  // de plataforma. Cualquier otra cuenta sigue encerrada en su tenant.
+  return req.auth?.role === "admin" && req.auth?.isRootOwner === true;
 }
 function tenantScope(req: express.Request): Record<string, unknown> {
   // A missing tenant must never widen a tenant-owned query. The protected
