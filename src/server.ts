@@ -3397,6 +3397,108 @@ app.post("/api/v1/admin/maintenance/employees/:id/send-activation", requireRole(
   const delivery = await sendEmployeePasswordLink(employee, surface, "activation");
   return res.json({ email: employee.email, surface, sent: delivery.delivery.sent, error: delivery.delivery.error ?? null });
 });
+// Alta directa de un rider desde mantenimiento (sin expediente previo).
+app.post("/api/v1/admin/maintenance/riders", requireRole("admin"), async (req, res) => {
+  const parsed = z.object({
+    name: z.string().trim().min(2).max(160),
+    email: z.string().trim().email(),
+    phone: z.string().trim().min(6).max(40),
+    city: z.string().trim().min(2).max(80).default("Xàtiva"),
+    zoneSlug: z.string().trim().min(2).max(80).default("xativa-centro"),
+    vehicle: z.enum(["bike", "electric_bike", "electric_scooter", "motorcycle", "scooter", "car"]).default("electric_scooter"),
+    fleetId: z.string().regex(/^[a-f\d]{24}$/).nullable().optional(),
+    availability: z.string().trim().max(160).default("Completa"),
+  }).safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "INVALID_RIDER_INPUT", details: parsed.error.flatten() });
+  const data = parsed.data;
+  const email = data.email.toLowerCase();
+  const existing = await Rider.findOne({ email }).select("_id riderCode fleetId").lean().exec() as any;
+  const rider = await Rider.findOneAndUpdate(
+    { email },
+    {
+      $set: {
+        name: data.name,
+        phone: data.phone,
+        city: data.city,
+        zoneSlug: data.zoneSlug,
+        vehicle: data.vehicle,
+        availability: data.availability,
+        fleetId: data.fleetId ?? existing?.fleetId ?? null,
+        lifecycleStatus: "active",
+        status: "offline",
+      },
+      $setOnInsert: { riderCode: await nextRiderCode() },
+    },
+    { upsert: true, new: true, setDefaultsOnInsert: true },
+  ).lean().exec() as any;
+  const employee = await EmployeeAccount.findOneAndUpdate(
+    { email },
+    {
+      $set: {
+        name: data.name,
+        jobRole: "rider",
+        apiRole: "rider",
+        roles: ["rider"],
+        primaryRole: "rider",
+        accessLevel: "subadmin",
+        authorizationStatus: "approved",
+        authorizedAt: new Date(),
+        active: true,
+        mustChangePassword: true,
+        fleetId: rider?.fleetId ?? null,
+      },
+      $setOnInsert: {
+        employeeCode: `PIKI-E-${String(rider?._id).replace(/[^a-z0-9]/gi, "").slice(-8).toUpperCase()}`,
+        passwordHash: hashPassword(generateTemporaryPassword()),
+      },
+    },
+    { upsert: true, new: true, setDefaultsOnInsert: true },
+  ).lean().exec() as any;
+  return res.json({
+    riderId: String(rider._id),
+    riderCode: rider.riderCode,
+    employeeId: String(employee._id),
+    name: rider.name,
+    email: rider.email,
+    phone: rider.phone,
+    city: rider.city,
+    fleetId: rider.fleetId ? String(rider.fleetId) : null,
+    created: !existing,
+  });
+});
+
+// Asignación de flota desde mantenimiento.
+app.patch("/api/v1/admin/maintenance/riders/:id/fleet", requireRole("admin"), async (req, res) => {
+  const id = objectId(String(req.params.id));
+  if (!id) return res.status(400).json({ error: "INVALID_RIDER_ID" });
+  const parsed = z.object({ fleetId: z.string().regex(/^[a-f\d]{24}$/).nullable() }).safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "INVALID_FLEET_ID" });
+  const rider = await Rider.findByIdAndUpdate(id, { $set: { fleetId: parsed.data.fleetId } }, { new: true }).lean().exec() as any;
+  if (!rider) return res.status(404).json({ error: "RIDER_NOT_FOUND" });
+  await EmployeeAccount.updateOne({ email: rider.email }, { $set: { fleetId: parsed.data.fleetId ?? null } }).exec();
+  return res.json({ riderId: String(rider._id), riderCode: rider.riderCode, fleetId: rider.fleetId ? String(rider.fleetId) : null });
+});
+
+// Directorio de riders con flota y estado, sin filtro de tenant.
+app.get("/api/v1/admin/maintenance/riders", requireRole("admin"), async (_req, res) => {
+  const riders = await Rider.find({}).sort({ createdAt: -1 }).lean().exec() as any[];
+  const fleets = await Fleet.find({}).select("_id name").lean().exec() as any[];
+  const fleetNames = new Map(fleets.map((fleet) => [String(fleet._id), fleet.name]));
+  return res.json({
+    count: riders.length,
+    riders: riders.map((rider) => ({
+      id: String(rider._id),
+      riderCode: rider.riderCode,
+      name: rider.name,
+      email: rider.email,
+      city: rider.city,
+      status: rider.status,
+      lifecycleStatus: rider.lifecycleStatus,
+      fleetId: rider.fleetId ? String(rider.fleetId) : null,
+      fleetName: rider.fleetId ? fleetNames.get(String(rider.fleetId)) ?? null : null,
+    })),
+  });
+});
 // Listado de expedientes sin ámbito de tenant, para tareas de mantenimiento
 // hechas con el token de administración de entorno.
 app.get("/api/v1/admin/maintenance/rider-applications", requireRole("admin"), async (_req, res) => {
