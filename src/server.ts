@@ -3386,6 +3386,17 @@ app.patch("/api/v1/admin/riders/:id/lifecycle", requireRole("admin"), async (req
   return res.json({ rider });
 });
 
+// Envío del enlace de activación sin sesión de empleado (token de entorno).
+app.post("/api/v1/admin/maintenance/employees/:id/send-activation", requireRole("admin"), async (req, res) => {
+  const id = objectId(String(req.params.id));
+  if (!id) return res.status(400).json({ error: "INVALID_EMPLOYEE_ID" });
+  const employee = await EmployeeAccount.findById(id).lean().exec() as any;
+  if (!employee) return res.status(404).json({ error: "EMPLOYEE_NOT_FOUND" });
+  const surface = preferredCredentialSurface(employee);
+  if (!surface) return res.status(409).json({ error: "NO_CREDENTIAL_SURFACE" });
+  const delivery = await sendEmployeePasswordLink(employee, surface, "activation");
+  return res.json({ email: employee.email, surface, sent: delivery.delivery.sent, error: delivery.delivery.error ?? null });
+});
 // Listado de expedientes sin ámbito de tenant, para tareas de mantenimiento
 // hechas con el token de administración de entorno.
 app.get("/api/v1/admin/maintenance/rider-applications", requireRole("admin"), async (_req, res) => {
