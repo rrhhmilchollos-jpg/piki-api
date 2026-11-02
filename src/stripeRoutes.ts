@@ -80,12 +80,26 @@ async function findOrderByReference(reference: string, extraCode?: string | null
     if (byId) return byId;
   }
   const list = [...candidates];
-  return Order.findOne({
+  const exact = await Order.findOne({
     $or: [
       { displayCode: { $in: list } },
       { shortOrderNumber: { $in: list } },
       { orderCode: { $in: list } },
       { code: { $in: list } },
+    ],
+  });
+  if (exact) return exact;
+
+  // Último recurso: comparación sin distinguir mayúsculas ni el prefijo PIKI-.
+  const bare = String(reference).trim().replace(/^PIKI-?/i, "");
+  if (!bare) return null;
+  const pattern = new RegExp(`^\\s*(PIKI-?)?${bare.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*$`, "i");
+  return Order.findOne({
+    $or: [
+      { displayCode: pattern },
+      { shortOrderNumber: pattern },
+      { orderCode: pattern },
+      { code: pattern },
     ],
   });
 }
