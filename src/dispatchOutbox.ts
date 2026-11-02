@@ -294,5 +294,23 @@ export async function reclaimStaleDispatchEvents(now = new Date(), staleAfterMs 
     { _id: { $in: stale.map((event) => event._id) }, status: "processing" },
     { $set: { status: "pending", availableAt: now, leaseOwner: null, leaseUntil: null } },
   );
+  // Un evento que acumuló cientos de intentos puede quedar con el reintento
+  // programado años vista: ni se procesa, ni muere, y bloquea su pedido. Se
+  // devuelve a la cola con el contador a cero.
+  const runaway = await DispatchOutbox.find({
+    status: { $in: ["pending", "retry"] },
+    availableAt: { $gt: new Date(now.getTime() + 3_600_000) },
+  })
+    .select("_id")
+    .limit(100)
+    .lean()
+    .exec() as Array<{ _id: unknown }>;
+  if (runaway.length) {
+    const reset = await DispatchOutbox.updateMany(
+      { _id: { $in: runaway.map((event) => event._id) } },
+      { $set: { availableAt: now, attempts: 0, status: "pending", leaseOwner: null, leaseUntil: null } },
+    );
+    return Number(result.modifiedCount || 0) + Number(reset.modifiedCount || 0);
+  }
   return Number(result.modifiedCount || 0);
 }
