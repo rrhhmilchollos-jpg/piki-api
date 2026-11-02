@@ -4408,7 +4408,10 @@ app.post("/api/v1/orders/:id/transitions", requireRole("admin", "partner", "ride
   if (!parsed.success) return res.status(400).json({ error: "INVALID_TRANSITION", details: parsed.error.flatten() });
   const orderId = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
   const id = objectId(orderId); if (!id) return res.status(400).json({ error: "INVALID_ORDER_ID" });
-  const order = await Order.findById(id); if (!order) return res.status(404).json({ error: "ORDER_NOT_FOUND" });
+  // Un admin o finance solo puede tocar pedidos de su tenant; el superadmin de
+  // plataforma sigue siendo la única excepción explícita.
+  const orderTenantScope = req.auth?.role === "admin" || req.auth?.role === "finance" ? tenantScope(req) : {};
+  const order = await Order.findOne({ _id: id, ...orderTenantScope }); if (!order) return res.status(404).json({ error: "ORDER_NOT_FOUND" });
   const employee = await employeeScope(req);
   if (req.auth?.role === "partner" && (!employee?.restaurantId || String(order.restaurantId) !== String(employee.restaurantId))) return res.status(403).json({ error: "PARTNER_ORDER_ACCESS_DENIED" });
   if (req.auth?.role === "fleet" && (!employee?.fleetId || !(await Rider.exists({ _id: order.riderId, fleetId: employee.fleetId }))) ) return res.status(403).json({ error: "FLEET_ORDER_ACCESS_DENIED" });
@@ -4439,7 +4442,7 @@ app.post("/api/v1/orders/:id/transitions", requireRole("admin", "partner", "ride
   const update: Record<string, unknown> = { $set: { status: parsed.data.status, ...(actorRole === "partner" && parsed.data.status === "accepted" ? { partnerPrepDeadlineAt: new Date(Date.now() + PARTNER_PREPARATION_LIMIT_MINUTES * 60_000) } : {}), ...(actorRole === "partner" && parsed.data.status === "ready_for_pickup" ? { partnerPrepDeadlineAt: null, pickupDeadlineAt: new Date(Date.now() + PICKUP_REASSIGN_AFTER_MS) } : {}), ...(actorRole === "partner" && parsed.data.status === "cancelled" ? { partnerPrepDeadlineAt: null, pickupDeadlineAt: null } : {}), ...(actorRole === "rider" && parsed.data.status === "picked_up" && order.assignmentState === "offered" ? { assignmentState: "assigned", assignmentExpiresAt: null, pickupDeadlineAt: null } : {}) }, $inc: { version: 1 }, $push: { statusHistory: { status: parsed.data.status, actorRole, reason: parsed.data.reason || "" } } };
   if (parsed.data.status === "delivered") update.$set = { status: "delivered", deliveredAt: new Date(), archivedAt: new Date() };
   if (parsed.data.status === "cancelled") update.$set = { status: "cancelled", cancelledAt: new Date(), archivedAt: new Date() };
-  const updated = await Order.findOneAndUpdate({ _id: id, version: order.version, status: order.status }, update, { new: true }).lean().exec();
+  const updated = await Order.findOneAndUpdate({ _id: id, ...orderTenantScope, version: order.version, status: order.status }, update, { new: true }).lean().exec();
   if (!updated) return res.status(409).json({ error: "ORDER_CHANGED_RETRY" });
   if (actorRole === "rider" && parsed.data.status === "picked_up" && order.assignmentState === "offered" && order.riderId) {
     await RiderAssignmentReservation.updateOne({ orderId: order._id, riderId: order.riderId, status: "reserved" }, { $set: { expiresAt: null } }).exec();
@@ -4699,6 +4702,7 @@ app.post("/api/v1/ops/cash-handovers", requireRole("admin", "fleet", "finance"),
   const handoverRiderId = objectId(parsed.data.riderId);
   if (!handoverRiderId) return res.status(400).json({ error: "INVALID_RIDER_ID" });
   if (req.auth?.role === "fleet" && !(await fleetCanAccessRider(req, handoverRiderId))) return res.status(403).json({ error: "FLEET_RIDER_ACCESS_DENIED" });
+  if ((req.auth?.role === "admin" || req.auth?.role === "finance") && !(await Rider.exists({ _id: handoverRiderId, ...tenantScope(req) }))) return res.status(403).json({ error: "RIDER_TENANT_ACCESS_DENIED" });
   try {
     const result = await recordCashHandover(parsed.data, req.auth?.role === "finance" ? "finance" : req.auth?.role === "fleet" ? "fleet" : "admin");
     await publishCashWalletEvent({ riderId: objectId(parsed.data.riderId)!, amountCents: parsed.data.amountCents, type: "cash.handover_recorded", reference: parsed.data.reference });
@@ -4894,6 +4898,7 @@ app.patch("/api/v1/riders/:id/status", requireRole("admin", "rider", "fleet"), a
   if (!parsed.success) return res.status(400).json({ error: "INVALID_RIDER_STATUS" });
   if (req.auth?.role === "rider" && !(await riderAccessForRequest(id, req))) return res.status(403).json({ error: "RIDER_ACCESS_DENIED" });
   if (req.auth?.role === "fleet" && !(await fleetCanAccessRider(req, id))) return res.status(403).json({ error: "FLEET_RIDER_ACCESS_DENIED" });
+  if ((req.auth?.role === "admin" || req.auth?.role === "finance") && !(await Rider.exists({ _id: id, ...tenantScope(req) }))) return res.status(403).json({ error: "RIDER_TENANT_ACCESS_DENIED" });
   if (parsed.data.status === "available") {
     const { now, slot } = await findCurrentRiderSlot(id);
     const rider = await Rider.findById(id).select("lastLocationAt").lean().exec() as any;
@@ -5137,6 +5142,8 @@ const automaticDispatchSweepStats = {
   lastError: null as string | null,
 };
 const PICKUP_REASSIGN_AFTER_MS = 10 * 60_000;
+// Una oferta sin respuesta no puede bloquear el pedido ni la capacidad del Rider.
+const RIDER_OFFER_TTL_MS = Math.max(60_000, Number(process.env.PIKI_RIDER_OFFER_TTL_SECONDS || 180) * 1000);
 const PICKUP_ARRIVAL_RADIUS_METERS = Math.max(30, Number(process.env.PIKI_PICKUP_ARRIVAL_RADIUS_METERS || 80));
 const PICKUP_CONFIRMATION_RADIUS_METERS = Math.max(100, Number(process.env.PIKI_PICKUP_CONFIRMATION_RADIUS_METERS || 150));
 const DELIVERY_CONFIRMATION_RADIUS_METERS = Math.max(30, Number(process.env.PIKI_DELIVERY_CONFIRMATION_RADIUS_METERS || 80));
@@ -5235,8 +5242,8 @@ async function assignOrderAutomatically(orderId: mongoose.Types.ObjectId, prefer
       const rider = assignmentReservation.rider;
       const eligibility = evaluateDispatchVehicleEligibility(rider.vehicle, dispatchVehicleInputForOrder(order));
       if (!eligibility.eligible) { await releaseRiderOrderSlot(order._id, rider._id); continue; }
-      // El identificador permite auditar la oferta; no se fija una caducidad temporal.
-      const expiresAt = null;
+      // La oferta caduca: si el Rider no responde, el pedido vuelve a la cola.
+      const expiresAt = new Date(Date.now() + RIDER_OFFER_TTL_MS);
       const assigned = await Order.findOneAndUpdate({ _id: order._id, ...tenantFilter, riderId: null, assignmentState: { $in: ["unassigned", "expired", "rejected"] } }, { $set: { riderId: rider._id, assignmentState: "offered", offerId: randomUUID(), assignmentExpiresAt: expiresAt, pickupDeadlineAt: null, dispatchScore: decision.score }, $inc: { dispatchAttempts: 1, version: 1 } }, { new: true }).lean().exec() as any;
       if (!assigned) { await releaseRiderOrderSlot(order._id, rider._id); continue; }
       await DispatchDecision.create({ ...tenantFilter, orderId: assigned._id, ...decision, riderId: rider._id, outcome: "offered", actorRole: "system" });
@@ -5371,11 +5378,33 @@ app.delete("/api/v1/admin/qa/dispatch-orders/:id", requireRole("admin"), async (
 });
 
 async function expireStaleOffers() {
-  // Las ofertas no caducan por tiempo. El rider asignado puede aceptarlas
-  // siempre; solo una aceptación atómica, una reasignación de Soporte o el
-  // cierre del pedido libera la reserva. Se conserva la función para que los
-  // contadores históricos del sweep sigan siendo compatibles.
-  return 0;
+  if (!databaseReady || mongoose.connection.readyState !== 1) return 0;
+  const now = new Date();
+  const stale = await Order.find({
+    assignmentState: "offered",
+    riderId: { $ne: null },
+    assignmentExpiresAt: { $ne: null, $lte: now },
+    status: { $nin: ["delivered", "cancelled"] },
+  }).select("_id riderId tenantId version status assignmentState").limit(100).lean().exec() as any[];
+  let expired = 0;
+  for (const order of stale) {
+    const released = await Order.findOneAndUpdate(
+      { _id: order._id, assignmentState: "offered", riderId: order.riderId, version: order.version },
+      {
+        $set: { riderId: null, assignmentState: "expired", assignmentExpiresAt: null, offerId: null, pickupDeadlineAt: null },
+        $inc: { dispatchAttempts: 1, version: 1 },
+        $push: { statusHistory: { status: order.status, actorRole: "system", reason: `Oferta caducada: el Rider no respondió en ${Math.round(RIDER_OFFER_TTL_MS / 60_000)} minutos. El pedido vuelve a la cola.` } },
+      },
+      { new: false },
+    ).lean().exec() as any;
+    if (!released?.riderId) continue;
+    await releaseRiderOrderSlot(released._id, released.riderId);
+    await DispatchDecision.updateMany({ orderId: released._id, riderId: released.riderId, outcome: "offered" }, { $set: { outcome: "expired", actorRole: "system" } }).exec();
+    await publishOrderStatusEvents(released, released.status).catch((error) => console.warn("Offer expiry event failed", error instanceof Error ? error.message : error));
+    await enqueueDispatchOutbox({ orderId: released._id, tenantId: released.tenantId || null, idempotencyKey: dispatchRequeueIdempotencyKey(released._id, Number(released.version || 0) + 1), reason: "offer_expired" });
+    expired += 1;
+  }
+  return expired;
 }
 
 let dispatchRecoveryCursor: mongoose.Types.ObjectId | null = null;
