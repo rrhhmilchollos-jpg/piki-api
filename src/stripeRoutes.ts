@@ -53,25 +53,39 @@ const authorizeSchema = z.object({
   paymentMethodId: z.string().min(3).optional(),
   customerId: z.string().min(3).optional(),
   email: z.string().email().optional(),
+  orderCode: z.string().min(3).max(40).optional(),
+  shortOrderNumber: z.string().min(1).max(40).optional(),
 });
 
 /**
  * El seguimiento del cliente identifica el pedido por su código visible
  * (PIKI-XXXX), no por el ObjectId. Aceptamos las dos formas.
  */
-async function findOrderByReference(reference: string) {
+async function findOrderByReference(reference: string, extraCode?: string | null) {
+  const candidates = new Set<string>();
+  const push = (value?: string | null) => {
+    if (!value) return;
+    const raw = String(value).trim();
+    if (!raw) return;
+    candidates.add(raw);
+    candidates.add(raw.toUpperCase());
+    candidates.add(raw.replace(/^PIKI-?/i, "").toUpperCase());
+    candidates.add(`PIKI-${raw.replace(/^PIKI-?/i, "").toUpperCase()}`);
+  };
+  push(reference);
+  push(extraCode);
+
   if (mongoose.isValidObjectId(reference)) {
     const byId = await Order.findById(reference);
     if (byId) return byId;
   }
-  const code = reference.trim().toUpperCase();
+  const list = [...candidates];
   return Order.findOne({
     $or: [
-      { displayCode: code },
-      { shortOrderNumber: code },
-      { orderCode: code },
-      { code: code },
-      { displayCode: reference.trim() },
+      { displayCode: { $in: list } },
+      { shortOrderNumber: { $in: list } },
+      { orderCode: { $in: list } },
+      { code: { $in: list } },
     ],
   });
 }
@@ -133,9 +147,10 @@ export function mountStripeRoutes(app: Express): void {
         response.status(400).json({ error: "datos inválidos", detail: parsed.error.issues });
         return;
       }
-      const order = await findOrderByReference(reference);
+      const bodyCode = (request.body ?? {}) as { orderCode?: string; shortOrderNumber?: string };
+      const order = await findOrderByReference(reference, bodyCode.orderCode ?? bodyCode.shortOrderNumber ?? null);
       if (!order) {
-        response.status(404).json({ error: "pedido no encontrado" });
+        response.status(404).json({ error: "pedido no encontrado", referencia: reference });
         return;
       }
       const orderId = String(order._id);
