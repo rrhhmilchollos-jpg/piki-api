@@ -23,6 +23,7 @@ import {
   captureCodOrder,
   handleStripeEvent,
   releaseCodOrder,
+  retrieveAuthorization,
   stripeConfigured,
   sweepExpiringCodAuthorizations,
   verifyStripeWebhook,
@@ -450,6 +451,84 @@ export function mountStripeRoutes(app: Express): void {
     requireRole("admin", "finance", "fleet"),
     async (_request: Request, response: Response) => {
       response.json(await codHoldLiability());
+    },
+  );
+
+  // Auditoría de un pedido concreto: qué se retuvo, qué se cobró y en qué
+  // estado está el pago en el banco. Solo lectura y solo con el token de
+  // plataforma, para poder responder «¿esto es una retención o un cargo?».
+  app.get(
+    "/api/v1/admin/payment-audit/:reference",
+    requireRole("admin"),
+    async (request: Request, response: Response) => {
+      const reference = String(request.params.reference || "").trim();
+      if (!reference) return response.status(400).json({ error: "REFERENCE_REQUIRED" });
+      const order = await findOrderByReference(reference);
+      const hold = await CodHold.findOne({
+        $or: [
+          ...(order?.orderId ? [{ orderId: new mongoose.Types.ObjectId(String(order.orderId)) }] : []),
+          { reference: normalizeReference(reference) },
+        ],
+      })
+        .sort({ createdAt: -1 })
+        .lean()
+        .exec() as Record<string, any> | null;
+      const paymentIntentId = String(hold?.paymentIntentId || (order as any)?.stripePaymentIntentId || "");
+      let bank: Record<string, unknown> | null = null;
+      if (paymentIntentId && stripeConfigured()) {
+        try {
+          const snapshot = await retrieveAuthorization(paymentIntentId);
+          bank = {
+            paymentIntentId,
+            status: snapshot.status,
+            amountCents: snapshot.amountCents,
+            capturedCents: snapshot.capturedCents,
+          };
+        } catch (error) {
+          bank = { paymentIntentId, error: error instanceof Error ? error.message : String(error) };
+        }
+      }
+      response.json({
+        reference,
+        order: order
+          ? {
+              orderId: order.orderId,
+              publicCode: order.publicCode || order.reference,
+              status: order.status,
+              paymentMethod: (order as any).paymentMethod ?? null,
+              paymentState: order.paymentState,
+              totalCents: (order as any).totalCents ?? null,
+              paymentCapturedCents: (order as any).paymentCapturedCents ?? null,
+              paymentCapturedAt: (order as any).paymentCapturedAt ?? null,
+              cashCollectedAt: order.cashCollectedAt,
+              deliveredAt: order.deliveredAt,
+              createdAt: order.createdAt,
+              riderId: (order as any).riderId ? String((order as any).riderId) : null,
+            }
+          : null,
+        codHold: hold
+          ? {
+              reference: hold.reference,
+              status: hold.status,
+              amountCents: hold.amountCents,
+              paymentIntentId: hold.paymentIntentId,
+              createdAt: hold.createdAt,
+              expiresAt: hold.expiresAt,
+              resolvedAt: hold.resolvedAt ?? null,
+              resolutionReason: hold.resolutionReason ?? null,
+            }
+          : null,
+        bank,
+        verdict: !hold
+          ? order
+            ? "pedido_sin_garantia"
+            : "sin_pedido_ni_garantia"
+          : hold.status === "captured"
+            ? "garantia_cobrada"
+            : hold.status === "authorized"
+              ? "retencion_viva"
+              : `garantia_${hold.status}`,
+      });
     },
   );
 }
