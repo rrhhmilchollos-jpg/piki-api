@@ -399,6 +399,44 @@ async function handleCustomerTrpcSingle(req: Request, res: Response) {
       const message = await RiderOrderMessage.create({ orderId: order._id, riderId: order.riderId, senderRole: "customer", body });
       return reply(res, { id: String(message._id), senderRole: message.senderRole, body: message.body, createdAt: message.createdAt });
     }
+    if (procedure === "order.quote") {
+      // Cotización única: la misma que después se cobra en el checkout.
+      // El cliente nunca debe ver un total distinto del que se le pasa al pago.
+      const restaurant = await Restaurant.findOne({ _id: input?.restaurantId, ...CUSTOMER_ORDERABLE_RESTAURANT_FILTER }).lean().exec() as any;
+      if (!restaurant) return fail(res, "Restaurante no encontrado", "NOT_FOUND");
+      const requested = Array.isArray(input?.items) ? input.items : [];
+      const useReferenceFallback = usesReferenceAddOns(restaurant);
+      let subtotalCents = 0;
+      for (const line of requested) {
+        const item = (restaurant.menu || []).find((candidate: any) => candidate.id === line?.id);
+        if (!item) return fail(res, "Un producto de tu cesta ya no está en la carta", "PRODUCT_UNAVAILABLE");
+        const quantity = Number(line.quantity);
+        if (!Number.isInteger(quantity) || quantity < 1) return fail(res, "Cantidad no válida", "BAD_REQUEST");
+        try {
+          subtotalCents += quoteMenuItem(item, line.selections, useReferenceFallback).unitPriceCents * quantity;
+        } catch {
+          return fail(res, "Revisa las opciones del producto", "PRODUCT_UNAVAILABLE");
+        }
+      }
+      const latitude = Number(input?.deliveryLocation?.latitude);
+      const longitude = Number(input?.deliveryLocation?.longitude);
+      if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) {
+        return reply(res, { subtotalCents, deliveryFeeCents: null, serviceFeeCents: null, totalCents: null, needsAddress: true });
+      }
+      const coverage = evaluateXativaCoverage([longitude, latitude]);
+      if (!coverage.covered || coverage.deliveryFeeCents === null || coverage.serviceFeeCents === null) {
+        return fail(res, "Todavía no repartimos en esa dirección.", "DELIVERY_OUTSIDE_COVERAGE");
+      }
+      const deliveryFeeCents = coverage.deliveryFeeCents;
+      const serviceFeeCents = coverage.serviceFeeCents;
+      return reply(res, {
+        subtotalCents,
+        deliveryFeeCents,
+        serviceFeeCents,
+        totalCents: subtotalCents + deliveryFeeCents + serviceFeeCents,
+        needsAddress: false,
+      });
+    }
     if (procedure === "order.create" || procedure === "order.checkout") {
       const user = await currentCustomer(req) as any;
       if (!user) return fail(res, "Debes iniciar sesión para realizar pedidos", "AUTH_REQUIRED");
