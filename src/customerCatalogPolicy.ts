@@ -116,6 +116,9 @@ export function menuItemIsAvailable(item: { available?: boolean } | null | undef
 }
 export function customerMenuForRestaurant<T extends { slug?: string; menu?: any[] }>(restaurant: T): any[] {
   const menu = Array.isArray(restaurant.menu) ? restaurant.menu.filter(menuItemIsAvailable) : [];
+  // Si la carta ya guarda el precio final con comision incluida, no se vuelve a
+  // aplicar el margen: una sola cifra para la ficha, la cesta y el ticket.
+  if ((restaurant as T & { priceIncludesCommission?: boolean }).priceIncludesCommission === true) return menu;
   const rate = customerCommissionRate(restaurant as T & { partnerProfile?: { commissionRateBps?: number } });
   return rate > 0 ? menu.map((item) => applyPartnerMenuPricing(item, rate, restaurant.slug || "")) : menu;
 }
