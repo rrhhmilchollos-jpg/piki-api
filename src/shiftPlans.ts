@@ -618,9 +618,26 @@ export async function runShiftSweep(options: {
     assignedMinutes: Math.max(0, Math.round((now.getTime() - new Date(order.assignedAt || order.createdAt || now).getTime()) / 60000)),
   }));
 
+  // Solo entra en el barrido quien está trabajando de verdad: en línea, con un
+  // turno abierto o con un pedido encima. Un rider ya offline no necesita que
+  // se le corte nada cada cinco minutos.
+  const activeRiderIds = new Set<string>();
+  const planRiderIds = riders.map((rider) => rider.riderId).filter((riderId) => mongoose.isValidObjectId(riderId));
+  if (planRiderIds.length) {
+    const planObjectIds = planRiderIds.map((riderId) => new mongoose.Types.ObjectId(riderId));
+    const [riderDocs, openSlots] = await Promise.all([
+      Rider.find({ _id: { $in: planObjectIds } }).select("_id status activeOrderId").lean().exec() as Promise<any[]>,
+      RiderSlot.find({ riderId: { $in: planObjectIds }, status: "active" }).select("riderId").lean().exec() as Promise<any[]>,
+    ]);
+    for (const doc of riderDocs) {
+      if (String(doc.status || "") !== "offline" || doc.activeOrderId) activeRiderIds.add(String(doc._id));
+    }
+    for (const slot of openSlots) activeRiderIds.add(String(slot.riderId));
+  }
+
   const result = planSweep({
     now,
-    riders: riders.map((rider) => ({
+    riders: riders.filter((rider) => activeRiderIds.has(rider.riderId)).map((rider) => ({
       riderId: rider.riderId,
       plan: rider.plan,
       workedMinutesThisWeek: workedByRider.get(rider.riderId) ?? 0,
