@@ -549,6 +549,25 @@ async function createRandomOrderCode() {
   }
   throw new Error("ORDER_CODE_CAPACITY_REACHED");
 }
+/**
+ * Número de pedido y código de entrega en una sola pasada.
+ *
+ * El número es siempre numérico y el código que ven rider y comercio son sus
+ * TRES ÚLTIMAS CIFRAS, como en Glovo: el cliente lee «4983» en su pedido y el
+ * rider ve «983» en la puerta. Para que ese código identifique un solo pedido
+ * del día, se descarta el número si sus tres últimas cifras ya están en uso hoy.
+ */
+async function createOrderCodes() {
+  const today = madridNow().date;
+  for (let attempt = 0; attempt < 300; attempt += 1) {
+    const publicCode = String(randomInt(10_000_000, 100_000_000));
+    const displayCode = publicCode.slice(-3);
+    if (await Order.exists({ publicCode })) continue;
+    if (await Order.exists({ displayCodeDate: today, displayCode })) continue;
+    return { publicCode, displayCode, displayCodeDate: today };
+  }
+  throw new Error("ORDER_CODE_CAPACITY_REACHED");
+}
 
 async function dispatchLoadPolicy() {
   const [queuedOrders, activeRiders] = await Promise.all([
@@ -2101,6 +2120,9 @@ app.get("/api/v1/partners/kitchen/orders", requireRole("partner"), async (req, r
     const customerName = String(linkedCustomer?.name || order.customerName || "").trim();
     return {
       ...order,
+      // Código de entrega: las tres últimas cifras del número de pedido, el que
+      // el rider canta en el mostrador y el cliente ve en su pantalla.
+      deliveryCode: order.displayCode || String(order.publicCode || "").slice(-3) || null,
       restaurant: restaurant ? { name: restaurant.name, address: restaurant.address || "", phone: restaurant.phone || "", cuisine: restaurant.cuisine || "" } : null,
       customer: customerName ? { name: customerName, email: linkedCustomer?.email || "" } : null,
       partnerPrepDeadlineAt: order.partnerPrepDeadlineAt || null,
@@ -3574,8 +3596,8 @@ app.post("/api/v1/orders", rateLimit(20, 60_000, "orders-create"), async (req, r
   });
   if (marketplace.customerTotalCents !== totalCents) return res.status(500).json({ error: "MARKETPLACE_TOTAL_MISMATCH" });
   if (!isCashOrderWithinLimit(parsed.data.paymentMethod, totalCents)) return res.status(422).json(cashOrderLimitError(totalCents));
-  const publicCode = await createRandomOrderCode();
-  const dailyCode = await createDailyDisplayCode();
+  const { publicCode, displayCode, displayCodeDate } = await createOrderCodes();
+  const dailyCode = { displayCode, displayCodeDate };
   const order = await Order.create({ tenantId: restaurant.tenantId || null, publicCode, ...dailyCode, restaurantId: restaurant._id, customerId: authenticatedCustomer?._id || null, customerName: String(authenticatedCustomer?.name || "").trim(), items: normalizedItems, deliveryAddress: parsed.data.deliveryAddress, deliveryNote: parsed.data.deliveryNote, deliveryLocation: { type: "Point", coordinates: deliveryPoint }, pickupLocation: restaurant.location || undefined, coveragePolicySlug: coverage.policySlug, coveragePolicyVersion: coverage.policyVersion, coverageDecision: coverage.reason, straightLineDistanceKm: coverage.straightLineDistanceKm, withinMunicipality: withinSameOperationalCity(restaurant.location?.coordinates, deliveryPoint), deliveryBaseFeeCents: coverage.deliveryBaseFeeCents, outsideMunicipalitySurchargeCents: coverage.outsideMunicipalitySurchargeCents, routeDistanceKm: route.routeDistanceKm, routeDurationMinutes: route.routeDurationMinutes, routeProvider: route.routeProvider, routingDegraded: route.routingDegraded, requiredVehicleClasses: route.requiredVehicleClasses, subtotalCents, deliveryFeeCents, serviceFeeCents, totalCents,
     marketplaceCommissionRateBps: marketplace.commissionRateBps,
     marketplaceCommissionCents: marketplace.platformCommissionCents,
@@ -5342,8 +5364,8 @@ app.post("/api/v1/admin/qa/dispatch-orders", requireRole("admin"), async (req, r
   });
   await RiderSlot.create({ tenantId: restaurant.tenantId || null, riderId: qaRider._id, zoneSlug: "qa-dispatch", date: now.date, startTime: now.time, endTime: "23:59", status: "active", notes: "PIKI QA dispatch automatico" });
 
-  const publicCode = await createRandomOrderCode();
-  const dailyCode = await createDailyDisplayCode();
+  const { publicCode, displayCode, displayCodeDate } = await createOrderCodes();
+  const dailyCode = { displayCode, displayCodeDate };
   const menuItem = Array.isArray(restaurant.menu) && restaurant.menu[0] ? restaurant.menu[0] : null;
   const itemName = String(menuItem?.name || "Pedido de simulación QA");
   const unitPriceCents = Math.max(0, Number(menuItem?.priceCents || 0));
@@ -5681,6 +5703,7 @@ app.get("/api/v1/riders/:id/offers", requireRole("rider"), async (req, res) => {
       _id: offer._id,
       publicCode: offer.publicCode,
       displayCode: offer.displayCode || null,
+      deliveryCode: offer.displayCode || String(offer.publicCode || "").slice(-3) || null,
       displayCodeDate: offer.displayCodeDate || null,
       status: offer.status,
       paymentState: offer.paymentState,
