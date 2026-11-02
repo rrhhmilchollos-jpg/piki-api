@@ -84,6 +84,7 @@ export function authorizationAmountCents(order: {
 
 export interface AuthorizeCodInput {
   orderId: string;
+  reference?: string | null;
   amountCents: number;
   customerId?: string | null;
   paymentMethodId?: string | null;
@@ -117,7 +118,11 @@ export async function authorizeCodOrder(
     confirm: Boolean(input.paymentMethodId),
     description: input.description ?? `PIKI pedido ${input.orderId}`,
     receipt_email: input.email ?? undefined,
-    metadata: { orderId: input.orderId, flow: "cod_guarantee" },
+    metadata: {
+      orderId: input.orderId,
+      flow: "cod_guarantee",
+      ...(input.reference ? { reference: input.reference } : {}),
+    },
     // Guardamos la tarjeta para poder cobrar si el cliente no paga al recibir.
     setup_future_usage: "off_session",
   });

@@ -205,11 +205,11 @@ export function mountStripeRoutes(app: Express): void {
         }
         return;
       }
-      const orderId = String(order._id);
       if (!order) {
         response.status(404).json({ error: "pedido no encontrado" });
         return;
       }
+      const orderId = String(order._id);
       if (order.paymentMethod !== "cash") {
         response.status(409).json({ error: "el pedido no es contra­rreembolso" });
         return;
@@ -247,6 +247,7 @@ export function mountStripeRoutes(app: Express): void {
       try {
         const result = await authorizeCodOrder({
           orderId,
+          reference: normalizeReference(String(order.publicCode || reference)),
           amountCents,
           paymentMethodId: parsed.data.paymentMethodId ?? null,
           customerId: parsed.data.customerId ?? null,
@@ -260,6 +261,44 @@ export function mountStripeRoutes(app: Express): void {
           paymentHoldCents: amountCents,
         });
         await order.save();
+        // La retención tiene que quedar en el libro de garantías: sin esto el
+        // barrido, Fleet y contabilidad no la ven y el dinero del cliente queda
+        // comprometido sin que nadie lo mire. Si falla, el importador de Stripe
+        // la recupera en la siguiente pasada.
+        try {
+          const holdReference = normalizeReference(String(order.publicCode || reference));
+          await CodHold.findOneAndUpdate(
+            { reference: holdReference },
+            {
+              $set: {
+                amountCents,
+                status: result.status === "requires_capture" ? "authorized" : "failed",
+                paymentIntentId: result.paymentIntentId,
+                clientSecret: result.clientSecret,
+                expiresAt: result.expiresAt,
+                capturedCents: null,
+                resolvedAt: null,
+                reason: null,
+                stripeStatus: result.status,
+                orderId: order._id,
+                sweepClaimedUntil: null,
+                lastSweepAt: null,
+                lastSweepReason: null,
+              },
+              $setOnInsert: { reference: holdReference },
+            },
+            { upsert: true, new: true, setDefaultsOnInsert: true },
+          );
+        } catch (error) {
+          console.error(
+            JSON.stringify({
+              event: "cod_hold_persist_failed",
+              order: String(order.publicCode || reference),
+              paymentIntentId: result.paymentIntentId,
+              error: error instanceof Error ? error.message : String(error),
+            }),
+          );
+        }
         response.status(201).json({
           paymentIntentId: result.paymentIntentId,
           clientSecret: result.clientSecret,
