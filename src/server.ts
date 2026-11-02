@@ -3383,6 +3383,41 @@ app.patch("/api/v1/admin/riders/:id/lifecycle", requireRole("admin"), async (req
   return res.json({ rider });
 });
 
+// Limpieza de riders de prueba creados por QA. Solo toca cuentas marcadas como
+// test o con el correo de QA, y nunca con pedidos vivos encima.
+app.post("/api/v1/admin/riders/purge-qa", requireRole("admin"), async (req, res) => {
+  const apply = req.query.apply === "1" || req.body?.apply === true;
+  const candidates = (await Rider.find({
+    $or: [{ isTestRider: true }, { email: { $regex: "qa-rider", $options: "i" } }],
+  })
+    .select("_id riderCode name email status isTestRider")
+    .lean()
+    .exec()) as any[];
+  const report: Array<Record<string, unknown>> = [];
+  for (const rider of candidates) {
+    const activeOrders = await Order.countDocuments({
+      riderId: rider._id,
+      status: { $in: [...activeOperationalOrderStatuses] },
+    }).exec();
+    report.push({ riderCode: rider.riderCode, name: rider.name, email: rider.email, activeOrders });
+    if (!apply || activeOrders > 0) continue;
+    const riderFilter = { riderId: rider._id };
+    await Promise.all([
+      LocationSample.deleteMany(riderFilter).catch(() => undefined),
+      TrackingSession.deleteMany(riderFilter).catch(() => undefined),
+      RiderSlot.deleteMany(riderFilter).catch(() => undefined),
+      RiderAssignmentReservation.deleteMany(riderFilter).catch(() => undefined),
+      DispatchDecision.deleteMany({ riderId: rider._id }).catch(() => undefined),
+      RiderOrderMessage.deleteMany(riderFilter).catch(() => undefined),
+      RiderIncident.deleteMany(riderFilter).catch(() => undefined),
+      Notification.deleteMany({ recipientId: rider._id }).catch(() => undefined),
+      PushSubscription.deleteMany({ ownerId: rider._id }).catch(() => undefined),
+      SupportTicket.deleteMany({ riderId: rider._id }).catch(() => undefined),
+    ]);
+    await Rider.deleteOne({ _id: rider._id, ...(rider.isTestRider ? {} : { email: rider.email }) }).exec();
+  }
+  return res.json({ apply, deleted: apply ? report.filter((r) => !r.activeOrders).length : 0, riders: report });
+});
 app.delete("/api/v1/admin/riders/:id/test-account", requireOwner(), async (req, res) => {
   const id = objectId(String(req.params.id));
   if (!id) return res.status(400).json({ error: "INVALID_RIDER_ID" });
