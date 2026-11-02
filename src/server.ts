@@ -22,6 +22,7 @@ import { normalizeLeadEmail, partnerLeadSubmissionSchema, riderLeadSubmissionSch
 import { assertTransition, calculateEtaRange, transitionSchema, validateCoordinates } from "./algorithms/index.js";
 import { configuredAuthRoles, requireOwner, requireRole, resolveRole } from "./auth.js";
 import { mountRiderTracking, ensureTrackingIndexes } from "./riderTrackingRoutes.js";
+import { mountShiftSweep } from "./shiftRoutes.js";
 import { EmployeeSession, issueEmployeeSession, revokeEmployeeSessions, sessionRole } from "./employeeSessions.js";
 import { isStripeSignatureError, processStripeWebhook, stripeConfigured, createSignaturitSignature, signaturitBaseUrl, signaturitConfigured, signaturitMode, signatureWebhookUrl, webhookDigest, handleCustomerTrpc, currentCustomer, issueCustomerSession, setCustomerOrderDispatcher } from "./integrations/index.js";
 import { getVersionPolicy, isPikiSurface, requiresUpdate, setVersionPolicy, syncVersionPolicy, versionPolicySchema, type PikiSurface } from "./appVersion.js";
@@ -82,6 +83,7 @@ import { adjustEtaLabel, currentWeather, distanceKm } from "./weather.js";
 
 export const app = express();
 mountRiderTracking(app);
+mountShiftSweep(app);
 app.set("trust proxy", 1);
 const port = Number(process.env.PORT || 3000);
 const PARTNER_PREPARATION_LIMIT_MINUTES = 45;
