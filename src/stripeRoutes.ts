@@ -55,6 +55,27 @@ const authorizeSchema = z.object({
   email: z.string().email().optional(),
 });
 
+/**
+ * El seguimiento del cliente identifica el pedido por su código visible
+ * (PIKI-XXXX), no por el ObjectId. Aceptamos las dos formas.
+ */
+async function findOrderByReference(reference: string) {
+  if (mongoose.isValidObjectId(reference)) {
+    const byId = await Order.findById(reference);
+    if (byId) return byId;
+  }
+  const code = reference.trim().toUpperCase();
+  return Order.findOne({
+    $or: [
+      { displayCode: code },
+      { shortOrderNumber: code },
+      { orderCode: code },
+      { code: code },
+      { displayCode: reference.trim() },
+    ],
+  });
+}
+
 function orderIdFrom(request: Request): string | null {
   const id = request.params.id;
   return typeof id === "string" && mongoose.isValidObjectId(id) ? id : null;
@@ -102,8 +123,8 @@ export function mountStripeRoutes(app: Express): void {
     "/api/v1/orders/:id/cod-authorization",
     codAuthorizationLimiter,
     async (request: Request, response: Response) => {
-      const orderId = orderIdFrom(request);
-      if (!orderId) {
+      const reference = String(request.params.id ?? "").trim();
+      if (!reference) {
         response.status(400).json({ error: "pedido inválido" });
         return;
       }
@@ -112,7 +133,12 @@ export function mountStripeRoutes(app: Express): void {
         response.status(400).json({ error: "datos inválidos", detail: parsed.error.issues });
         return;
       }
-      const order = await Order.findById(orderId);
+      const order = await findOrderByReference(reference);
+      if (!order) {
+        response.status(404).json({ error: "pedido no encontrado" });
+        return;
+      }
+      const orderId = String(order._id);
       if (!order) {
         response.status(404).json({ error: "pedido no encontrado" });
         return;
@@ -173,12 +199,12 @@ export function mountStripeRoutes(app: Express): void {
     "/api/v1/admin/orders/:id/cod-capture",
     requireRole("admin", "finance", "fleet"),
     async (request: Request, response: Response) => {
-      const orderId = orderIdFrom(request);
-      if (!orderId) {
+      const reference = String(request.params.id ?? "").trim();
+      if (!reference) {
         response.status(400).json({ error: "pedido inválido" });
         return;
       }
-      const order = await Order.findById(orderId);
+      const order = await findOrderByReference(reference);
       if (!order || !order.stripePaymentIntentId) {
         response.status(404).json({ error: "pedido sin retención" });
         return;
@@ -207,12 +233,12 @@ export function mountStripeRoutes(app: Express): void {
     "/api/v1/admin/orders/:id/cod-release",
     requireRole("admin", "finance", "fleet"),
     async (request: Request, response: Response) => {
-      const orderId = orderIdFrom(request);
-      if (!orderId) {
+      const reference = String(request.params.id ?? "").trim();
+      if (!reference) {
         response.status(400).json({ error: "pedido inválido" });
         return;
       }
-      const order = await Order.findById(orderId);
+      const order = await findOrderByReference(reference);
       if (!order || !order.stripePaymentIntentId) {
         response.status(404).json({ error: "pedido sin retención" });
         return;
