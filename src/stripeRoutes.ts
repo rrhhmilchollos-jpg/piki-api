@@ -24,6 +24,7 @@ import {
   handleStripeEvent,
   releaseCodOrder,
   retrieveAuthorization,
+  stripeClient,
   stripeConfigured,
   sweepExpiringCodAuthorizations,
   verifyStripeWebhook,
@@ -451,6 +452,39 @@ export function mountStripeRoutes(app: Express): void {
     requireRole("admin", "finance", "fleet"),
     async (_request: Request, response: Response) => {
       response.json(await codHoldLiability());
+    },
+  );
+
+  // Movimientos reales en Stripe: distingue una retención (requires_capture) de
+  // un cobro (succeeded) sin tener que abrir el panel.
+  app.get(
+    "/api/v1/admin/stripe-audit",
+    requireRole("admin"),
+    async (request: Request, response: Response) => {
+      if (!stripeConfigured()) return response.status(503).json({ error: "STRIPE_NOT_CONFIGURED" });
+      const limit = Math.max(1, Math.min(100, Number(request.query.limit ?? 20) || 20));
+      try {
+        const intents = await stripeClient().paymentIntents.list({ limit });
+        response.json({
+          mode: String(process.env.STRIPE_SECRET_KEY || "").startsWith("sk_live") ? "live" : "test",
+          paymentIntents: intents.data.map((intent: Record<string, any>) => ({
+            id: intent.id,
+            created: new Date(intent.created * 1000).toISOString(),
+            amountCents: intent.amount,
+            amountReceivedCents: intent.amount_received ?? 0,
+            status: intent.status,
+            captureMethod: (intent as unknown as { capture_method?: string }).capture_method ?? null,
+            flow: intent.metadata?.flow ?? null,
+            capturedBy: intent.metadata?.capturedBy ?? null,
+            orderId: intent.metadata?.orderId ?? null,
+            reference: intent.metadata?.reference ?? intent.metadata?.publicCode ?? null,
+            description: intent.description ?? null,
+            lastPaymentError: intent.last_payment_error?.message ?? null,
+          })),
+        });
+      } catch (error) {
+        response.status(502).json({ error: error instanceof Error ? error.message : String(error) });
+      }
     },
   );
 
