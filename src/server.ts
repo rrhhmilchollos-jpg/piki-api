@@ -3528,7 +3528,18 @@ app.post("/api/v1/admin/riders/purge-qa", requireRole("admin"), async (req, res)
     ]);
     await Rider.deleteOne({ _id: rider._id, ...(rider.isTestRider ? {} : { email: rider.email }) }).exec();
   }
-  return res.json({ apply, deleted: apply ? report.filter((r) => !r.activeOrders).length : 0, riders: report });
+  // El expediente de alta del rider de prueba tampoco debe quedarse en la
+  // bandeja de "Altas manuales".
+  const qaApplications = await RiderApplication.find({ email: { $regex: "qa-rider", $options: "i" } }).select("_id name email").lean().exec() as any[];
+  if (apply && qaApplications.length) {
+    await RiderApplication.deleteMany({ _id: { $in: qaApplications.map((application) => application._id) } }).exec();
+  }
+  return res.json({
+    apply,
+    deleted: apply ? report.filter((r) => !r.activeOrders).length : 0,
+    riders: report,
+    applications: qaApplications.map((application) => ({ id: String(application._id), name: application.name, email: application.email })),
+  });
 });
 app.delete("/api/v1/admin/riders/:id/test-account", requireOwner(), async (req, res) => {
   const id = objectId(String(req.params.id));
