@@ -44,7 +44,7 @@ import { evaluateXativaCoverage, withinSameOperationalCity, XATIVA_PHASE_2_LOCAL
 import { quoteDeliveryRoute } from "./coverage/routing.js";
 import { ROOT_TENANT_SLUG, runTenantMigration } from "./tenantMigration.js";
 import { onboardingScope } from "./onboardingScope.js";
-import { notifyOrderPlaced } from "./orderAlerts.js";
+import { ORDER_ALERT_RECIPIENT, notifyOrderPlaced } from "./orderAlerts.js";
 import { corporateEmailConfiguration, escapeCorporateHtml, sendCorporateEmail, sendLeadContactEmail, verifyCorporateEmailConnection } from "./corporateEmail.js";
 import { activeOperationalOrderStatuses, dispatchableOrderStatuses, dispatchablePaymentFilter, isDispatchableOrderStatus, isDispatchablePayment } from "./dispatchEligibility.js";
 import { canReceivePartnerLocations, partnerCan, partnerPermissions, partnerRolesForEmployee, permissionsForPartnerRoles, type PartnerPermission } from "./partnerAccess.js";
@@ -4940,6 +4940,24 @@ app.post("/api/v1/admin/orders/cleanup-test-data", requireOwner(), async (_req, 
 });
 // Borrado de pedidos concretos, para limpiar pruebas de producción.
 // Primero simula; solo borra de verdad con ?apply=1 o {"apply": true}.
+app.post("/api/v1/admin/maintenance/test-order-alert", requireRole("admin"), async (_req, res) => {
+  const sample = {
+    _id: new mongoose.Types.ObjectId(),
+    publicCode: "PIKI-PRUEBA",
+    customerName: "Cliente de prueba",
+    totalCents: 1878,
+    subtotalCents: 1500,
+    deliveryFeeCents: 199,
+    serviceFeeCents: 179,
+    paymentMethod: "cash",
+    deliveryAddress: { street: "Carrer de Sant Agustí 12", city: "Xàtiva" },
+    items: [{ name: "Pollo al ast con patatas", quantity: 1, lineTotalCents: 1500 }],
+    restaurantId: null,
+    isTestOrder: false,
+  };
+  const result = await notifyOrderPlaced(sample);
+  return res.json({ ...result, recipient: ORDER_ALERT_RECIPIENT });
+});
 app.post("/api/v1/admin/maintenance/reset-live-orders", requireRole("admin"), async (req, res) => {
   const activeStatuses = ["pending", "confirmed", "accepted", "preparing", "ready", "ready_for_pickup", "assigned", "picked_up", "arriving", "awaiting_payment"];
   const before = req.body?.before ? new Date(String(req.body.before)) : new Date();
