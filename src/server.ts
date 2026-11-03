@@ -3397,6 +3397,63 @@ app.post("/api/v1/admin/maintenance/employees/:id/send-activation", requireRole(
   const delivery = await sendEmployeePasswordLink(employee, surface, "activation");
   return res.json({ email: employee.email, surface, sent: delivery.delivery.sent, error: delivery.delivery.error ?? null });
 });
+// Nombramiento del responsable de una flota y su tenant, desde mantenimiento.
+app.patch("/api/v1/admin/maintenance/fleets/:id/manager", requireRole("admin"), async (req, res) => {
+  const id = objectId(String(req.params.id));
+  if (!id) return res.status(400).json({ error: "INVALID_FLEET_ID" });
+  const parsed = z.object({
+    name: z.string().trim().min(2).max(120),
+    email: z.string().trim().email(),
+    tenantId: z.string().regex(/^[a-f\d]{24}$/).nullable().optional(),
+    keepRiderRole: z.boolean().default(true),
+    contactPhone: z.string().trim().min(6).max(40).optional(),
+  }).safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "INVALID_MANAGER_INPUT", details: parsed.error.flatten() });
+  const fleet = await Fleet.findById(id).lean().exec() as any;
+  if (!fleet) return res.status(404).json({ error: "FLEET_NOT_FOUND" });
+  const email = parsed.data.email.toLowerCase();
+  const tenantId = parsed.data.tenantId ?? (fleet.tenantId ? String(fleet.tenantId) : null);
+  const roles = parsed.data.keepRiderRole ? ["fleet", "rider"] : ["fleet"];
+  const employee = await EmployeeAccount.findOneAndUpdate(
+    { email },
+    {
+      $set: {
+        name: parsed.data.name,
+        jobRole: "fleet",
+        apiRole: "fleet",
+        roles,
+        primaryRole: "fleet",
+        accessLevel: "subadmin",
+        authorizationStatus: "approved",
+        authorizedAt: new Date(),
+        active: true,
+        fleetId: fleet._id,
+        tenantId: tenantId ? objectId(tenantId) : null,
+        zoneSlugs: fleet.serviceZones ?? [],
+        mustChangePassword: false,
+      },
+    },
+    { upsert: true, new: true, setDefaultsOnInsert: true },
+  ).lean().exec() as any;
+  const fleetPatch: Record<string, unknown> = {
+    managerName: parsed.data.name,
+    managerEmail: email,
+    contactEmail: email,
+    managerEmployeeId: employee._id,
+  };
+  if (tenantId) fleetPatch.tenantId = objectId(tenantId);
+  if (parsed.data.contactPhone) fleetPatch.contactPhone = parsed.data.contactPhone;
+  await Fleet.updateOne({ _id: fleet._id }, { $set: fleetPatch }).exec();
+  return res.json({
+    fleetId: String(fleet._id),
+    fleetName: fleet.name,
+    managerEmployeeId: String(employee._id),
+    roles,
+    tenantId,
+    serviceZones: fleet.serviceZones ?? [],
+  });
+});
+
 // Alta directa de un rider desde mantenimiento (sin expediente previo).
 app.post("/api/v1/admin/maintenance/riders", requireRole("admin"), async (req, res) => {
   const parsed = z.object({
