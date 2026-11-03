@@ -107,8 +107,10 @@ function shift(date: Date, block: ShiftBlockId): PlannedShift {
  *  - 40 h: jornada completa de lunes a viernes, mediodía y noche.
  */
 export function planWeek(weeklyHours: number, weekStart: string): WeekPlan {
-  const start = new Date(`${weekStart}T00:00:00Z`);
-  if (Number.isNaN(start.getTime())) throw new Error("WEEK_START_INVALID");
+  const raw = new Date(`${weekStart}T00:00:00Z`);
+  if (Number.isNaN(raw.getTime())) throw new Error("WEEK_START_INVALID");
+  // La semana siempre empieza en lunes, venga la fecha que venga.
+  const start = new Date(`${weekStartOf(weekStart)}T00:00:00Z`);
   const needed = blocksForWeeklyHours(weeklyHours);
   const shifts: PlannedShift[] = [];
 
@@ -127,7 +129,11 @@ export function planWeek(weeklyHours: number, weekStart: string): WeekPlan {
     // Turnos partidos en los días de máxima demanda.
     for (const offset of [4, 5, 6]) push(offset, "midday");
     for (const offset of [4, 5, 6]) push(offset, "night");
-    if (shifts.length < needed) push(3, "night");
+    // 30 h no es múltiplo de 4: se completa con el bloque más cercano y se
+    // avisa de la diferencia real en `plannedHours`.
+    for (const [offset, block] of [[3, "night"], [3, "midday"], [2, "night"], [2, "midday"]] as Array<[number, ShiftBlockId]>) {
+      push(offset, block);
+    }
   } else {
     // Jornada completa de lunes a viernes.
     for (let index = 0; index < 5; index += 1) push(index, "midday");

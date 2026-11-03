@@ -3530,7 +3530,7 @@ app.post("/api/v1/admin/maintenance/stripe-payout-schedule", requireRole("admin"
       headers: {
         Authorization: `Bearer ${process.env.STRIPE_SECRET_KEY}`,
         "Content-Type": "application/x-www-form-urlencoded",
-        "Stripe-Version": "2025-03-31.basil",
+        "Stripe-Version": "2025-08-27.preview",
       },
       body: body.toString(),
     });
