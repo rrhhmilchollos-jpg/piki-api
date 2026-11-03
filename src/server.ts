@@ -873,7 +873,7 @@ type EmployeeCredentialSurface = (typeof employeeCredentialSurfaces)[number];
 const employeeCredentialAppUrls: Record<EmployeeCredentialSurface, string> = {
   admin: String(process.env.ADMIN_APP_URL || "https://admin.pikidelivery.com").replace(/\/$/, ""),
   partner: String(process.env.PARTNER_APP_URL || "https://partners.pikidelivery.com").replace(/\/$/, ""),
-  rider: String(process.env.RIDER_APP_URL || "https://riders.pikidelivery.com").replace(/\/$/, ""),
+  rider: String(process.env.RIDER_APP_URL || "https://rider.pikidelivery.com").replace(/\/$/, ""),
   fleet: String(process.env.FLEET_APP_URL || "https://fleet.pikidelivery.com").replace(/\/$/, ""),
 };
 const employeeCredentialLabels: Record<EmployeeCredentialSurface, string> = {
