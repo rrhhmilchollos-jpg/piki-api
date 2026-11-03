@@ -873,7 +873,7 @@ type EmployeeCredentialSurface = (typeof employeeCredentialSurfaces)[number];
 const employeeCredentialAppUrls: Record<EmployeeCredentialSurface, string> = {
   admin: String(process.env.ADMIN_APP_URL || "https://admin.pikidelivery.com").replace(/\/$/, ""),
   partner: String(process.env.PARTNER_APP_URL || "https://partners.pikidelivery.com").replace(/\/$/, ""),
-  rider: String(process.env.RIDER_APP_URL || "https://rider.pikidelivery.com").replace(/\/$/, ""),
+  rider: String(process.env.RIDER_APP_URL || "https://riders.pikidelivery.com").replace(/\/$/, ""),
   fleet: String(process.env.FLEET_APP_URL || "https://fleet.pikidelivery.com").replace(/\/$/, ""),
 };
 const employeeCredentialLabels: Record<EmployeeCredentialSurface, string> = {
@@ -2939,7 +2939,7 @@ app.post("/api/v1/admin/rider-applications/:id/prl-course", requireRole("admin",
   const token = trainingToken();
   const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
   const assignment = await RiderTrainingAssignment.findOneAndUpdate({ tenantId, riderId: rider._id, courseId: course._id }, { $set: { riderApplicationId: application._id, fleetId: rider.fleetId || application.assignedFleetId || null, employeeId: employee._id, status: "assigned", accessTokenHash: trainingTokenHash(token), tokenPrefix: token.slice(0, 10), expiresAt, consentAcceptedAt: null, submittedAt: null, reviewDecision: "pending", reviewNotes: "", reviewedBy: null, reviewedAt: null } }, { upsert: true, new: true, setDefaultsOnInsert: true }).lean().exec() as any;
-  const baseUrl = String(process.env.RIDER_APP_URL || "https://rider.pikidelivery.com").replace(/\/$/, "");
+  const baseUrl = String(process.env.RIDER_APP_URL || "https://riders.pikidelivery.com").replace(/\/$/, "");
   const courseUrl = `${baseUrl}/training/prl?token=${encodeURIComponent(token)}`;
   const email = await sendCorporateEmail({ recipientEmail: employee.email, subject: "PIKI · Curso PRL 1 obligatorio", idempotencyKey: `piki-prl-course-${assignment._id}-${assignment.tokenPrefix}`, text: `Hola ${employee.name || application.name},\n\nTienes asignado el curso PIKI 1 de Prevención de Riesgos Laborales para Riders.\n\nAccede aquí: ${courseUrl}\n\nEl enlace caduca en 7 días y la evaluación final será revisada por el equipo PIKI.`, html: `<p>Hola ${employee.name || application.name},</p><p>Tienes asignado el curso <strong>PIKI 1 · Prevención de Riesgos Laborales para Riders</strong>.</p><p><a href="${courseUrl}">Acceder al curso</a></p><p>El enlace caduca en 7 días y la evaluación final será revisada por el equipo PIKI.</p>` });
   return res.json({ assignment: { id: assignment._id, status: assignment.status, expiresAt: assignment.expiresAt }, course: { slug: PIKI_PRL_COURSE_SLUG, title: course.title, version: course.version, questions: publicTrainingQuestions, passPercent: course.passPercent }, delivery: { emailSent: email.sent, courseUrl: email.sent ? undefined : courseUrl, error: email.sent ? undefined : email.error } });
