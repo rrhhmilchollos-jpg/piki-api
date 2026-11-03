@@ -90,6 +90,12 @@ export interface AuthorizeCodInput {
   paymentMethodId?: string | null;
   email?: string | null;
   description?: string;
+  /**
+   * manual (por defecto) retiene el importe como garantía y se libera al
+   * entregar en efectivo; automatic cobra el total en el momento, que es lo que
+   * se usa cuando el cliente elige pagar con tarjeta.
+   */
+  captureMethod?: "manual" | "automatic";
 }
 
 export interface AuthorizeCodResult {
@@ -111,7 +117,7 @@ export async function authorizeCodOrder(
   const intent = await stripe.paymentIntents.create({
     amount: Math.round(input.amountCents),
     currency: "eur",
-    capture_method: "manual",
+    capture_method: input.captureMethod === "automatic" ? "automatic" : "manual",
     payment_method_types: ["card"],
     customer: input.customerId ?? undefined,
     payment_method: input.paymentMethodId ?? undefined,

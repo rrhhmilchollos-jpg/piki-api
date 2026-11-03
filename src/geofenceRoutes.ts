@@ -18,16 +18,23 @@ type ZoneDoc = { slug: string; name: string; polygon?: GeoGeometry | null };
 /** Zonas que cubren al rider: su slug asignado o, si no tiene, toda su ciudad. */
 export async function riderZones(rider: { zoneSlug?: string | null; city?: string | null }): Promise<ZoneDoc[]> {
   const zones = await Zone.find({ isActive: true }).select("slug name polygon").lean().exec() as unknown as ZoneDoc[];
+  const normalise = (value: string) => value.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
+  const citySlug = normalise(String(rider.city ?? "")).trim().replace(/\s+/g, "-");
+  const assigned = rider.zoneSlug ? normalise(rider.zoneSlug) : "";
+  // La geocerca es el municipio completo: si el rider está asignado a una zona
+  // de su ciudad, reparte en todas las zonas de esa ciudad (centro, barrios y
+  // pedanías), no solo en el polígono de su zona operativa.
+  const municipality = assigned && citySlug && assigned.startsWith(citySlug) ? citySlug : null;
+  const prefix = municipality ?? citySlug;
+  if (prefix) {
+    const byCity = zones.filter((zone) => normalise(zone.slug) === prefix || normalise(zone.slug).startsWith(`${prefix}-`));
+    if (byCity.length) return byCity;
+  }
   if (rider.zoneSlug) {
     const exact = zones.filter((zone) => zone.slug === rider.zoneSlug);
     if (exact.length) return exact;
   }
-  const city = String(rider.city ?? "").trim().toLowerCase();
-  if (!city) return [];
-  const normalise = (value: string) => value.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
-  const wanted = normalise(city).replace(/\s+/g, "-");
-  const matches = zones.filter((zone) => normalise(zone.slug) === wanted || normalise(zone.slug).startsWith(`${wanted}-`));
-  return matches;
+  return [];
 }
 
 export async function riderDeliveryGeometry(rider: { zoneSlug?: string | null; city?: string | null }): Promise<GeoGeometry | null> {

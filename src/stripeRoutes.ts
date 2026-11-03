@@ -57,6 +57,7 @@ function codAuthorizationLimiter(request: Request, response: Response, next: () 
 
 const authorizeSchema = z.object({
   paymentMethodId: z.string().min(3).optional(),
+  paymentMethod: z.enum(["cash", "card"]).optional(),
   customerId: z.string().min(3).optional(),
   email: z.string().email().optional(),
   orderCode: z.string().min(3).max(40).optional(),
@@ -245,6 +246,10 @@ export function mountStripeRoutes(app: Express): void {
         return;
       }
       try {
+        // El cliente elige un único método: tarjeta (se cobra el total ahora) o
+        // efectivo (la tarjeta solo garantiza y se libera al entregar).
+        const chosenMethod = parsed.data.paymentMethod === "card" ? "card" : "cash";
+        const captureNow = chosenMethod === "card";
         const result = await authorizeCodOrder({
           orderId,
           reference: normalizeReference(String(order.publicCode || reference)),
@@ -252,13 +257,17 @@ export function mountStripeRoutes(app: Express): void {
           paymentMethodId: parsed.data.paymentMethodId ?? null,
           customerId: parsed.data.customerId ?? null,
           email: parsed.data.email ?? null,
+          captureMethod: captureNow ? "automatic" : "manual",
         });
         order.set({
           stripePaymentIntentId: result.paymentIntentId,
-          paymentState: result.status === "requires_capture" ? "authorized" : "pending",
-          paymentAuthorizedAt: result.status === "requires_capture" ? new Date() : null,
-          paymentAuthorizationExpiresAt: authorizationExpiry(),
-          paymentHoldCents: amountCents,
+          paymentState: captureNow
+            ? (result.status === "succeeded" ? "paid" : "pending")
+            : (result.status === "requires_capture" ? "authorized" : "pending"),
+          paymentAuthorizedAt: captureNow ? new Date() : (result.status === "requires_capture" ? new Date() : null),
+          paymentAuthorizationExpiresAt: captureNow ? null : authorizationExpiry(),
+          paymentHoldCents: captureNow ? 0 : amountCents,
+          ...(captureNow ? { paymentMethod: "card", paymentSettledAt: new Date() } : { paymentMethod: order.paymentMethod }),
         });
         await order.save();
         // La retención tiene que quedar en el libro de garantías: sin esto el
