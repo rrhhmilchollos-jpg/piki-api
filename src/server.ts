@@ -6,6 +6,8 @@ import { VEHICLE_CATALOG_VERSION, VEHICLE_TYPES, incompatibleVehicles, uniqueVeh
 import { registerTerritoryRoutes } from "./coverage/territoryRoutes.js";
 import { operationalZoneInputSchema } from "./coverage/zoneInput.js";
 import { stripeClient } from "./stripePayments.js";
+import { planWeek, weekStartOf } from "./glovoShiftPlanner.js";
+import { calculatePayroll, payrollGap } from "./payroll.js";
 import { missingPartnerDocumentTypes, missingRiderDocumentTypes, type RiderVehicle } from "./manualOnboardingPolicy.js";
 import "dotenv/config";
 import "express-async-errors";
@@ -991,7 +993,9 @@ app.get("/api/v1/auth/employee/me", requireRole("admin", "partner", "rider", "fl
   const roles = partnerRolesForEmployee(employee);
   const permissions = [...permissionsForPartnerRoles(roles)];
   const locations = employee ? await partnerLocationsFor(employee, roles, permissions) : [];
-  return res.json({ employee: { id: req.auth?.employeeId, employeeCode: employee?.employeeCode || (req.auth?.employeeId ? employeeCodeFor(req.auth.employeeId) : null), name: employee?.name || null, email: employee?.email || null, role: req.auth?.role, accessLevel: employee?.accessLevel || "subadmin", authorizationStatus: employee?.authorizationStatus || "approved", ownerProtected: Boolean(employee?.ownerProtected), jobRole: employee?.jobRole || null, apiRole: employee?.apiRole || req.auth?.role || null, roles, permissions, primaryRole: employee?.primaryRole || employee?.apiRole || req.auth?.role, zoneSlugs: employee?.zoneSlugs || [], locations, mustChangePassword: Boolean(req.auth?.mustChangePassword) } });
+  const employeeFleet = employee?.fleetId ? await Fleet.findById(employee.fleetId).select("name managerName managerEmployeeId city").lean().exec() as any : null;
+  const fleetManager = employeeFleet?.managerEmployeeId ? await EmployeeAccount.findById(employeeFleet.managerEmployeeId).select("name email").lean().exec() as any : null;
+  return res.json({ employee: { id: req.auth?.employeeId, employeeCode: employee?.employeeCode || (req.auth?.employeeId ? employeeCodeFor(req.auth.employeeId) : null), name: employee?.name || null, email: employee?.email || null, role: req.auth?.role, accessLevel: employee?.accessLevel || "subadmin", authorizationStatus: employee?.authorizationStatus || "approved", ownerProtected: Boolean(employee?.ownerProtected), jobRole: employee?.jobRole || null, apiRole: employee?.apiRole || req.auth?.role || null, roles, permissions, primaryRole: employee?.primaryRole || employee?.apiRole || req.auth?.role, zoneSlugs: employee?.zoneSlugs || [], locations, fleetId: employee?.fleetId ? String(employee.fleetId) : null, fleetName: employeeFleet?.name || null, fleetCity: employeeFleet?.city || null, fleetManagerName: fleetManager?.name || employeeFleet?.managerName || null, isFleetManager: Boolean(employee?.fleetId && employeeFleet?.managerEmployeeId && String(employeeFleet.managerEmployeeId) === String(employee?._id)), mustChangePassword: Boolean(req.auth?.mustChangePassword) } });
 });
 app.post("/api/v1/auth/employee/change-password", requireRole("admin", "partner", "rider", "fleet", "commercial", "gerente_comercial_zona", "finance", "support"), async (req, res) => {
   const parsed = z.object({ currentPassword: z.string().min(8), newPassword: z.string().min(12).max(200).regex(/[A-Z]/).regex(/[a-z]/).regex(/[0-9]/) }).safeParse(req.body);
@@ -3398,6 +3402,86 @@ app.post("/api/v1/admin/maintenance/employees/:id/send-activation", requireRole(
   const delivery = await sendEmployeePasswordLink(employee, surface, "activation");
   return res.json({ email: employee.email, surface, sent: delivery.delivery.sent, error: delivery.delivery.error ?? null });
 });
+// Vista previa del plan semanal según el contrato (sin escribir nada).
+app.get("/api/v1/admin/maintenance/shift-plan", requireRole("admin"), async (req, res) => {
+  const weeklyHours = Number(req.query.weeklyHours ?? 30);
+  const weekStart = String(req.query.weekStart ?? weekStartOf(new Date().toISOString().slice(0, 10)));
+  if (!Number.isFinite(weeklyHours) || weeklyHours <= 0) return res.status(400).json({ error: "INVALID_WEEKLY_HOURS" });
+  try {
+    return res.json({ weekStart, ...planWeek(weeklyHours, weekStart) });
+  } catch (error) {
+    return res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+// Nómina mensual: bruto, cotización, IRPF, neto y propinas.
+app.get("/api/v1/admin/maintenance/payroll", requireRole("admin"), async (req, res) => {
+  const weeklyHours = Number(req.query.weeklyHours ?? 30);
+  const tipsCents = Number(req.query.tipsCents ?? 0);
+  const targetNetCents = req.query.targetNetCents ? Number(req.query.targetNetCents) : null;
+  if (!Number.isFinite(weeklyHours) || weeklyHours <= 0) return res.status(400).json({ error: "INVALID_WEEKLY_HOURS" });
+  const breakdown = calculatePayroll({ weeklyHours, tipsCents });
+  return res.json({
+    ...breakdown,
+    gap: targetNetCents ? payrollGap({ weeklyHours, tipsCents }, targetNetCents) : null,
+    targetNetCents,
+  });
+});
+
+// Contrato del rider y generación de su semana de turnos.
+app.post("/api/v1/admin/maintenance/riders/:id/contract", requireRole("admin"), async (req, res) => {
+  const id = objectId(String(req.params.id));
+  if (!id) return res.status(400).json({ error: "INVALID_RIDER_ID" });
+  const parsed = z.object({
+    weeklyHours: z.coerce.number().int().min(4).max(60),
+    weekStart: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+    apply: z.coerce.boolean().default(false),
+  }).safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "INVALID_CONTRACT_INPUT", details: parsed.error.flatten() });
+  const rider = await Rider.findById(id).lean().exec() as any;
+  if (!rider) return res.status(404).json({ error: "RIDER_NOT_FOUND" });
+  const weekStart = parsed.data.weekStart ?? weekStartOf(new Date().toISOString().slice(0, 10));
+  const plan = planWeek(parsed.data.weeklyHours, weekStart);
+  if (!parsed.data.apply) return res.json({ apply: false, rider: { id: String(rider._id), name: rider.name }, weekStart, ...plan });
+  await Rider.updateOne({ _id: rider._id }, { $set: { contractWeeklyHours: parsed.data.weeklyHours } }).exec();
+  const created: string[] = [];
+  for (const shift of plan.shifts) {
+    const exists = await RiderSlot.exists({ riderId: rider._id, date: shift.date, startTime: shift.startTime });
+    if (exists) continue;
+    await RiderSlot.create({
+      riderId: rider._id,
+      zoneSlug: rider.zoneSlug || "xativa-centro",
+      date: shift.date,
+      startTime: shift.startTime,
+      endTime: shift.endTime,
+      status: "planned",
+      notes: `Bloque ${shift.block === "midday" ? "mediodía" : "noche"} · contrato ${parsed.data.weeklyHours} h`,
+      tenantId: rider.tenantId ?? null,
+    });
+    created.push(`${shift.date} ${shift.startTime}-${shift.endTime}`);
+  }
+  return res.json({ apply: true, rider: { id: String(rider._id), name: rider.name }, weekStart, weeklyHours: parsed.data.weeklyHours, plannedHours: plan.plannedHours, created, restViolations: plan.restViolations });
+});
+
+// Baja completa de un rider: perfil, cuenta de acceso, turnos y expediente.
+app.delete("/api/v1/admin/maintenance/riders/:id", requireRole("admin"), async (req, res) => {
+  const id = objectId(String(req.params.id));
+  if (!id) return res.status(400).json({ error: "INVALID_RIDER_ID" });
+  const rider = await Rider.findById(id).lean().exec() as any;
+  if (!rider) return res.status(404).json({ error: "RIDER_NOT_FOUND" });
+  const openOrders = await Order.countDocuments({ riderId: id, status: { $nin: ["delivered", "cancelled"] } });
+  if (openOrders > 0) return res.status(409).json({ error: "RIDER_HAS_OPEN_ORDERS", openOrders });
+  const slots = await RiderSlot.deleteMany({ riderId: id }).exec();
+  await EmployeeAccount.deleteMany({ email: rider.email }).exec();
+  await RiderApplication.deleteMany({ email: rider.email }).exec();
+  await Rider.findByIdAndDelete(id).exec();
+  return res.json({
+    deleted: true,
+    rider: { id: String(rider._id), riderCode: rider.riderCode, name: rider.name, email: rider.email },
+    slotsDeleted: slots.deletedCount ?? 0,
+  });
+});
+
 // Absorción de flotas antiguas en la matriz: mueve riders, une zonas y retira
 // la flota de origen sin dejar riders huérfanos.
 app.post("/api/v1/admin/maintenance/fleets/:id/absorb", requireRole("admin"), async (req, res) => {
@@ -3430,6 +3514,26 @@ app.post("/api/v1/admin/maintenance/fleets/:id/absorb", requireRole("admin"), as
     await Fleet.updateOne({ _id: fleet._id }, { $set: { isActive: false, absorbedIntoFleetId: target._id, absorbedAt: new Date(), serviceZones: [], notes: `Absorbida en ${target.name}` } }).exec();
   }
   return res.json({ apply: true, ...report });
+});
+
+// Cambio de la frecuencia de liquidación de Stripe (p. ej. a diaria).
+app.post("/api/v1/admin/maintenance/stripe-payout-schedule", requireRole("admin"), async (req, res) => {
+  if (!stripeConfigured()) return res.status(409).json({ error: "STRIPE_NOT_CONFIGURED" });
+  const parsed = z.object({ interval: z.enum(["daily", "weekly", "monthly", "manual"]) }).safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "INVALID_SCHEDULE" });
+  const stripe = stripeClient();
+  try {
+    const updated = await (stripe as any).balanceSettings.update({
+      payments: { payouts: { schedule: { interval: parsed.data.interval } } },
+    });
+    return res.json({ updated: true, schedule: updated?.payments?.payouts?.schedule ?? null });
+  } catch (error) {
+    return res.status(502).json({
+      updated: false,
+      error: error instanceof Error ? error.message : String(error),
+      hint: "Si el API no permite cambiarlo, hazlo en Stripe → Configuración → Pagos → Frecuencia de liquidaciones.",
+    });
+  }
 });
 
 // Estado real de cobros y liquidaciones en Stripe (solo lectura).
