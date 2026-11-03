@@ -597,6 +597,19 @@ export function mountStripeRoutes(app: Express): void {
     },
   );
 
+  app.post(
+    "/api/v1/admin/charge-test/:id/cancel",
+    requireRole("admin"),
+    async (request: Request, response: Response) => {
+      if (!stripeConfigured()) return response.status(503).json({ error: "STRIPE_NOT_CONFIGURED" });
+      try {
+        const canceled = await stripeClient().paymentIntents.cancel(String(request.params.id));
+        return response.json({ id: canceled.id, status: canceled.status, amountReceivedCents: canceled.amount_received, livemode: canceled.livemode });
+      } catch (error) {
+        return response.status(502).json({ error: error instanceof Error ? error.message : String(error) });
+      }
+    },
+  );
   app.get(
     "/api/v1/admin/charge-test/:id",
     requireRole("admin"),

@@ -44,6 +44,7 @@ import { evaluateXativaCoverage, withinSameOperationalCity, XATIVA_PHASE_2_LOCAL
 import { quoteDeliveryRoute } from "./coverage/routing.js";
 import { ROOT_TENANT_SLUG, runTenantMigration } from "./tenantMigration.js";
 import { onboardingScope } from "./onboardingScope.js";
+import { notifyOrderPlaced } from "./orderAlerts.js";
 import { corporateEmailConfiguration, escapeCorporateHtml, sendCorporateEmail, sendLeadContactEmail, verifyCorporateEmailConnection } from "./corporateEmail.js";
 import { activeOperationalOrderStatuses, dispatchableOrderStatuses, dispatchablePaymentFilter, isDispatchableOrderStatus, isDispatchablePayment } from "./dispatchEligibility.js";
 import { canReceivePartnerLocations, partnerCan, partnerPermissions, partnerRolesForEmployee, permissionsForPartnerRoles, type PartnerPermission } from "./partnerAccess.js";
@@ -4204,6 +4205,7 @@ app.post("/api/v1/orders", rateLimit(20, 60_000, "orders-create"), async (req, r
     riderEarningsCents: marketplace.riderEarningsCents,
     platformNetBeforeProcessingCents: marketplace.platformNetBeforeProcessingCents,
     payoutStatus: "pending", paymentMethod: parsed.data.paymentMethod, paymentState: "pending", statusHistory: [{ status: "pending", actorRole: "customer", reason: parsed.data.paymentMethod === "cash" ? "Pedido a contrarreembolso; cobro pendiente hasta la entrega" : "Pedido creado con política de cobertura Xàtiva" }] });
+  void notifyOrderPlaced(order).catch(() => undefined);
   if (parsed.data.paymentMethod === "cash") {
     const dispatch = enqueueOrderForDispatch(order._id as mongoose.Types.ObjectId).catch((error) => console.warn("Dispatch outbox enqueue failed", error instanceof Error ? error.message : error));
     await Promise.all([dispatch, publishOrderIntakeEvents(order, { settlement: "cash_due", message: "Contrarreembolso: el Rider cobrará en efectivo al entregar." })]);
@@ -4938,6 +4940,19 @@ app.post("/api/v1/admin/orders/cleanup-test-data", requireOwner(), async (_req, 
 });
 // Borrado de pedidos concretos, para limpiar pruebas de producción.
 // Primero simula; solo borra de verdad con ?apply=1 o {"apply": true}.
+app.post("/api/v1/admin/maintenance/reset-live-orders", requireRole("admin"), async (req, res) => {
+  const activeStatuses = ["pending", "confirmed", "accepted", "preparing", "ready", "ready_for_pickup", "assigned", "picked_up", "arriving", "awaiting_payment"];
+  const before = req.body?.before ? new Date(String(req.body.before)) : new Date();
+  const dryRun = req.body?.dryRun !== false;
+  const scope: Record<string, unknown> = { status: { $in: activeStatuses }, createdAt: { $lt: before } };
+  const stale = await Order.find(scope).select("publicCode status totalCents paymentMethod createdAt isTestOrder").lean().exec() as any[];
+  if (dryRun) return res.json({ dryRun: true, before: before.toISOString(), count: stale.length, orders: stale.map(o => ({ id: String(o._id), reference: o.publicCode || null, status: o.status, totalCents: o.totalCents, paymentMethod: o.paymentMethod, createdAt: o.createdAt, isTestOrder: Boolean(o.isTestOrder) })) });
+  const ids = stale.map(o => o._id);
+  if (!ids.length) return res.json({ dryRun: false, removed: 0, counterAfter: await Order.countDocuments({ status: { $in: activeStatuses } }).exec() });
+  await Order.deleteMany({ _id: { $in: ids } }).exec();
+  const remaining = await Order.countDocuments({ status: { $in: activeStatuses } }).exec();
+  return res.json({ dryRun: false, removed: ids.length, references: stale.map(o => o.publicCode || String(o._id)), counterAfter: remaining });
+});
 app.post("/api/v1/admin/orders/purge", requireRole("admin"), async (req, res) => {
   const raw = Array.isArray(req.body?.references) ? (req.body.references as unknown[]) : [];
   const references = raw.map((value) => String(value).trim()).filter(Boolean);
@@ -6046,6 +6061,7 @@ app.post("/api/v1/admin/qa/dispatch-orders", requireRole("admin"), async (req, r
     assignmentState: "unassigned",
     statusHistory: [{ status: "ready_for_pickup", actorRole: "system", reason: `Simulación QA solicitada por ${employee?.email || "admin"}. Sin cobro ni entrega real.` }],
   });
+  void notifyOrderPlaced(order).catch(() => undefined);
   const dispatch = await enqueueOrderForDispatch(order._id as mongoose.Types.ObjectId, qaRider._id as mongoose.Types.ObjectId);
   const supportTicket = await SupportTicket.create({
     tenantId: restaurant.tenantId || null,
