@@ -4966,6 +4966,41 @@ app.post("/api/v1/admin/maintenance/menus/commission-flag", requireRole("admin")
   invalidateCatalogCache();
   return res.json({ priceIncludesCommission: value, matched: result.matchedCount ?? null, modified: result.modifiedCount ?? null });
 });
+app.get("/api/v1/admin/orders", requireRole("admin"), async (req, res) => {
+  const limit = Math.min(200, Math.max(1, Number(req.query.limit) || 50));
+  const status = String(req.query.status || "").trim();
+  const search = String(req.query.search || "").trim();
+  const filter: Record<string, unknown> = {};
+  if (status && status !== "all") filter.status = status;
+  if (search) {
+    const rx = new RegExp(search.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
+    filter.$or = [{ publicCode: rx }, { displayCode: rx }, { customerName: rx }, { restaurantName: rx }];
+  }
+  const orders = await Order.find(filter).sort({ createdAt: -1 }).limit(limit).lean().exec() as any[];
+  const totals = { total: orders.length, live: 0, unassigned: 0 };
+  const rows = orders.map((order) => {
+    const live = !["delivered", "cancelled", "rejected", "expired"].includes(String(order.status));
+    if (live) totals.live += 1;
+    if (live && !order.riderId) totals.unassigned += 1;
+    return {
+      id: String(order._id),
+      publicCode: order.publicCode || "",
+      displayCode: order.displayCode || "",
+      status: order.status || "",
+      paymentState: order.paymentState || "",
+      paymentMethod: order.paymentMethod || "",
+      totalCents: Number(order.totalCents) || 0,
+      subtotalCents: Number(order.subtotalCents) || 0,
+      deliveryFeeCents: Number(order.deliveryFeeCents) || 0,
+      restaurantName: order.restaurantName || "",
+      customerName: order.customerName || "",
+      riderId: order.riderId ? String(order.riderId) : null,
+      createdAt: order.createdAt || null,
+      cashDueAtDelivery: Boolean(order.cashDueAtDelivery),
+    };
+  });
+  return res.json({ orders: rows, totals });
+});
 app.get("/api/v1/admin/maintenance/pricing-check", requireRole("admin"), async (req, res) => {
   const reference = String(req.query.restaurant || "");
   const itemId = String(req.query.item || "");
