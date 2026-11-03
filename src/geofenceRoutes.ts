@@ -94,9 +94,10 @@ export function mountGeofenceRoutes(app: Express): void {
     const delivering = await hasActiveDelivery(rider._id);
 
     if (inside) {
-      if ((rider.geofenceStrikes ?? 0) > 0) {
-        await Rider.updateOne({ _id: rider._id }, { $set: { geofenceStrikes: 0, geofenceZoneSlug: rider.zoneSlug ?? null } }).exec();
-      }
+      await Rider.updateOne(
+        { _id: rider._id },
+        { $set: { geofenceStrikes: 0, geofenceZoneSlug: rider.zoneSlug ?? null, geofenceOutside: false, geofenceCheckedAt: new Date(), geofenceDistanceMeters: 0 } },
+      ).exec();
       return res.json({ inside: true, distanceMeters: 0, delivering, action: "none", strikes: 0, message: "Dentro de tu zona de reparto." });
     }
     if (delivering) {
@@ -119,6 +120,8 @@ export function mountGeofenceRoutes(app: Express): void {
       lastGeofenceViolationAt: new Date(),
       geofenceZoneSlug: rider.zoneSlug ?? null,
       geofenceDistanceMeters: distance,
+      geofenceOutside: true,
+      geofenceCheckedAt: new Date(),
     };
     let action: "warn" | "sanction" = strikes >= GEOFENCE_STRIKE_LIMIT ? "sanction" : "warn";
     if (action === "sanction") {

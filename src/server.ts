@@ -6785,11 +6785,43 @@ app.get("/api/v1/fleet/operations/live", requireRole("admin", "fleet"), async (r
   const freshSince = new Date(Date.now() - 90_000);
   const tenant = tenantScope(req);
   const activeRiderIds = await RiderSlot.distinct("riderId", { ...tenant, date: now.date, status: "active", startTime: { $lte: now.time }, endTime: { $gt: now.time } });
-  const riders = await Rider.find({ ...await fleetRiderFilter(req), _id: { $in: activeRiderIds }, status: { $in: ["available", "busy"] }, lastLocationAt: { $gte: freshSince }, location: { $exists: true } }).select("riderCode name status vehicle location lastLocationAt geofence activeOrderId").lean().exec() as any[];
+  // En turno se muestra siempre, aunque el GPS esté viejo: la flota necesita
+  // ver el estado y las alertas de zona de todo el turno, no solo del que acaba
+  // de mandar posición.
+  const riders = await Rider.find({ ...await fleetRiderFilter(req), _id: { $in: activeRiderIds }, status: { $in: ["available", "busy"] } }).select("riderCode name status vehicle city zoneSlug location lastLocationAt geofence geofenceOutside geofenceStrikes geofenceCheckedAt geofenceDistanceMeters activeOrderId").lean().exec() as any[];
   const activeOrderIds = riders.map((rider) => rider.activeOrderId).filter(Boolean);
   const orders = await Order.find({ ...tenant, _id: { $in: activeOrderIds } }).select("publicCode displayCode status assignmentState").lean().exec() as any[];
   const orderMap = new Map(orders.map((order) => [String(order._id), order]));
-  return res.json({ refreshedAt: new Date().toISOString(), freshnessSeconds: 90, riders: riders.map((rider) => ({ _id: rider._id, id: rider._id, riderCode: rider.riderCode, name: rider.name, status: rider.status, vehicle: rider.vehicle, geofence: rider.geofence || null, location: rider.location, lastLocationAt: rider.lastLocationAt, activeOrder: rider.activeOrderId ? orderMap.get(String(rider.activeOrderId)) || null : null })) });
+  const nowMs = Date.now();
+  const staleAfterMs = 90_000;
+  return res.json({
+    refreshedAt: new Date().toISOString(),
+    freshnessSeconds: 90,
+    riders: riders.map((rider) => {
+      const lastAt = rider.lastLocationAt ? new Date(rider.lastLocationAt).getTime() : 0;
+      const gpsAgeSeconds = lastAt ? Math.round((nowMs - lastAt) / 1000) : null;
+      return {
+        _id: rider._id,
+        id: rider._id,
+        riderCode: rider.riderCode,
+        name: rider.name,
+        status: rider.status,
+        vehicle: rider.vehicle,
+        city: rider.city ?? null,
+        zoneSlug: rider.zoneSlug ?? null,
+        geofence: rider.geofence || null,
+        location: rider.location ?? null,
+        lastLocationAt: rider.lastLocationAt ?? null,
+        gpsAgeSeconds,
+        hasFreshGps: gpsAgeSeconds !== null && gpsAgeSeconds * 1000 <= staleAfterMs,
+        outsideZone: rider.geofenceOutside === true,
+        geofenceStrikes: rider.geofenceStrikes ?? 0,
+        geofenceCheckedAt: rider.geofenceCheckedAt ?? null,
+        geofenceDistanceMeters: rider.geofenceDistanceMeters ?? null,
+        activeOrder: rider.activeOrderId ? orderMap.get(String(rider.activeOrderId)) || null : null,
+      };
+    }),
+  });
 });
 
 app.get("/api/v1/riders/overview", requireRole("admin", "fleet"), async (_req, res) => {
