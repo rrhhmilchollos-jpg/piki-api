@@ -3471,12 +3471,34 @@ app.post("/api/v1/admin/maintenance/riders", requireRole("admin"), async (req, r
 app.patch("/api/v1/admin/maintenance/riders/:id/fleet", requireRole("admin"), async (req, res) => {
   const id = objectId(String(req.params.id));
   if (!id) return res.status(400).json({ error: "INVALID_RIDER_ID" });
-  const parsed = z.object({ fleetId: z.string().regex(/^[a-f\d]{24}$/).nullable() }).safeParse(req.body);
-  if (!parsed.success) return res.status(400).json({ error: "INVALID_FLEET_ID" });
-  const rider = await Rider.findByIdAndUpdate(id, { $set: { fleetId: parsed.data.fleetId } }, { new: true }).lean().exec() as any;
+  const parsed = z.object({
+    fleetId: z.string().regex(/^[a-f\d]{24}$/).nullable().optional(),
+    city: z.string().trim().min(2).max(80).optional(),
+    zoneSlug: z.string().trim().regex(/^[a-z0-9-]+$/).optional(),
+    phone: z.string().trim().min(6).max(40).optional(),
+    name: z.string().trim().min(2).max(160).optional(),
+  }).safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "INVALID_RIDER_PATCH", details: parsed.error.flatten() });
+  const patch: Record<string, unknown> = {};
+  if (parsed.data.fleetId !== undefined) patch.fleetId = parsed.data.fleetId;
+  if (parsed.data.city) patch.city = parsed.data.city;
+  if (parsed.data.zoneSlug) patch.zoneSlug = parsed.data.zoneSlug;
+  if (parsed.data.phone) patch.phone = parsed.data.phone;
+  if (parsed.data.name) patch.name = parsed.data.name;
+  if (!Object.keys(patch).length) return res.status(400).json({ error: "EMPTY_PATCH" });
+  const rider = await Rider.findByIdAndUpdate(id, { $set: patch }, { new: true }).lean().exec() as any;
   if (!rider) return res.status(404).json({ error: "RIDER_NOT_FOUND" });
-  await EmployeeAccount.updateOne({ email: rider.email }, { $set: { fleetId: parsed.data.fleetId ?? null } }).exec();
-  return res.json({ riderId: String(rider._id), riderCode: rider.riderCode, fleetId: rider.fleetId ? String(rider.fleetId) : null });
+  if (parsed.data.fleetId !== undefined) {
+    await EmployeeAccount.updateOne({ email: rider.email }, { $set: { fleetId: parsed.data.fleetId ?? null } }).exec();
+  }
+  return res.json({
+    riderId: String(rider._id),
+    riderCode: rider.riderCode,
+    name: rider.name,
+    city: rider.city,
+    zoneSlug: rider.zoneSlug,
+    fleetId: rider.fleetId ? String(rider.fleetId) : null,
+  });
 });
 
 // Directorio de riders con flota y estado, sin filtro de tenant.
