@@ -556,6 +556,57 @@ export function mountStripeRoutes(app: Express): void {
 
   // Últimos pedidos con su estado de pago, sin filtro de tenant: sirve para
   // comprobar de un vistazo si el tráfico real entra como retención o como cobro.
+  // Prueba de cobro real con importe mínimo: crea un intent con captura
+    // automática para que el titular confirme con su tarjeta en /pago-prueba.
+    app.post(
+    "/api/v1/admin/charge-test",
+    requireRole("admin"),
+    async (request: Request, response: Response) => {
+      if (!stripeConfigured()) return response.status(503).json({ error: "STRIPE_NOT_CONFIGURED" });
+      const amount = Number(request.query.amountCents ?? 50);
+      if (!Number.isFinite(amount) || amount < 50 || amount > 100) {
+        return response.status(400).json({ error: "importe fuera del rango de prueba (50 a 100 céntimos)" });
+      }
+      const intent = await stripeClient().paymentIntents.create({
+        amount: Math.round(amount),
+        currency: "eur",
+        capture_method: "automatic",
+        payment_method_types: ["card"],
+        description: "PIKI prueba de cobro con tarjeta",
+        metadata: { flow: "card_charge_test", surface: "admin" },
+      });
+      return response.json({
+        id: intent.id,
+        clientSecret: intent.client_secret,
+        amountCents: intent.amount,
+        captureMethod: intent.capture_method,
+        status: intent.status,
+        livemode: intent.livemode,
+        checkoutUrl: `/pago-prueba?cs=${encodeURIComponent(intent.client_secret ?? "")}`,
+      });
+    },
+  );
+
+  app.get(
+    "/api/v1/admin/charge-test/:id",
+    requireRole("admin"),
+    async (request: Request, response: Response) => {
+      if (!stripeConfigured()) return response.status(503).json({ error: "STRIPE_NOT_CONFIGURED" });
+      const intent = await stripeClient().paymentIntents.retrieve(String(request.params.id), { expand: ["latest_charge"] });
+      const charge = (intent as any).latest_charge;
+      return response.json({
+        id: intent.id,
+        status: intent.status,
+        amountCents: intent.amount,
+        amountReceivedCents: intent.amount_received,
+        captureMethod: intent.capture_method,
+        livemode: intent.livemode,
+        currency: intent.currency,
+        paymentMethodType: (charge && typeof charge === "object" ? charge.payment_method_details?.type : null) ?? null,
+      });
+    },
+  );
+
   app.get(
     "/api/v1/admin/payment-audit",
     requireRole("admin"),
