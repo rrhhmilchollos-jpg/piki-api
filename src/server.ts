@@ -4958,6 +4958,26 @@ app.post("/api/v1/admin/orders/cleanup-test-data", requireOwner(), async (_req, 
 });
 // Borrado de pedidos concretos, para limpiar pruebas de producción.
 // Primero simula; solo borra de verdad con ?apply=1 o {"apply": true}.
+app.get("/api/v1/admin/maintenance/pricing-check", requireRole("admin"), async (req, res) => {
+  const reference = String(req.query.restaurant || "");
+  const itemId = String(req.query.item || "");
+  const filter = reference.match(/^[a-f0-9]{24}$/i) ? { _id: reference } : { slug: reference };
+  const restaurant = await Restaurant.findOne(filter).lean().exec() as any;
+  if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
+  const storedMenu = canonicalRestaurantMenu(restaurant);
+  const stored = storedMenu.find((item: any) => String(item.id) === itemId);
+  const commissionMenu = customerMenuForRestaurant({ ...restaurant, menu: storedMenu });
+  const commissionItem = commissionMenu.find((item: any) => String(item.id) === itemId);
+  const presentedMenu = (presentCustomerCatalogRestaurant({ ...restaurant, menu: storedMenu }).menu || []) as any[];
+  const presentedItem = presentedMenu.find((item: any) => String(item.id) === itemId);
+  return res.json({
+    restaurant: { slug: restaurant.slug, priceIncludesCommission: restaurant.priceIncludesCommission ?? null, commissionRate: customerCommissionRate(restaurant), menuLength: storedMenu.length },
+    itemId,
+    storedPrice: stored?.price ?? null,
+    customerMenuPrice: commissionItem?.price ?? null,
+    catalogPrice: presentedItem?.price ?? null,
+  });
+});
 app.post("/api/v1/admin/maintenance/menus/apply-commission", requireRole("admin"), async (req, res) => {
   // Un único precio por producto: la comisión de PIKI se integra en la carta y se
   // marca el comercio para que ninguna capa posterior vuelva a aplicarla.
