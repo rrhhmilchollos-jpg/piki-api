@@ -1315,7 +1315,7 @@ app.get("/api/v1/catalog/restaurants", async (req, res) => {
     const presented = presentCustomerCatalogRestaurant({ ...restaurant, postalCode: restaurant.partnerProfile?.postalCode || postalCodeFromAddress, locality: restaurant.locality || restaurant.partnerProfile?.city || null, menu: canonicalRestaurantMenu(restaurant) });
     const remaining = Math.max(0, FREE_DELIVERY_LAUNCH_LIMIT - (orderCountByRestaurant.get(String(restaurant._id)) || 0));
     const launchWindow = isFreeDeliveryLaunchWindow();
-    return { ...presented, fulfillmentMode: presented.fulfillmentMode || restaurant.fulfillmentMode || (restaurant.listingType === "local_directory" ? "assisted_purchase" : "partner_delivery"), freeDeliveryEligible: launchWindow && remaining > 0, freeDeliveryOrdersRemaining: launchWindow ? remaining : 0 };
+    return { ...presented, minimumOrderCents: Number(process.env.PIKI_MINIMUM_ORDER_CENTS || 500), fulfillmentMode: presented.fulfillmentMode || restaurant.fulfillmentMode || (restaurant.listingType === "local_directory" ? "assisted_purchase" : "partner_delivery"), freeDeliveryEligible: launchWindow && remaining > 0, freeDeliveryOrdersRemaining: launchWindow ? remaining : 0 };
   }) };
   catalogCache.set(cacheKey, { expiresAt: Date.now() + CATALOG_CACHE_MS, body });
   void sharedCacheSet(`piki:catalog:${cacheKey}`, body, 30);
@@ -4182,6 +4182,18 @@ app.post("/api/v1/orders", rateLimit(20, 60_000, "orders-create"), async (req, r
   if (!Array.isArray(restaurantPoint) || restaurantPoint.length < 2) return res.status(409).json({ error: "RESTAURANT_LOCATION_UNAVAILABLE" });
   const route = await quoteDeliveryRoute([Number(restaurantPoint[0]), Number(restaurantPoint[1])], deliveryPoint);
   const subtotalCents = normalizedItems.reduce((sum, item) => sum + item.unitPriceCents * item.quantity, 0);
+  // Pedido mínimo de reparto: por debajo de 5 € no hay delivery, se avisa con el
+  // importe exacto que falta para que el cliente pueda completarlo.
+  const minimumOrderCents = Number(process.env.PIKI_MINIMUM_ORDER_CENTS || 500);
+  if (subtotalCents < minimumOrderCents) {
+    return res.status(422).json({
+      error: "MINIMUM_ORDER_NOT_MET",
+      message: `El pedido mínimo para reparto es de ${(minimumOrderCents / 100).toFixed(2).replace(".", ",")} €`,
+      minimumOrderCents,
+      subtotalCents,
+      missingCents: minimumOrderCents - subtotalCents,
+    });
+  }
   const freeDelivery = await freeDeliveryState(restaurant);
   const authenticatedCustomer = await currentCustomer(req) as any;
   // PIKI Pass removes the delivery fee on the server, never from a client flag,
@@ -4944,6 +4956,20 @@ app.post("/api/v1/admin/orders/cleanup-test-data", requireOwner(), async (_req, 
 });
 // Borrado de pedidos concretos, para limpiar pruebas de producción.
 // Primero simula; solo borra de verdad con ?apply=1 o {"apply": true}.
+app.put("/api/v1/admin/maintenance/restaurants/:id/menu", requireRole("admin"), async (req, res) => {
+  const id = objectId(String(req.params.id));
+  if (!id) return res.status(400).json({ error: "INVALID_RESTAURANT_ID" });
+  const parsed = z.object({ items: partnerMenuItemsSchema }).safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "INVALID_MENU", details: parsed.error.flatten() });
+  const restaurant = await Restaurant.findOneAndUpdate(
+    { _id: id, onboardingStatus: "approved" },
+    { $set: { menu: parsed.data.items } },
+    { new: true },
+  ).select("_id slug name menu").lean().exec() as any;
+  if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND_OR_NOT_APPROVED" });
+  invalidateCatalogCache();
+  return res.json({ updated: true, menu: restaurant.menu || [] });
+});
 app.post("/api/v1/admin/maintenance/daily-summary", requireRole("admin"), async (_req, res) => {
   const result = await sendDailyBusinessSummary();
   return res.json({ ...result, recipient: BUSINESS_SUMMARY_RECIPIENT });
