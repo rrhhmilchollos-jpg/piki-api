@@ -6959,9 +6959,15 @@ app.get("/api/v1/fleet/orders", requireRole("admin", "fleet"), async (req, res) 
   const normalise = (value: unknown) => String(value ?? "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().trim();
   const target = normalise(locality);
   const orders = await Order.find({}).sort({ createdAt: -1 }).limit(300).lean().exec() as any[];
+  // El pedido no guarda siempre la ciudad: se resuelve por su comercio.
+  const restaurantIds = Array.from(new Set(orders.map((order) => String(order.restaurantId || "")).filter(Boolean)));
+  const restaurants = restaurantIds.length
+    ? await Restaurant.find({ _id: { $in: restaurantIds } }).select("city locality slug name").lean().exec() as any[]
+    : [];
+  const cityByRestaurant = new Map(restaurants.map((restaurant) => [String(restaurant._id), restaurant.city || restaurant.locality || ""]));
   const rows = orders
     .filter((order) => {
-      const candidates = [order.city, order.localityName, order.restaurantCity, order.restaurantLocality, order.deliveryLocality, order.restaurantName];
+      const candidates = [order.city, order.localityName, order.restaurantCity, order.restaurantLocality, order.deliveryLocality, order.restaurantName, cityByRestaurant.get(String(order.restaurantId || ""))];
       return candidates.some((value) => value && (normalise(value).includes(target) || target.includes(normalise(value))));
     })
     .map((order) => ({
