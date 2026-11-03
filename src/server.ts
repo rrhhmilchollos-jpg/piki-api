@@ -3523,10 +3523,20 @@ app.post("/api/v1/admin/maintenance/stripe-payout-schedule", requireRole("admin"
   if (!parsed.success) return res.status(400).json({ error: "INVALID_SCHEDULE" });
   const stripe = stripeClient();
   try {
-    const updated = await (stripe as any).balanceSettings.update({
-      payments: { payouts: { schedule: { interval: parsed.data.interval } } },
+    const body = new URLSearchParams();
+    body.set("payments[payouts][schedule][interval]", parsed.data.interval);
+    const response = await fetch("https://api.stripe.com/v1/balance_settings", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${process.env.STRIPE_SECRET_KEY}`,
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Stripe-Version": "2025-03-31.basil",
+      },
+      body: body.toString(),
     });
-    return res.json({ updated: true, schedule: updated?.payments?.payouts?.schedule ?? null });
+    const payload = await response.json() as any;
+    if (!response.ok) throw new Error(payload?.error?.message || `Stripe ${response.status}`);
+    return res.json({ updated: true, schedule: payload?.payments?.payouts?.schedule ?? null });
   } catch (error) {
     return res.status(502).json({
       updated: false,
