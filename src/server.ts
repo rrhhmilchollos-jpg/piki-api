@@ -5,6 +5,7 @@ import { reserveRiderOrderSlot } from "./dispatchReservation.js";
 import { VEHICLE_CATALOG_VERSION, VEHICLE_TYPES, incompatibleVehicles, uniqueVehicles, vehicleTypeSchema, type VehicleType } from "./vehicleCatalog.js";
 import { registerTerritoryRoutes } from "./coverage/territoryRoutes.js";
 import { operationalZoneInputSchema } from "./coverage/zoneInput.js";
+import { stripeClient } from "./stripePayments.js";
 import { missingPartnerDocumentTypes, missingRiderDocumentTypes, type RiderVehicle } from "./manualOnboardingPolicy.js";
 import "dotenv/config";
 import "express-async-errors";
@@ -3397,6 +3398,77 @@ app.post("/api/v1/admin/maintenance/employees/:id/send-activation", requireRole(
   const delivery = await sendEmployeePasswordLink(employee, surface, "activation");
   return res.json({ email: employee.email, surface, sent: delivery.delivery.sent, error: delivery.delivery.error ?? null });
 });
+// Absorción de flotas antiguas en la matriz: mueve riders, une zonas y retira
+// la flota de origen sin dejar riders huérfanos.
+app.post("/api/v1/admin/maintenance/fleets/:id/absorb", requireRole("admin"), async (req, res) => {
+  const targetId = objectId(String(req.params.id));
+  if (!targetId) return res.status(400).json({ error: "INVALID_FLEET_ID" });
+  const parsed = z.object({
+    sourceFleetIds: z.array(z.string().regex(/^[a-f\d]{24}$/)).min(1).max(20),
+    apply: z.coerce.boolean().default(false),
+  }).safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "INVALID_ABSORB_INPUT", details: parsed.error.flatten() });
+  const target = await Fleet.findById(targetId).lean().exec() as any;
+  if (!target) return res.status(404).json({ error: "FLEET_NOT_FOUND" });
+  const sources = await Fleet.find({ _id: { $in: parsed.data.sourceFleetIds.map((id) => objectId(id)) } }).lean().exec() as any[];
+  const mergedZones = [...new Set([...(target.serviceZones ?? []), ...sources.flatMap((fleet) => fleet.serviceZones ?? [])])];
+  const riders = await Rider.find({ fleetId: { $in: sources.map((fleet) => fleet._id) } }).select("_id riderCode name email").lean().exec() as any[];
+  const report = {
+    target: { id: String(target._id), name: target.name, zonesBefore: (target.serviceZones ?? []).length, zonesAfter: mergedZones.length },
+    sources: sources.map((fleet) => ({ id: String(fleet._id), name: fleet.name, zones: (fleet.serviceZones ?? []).length, riders: riders.filter((rider) => String(rider.fleetId) === String(fleet._id)).length })),
+    riders: riders.map((rider) => ({ id: String(rider._id), riderCode: rider.riderCode, name: rider.name, email: rider.email })),
+    newZones: mergedZones.filter((zone) => !(target.serviceZones ?? []).includes(zone)),
+  };
+  if (!parsed.data.apply) return res.json({ apply: false, ...report });
+
+  for (const rider of riders) {
+    await Rider.updateOne({ _id: rider._id }, { $set: { fleetId: target._id, tenantId: target.tenantId ?? null } }).exec();
+    await EmployeeAccount.updateOne({ email: rider.email }, { $set: { fleetId: target._id } }).exec();
+  }
+  await Fleet.updateOne({ _id: target._id }, { $set: { serviceZones: mergedZones } }).exec();
+  for (const fleet of sources) {
+    await Fleet.updateOne({ _id: fleet._id }, { $set: { isActive: false, absorbedIntoFleetId: target._id, absorbedAt: new Date(), serviceZones: [], notes: `Absorbida en ${target.name}` } }).exec();
+  }
+  return res.json({ apply: true, ...report });
+});
+
+// Estado real de cobros y liquidaciones en Stripe (solo lectura).
+app.get("/api/v1/admin/maintenance/stripe-payouts", requireRole("admin"), async (_req, res) => {
+  if (!stripeConfigured()) return res.status(409).json({ error: "STRIPE_NOT_CONFIGURED" });
+  const stripe = stripeClient();
+  const out: Record<string, unknown> = {};
+  try {
+    const balance = await stripe.balance.retrieve();
+    out.balance = {
+      available: balance.available.map((entry) => ({ currency: entry.currency, amountCents: entry.amount })),
+      pending: balance.pending.map((entry) => ({ currency: entry.currency, amountCents: entry.amount })),
+      livemode: balance.livemode,
+    };
+  } catch (error) {
+    out.balanceError = error instanceof Error ? error.message : String(error);
+  }
+  try {
+    const settings = await (stripe as any).balanceSettings?.retrieve?.();
+    out.payoutSchedule = settings?.payments?.payouts?.schedule ?? settings?.payouts?.schedule ?? null;
+  } catch (error) {
+    out.payoutScheduleError = error instanceof Error ? error.message : String(error);
+  }
+  try {
+    const payouts = await stripe.payouts.list({ limit: 5 });
+    out.payouts = payouts.data.map((payout) => ({
+      id: payout.id,
+      amountCents: payout.amount,
+      currency: payout.currency,
+      status: payout.status,
+      arrivalDate: payout.arrival_date ? new Date(payout.arrival_date * 1000).toISOString() : null,
+      created: new Date(payout.created * 1000).toISOString(),
+    }));
+  } catch (error) {
+    out.payoutsError = error instanceof Error ? error.message : String(error);
+  }
+  return res.json(out);
+});
+
 // Auditoría de flotas: responsable, zonas y riders, sin filtro de tenant.
 app.get("/api/v1/admin/maintenance/fleets", requireRole("admin"), async (_req, res) => {
   const fleets = await Fleet.find({}).sort({ createdAt: 1 }).lean().exec() as any[];
