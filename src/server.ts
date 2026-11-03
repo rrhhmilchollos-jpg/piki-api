@@ -2922,7 +2922,7 @@ app.patch("/api/v1/rider-applications/:id/status", requireRole("admin"), async (
 
 function normalizedZoneSlug(value: string) { return String(value || "").trim().toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, ""); }
 const leadRoutingSchema = z.object({ zoneSlug: z.string().regex(/^[a-z0-9-]+$/).optional(), reason: z.string().trim().min(3).max(500).optional() });
-app.post("/api/v1/admin/rider-applications/:id/prl-course", requireRole("admin", "fleet"), async (req, res) => {
+app.post("/api/v1/admin/rider-applications/:id/prl-course", requireRole("admin", "fleet", "owner", "fleet_manager"), async (req, res) => {
   const applicationId = objectId(String(req.params.id));
   if (!applicationId) return res.status(400).json({ error: "INVALID_APPLICATION_ID" });
   const application = await RiderApplication.findOne({ _id: applicationId, ...await adminOnboardingScope(req) }).lean().exec() as any;
@@ -2966,7 +2966,7 @@ app.post("/api/v1/rider-training/submit", async (req, res) => {
   await RiderTrainingAssignment.updateOne({ _id: assignment._id, status: { $in: ["assigned", "in_progress"] } }, { $set: { status: "submitted", consentAcceptedAt: new Date(), submittedAt: response.submittedAt || new Date() } }).exec();
   return res.json({ response: { id: response._id, scorePercent: response.scorePercent, passedKnowledgeThreshold: response.passedKnowledgeThreshold, status: "submitted" }, notice: "El resultado queda pendiente de revisión humana por el equipo PIKI." });
 });
-app.get("/api/v1/admin/rider-training", requireRole("admin", "fleet"), async (req, res) => {
+app.get("/api/v1/admin/rider-training", requireRole("admin", "fleet", "owner", "fleet_manager"), async (req, res) => {
   const scope = await buildTenantScope(req);
   if (req.auth?.role === "fleet") { const fleetEmployee = await employeeScope(req); scope.fleetId = fleetEmployee?.fleetId || null; }
   const assignments = await RiderTrainingAssignment.find(scope).sort({ updatedAt: -1 }).limit(200).lean().exec() as any[];
@@ -2974,7 +2974,7 @@ app.get("/api/v1/admin/rider-training", requireRole("admin", "fleet"), async (re
   const byAssignment = new Map(responses.map((item) => [String(item.assignmentId), item]));
   return res.json({ assignments: assignments.map((item) => ({ ...item, accessTokenHash: undefined, response: byAssignment.get(String(item._id)) || null })) });
 });
-app.patch("/api/v1/admin/rider-training/:id/review", requireRole("admin", "fleet"), async (req, res) => {
+app.patch("/api/v1/admin/rider-training/:id/review", requireRole("admin", "fleet", "owner", "fleet_manager"), async (req, res) => {
   const parsed = z.object({ decision: z.enum(["approved", "needs_review", "rejected"]), notes: z.string().max(2000).default("") }).safeParse(req.body);
   const id = objectId(String(req.params.id));
   if (!id || !parsed.success) return res.status(400).json({ error: "INVALID_TRAINING_REVIEW" });
@@ -3344,7 +3344,7 @@ app.post("/api/v1/public/document-requests/:token/documents", async (req, res) =
   return res.status(201).json({ message: completed ? "Documentación enviada para revisión." : "Documentación parcial recibida. Puedes continuar con los requisitos pendientes.", ...publicDocumentRequestResponse(updated) });
 });
 
-app.get("/api/v1/riders", requireRole("admin", "fleet"), async (req, res) => {
+app.get("/api/v1/riders", requireRole("admin", "fleet", "owner", "fleet_manager"), async (req, res) => {
   const pagination = parseRiderListPagination(req.query.limit, req.query.offset, 200);
   if (!pagination) return res.status(400).json({ error: "INVALID_RIDER_PAGINATION" });
   const status = typeof req.query.status === "string" ? req.query.status : undefined;
@@ -3358,7 +3358,7 @@ app.get("/api/v1/riders", requireRole("admin", "fleet"), async (req, res) => {
 });
 
 const riderLifecycleStatuses = ["pending_documents", "active", "suspended", "terminated"] as const;
-app.get("/api/v1/admin/riders/directory", requireRole("admin", "fleet"), async (req, res) => {
+app.get("/api/v1/admin/riders/directory", requireRole("admin", "fleet", "owner", "fleet_manager"), async (req, res) => {
   const pagination = parseRiderListPagination(req.query.limit, req.query.offset, 500);
   if (!pagination) return res.status(400).json({ error: "INVALID_RIDER_PAGINATION" });
   const lifecycle = typeof req.query.lifecycleStatus === "string" && riderLifecycleStatuses.includes(req.query.lifecycleStatus as typeof riderLifecycleStatuses[number]) ? req.query.lifecycleStatus : undefined;
@@ -4014,7 +4014,7 @@ app.delete("/api/v1/admin/riders/:id/test-account", requireOwner(), async (req, 
 });
 
 const riderZoneSchema = z.object({ zoneSlug: z.string().regex(/^[a-z0-9-]+$/).nullable() });
-app.patch("/api/v1/riders/:id/zone", requireRole("admin", "fleet"), async (req, res) => {
+app.patch("/api/v1/riders/:id/zone", requireRole("admin", "fleet", "owner", "fleet_manager"), async (req, res) => {
   const riderId = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
   if (!riderId) return res.status(400).json({ error: "INVALID_RIDER_ID" });
   const parsed = riderZoneSchema.safeParse({ zoneSlug: req.body?.zoneSlug ?? req.body?.zone ?? null });
@@ -4045,7 +4045,7 @@ app.get("/api/v1/rider-slots", requireRole("admin", "fleet", "rider"), async (re
   return res.json({ slots });
 });
 
-app.post("/api/v1/rider-slots", requireRole("admin", "fleet"), async (req, res) => {
+app.post("/api/v1/rider-slots", requireRole("admin", "fleet", "owner", "fleet_manager"), async (req, res) => {
   const parsed = riderSlotCreateSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_RIDER_SLOT", details: parsed.error.flatten() });
   const riderId = objectId(parsed.data.riderId); if (!riderId) return res.status(400).json({ error: "INVALID_RIDER_ID" });
@@ -4062,7 +4062,7 @@ app.post("/api/v1/rider-slots", requireRole("admin", "fleet"), async (req, res) 
   await publishRiderScheduleEvent({ riderId: String(riderId), tenantId: (slot as any)?.tenantId, action: "updated" });
   return res.status(201).json({ slot });
 });
-app.post("/api/v1/rider-slots/week", requireRole("admin", "fleet"), async (req, res) => {
+app.post("/api/v1/rider-slots/week", requireRole("admin", "fleet", "owner", "fleet_manager"), async (req, res) => {
   const parsed = riderSlotWeekSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_RIDER_SLOT", details: parsed.error.flatten() });
   if (parsed.data.startTime === parsed.data.endTime) return res.status(400).json({ error: "INVALID_SLOT_TIME_RANGE" });
@@ -4117,7 +4117,7 @@ app.post("/api/v1/rider-slots/week", requireRole("admin", "fleet"), async (req, 
     await session.endSession();
   }
 });
-app.patch("/api/v1/rider-slots/:id", requireRole("admin", "fleet"), async (req, res) => {
+app.patch("/api/v1/rider-slots/:id", requireRole("admin", "fleet", "owner", "fleet_manager"), async (req, res) => {
   const slotId = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
   if (!slotId) return res.status(400).json({ error: "INVALID_RIDER_SLOT_ID" });
   const parsed = riderSlotSchema.safeParse(req.body);
@@ -4137,7 +4137,7 @@ app.patch("/api/v1/rider-slots/:id", requireRole("admin", "fleet"), async (req, 
     throw error;
   }
 });
-app.delete("/api/v1/rider-slots/:id", requireRole("admin", "fleet"), async (req, res) => {
+app.delete("/api/v1/rider-slots/:id", requireRole("admin", "fleet", "owner", "fleet_manager"), async (req, res) => {
   const slotId = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
   if (!slotId) return res.status(400).json({ error: "INVALID_RIDER_SLOT_ID" });
   const existing = await RiderSlot.findOne({ _id: slotId, ...tenantScope(req) }).lean().exec() as any;
@@ -5928,7 +5928,7 @@ app.post("/api/v1/riders/:id/shift/stop", requireRole("admin", "rider", "fleet")
   return res.json({ message: "Jornada finalizada", rider: { id: rider._id, riderCode: rider.riderCode, status: rider.status } });
 });
 
-app.post("/api/v1/riders/:id/slots", requireRole("admin", "fleet"), async (req, res) => {
+app.post("/api/v1/riders/:id/slots", requireRole("admin", "fleet", "owner", "fleet_manager"), async (req, res) => {
   const riderIdParam = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
   const riderId = objectId(riderIdParam); if (!riderId) return res.status(400).json({ error: "INVALID_RIDER_ID" });
   const parsed = riderSlotSchema.safeParse(req.body); if (!parsed.success) return res.status(400).json({ error: "INVALID_RIDER_SLOT", details: parsed.error.flatten() });
@@ -5955,7 +5955,7 @@ app.post("/api/v1/riders/:id/slots", requireRole("admin", "fleet"), async (req, 
   }
 });
 
-app.get("/api/v1/fleet/heatmap", requireRole("admin", "fleet"), async (req, res) => {
+app.get("/api/v1/fleet/heatmap", requireRole("admin", "fleet", "owner", "fleet_manager"), async (req, res) => {
   const since = new Date(Date.now() - 24 * 60 * 60 * 1000);
   const tenant = tenantScope(req);
   const fleetRiders = req.auth?.role === "fleet" ? await Rider.find(await fleetRiderFilter(req)).select("_id").lean().exec() : null;
@@ -5965,7 +5965,7 @@ app.get("/api/v1/fleet/heatmap", requireRole("admin", "fleet"), async (req, res)
   return res.json({ since, points: [...bins.values()].sort((a, b) => b.demand - a.demand) });
 });
 
-app.post("/api/v1/riders/:id/incidents", requireRole("admin", "fleet"), async (req, res) => {
+app.post("/api/v1/riders/:id/incidents", requireRole("admin", "fleet", "owner", "fleet_manager"), async (req, res) => {
   const parsed = riderIncidentSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_RIDER_INCIDENT", details: parsed.error.flatten() });
   const riderIdParam = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
@@ -6379,7 +6379,7 @@ async function findDispatchRestaurant(order: any, req: express.Request, scope: R
   const scoped = await Restaurant.findOne({ _id: order.restaurantId, ...(order.tenantId == null ? {} : restaurantScope) }).lean().exec() as any;
   return scoped;
 }
-app.get("/api/v1/dispatch/orders/:id/preview", requireRole("admin", "fleet"), async (req, res) => {
+app.get("/api/v1/dispatch/orders/:id/preview", requireRole("admin", "fleet", "owner", "fleet_manager"), async (req, res) => {
   const parsed = dispatchSchema.safeParse(req.query);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_DISPATCH_REQUEST", details: parsed.error.flatten() });
   const orderIdParam = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
@@ -6410,7 +6410,7 @@ app.get("/api/v1/dispatch/orders/:id/preview", requireRole("admin", "fleet"), as
   return res.json({ algorithmVersion: ranked[0]?.algorithmVersion || "piki-jarvis-v2-proximity-rating", orderId: order._id, policy, candidatesConsidered: riders.length, eligibleCandidates: ranked.length, candidates: ranked, diagnostic });
 });
 
-app.get("/api/v1/dispatch/orders/:id/decisions", requireRole("admin", "fleet"), async (req, res) => {
+app.get("/api/v1/dispatch/orders/:id/decisions", requireRole("admin", "fleet", "owner", "fleet_manager"), async (req, res) => {
   const orderId = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
   if (!orderId) return res.status(400).json({ error: "INVALID_ORDER_ID" });
   const order = await findDispatchOrder(orderId, req);
@@ -6421,7 +6421,7 @@ app.get("/api/v1/dispatch/orders/:id/decisions", requireRole("admin", "fleet"), 
   return res.json({ decisions });
 });
 
-app.post("/api/v1/dispatch/orders/:id/assign", requireRole("admin", "fleet"), async (req, res) => {
+app.post("/api/v1/dispatch/orders/:id/assign", requireRole("admin", "fleet", "owner", "fleet_manager"), async (req, res) => {
   const parsed = dispatchSchema.safeParse(req.body || {});
   if (!parsed.success) return res.status(400).json({ error: "INVALID_DISPATCH_REQUEST", details: parsed.error.flatten() });
   const orderIdParam = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
@@ -6631,7 +6631,7 @@ app.post("/api/v1/zones", requireRole("admin"), async (req, res) => {
   return res.status(201).json({ zone });
 });
 
-app.get("/api/v1/zones", requireRole("admin", "fleet"), async (req, res) => {
+app.get("/api/v1/zones", requireRole("admin", "fleet", "owner", "fleet_manager"), async (req, res) => {
   const employee = await employeeScope(req);
   let filter: Record<string, unknown> = { ...tenantScope(req), isActive: true };
   if (req.auth?.role === "fleet") {
@@ -6643,7 +6643,7 @@ app.get("/api/v1/zones", requireRole("admin", "fleet"), async (req, res) => {
   return res.json({ zones });
 });
 
-app.get("/api/v1/fleets", requireRole("admin", "fleet"), async (req, res) => {
+app.get("/api/v1/fleets", requireRole("admin", "fleet", "owner", "fleet_manager"), async (req, res) => {
   const employee = await employeeScope(req);
   const filter = { ...tenantScope(req), ...(req.auth?.role === "fleet" ? { _id: employee?.fleetId || null } : {}) };
   const fleets = await Fleet.find(filter).select("_id name city localityCode localityName provinceCode provinceName vehicleTypes maxRiders serviceZones isActive createdAt updatedAt").sort({ name: 1 }).lean().exec() as any[];
@@ -6660,7 +6660,7 @@ const fleetInputSchema = z.object({
   if (new Set(value.serviceZones).size !== value.serviceZones.length) context.addIssue({ code: z.ZodIssueCode.custom, path: ["serviceZones"], message: "No se pueden repetir zonas de servicio." });
   if (new Set(value.vehicleTypes).size !== value.vehicleTypes.length) context.addIssue({ code: z.ZodIssueCode.custom, path: ["vehicleTypes"], message: "No se pueden repetir tipos de vehículo." });
 });
-app.post("/api/v1/fleets", requireRole("admin", "fleet"), async (req, res) => {
+app.post("/api/v1/fleets", requireRole("admin", "fleet", "owner", "fleet_manager"), async (req, res) => {
   const parsed = fleetInputSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_FLEET", details: parsed.error.flatten() });
   const employee = await employeeScope(req);
@@ -6730,7 +6730,7 @@ app.post("/api/v1/fleets", requireRole("admin", "fleet"), async (req, res) => {
   }
 });
 
-app.patch("/api/v1/rider-applications/:id/assign-fleet", requireRole("admin", "fleet"), async (req, res) => {
+app.patch("/api/v1/rider-applications/:id/assign-fleet", requireRole("admin", "fleet", "owner", "fleet_manager"), async (req, res) => {
   const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id); if (!id) return res.status(400).json({ error: "INVALID_APPLICATION_ID" });
   const fleetId = objectId(typeof req.body?.fleetId === "string" ? req.body.fleetId : ""); if (!fleetId) return res.status(400).json({ error: "INVALID_FLEET_ID" });
   const tenant = tenantScope(req);
@@ -6874,7 +6874,7 @@ app.get("/api/v1/admin/overview", requireRole("admin"), async (req, res) => {
   res.json({ service: "piki-api", overview: { active_restaurants: activeRestaurants, pending_restaurants: pendingRestaurants, riders, open_orders: openOrders, delivered_today: deliveredToday, gmv_today_cents: Number(gmv[0]?.totalCents || 0), paid_orders_today: Number(gmv[0]?.orders || 0) } });
 });
 
-app.get("/api/v1/admin/operations/health", requireRole("admin", "fleet"), async (req, res) => {
+app.get("/api/v1/admin/operations/health", requireRole("admin", "fleet", "owner", "fleet_manager"), async (req, res) => {
   const now = Date.now();
   const freshCutoff = new Date(now - 90_000);
   const staleCutoff = new Date(now - 10 * 60_000);
@@ -6951,7 +6951,7 @@ app.get("/api/v1/admin/operations/live", requireRole("admin"), async (req, res) 
  * offline coordinates never reach this response, so the map cannot present a
  * stale position as live.
  */
-app.get("/api/v1/fleet/orders", requireRole("admin", "fleet"), async (req, res) => {
+app.get("/api/v1/fleet/orders", requireRole("admin", "fleet", "owner", "fleet_manager"), async (req, res) => {
   // Alcance de flota: el gestor solo ve pedidos de su localidad. Sin localidad
   // explícita no se devuelve nada para no exponer la operación de otras ciudades.
   const locality = String(req.query.locality || "").trim();
@@ -6993,7 +6993,7 @@ app.get("/api/v1/fleet/orders", requireRole("admin", "fleet"), async (req, res) 
   rows.forEach((row) => groups[bucket(String(row.status))].push(row));
   return res.json({ locality, orders: rows, groups, totals: { total: rows.length, incoming: groups.incoming.length, queue: groups.queue.length, delivered: groups.delivered.length, cancelled: groups.cancelled.length } });
 });
-app.get("/api/v1/fleet/operations/live", requireRole("admin", "fleet"), async (req, res) => {
+app.get("/api/v1/fleet/operations/live", requireRole("admin", "fleet", "owner", "fleet_manager"), async (req, res) => {
   const now = madridNow();
   const freshSince = new Date(Date.now() - 90_000);
   const tenant = tenantScope(req);
@@ -7037,7 +7037,7 @@ app.get("/api/v1/fleet/operations/live", requireRole("admin", "fleet"), async (r
   });
 });
 
-app.get("/api/v1/riders/overview", requireRole("admin", "fleet"), async (_req, res) => {
+app.get("/api/v1/riders/overview", requireRole("admin", "fleet", "owner", "fleet_manager"), async (_req, res) => {
   const startOfDay = new Date(); startOfDay.setHours(0, 0, 0, 0);
   const [registered, unassigned, active, completed] = await Promise.all([Rider.countDocuments(), Order.countDocuments({ riderId: null, ...dispatchablePaymentFilter, status: { $in: [...dispatchableOrderStatuses] } }), Order.countDocuments({ riderId: { $ne: null }, status: { $in: ["picked_up", "on_the_way"] } }), Order.countDocuments({ riderId: { $ne: null }, status: "delivered", deliveredAt: { $gte: startOfDay } })]);
   res.json({ service: "piki-api", overview: { registered_riders: registered, unassigned_orders: unassigned, active_deliveries: active, completed_today: completed } });
@@ -7060,7 +7060,7 @@ app.get("/api/v1/riders/statistics", requireRole("rider"), async (req, res) => {
   return res.json({ statistics: { completed: totals.completed, cancelled: totals.cancelled, accepted: totals.accepted, rating: rider.reliabilityScore ? `${Math.round(rider.reliabilityScore * 100)}%` : "—", distance: "—", dailyDeliveries } });
 });
 
-app.get("/api/v1/fleets/overview", requireRole("admin", "fleet"), async (_req, res) => {
+app.get("/api/v1/fleets/overview", requireRole("admin", "fleet", "owner", "fleet_manager"), async (_req, res) => {
   const [fleets, assignedRiders, zones, liveOrders] = await Promise.all([Fleet.countDocuments({ isActive: true }), Rider.countDocuments({ fleetId: { $ne: null } }), Zone.countDocuments({ isActive: true }), Order.countDocuments({ status: { $in: ["pending", "accepted", "preparing", "ready_for_pickup", "picked_up", "on_the_way"] } })]);
   res.json({ service: "piki-api", overview: { active_fleets: fleets, assigned_riders: assignedRiders, active_zones: zones, live_orders: liveOrders } });
 });
