@@ -3448,10 +3448,32 @@ app.get("/api/v1/admin/maintenance/stripe-payouts", requireRole("admin"), async 
     out.balanceError = error instanceof Error ? error.message : String(error);
   }
   try {
-    const settings = await (stripe as any).balanceSettings?.retrieve?.();
-    out.payoutSchedule = settings?.payments?.payouts?.schedule ?? settings?.payouts?.schedule ?? null;
+    const account = await stripe.accounts.retrieve();
+    const payouts = (account as any).settings?.payouts ?? null;
+    out.account = {
+      id: account.id,
+      country: account.country ?? null,
+      defaultCurrency: account.default_currency ?? null,
+      payoutSchedule: payouts?.schedule ?? null,
+      payoutStatementDescriptor: payouts?.statement_descriptor ?? null,
+      chargesEnabled: account.charges_enabled ?? null,
+      payoutsEnabled: account.payouts_enabled ?? null,
+    };
   } catch (error) {
-    out.payoutScheduleError = error instanceof Error ? error.message : String(error);
+    out.accountError = error instanceof Error ? error.message : String(error);
+  }
+  try {
+    const charges = await stripe.charges.list({ limit: 5 });
+    out.recentCharges = charges.data.map((charge) => ({
+      id: charge.id,
+      amountCents: charge.amount,
+      captured: charge.captured,
+      refunded: charge.refunded,
+      status: charge.status,
+      created: new Date(charge.created * 1000).toISOString(),
+    }));
+  } catch (error) {
+    out.chargesError = error instanceof Error ? error.message : String(error);
   }
   try {
     const payouts = await stripe.payouts.list({ limit: 5 });
