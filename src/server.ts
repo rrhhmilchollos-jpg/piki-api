@@ -6,6 +6,7 @@ import { VEHICLE_CATALOG_VERSION, VEHICLE_TYPES, incompatibleVehicles, uniqueVeh
 import { registerTerritoryRoutes } from "./coverage/territoryRoutes.js";
 import { operationalZoneInputSchema } from "./coverage/zoneInput.js";
 import { stripeClient } from "./stripePayments.js";
+import { mountGeofenceRoutes } from "./geofenceRoutes.js";
 import { planWeek, weekStartOf } from "./glovoShiftPlanner.js";
 import { calculatePayroll, payrollGap } from "./payroll.js";
 import { missingPartnerDocumentTypes, missingRiderDocumentTypes, type RiderVehicle } from "./manualOnboardingPolicy.js";
@@ -364,6 +365,7 @@ app.use(express.json({ limit: "20mb" }));
 // bloquea las llamadas desde Fleet con "Failed to fetch".
 mountRiderTracking(app);
 mountStripeRoutes(app);
+mountGeofenceRoutes(app);
 mountShiftRoutes(app);
 
 // Signed Customer -> API/Admin bridge. It accepts profile metadata only;
