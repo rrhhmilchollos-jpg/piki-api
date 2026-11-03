@@ -44,7 +44,9 @@ import { evaluateXativaCoverage, withinSameOperationalCity, XATIVA_PHASE_2_LOCAL
 import { quoteDeliveryRoute } from "./coverage/routing.js";
 import { ROOT_TENANT_SLUG, runTenantMigration } from "./tenantMigration.js";
 import { onboardingScope } from "./onboardingScope.js";
-import { ORDER_ALERT_RECIPIENT, notifyOrderPlaced } from "./orderAlerts.js";
+import { ORDER_ALERT_RECIPIENT, notifyOrderCancelled, notifyOrderPlaced } from "./orderAlerts.js";
+import { startDailySummaryWorker, stopDailySummaryWorker } from "./dailySummaryWorker.js";
+import { BUSINESS_SUMMARY_RECIPIENT, sendDailyBusinessSummary } from "./dailyBusinessSummary.js";
 import { corporateEmailConfiguration, escapeCorporateHtml, sendCorporateEmail, sendLeadContactEmail, verifyCorporateEmailConnection } from "./corporateEmail.js";
 import { activeOperationalOrderStatuses, dispatchableOrderStatuses, dispatchablePaymentFilter, isDispatchableOrderStatus, isDispatchablePayment } from "./dispatchEligibility.js";
 import { canReceivePartnerLocations, partnerCan, partnerPermissions, partnerRolesForEmployee, permissionsForPartnerRoles, type PartnerPermission } from "./partnerAccess.js";
@@ -186,7 +188,8 @@ async function reversePhoton(latitude: number, longitude: number) {
   const label = [address.road, [address.postcode, address.locality].filter(Boolean).join(" ")].filter(Boolean).join(", ");
   return { label: label || `Ubicación GPS ${latitude.toFixed(5)}, ${longitude.toFixed(5)}`, latitude, longitude, locality: address.locality || null, address: properties };
 }
-mongoose.connection.on("connected", () => { databaseReady = true; startShiftSweepWorker(); startCodHoldSweepWorker(); startRealtimeRelay(); startCatalogRelay(); startGoogleBusinessSyncWorker(); void processExpiringCustomerCreditNotifications().catch((error) => console.warn("Credit expiry worker failed", error)); setInterval(() => void processExpiringCustomerCreditNotifications().catch((error) => console.warn("Credit expiry worker failed", error)), 15 * 60_000).unref(); void syncPublicIds().catch((error) => console.error("Public ID sync failed", error)); void ensurePikiPrlCourse().catch((error) => console.error("PIKI PRL course seed failed", error)); });
+mongoose.connection.on("connected", () => { databaseReady = true; startShiftSweepWorker(); startCodHoldSweepWorker()
+  startDailySummaryWorker();; startRealtimeRelay(); startCatalogRelay(); startGoogleBusinessSyncWorker(); void processExpiringCustomerCreditNotifications().catch((error) => console.warn("Credit expiry worker failed", error)); setInterval(() => void processExpiringCustomerCreditNotifications().catch((error) => console.warn("Credit expiry worker failed", error)), 15 * 60_000).unref(); void syncPublicIds().catch((error) => console.error("Public ID sync failed", error)); void ensurePikiPrlCourse().catch((error) => console.error("PIKI PRL course seed failed", error)); });
 mongoose.connection.on("disconnected", () => { databaseReady = false; console.warn("MongoDB disconnected; API entering not-ready state"); });
 mongoose.connection.on("error", (error) => { databaseReady = false; console.error("MongoDB connection error", error instanceof Error ? error.message : error); });
 
@@ -4813,6 +4816,7 @@ app.post("/api/v1/admin/support/orders/:id/cancel", requireRole(...supportOperat
   const actorEmployeeId = objectId(String(req.auth?.employeeId || ""));
   if (parsed.data.ticketId) await SupportTicket.updateOne({ _id: objectId(parsed.data.ticketId), ...supportTenantScope(req) }, { $push: { actions: { action: "order_cancelled", actorEmployeeId, reason: parsed.data.reason, metadata: { orderId: String(orderId) } } } }).exec();
   scheduleCustomerOrderPush(updated, "cancelled");
+  void notifyOrderCancelled(updated, parsed.data.reason).catch(() => undefined);
   return res.json({ order: updated, audit: { action: "order_cancelled", reason: parsed.data.reason } });
 });
 app.post("/api/v1/admin/support/orders/:id/reassign", requireRole(...supportOperatorRoles), async (req, res) => {
@@ -4940,6 +4944,14 @@ app.post("/api/v1/admin/orders/cleanup-test-data", requireOwner(), async (_req, 
 });
 // Borrado de pedidos concretos, para limpiar pruebas de producción.
 // Primero simula; solo borra de verdad con ?apply=1 o {"apply": true}.
+app.post("/api/v1/admin/maintenance/daily-summary", requireRole("admin"), async (_req, res) => {
+  const result = await sendDailyBusinessSummary();
+  return res.json({ ...result, recipient: BUSINESS_SUMMARY_RECIPIENT });
+});
+app.get("/api/v1/admin/maintenance/daily-summary", requireRole("admin"), async (_req, res) => {
+  const { buildDailyBusinessSummary } = await import("./dailyBusinessSummary.js");
+  return res.json({ preview: await buildDailyBusinessSummary(), recipient: BUSINESS_SUMMARY_RECIPIENT });
+});
 app.post("/api/v1/admin/maintenance/test-order-alert", requireRole("admin"), async (_req, res) => {
   const sample = {
     _id: new mongoose.Types.ObjectId(),
@@ -5166,6 +5178,7 @@ app.post("/api/v1/orders/:id/transitions", requireRole("admin", "partner", "ride
   }
   if (["delivered", "cancelled"].includes(parsed.data.status)) await RiderOrderMessage.deleteMany({ orderId: order._id }).exec();
   scheduleCustomerOrderPush(updated, parsed.data.status);
+  if (parsed.data.status === "cancelled") void notifyOrderCancelled(updated, String((parsed.data as { reason?: string }).reason || "")).catch(() => undefined);
   if (actorRole === "partner" && ["accepted", "preparing", "ready_for_pickup"].includes(parsed.data.status)) {
     void enqueueOrderForDispatch(id, undefined, "partner_status")
       .catch((error) => console.warn("Partner dispatch enqueue failed", error instanceof Error ? error.message : error));
@@ -7151,7 +7164,8 @@ async function start() {
   // `npm run start:dispatch-worker` as a separate service to consume the
   // persistent dispatch_outbox with atomic leases and retry/backoff.
   const shutdown = () => {
-    stopGoogleBusinessSyncWorker(); stopNotificationWorker(); stopCodHoldSweepWorker(); databaseReady = false;
+    stopGoogleBusinessSyncWorker(); stopNotificationWorker(); stopCodHoldSweepWorker();
+  stopDailySummaryWorker(); databaseReady = false;
     server.close(() => { void mongoose.disconnect().finally(() => process.exit(0)); });
     setTimeout(() => process.exit(0), 25_000).unref();
   };

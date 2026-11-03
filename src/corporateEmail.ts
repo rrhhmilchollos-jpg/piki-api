@@ -1,6 +1,6 @@
 import nodemailer from "nodemailer";
 import { createHash } from "node:crypto";
-type CorporateEmail = { recipientEmail: string; subject: string; text: string; html: string; idempotencyKey: string };
+type CorporateEmail = { recipientEmail: string; subject: string; text: string; html: string; idempotencyKey: string; fromEmail?: string };
 export type CorporateEmailResult = { sent: boolean; error?: string; providerId?: string };
 export function corporateEmailConfiguration() {
   const smtp = Boolean(process.env.SMTP_HOST?.trim() && process.env.SMTP_USER?.trim() && (process.env.SMTP_PASSWORD || process.env.SMTP_PASS));
@@ -23,6 +23,7 @@ export function escapeCorporateHtml(value: string) {
 }
 export async function sendCorporateEmail(input: CorporateEmail): Promise<CorporateEmailResult> {
   const configuration = corporateEmailConfiguration();
+  const from = input.fromEmail ? input.fromEmail.trim() : configuration.from;
   const deliveryKey = createHash("sha256").update(input.idempotencyKey).digest("hex");
   if (!configuration.configured) return { sent: false, error: "CORPORATE_EMAIL_NOT_CONFIGURED" };
   if (configuration.provider === "smtp") {
@@ -35,7 +36,7 @@ export async function sendCorporateEmail(input: CorporateEmail): Promise<Corpora
       tls: { minVersion: "TLSv1.2", rejectUnauthorized: true },
     });
     try {
-      const result = await transport.sendMail({ from: configuration.from, sender: configuration.from, replyTo: configuration.replyTo, to: input.recipientEmail, subject: input.subject, text: input.text, html: input.html, messageId: `<${deliveryKey}@pikidelivery.com>`, headers: { "X-PIKI-Delivery-Key": deliveryKey, "X-Mailer": "PIKI Delivery", "X-Auto-Response-Suppress": "All" }, envelope: { from: process.env.SMTP_USER!.trim(), to: input.recipientEmail } });
+      const result = await transport.sendMail({ from, sender: from, replyTo: configuration.replyTo, to: input.recipientEmail, subject: input.subject, text: input.text, html: input.html, messageId: `<${deliveryKey}@pikidelivery.com>`, headers: { "X-PIKI-Delivery-Key": deliveryKey, "X-Mailer": "PIKI Delivery", "X-Auto-Response-Suppress": "All" }, envelope: { from: process.env.SMTP_USER!.trim(), to: input.recipientEmail } });
       if (!(result.accepted || []).some((address: string) => String(address).toLowerCase() === input.recipientEmail.toLowerCase())) return { sent: false, error: "CORPORATE_EMAIL_RECIPIENT_REJECTED" };
       return { sent: true, providerId: String(result.messageId) };
     } catch (error) {
@@ -47,7 +48,7 @@ export async function sendCorporateEmail(input: CorporateEmail): Promise<Corpora
   try {
     const response = await fetch("https://api.resend.com/emails", {
       method: "POST", headers: { Authorization: `Bearer ${process.env.RESEND_API_KEY!.trim()}`, "Content-Type": "application/json", "Idempotency-Key": deliveryKey },
-      body: JSON.stringify({ from: configuration.from, reply_to: configuration.replyTo, to: [input.recipientEmail], subject: input.subject, text: input.text, html: input.html }), signal: AbortSignal.timeout(8_000),
+      body: JSON.stringify({ from, reply_to: configuration.replyTo, to: [input.recipientEmail], subject: input.subject, text: input.text, html: input.html }), signal: AbortSignal.timeout(8_000),
     });
     const payload = await response.json().catch(() => ({})) as { id?: string };
     if (!response.ok || !payload.id) {
