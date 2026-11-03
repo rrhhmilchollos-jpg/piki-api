@@ -3492,6 +3492,34 @@ app.delete("/api/v1/admin/maintenance/riders/:id", requireRole("admin"), async (
 
 // Absorción de flotas antiguas en la matriz: mueve riders, une zonas y retira
 // la flota de origen sin dejar riders huérfanos.
+app.post("/api/v1/admin/maintenance/reviewer-accounts", requireRole("admin"), async (req, res) => {
+  const parsed = z.object({
+    email: z.string().email(),
+    name: z.string().min(2),
+    apiRole: z.enum(["admin", "fleet", "rider", "partner", "support", "commercial", "finance"]),
+    password: z.string().min(8),
+    jobRole: z.string().optional(),
+  }).safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "INVALID_REVIEWER_ACCOUNT", details: parsed.error.flatten() });
+  const email = parsed.data.email.trim().toLowerCase();
+  const apiRole = parsed.data.apiRole;
+  const jobRole = parsed.data.jobRole || (apiRole === "fleet" ? "zone_manager" : apiRole === "rider" ? "rider" : "administrativo");
+  const passwordHash = hashPassword(parsed.data.password);
+  const existing = await EmployeeAccount.findOne({ email }).select("_id").lean().exec() as any;
+  if (existing) {
+    await EmployeeAccount.updateOne({ _id: existing._id }, { $set: { name: parsed.data.name, apiRole, roles: [apiRole], primaryRole: apiRole, jobRole, passwordHash, mustChangePassword: false, active: true, authorizationStatus: "approved" } }).exec();
+    return res.json({ updated: true, employee: { id: String(existing._id), email, apiRole, jobRole } });
+  }
+  const employeeId = new mongoose.Types.ObjectId();
+  const employee = await EmployeeAccount.create({
+    _id: employeeId, employeeCode: employeeCodeFor(employeeId), name: parsed.data.name, email,
+    jobRole, apiRole, roles: [apiRole], primaryRole: apiRole, tenantId: null, accessLevel: "subadmin",
+    authorizationStatus: "approved", authorizedAt: new Date(), authorizedBy: null, restaurantId: null, fleetId: null,
+    passwordHash, mustChangePassword: false, active: true,
+  });
+  return res.status(201).json({ created: true, employee: { id: employee.id, employeeCode: employee.employeeCode, email, apiRole, jobRole } });
+});
+
 app.post("/api/v1/admin/maintenance/fleets/:id/absorb", requireRole("admin"), async (req, res) => {
   const targetId = objectId(String(req.params.id));
   if (!targetId) return res.status(400).json({ error: "INVALID_FLEET_ID" });
