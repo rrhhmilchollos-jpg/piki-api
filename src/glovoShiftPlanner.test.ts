@@ -52,24 +52,24 @@ test("un turno que no deja descanso suficiente se rechaza", () => {
   assert.equal(result.restHours, 8);
 });
 
-test("la nómina de 30 h aplica 6,47% de Seguridad Social y 2% de IRPF", () => {
+test("la nómina de 30 h deja 6,47% de Seguridad Social y un neto de 1.180 €", () => {
   const payroll = calculatePayroll({ weeklyHours: 30 });
   assert.equal(payroll.monthlyGrossCents, 134_000);
   assert.equal(payroll.socialSecurityCents, 8_670);
-  assert.equal(payroll.irpfCents, 2_680);
-  assert.equal(payroll.netCents, 122_650);
-  assert.equal(Math.round(payroll.effectiveDeductionRate * 100) / 100, 8.47);
+  assert.equal(payroll.irpfCents, 7_330);
+  assert.equal(payroll.netCents, 118_000);
+  assert.equal(Math.round(payroll.effectiveDeductionRate * 100) / 100, 11.94);
 });
 
 test("las propinas van íntegras al rider", () => {
   const payroll = calculatePayroll({ weeklyHours: 30, tipsCents: 2_500 });
-  assert.equal(payroll.netCents, 122_650);
-  assert.equal(payroll.totalToRiderCents, 125_150);
+  assert.equal(payroll.netCents, 118_000);
+  assert.equal(payroll.totalToRiderCents, 120_500);
 });
 
-test("para llegar a 1.180 € netos haría falta una retención mayor que la pactada", () => {
+test("con la retención ajustada el neto coincide con el objetivo", () => {
   const gap = payrollGap({ weeklyHours: 30 }, 118_000);
-  assert.equal(gap.deltaCents, -4_650);
+  assert.equal(gap.deltaCents, 0);
   assert.equal(Math.round(gap.requiredRate * 100) / 100, 11.94);
-  assert.ok(requiredDeductionRate(134_000, 118_000) > 8.47);
+  assert.equal(requiredDeductionRate(134_000, 118_000), 11.940298507462686);
 });

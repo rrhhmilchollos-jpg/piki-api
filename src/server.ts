@@ -3577,6 +3577,31 @@ app.get("/api/v1/admin/maintenance/stripe-payouts", requireRole("admin"), async 
     out.accountError = error instanceof Error ? error.message : String(error);
   }
   try {
+    const accountId = (out.account as any)?.id;
+    if (accountId) {
+      const external = await stripe.accounts.listExternalAccounts(accountId, { limit: 10 });
+      const items = external.data.map((entry: any) => ({
+        type: entry.object,
+        bankName: entry.bank_name ?? null,
+        last4: entry.last4 ?? null,
+        currency: entry.currency ?? null,
+        status: entry.status ?? null,
+        defaultForCurrency: entry.default_for_currency ?? null,
+      }));
+      out.externalAccounts = items;
+      // En España los pagos instantáneos de Stripe exigen una tarjeta de débito
+      // como destino; con cuenta bancaria solo hay liquidación estándar.
+      out.instantPayout = {
+        eligible: items.some((item: any) => item.type === "card"),
+        reason: items.some((item: any) => item.type === "card")
+          ? "Hay una tarjeta de débito vinculada."
+          : "Solo hay cuentas bancarias: Stripe no permite liquidación instantánea; se usa la programada (diaria).",
+      };
+    }
+  } catch (error) {
+    out.externalAccountsError = error instanceof Error ? error.message : String(error);
+  }
+  try {
     const charges = await stripe.charges.list({ limit: 5 });
     out.recentCharges = charges.data.map((charge) => ({
       id: charge.id,

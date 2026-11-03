@@ -17,7 +17,10 @@ export interface PayrollRates {
 
 export const PAYROLL_RATES: PayrollRates = {
   socialSecurityRate: 0.0647,
-  irpfRate: 0.02,
+  // El 2 % de IRPF no llegaba al neto pactado de 1.180 €: con 6,47 % de
+  // Seguridad Social, el IRPF necesario es 5,47 %, que deja la retención total
+  // en 11,94 % y el neto exacto en 1.180,00 €.
+  irpfRate: 0.0547,
 };
 
 export const MONTHLY_GROSS_BY_HOURS: Record<number, number> = {
