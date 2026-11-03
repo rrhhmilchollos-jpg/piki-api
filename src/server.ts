@@ -4966,6 +4966,11 @@ app.post("/api/v1/admin/maintenance/menus/commission-flag", requireRole("admin")
   invalidateCatalogCache();
   return res.json({ priceIncludesCommission: value, matched: result.matchedCount ?? null, modified: result.modifiedCount ?? null });
 });
+app.get("/api/v1/orders", requireRole("admin"), async (req, res) => {
+  // El panel de administración consulta aquí el listado operativo.
+  const active = String(req.query.active || "") === "true";
+  res.redirect(307, `/api/v1/admin/orders${active ? "?status=pending" : ""}`);
+});
 app.get("/api/v1/admin/orders", requireRole("admin"), async (req, res) => {
   const limit = Math.min(200, Math.max(1, Number(req.query.limit) || 50));
   const status = String(req.query.status || "").trim();
