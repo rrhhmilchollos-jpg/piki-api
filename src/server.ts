@@ -514,7 +514,9 @@ const MENU_FILE_MIME_TYPES = ["application/pdf"] as const;
 const MENU_ASSET_MIME_TYPES = [...MENU_IMAGE_MIME_TYPES, ...MENU_FILE_MIME_TYPES] as const;
 const MENU_ASSET_KINDS = ["menu_image", "menu_file"] as const;
   function pricedRestaurantMenu(restaurant: any) {
-    return customerMenuForRestaurant({ ...restaurant, menu: canonicalRestaurantMenu(restaurant) });
+    // El checkout debe cotizar exactamente la misma carta que ve el cliente en el
+    // catálogo: una sola fuente de precio evita cobrar de menos o dos veces.
+    return (presentCustomerCatalogRestaurant({ ...restaurant, menu: canonicalRestaurantMenu(restaurant) }).menu || []) as any[];
   }
   const FREE_DELIVERY_LAUNCH_LIMIT = 30;
   const FREE_DELIVERY_LAUNCH_START = Date.parse(process.env.PIKI_FREE_DELIVERY_START || "2026-10-28T00:00:00+02:00");

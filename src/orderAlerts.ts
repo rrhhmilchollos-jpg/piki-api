@@ -25,7 +25,7 @@ export async function notifyOrderPlaced(order: any): Promise<{ sent: boolean; er
       ? ((await Restaurant.findById(order.restaurantId).select("name address city").lean().catch(() => null)) as any)
       : null;
     const items: Array<{ name?: string; quantity?: number; lineTotalCents?: number }> = Array.isArray(order.items) ? order.items : [];
-    const lines = items.map((item) => `· ${Number(item.quantity) || 1} × ${item.name || "Producto"} — ${euro(item.lineTotalCents)}`);
+    const lines = items.map((item: any) => `· ${Number(item.quantity) || 1} × ${item.name || "Producto"} — ${euro(item.lineTotalCents ?? (Number(item.unitPriceCents) || 0) * (Number(item.quantity) || 1))}`);
     const method =
       order.paymentMethod === "cash"
         ? "Efectivo al recibir (tarjeta retenida como garantía)"
