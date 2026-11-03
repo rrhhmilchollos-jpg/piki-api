@@ -11,7 +11,7 @@ export const XATIVA_COVERAGE_POLICY = {
   maxStraightLineDistanceKm: 3,
   deliveryBaseFeeCents: 299,
   outsideMunicipalitySurchargeCents: 0,
-  serviceFeeCents: 79,
+  serviceFeeCents: 0,
   routeVehicleThresholdKm: 1.5,
   // At or above 1.5 km, and when routing is unavailable, only motorized
   // motorcycle/scooter or car classes may be offered.

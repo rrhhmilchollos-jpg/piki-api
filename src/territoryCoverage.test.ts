@@ -18,7 +18,7 @@ test("ten executable areas include all nine requested places and have valid muni
     assert.equal(decision.covered, true, area.name);
     assert.equal(decision.municipalityCode, area.municipalityCode, area.name);
     assert.equal(decision.deliveryFeeCents, 299, "opening new zones does not invent a new delivery tariff");
-    assert.equal(decision.serviceFeeCents, 79);
+    assert.equal(decision.serviceFeeCents, 0);
   }
   assert.equal(evaluateXativaCoverage([-0.3763, 39.4699]).covered, false, "Valencia city is not enabled by a province label");
   assert.equal(evaluateXativaCoverage([NaN, 39]).covered, false);
