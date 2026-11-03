@@ -6951,6 +6951,42 @@ app.get("/api/v1/admin/operations/live", requireRole("admin"), async (req, res) 
  * offline coordinates never reach this response, so the map cannot present a
  * stale position as live.
  */
+app.get("/api/v1/fleet/orders", requireRole("admin", "fleet"), async (req, res) => {
+  // Alcance de flota: el gestor solo ve pedidos de su localidad. Sin localidad
+  // explícita no se devuelve nada para no exponer la operación de otras ciudades.
+  const locality = String(req.query.locality || "").trim();
+  if (!locality) return res.status(400).json({ error: "LOCALITY_REQUIRED", message: "Indica la localidad de la flota." });
+  const normalise = (value: unknown) => String(value ?? "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().trim();
+  const target = normalise(locality);
+  const orders = await Order.find({}).sort({ createdAt: -1 }).limit(300).lean().exec() as any[];
+  const rows = orders
+    .filter((order) => {
+      const candidates = [order.city, order.localityName, order.restaurantCity, order.restaurantLocality, order.deliveryLocality, order.restaurantName];
+      return candidates.some((value) => value && (normalise(value).includes(target) || target.includes(normalise(value))));
+    })
+    .map((order) => ({
+      id: String(order._id),
+      publicCode: order.publicCode || "",
+      displayCode: order.displayCode || "",
+      status: order.status || "",
+      paymentMethod: order.paymentMethod || "",
+      paymentState: order.paymentState || "",
+      totalCents: Number(order.totalCents) || 0,
+      restaurantName: order.restaurantName || "",
+      customerName: order.customerName || "",
+      riderId: order.riderId ? String(order.riderId) : null,
+      createdAt: order.createdAt || null,
+    }));
+  const bucket = (status: string) => {
+    if (["delivered", "completed"].includes(status)) return "delivered";
+    if (["cancelled", "rejected", "expired"].includes(status)) return "cancelled";
+    if (["preparing", "ready", "ready_for_pickup", "accepted"].includes(status)) return "queue";
+    return "incoming";
+  };
+  const groups = { incoming: [] as any[], queue: [] as any[], delivered: [] as any[], cancelled: [] as any[] };
+  rows.forEach((row) => groups[bucket(String(row.status))].push(row));
+  return res.json({ locality, orders: rows, groups, totals: { total: rows.length, incoming: groups.incoming.length, queue: groups.queue.length, delivered: groups.delivered.length, cancelled: groups.cancelled.length } });
+});
 app.get("/api/v1/fleet/operations/live", requireRole("admin", "fleet"), async (req, res) => {
   const now = madridNow();
   const freshSince = new Date(Date.now() - 90_000);
