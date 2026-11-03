@@ -3499,6 +3499,9 @@ app.post("/api/v1/admin/maintenance/reviewer-accounts", requireRole("admin"), as
     apiRole: z.enum(["admin", "fleet", "rider", "partner", "support", "commercial", "finance"]),
     password: z.string().min(8),
     jobRole: z.string().optional(),
+    tenantId: z.string().optional(),
+    fleetId: z.string().optional(),
+    restaurantId: z.string().optional(),
   }).safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_REVIEWER_ACCOUNT", details: parsed.error.flatten() });
   const email = parsed.data.email.trim().toLowerCase();
@@ -3507,14 +3510,14 @@ app.post("/api/v1/admin/maintenance/reviewer-accounts", requireRole("admin"), as
   const passwordHash = hashPassword(parsed.data.password);
   const existing = await EmployeeAccount.findOne({ email }).select("_id").lean().exec() as any;
   if (existing) {
-    await EmployeeAccount.updateOne({ _id: existing._id }, { $set: { name: parsed.data.name, apiRole, roles: [apiRole], primaryRole: apiRole, jobRole, passwordHash, mustChangePassword: false, active: true, authorizationStatus: "approved" } }).exec();
+    await EmployeeAccount.updateOne({ _id: existing._id }, { $set: { name: parsed.data.name, apiRole, roles: [apiRole], primaryRole: apiRole, jobRole, passwordHash, mustChangePassword: false, active: true, authorizationStatus: "approved", ...(parsed.data.tenantId ? { tenantId: objectId(parsed.data.tenantId) } : {}), ...(parsed.data.fleetId ? { fleetId: objectId(parsed.data.fleetId) } : {}), ...(parsed.data.restaurantId ? { restaurantId: objectId(parsed.data.restaurantId) } : {}) } }).exec();
     return res.json({ updated: true, employee: { id: String(existing._id), email, apiRole, jobRole } });
   }
   const employeeId = new mongoose.Types.ObjectId();
   const employee = await EmployeeAccount.create({
     _id: employeeId, employeeCode: employeeCodeFor(employeeId), name: parsed.data.name, email,
-    jobRole, apiRole, roles: [apiRole], primaryRole: apiRole, tenantId: null, accessLevel: "subadmin",
-    authorizationStatus: "approved", authorizedAt: new Date(), authorizedBy: null, restaurantId: null, fleetId: null,
+    jobRole, apiRole, roles: [apiRole], primaryRole: apiRole, tenantId: parsed.data.tenantId ? objectId(parsed.data.tenantId) : null, accessLevel: "subadmin",
+    authorizationStatus: "approved", authorizedAt: new Date(), authorizedBy: null, restaurantId: parsed.data.restaurantId ? objectId(parsed.data.restaurantId) : null, fleetId: parsed.data.fleetId ? objectId(parsed.data.fleetId) : null,
     passwordHash, mustChangePassword: false, active: true,
   });
   return res.status(201).json({ created: true, employee: { id: employee.id, employeeCode: employee.employeeCode, email, apiRole, jobRole } });
