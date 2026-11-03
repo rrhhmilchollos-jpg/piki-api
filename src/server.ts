@@ -520,7 +520,7 @@ const MENU_ASSET_KINDS = ["menu_image", "menu_file"] as const;
   }
   const FREE_DELIVERY_LAUNCH_LIMIT = 30;
   const FREE_DELIVERY_LAUNCH_START = Date.parse(process.env.PIKI_FREE_DELIVERY_START || "2026-10-28T00:00:00+02:00");
-  const FREE_DELIVERY_LAUNCH_END = Date.parse(process.env.PIKI_FREE_DELIVERY_END || "2026-11-04T00:00:00+01:00");
+  const FREE_DELIVERY_LAUNCH_END = Date.parse(process.env.PIKI_FREE_DELIVERY_END || "2026-11-02T00:00:00+01:00");
   function isFreeDeliveryLaunchWindow(now = Date.now()) { return now >= FREE_DELIVERY_LAUNCH_START && now < FREE_DELIVERY_LAUNCH_END; }
   async function freeDeliveryState(restaurant: { _id: unknown; slug?: string }) {
     if (!isFreeDeliveryLaunchWindow()) return { eligible: false, remaining: 0 };
@@ -4958,6 +4958,14 @@ app.post("/api/v1/admin/orders/cleanup-test-data", requireOwner(), async (_req, 
 });
 // Borrado de pedidos concretos, para limpiar pruebas de producción.
 // Primero simula; solo borra de verdad con ?apply=1 o {"apply": true}.
+app.post("/api/v1/admin/maintenance/menus/commission-flag", requireRole("admin"), async (req, res) => {
+  // El precio de carta es el precio base del comercio: la comisión de PIKI se
+  // aplica al presentar la carta, de forma identica en catalogo y en checkout.
+  const value = req.body?.priceIncludesCommission === true;
+  const result = await Restaurant.updateMany({}, { $set: { priceIncludesCommission: value } }).exec();
+  invalidateCatalogCache();
+  return res.json({ priceIncludesCommission: value, matched: result.matchedCount ?? null, modified: result.modifiedCount ?? null });
+});
 app.get("/api/v1/admin/maintenance/pricing-check", requireRole("admin"), async (req, res) => {
   const reference = String(req.query.restaurant || "");
   const itemId = String(req.query.item || "");
