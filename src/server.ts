@@ -4956,6 +4956,34 @@ app.post("/api/v1/admin/orders/cleanup-test-data", requireOwner(), async (_req, 
 });
 // Borrado de pedidos concretos, para limpiar pruebas de producción.
 // Primero simula; solo borra de verdad con ?apply=1 o {"apply": true}.
+app.post("/api/v1/admin/maintenance/menus/apply-commission", requireRole("admin"), async (req, res) => {
+  // Un único precio por producto: la comisión de PIKI se integra en la carta y se
+  // marca el comercio para que ninguna capa posterior vuelva a aplicarla.
+  const dryRun = req.body?.dryRun !== false;
+  const restaurants = await Restaurant.find({ onboardingStatus: "approved" }).select("_id slug name menu priceIncludesCommission").lean().exec() as any[];
+  const scaled = (value: unknown) => Math.round(Number(value || 0) * 1.2 * 100) / 100;
+  const report: any[] = [];
+  for (const restaurant of restaurants) {
+    const menu = Array.isArray(restaurant.menu) ? restaurant.menu : [];
+    if (restaurant.priceIncludesCommission === true || !menu.length) { report.push({ slug: restaurant.slug, skipped: true, items: menu.length }); continue; }
+    const next = menu.map((item: any) => ({
+      ...item,
+      price: scaled(item.price),
+      modifiers: (item.modifiers || []).map((group: any) => ({
+        ...group,
+        price: scaled(group.price),
+        optionItems: (group.optionItems || []).map((option: any) => ({ ...option, price: scaled(option.price) })),
+        options: (group.options || []).map((option: any) => (typeof option === "string" ? option : { ...option, price: scaled(option.price) })),
+      })),
+    }));
+    if (!dryRun) {
+      await Restaurant.updateOne({ _id: restaurant._id }, { $set: { menu: next, priceIncludesCommission: true } }).exec();
+      invalidateCatalogCache();
+    }
+    report.push({ slug: restaurant.slug, skipped: false, items: next.length, first: { before: menu[0]?.price, after: next[0]?.price } });
+  }
+  return res.json({ dryRun, restaurants: report });
+});
 app.put("/api/v1/admin/maintenance/restaurants/:id/menu", requireRole("admin"), async (req, res) => {
   const id = objectId(String(req.params.id));
   if (!id) return res.status(400).json({ error: "INVALID_RESTAURANT_ID" });
