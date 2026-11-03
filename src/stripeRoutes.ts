@@ -7,6 +7,7 @@
  *  - POST /api/v1/admin/cod-sweep               → barrido de retenciones a punto de caducar
  *  - POST /webhooks/stripe                      → eventos firmados de Stripe
  */
+import { stripeChargeTestPage } from "./stripeChargeTestPage.js";
 import express, { type Express, type Request, type Response } from "express";
 import mongoose from "mongoose";
 import { z } from "zod";
@@ -105,6 +106,15 @@ async function riderOwnsOrder(request: Request, order: { riderId?: unknown } | n
 }
 
 export function mountStripeRoutes(app: Express): void {
+  // Página para que el titular confirme el cargo de prueba con su tarjeta.
+  app.get("/pago-prueba", (_request: Request, response: Response) => {
+    const publishableKey =
+      process.env.PIKI_STRIPE_PUBLISHABLE_KEY ||
+      process.env.STRIPE_PUBLISHABLE_KEY ||
+      "pk_live_51UIqmwRNVIpslXC9ouvRIQP6ksNT7x9XomDKUzZ9sYm5vBQAGbhgk9MrXx1TyUMN59DBGzwbYRaYd0vQmKh1kjtX00BT99nFo9";
+    response.type("html").send(stripeChargeTestPage(publishableKey));
+  });
+
   app.get(
     "/api/v1/admin/stripe/status",
     requireRole("admin", "finance", "fleet"),
