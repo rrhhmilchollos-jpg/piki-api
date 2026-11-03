@@ -3397,6 +3397,29 @@ app.post("/api/v1/admin/maintenance/employees/:id/send-activation", requireRole(
   const delivery = await sendEmployeePasswordLink(employee, surface, "activation");
   return res.json({ email: employee.email, surface, sent: delivery.delivery.sent, error: delivery.delivery.error ?? null });
 });
+// Auditoría de flotas: responsable, zonas y riders, sin filtro de tenant.
+app.get("/api/v1/admin/maintenance/fleets", requireRole("admin"), async (_req, res) => {
+  const fleets = await Fleet.find({}).sort({ createdAt: 1 }).lean().exec() as any[];
+  const counts = await Rider.aggregate([{ $match: { fleetId: { $ne: null } } }, { $group: { _id: "$fleetId", total: { $sum: 1 } } }]).exec();
+  const ridersByFleet = new Map(counts.map((row: any) => [String(row._id), row.total]));
+  return res.json({
+    count: fleets.length,
+    fleets: fleets.map((fleet) => ({
+      id: String(fleet._id),
+      name: fleet.name,
+      displayName: fleet.displayName ?? null,
+      city: fleet.city ?? null,
+      managerName: fleet.managerName ?? null,
+      managerEmail: fleet.managerEmail ?? null,
+      managerEmployeeId: fleet.managerEmployeeId ? String(fleet.managerEmployeeId) : null,
+      tenantId: fleet.tenantId ? String(fleet.tenantId) : null,
+      isActive: fleet.isActive !== false,
+      zones: (fleet.serviceZones ?? []).length,
+      riders: ridersByFleet.get(String(fleet._id)) ?? 0,
+    })),
+  });
+});
+
 // Nombramiento del responsable de una flota y su tenant, desde mantenimiento.
 app.patch("/api/v1/admin/maintenance/fleets/:id/manager", requireRole("admin"), async (req, res) => {
   const id = objectId(String(req.params.id));
