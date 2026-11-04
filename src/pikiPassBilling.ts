@@ -18,7 +18,7 @@ const billingClient = secretKey ? new Stripe(secretKey) : null;
 
 export const PIKI_PASS_MONTHLY_CENTS = 499;
 export const PIKI_PASS_ANNUAL_CENTS = 4_990;
-export const PIKI_PASS_TRIAL_DAYS = 30;
+export const PIKI_PASS_TRIAL_DAYS = 0;
 export const PIKI_PASS_FREE_DELIVERY_MIN_SUBTOTAL_CENTS = 1_000;
 
 export type PikiPassPlan = "monthly" | "annual";
@@ -57,7 +57,7 @@ function lineItemFor(plan: PikiPassPlan): Stripe.Checkout.SessionCreateParams.Li
   };
 }
 
-/** Hosted Stripe Checkout in subscription mode, with the 30-day trial applied. */
+/** Hosted Stripe Checkout in subscription mode. Recurring PIKI Pass charges start immediately. */
 export async function createPassCheckoutSession(input: {
   customerId: string;
   customerEmail?: string | null;
@@ -71,8 +71,9 @@ export async function createPassCheckoutSession(input: {
     mode: "subscription",
     locale: "es",
     customer_email: input.customerEmail || undefined,
+    payment_method_types: ["card"],
     line_items: [lineItemFor(plan)],
-    subscription_data: { trial_period_days: PIKI_PASS_TRIAL_DAYS, metadata },
+    subscription_data: { metadata },
     metadata,
     client_reference_id: input.customerId,
     success_url: `${input.origin}/piki-pass?pass=success`,
@@ -99,6 +100,7 @@ export async function createPassOneOffSession(input: { customerId: string; custo
     mode: "payment",
     locale: "es",
     customer_email: input.customerEmail || undefined,
+    payment_method_types: ["card", "bizum" as unknown as Stripe.Checkout.SessionCreateParams.PaymentMethodType],
     line_items: [{ quantity: 1, price_data: { currency: "eur", product_data: { name: "PIKI Pass · 30 días" }, unit_amount: config.amountCents } }],
     metadata,
     payment_intent_data: { metadata },
