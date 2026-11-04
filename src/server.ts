@@ -5867,13 +5867,19 @@ async function archivePreviousDayPartnerOrders() {
   if (result.modifiedCount) console.log(JSON.stringify({ event: "partner_previous_day_orders_archived", madridDate, count: result.modifiedCount }));
   return result.modifiedCount;
 }
-function slotContainsTime(slot: { startTime: string; endTime: string }, time: string) { return slot.startTime < slot.endTime ? slot.startTime <= time && time < slot.endTime : time >= slot.startTime || time < slot.endTime; }
+function minutesOfDay(value: string) { const [hours, minutes] = String(value || "00:00").split(":").map(Number); return Math.max(0, Math.min(1440, hours * 60 + minutes)); }
+function isOvernightSlot(slot: { startTime: string; endTime: string }) { return minutesOfDay(slot.endTime) <= minutesOfDay(slot.startTime); }
+function slotContainsTime(slot: { startTime: string; endTime: string }, time: string) {
+  const start = minutesOfDay(slot.startTime); const current = minutesOfDay(time); const rawEnd = minutesOfDay(slot.endTime);
+  const end = rawEnd === 0 ? 1440 : rawEnd;
+  return start < end ? start <= current && current < end : current >= start || current < end;
+}
 
 async function expireRiderSlots(riderId: mongoose.Types.ObjectId, now: ReturnType<typeof madridNow>) {
   const candidates = await RiderSlot.find({ riderId, date: { $in: [now.date, previousCalendarDate(now.date)] }, status: "active" }).select("_id date startTime endTime").lean().exec() as any[];
   const expired = candidates.filter((slot) => {
-    if (slot.date === now.date) return slot.startTime < slot.endTime && now.time >= slot.endTime;
-    return slot.startTime < slot.endTime || now.time >= slot.endTime;
+    if (slot.date === now.date) return !isOvernightSlot(slot) && !slotContainsTime(slot, now.time);
+    return !isOvernightSlot(slot) || !slotContainsTime(slot, now.time);
   });
   if (!expired.length) return false;
   await RiderSlot.updateMany({ _id: { $in: expired.map((slot) => slot._id) }, status: "active" }, { $set: { status: "completed" } }).exec();
@@ -5884,7 +5890,7 @@ async function findCurrentRiderSlot(riderId: mongoose.Types.ObjectId) {
   const now = madridNow();
   await expireRiderSlots(riderId, now);
   const candidates = await RiderSlot.find({ riderId, date: { $in: [now.date, previousCalendarDate(now.date)] }, status: { $in: ["planned", "active"] } }).sort({ date: 1, startTime: 1 }).lean().exec();
-  const slot = candidates.find((candidate: any) => slotContainsTime(candidate, now.time) && (candidate.date === now.date || candidate.startTime >= candidate.endTime));
+  const slot = candidates.find((candidate: any) => slotContainsTime(candidate, now.time) && (candidate.date === now.date || isOvernightSlot(candidate)));
   return { now, slot, selfStartAllowed: false };
 }
 async function findNextRiderSlot(riderId: mongoose.Types.ObjectId, now: ReturnType<typeof madridNow>) {
@@ -5895,7 +5901,7 @@ async function findNextRiderSlot(riderId: mongoose.Types.ObjectId, now: ReturnTy
 async function currentSlotRiderIds(scope: Record<string, unknown> = {}) {
   const now = madridNow();
   const candidates = await RiderSlot.find({ ...scope, date: { $in: [now.date, previousCalendarDate(now.date)] }, status: { $in: ["planned", "active"] } }).select("riderId date startTime endTime").lean().exec();
-  return [...new Set(candidates.filter((candidate: any) => slotContainsTime(candidate, now.time) && (candidate.date === now.date || candidate.startTime >= candidate.endTime)).map((candidate: any) => candidate.riderId))];
+  return [...new Set(candidates.filter((candidate: any) => slotContainsTime(candidate, now.time) && (candidate.date === now.date || isOvernightSlot(candidate))).map((candidate: any) => candidate.riderId))];
 }
 
 async function canAccessRiderShift(riderId: mongoose.Types.ObjectId, req: express.Request) {
@@ -5990,7 +5996,7 @@ app.post("/api/v1/riders/:id/slots", requireRole("admin", "fleet"), async (req, 
   const riderIdParam = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
   const riderId = objectId(riderIdParam); if (!riderId) return res.status(400).json({ error: "INVALID_RIDER_ID" });
   const parsed = riderSlotSchema.safeParse(req.body); if (!parsed.success) return res.status(400).json({ error: "INVALID_RIDER_SLOT", details: parsed.error.flatten() });
-  if (parsed.data.endTime <= parsed.data.startTime) return res.status(400).json({ error: "INVALID_SLOT_TIME_RANGE" });
+  if (parsed.data.endTime === parsed.data.startTime) return res.status(400).json({ error: "INVALID_SLOT_TIME_RANGE" });
   const rider = await Rider.findOne(await riderResourceScope(req, riderId)).lean().exec(); if (!rider) return res.status(403).json({ error: "RIDER_ACCESS_DENIED" });
   const zone = await Zone.findOne({ ...tenantScope(req), slug: parsed.data.zoneSlug, isActive: true }).select("slug").lean().exec();
   if (!zone) return res.status(404).json({ error: "ZONE_NOT_FOUND" });
@@ -7055,7 +7061,7 @@ app.get("/api/v1/fleet/operations/live", requireRole("admin", "fleet"), async (r
   const now = madridNow();
   const freshSince = new Date(Date.now() - 90_000);
   const tenant = tenantScope(req);
-  const activeRiderIds = await RiderSlot.distinct("riderId", { ...tenant, date: now.date, status: "active", startTime: { $lte: now.time }, endTime: { $gt: now.time } });
+  const activeRiderIds = await currentSlotRiderIds(tenant);
   // En turno se muestra siempre, aunque el GPS esté viejo: la flota necesita
   // ver el estado y las alertas de zona de todo el turno, no solo del que acaba
   // de mandar posición.
