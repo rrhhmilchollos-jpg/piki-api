@@ -51,3 +51,18 @@ test("root owner retains its established administrative surface without broadeni
   assert.equal(sessionRole(owner, "fleet", "fleet"), "fleet");
   assert.equal(sessionRole(employee, "fleet", "fleet"), null);
 });
+
+test("one employee can use both Fleet and Rider sessions without duplicate accounts", () => {
+  const joar = {
+    email: "danielreyes17@outlook.es",
+    apiRole: "fleet",
+    primaryRole: "fleet",
+    roles: ["fleet", "rider"],
+    authorizationStatus: "approved",
+  };
+
+  assert.equal(sessionRole(joar, "fleet"), "fleet");
+  assert.equal(sessionRole(joar, "rider"), "rider");
+  assert.equal(sessionRole(joar, "admin", "admin"), null);
+  assert.equal(sessionRole(joar, "admin", "rider"), "rider");
+});
