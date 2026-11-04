@@ -7318,6 +7318,19 @@ async function ensureMrRoosterOperational() {
     : Array.isArray(existing?.menu) ? existing.menu.length : 0;
   if (result.matchedCount > 0) console.log(JSON.stringify({ event: "mr_rooster_operational", slug: "rooster-kebab-xativa", modified: result.modifiedCount > 0, menuCount, menuSeeded: shouldSeedMenu || process.env.REPAIR_MR_ROOSTER_MENU === "true", menuPreserved: !shouldSeedMenu && process.env.REPAIR_MR_ROOSTER_MENU !== "true", commissionRateBps: 2500, cashPaymentsEnabled: true }));
 }
+async function runConfiguredEmployeeDeactivation() {
+  if (process.env.RUN_EMPLOYEE_DEACTIVATION !== "true") return;
+  const email = String(process.env.EMPLOYEE_DEACTIVATION_EMAIL || "").trim().toLowerCase();
+  if (email !== "paduanyjoar9@gmail.com") throw new Error("EMPLOYEE_DEACTIVATION_EMAIL_NOT_ALLOWLISTED");
+  const employee = await EmployeeAccount.findOne({ email, active: true, authorizationStatus: "approved", jobRole: "fleet", apiRole: "fleet" }).select("_id email name tenantId jobRole apiRole accessLevel authorizationStatus").lean().exec() as any;
+  if (!employee || !/joar/i.test(String(employee.name || ""))) throw new Error("EMPLOYEE_DEACTIVATION_TARGET_NOT_FOUND_OR_MISMATCH");
+  const updated = await EmployeeAccount.findOneAndUpdate({ _id: employee._id, email, active: true, authorizationStatus: "approved" }, { $set: { active: false, authorizationStatus: "suspended", authorizedAt: null, authorizedBy: null, authorizationReason: "Perfil residual duplicado desactivado tras confirmación administrativa.", sessionHash: null } }, { new: true }).select("_id email name active authorizationStatus jobRole apiRole").lean().exec() as any;
+  if (!updated) throw new Error("EMPLOYEE_DEACTIVATION_CONCURRENT_CHANGE");
+  await AccessAuthorization.create({ employeeId: employee._id, action: "suspended", previousStatus: employee.authorizationStatus, nextStatus: "suspended", previousRole: employee.apiRole, nextRole: employee.apiRole, accessLevel: employee.accessLevel || "subadmin", actorEmployeeId: null, reason: "Perfil residual duplicado desactivado tras confirmación administrativa." });
+  await revokeEmployeeSessions(employee._id);
+  await recordGovernanceEvent({ actor: { role: "system", tenantId: employee.tenantId }, action: "employee_duplicate_deactivated", targetType: "employee", targetId: employee._id, before: { email, active: true, authorizationStatus: employee.authorizationStatus }, after: { email, active: false, authorizationStatus: "suspended" }, reason: "Cuenta residual confirmada como duplicado de Joar Daniel; cuenta operativa preservada." });
+  console.log(JSON.stringify({ event: "employee_deactivation_completed", employeeId: String(employee._id), email, active: updated.active, authorizationStatus: updated.authorizationStatus }));
+}
 async function start() {
   const uri = process.env.MONGODB_URI;
   if (uri) {
@@ -7339,6 +7352,7 @@ async function start() {
     await ensureMrRoosterOperational();
     await backfillPartnerOperationalLocations();
     await purgeTestDataIfEnabled();
+    await runConfiguredEmployeeDeactivation();
     databaseReady = true;
     if (process.env.RUN_TENANT_MIGRATION === "true") {
       if (process.env.ALLOW_TENANT_MIGRATION !== "true") throw new Error("RUN_TENANT_MIGRATION requires ALLOW_TENANT_MIGRATION=true");
