@@ -11,7 +11,7 @@ type SubscriptionPayload = {
   keys: { p256dh: string; auth: string };
 };
 
-type PushPayload = { title: string; body: string; url: string; tag?: string; renotify?: boolean };
+type PushPayload = { title: string; body: string; url: string; tag?: string; renotify?: boolean; sound?: string };
 type FirebaseServiceAccount = { project_id: string; client_email: string; private_key: string };
 
 const vapid = {
@@ -173,12 +173,13 @@ async function sendFcmPush(subscription: any, payload: PushPayload, surface: Pik
       url: payload.url,
       tag: payload.tag || "piki-order",
       surface,
+      ...(payload.sound ? { sound: payload.sound } : {}),
     },
     android: {
       priority: "high",
       notification: {
-        channelId: "piki_orders",
-        sound: "default",
+        channelId: payload.sound === "start_shift" ? "piki_shift_start" : "piki_orders",
+        sound: payload.sound || "default",
         visibility: "public",
       },
     },

@@ -82,7 +82,7 @@ type RealtimeNotificationInput = {
 };
 
 type Recipient = NotificationPrincipal;
-type NoticeCopy = { category: string; title: string; body: string; url: string; entityType: string; entityId: string };
+type NoticeCopy = { category: string; title: string; body: string; url: string; entityType: string; entityId: string; sound?: string };
 
 function validId(value: unknown): string | null {
   const id = typeof value === "string" ? value : value == null ? "" : String(value);
@@ -189,6 +189,19 @@ export function buildNoticeCopy(input: RealtimeNotificationInput, recipient: Rec
       entityId: String(input.payload.riderId || ""),
     };
   }
+  if (input.type === "rider.shift_start_reminder") {
+    if (recipient.surface !== "rider") return null;
+    const startTime = String(input.payload.startTime || "").trim();
+    return {
+      category: "shift",
+      title: "Hora de empezar tu jornada",
+      body: `Tienes un turno Fleet asignado${startTime ? ` a las ${startTime}` : ""}. Abre PIKI Rider para iniciar sesión.`,
+      url: "/?section=Jornada",
+      entityType: "rider_shift",
+      entityId: String(input.payload.shiftId || input.payload.riderId || ""),
+      sound: "start_shift",
+    };
+  }
   if (input.type.startsWith("onboarding.")) {
     const entityId = String(input.payload.entityId || input.payload.applicationId || input.payload.leadId || "");
     const applicationId = String(input.payload.applicationId || entityId);
@@ -278,7 +291,13 @@ async function resolveRecipients(input: RealtimeNotificationInput): Promise<Reci
     if (!riderId) return [];
     const rider = await Rider.findById(riderId).select("_id email tenantId").lean().exec() as any;
     if (!rider?.email) return [];
-    const accounts = await EmployeeAccount.find({ apiRole: "rider", email: String(rider.email).toLowerCase(), active: true, authorizationStatus: "approved", ...tenantQuery(rider.tenantId) }).select("_id tenantId").limit(100).lean().exec() as any[];
+    const accounts = await EmployeeAccount.find({
+      $and: [
+        { email: String(rider.email).toLowerCase(), active: true, authorizationStatus: "approved" },
+        tenantQuery(rider.tenantId),
+        { $or: [{ apiRole: "rider" }, { roles: "rider" }] },
+      ],
+    }).select("_id tenantId").limit(100).lean().exec() as any[];
     return accounts.map((account) => ({ surface: "rider", ownerType: "employee", ownerId: String(account._id), tenantId: notificationRecipientTenantId(account.tenantId) }));
   }
 
@@ -313,6 +332,7 @@ export async function publishInboxNotification(input: RealtimeNotificationInput)
       ownerType: recipient.ownerType,
       ownerId: new mongoose.Types.ObjectId(recipient.ownerId),
       ...copy,
+      sound: copy.sound || null,
       dedupeKey: `realtime:${input.eventId}:${recipient.surface}:${recipient.ownerId}`,
       readAt: null,
       pushStatus: "pending",
@@ -347,7 +367,7 @@ export async function listNotifications(principal: NotificationPrincipal, option
   const cursor = validId(options.cursor);
   const pageFilter = cursor ? { ...filter, _id: { $lt: new mongoose.Types.ObjectId(cursor) } } : filter;
   const [rows, unreadCount] = await Promise.all([
-    Notification.find(pageFilter).select("_id category title body url entityType entityId readAt createdAt").sort({ _id: -1 }).limit(options.limit + 1).lean().exec(),
+    Notification.find(pageFilter).select("_id category title body url entityType entityId sound readAt createdAt").sort({ _id: -1 }).limit(options.limit + 1).lean().exec(),
     Notification.countDocuments({ ...filter, readAt: null }).exec(),
   ]);
   const hasMore = rows.length > options.limit;
@@ -355,7 +375,7 @@ export async function listNotifications(principal: NotificationPrincipal, option
   return {
     notifications: items.map((item) => ({
       id: String(item._id), category: item.category, title: item.title, body: item.body,
-      url: item.url, entityType: item.entityType, entityId: item.entityId,
+      url: item.url, entityType: item.entityType, entityId: item.entityId, sound: item.sound || null,
       readAt: item.readAt ? new Date(item.readAt).toISOString() : null,
       createdAt: new Date(item.createdAt).toISOString(),
     })),
@@ -423,6 +443,7 @@ export async function processNotificationPushBatch(batchSize = 20): Promise<numb
           url: notification.url,
           tag: String(notification.dedupeKey),
           renotify: true,
+          sound: notification.sound || undefined,
         },
       });
       if (delivery.delivered > 0) {

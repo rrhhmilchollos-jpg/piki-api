@@ -30,6 +30,51 @@ import { ABANDONED_AFTER_MINUTES, isReleasable, isStaleInRoute, planSweep, type 
 /** Zona horaria de referencia del centro de operaciones de PIKI. */
 export const OPERATIONS_TIME_ZONE = "Europe/Madrid";
 
+function madridDateTime(now: Date): { date: string; time: string } {
+  const parts = new Intl.DateTimeFormat("en-GB", {
+    timeZone: OPERATIONS_TIME_ZONE,
+    year: "numeric", month: "2-digit", day: "2-digit",
+    hour: "2-digit", minute: "2-digit", hourCycle: "h23",
+  }).formatToParts(now).reduce<Record<string, string>>((result, part) => {
+    if (part.type !== "literal") result[part.type] = part.value;
+    return result;
+  }, {});
+  return { date: `${parts.year}-${parts.month}-${parts.day}`, time: `${parts.hour}:${parts.minute}` };
+}
+
+async function notifyUpcomingRiderShiftStarts(now: Date): Promise<number> {
+  const local = madridDateTime(now);
+  const currentMinutes = Number(local.time.slice(0, 2)) * 60 + Number(local.time.slice(3, 5));
+  const slots = await RiderSlot.find({ date: local.date, status: "planned" }).select("_id riderId tenantId startTime endTime").lean().exec() as any[];
+  let notified = 0;
+  for (const slot of slots) {
+    const match = /^([01]\d|2[0-3]):([0-5]\d)$/.exec(String(slot.startTime));
+    if (!match) continue;
+    const startMinutes = Number(match[1]) * 60 + Number(match[2]);
+    const minutesUntilStart = startMinutes - currentMinutes;
+    // The worker runs every five minutes. A small late window prevents a
+    // reminder being lost if a run starts just after the scheduled minute.
+    if (minutesUntilStart < -4 || minutesUntilStart > 5) continue;
+    const event = await publishRealtimeEvent({
+      channel: "rider",
+      audienceKey: `rider:${String(slot.riderId)}`,
+      tenantId: slot.tenantId || null,
+      type: "rider.shift_start_reminder",
+      payload: {
+        riderId: String(slot.riderId),
+        shiftId: String(slot._id),
+        date: local.date,
+        startTime: slot.startTime,
+        endTime: slot.endTime,
+        sound: "start_shift",
+      },
+      dedupeKey: `rider-shift-start:${String(slot.riderId)}:${local.date}:${slot.startTime}`,
+    });
+    if (event) notified += 1;
+  }
+  return notified;
+}
+
 const shiftSchema = new Schema(
   {
     weekday: { type: Number, required: true, min: 0, max: 6 },
@@ -604,6 +649,7 @@ export async function runShiftSweep(options: {
 }): Promise<ShiftSweepReport> {
   const now = options.now ?? new Date();
   const startedAt = now.toISOString();
+  if (options.apply) await notifyUpcomingRiderShiftStarts(now).catch((error) => console.warn("No se pudo notificar el inicio de turnos Rider", error instanceof Error ? error.message : error));
   const plans = (await RiderShiftPlanModel.find({}).lean().exec()) as any[];
   const riders = plans
     .filter((plan) => mongoose.isValidObjectId(plan.riderId))

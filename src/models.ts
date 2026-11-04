@@ -214,6 +214,7 @@ const notificationSchema = new Schema({
   url: { type: String, required: true, maxlength: 500 },
   entityType: { type: String, default: "", maxlength: 40 },
   entityId: { type: String, default: "", maxlength: 120 },
+  sound: { type: String, default: null, maxlength: 80 },
   dedupeKey: { type: String, required: true, unique: true, index: true },
   readAt: { type: Date, default: null, index: true },
   pushStatus: { type: String, enum: ["pending", "sending", "retry", "sent", "unavailable", "dead"], default: "pending", index: true },
