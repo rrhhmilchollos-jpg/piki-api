@@ -984,7 +984,9 @@ app.post("/api/v1/auth/employee/password-reset/confirm", rateLimit(8, 15 * 60_00
 });
 app.post("/api/v1/auth/employee/login", async (req, res) => {
   const parsed = employeeLoginSchema.safeParse(req.body); if (!parsed.success) return res.status(400).json({ error: "INVALID_LOGIN" });
+  const requestedSurface = String(req.headers["x-piki-surface"] || "").toLowerCase();
   const identifier = String(parsed.data.identifier || parsed.data.email || "").trim().toLowerCase();
+  if (requestedSurface === "rider" && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(identifier)) return res.status(400).json({ error: "RIDER_EMAIL_REQUIRED" });
   if (String(req.headers["x-piki-surface"] || "").toLowerCase() === "admin" && identifier !== ownerEmail) { /* subadmins are allowed; destructive operations remain superadmin-only */ }
   let employee = await EmployeeAccount.findOne({ $or: [{ email: identifier }, { employeeCode: identifier.toUpperCase() }] }).select("+passwordHash").exec() as any;
   if (!employee && /^piki-p-[a-z0-9-]+$/i.test(identifier)) {
@@ -998,7 +1000,7 @@ app.post("/api/v1/auth/employee/login", async (req, res) => {
     const isPartner = employee.apiRole === "partner";
     return res.status(403).json({ error: isPartner ? "PARTNER_PENDING_APPROVAL" : "ACCOUNT_NOT_ACTIVE", message: isPartner ? "Tu solicitud está pendiente de revisión por Administración. Podrás iniciar sesión cuando se aprueben el comercio y la documentación." : "Esta cuenta no está activa." });
   }
-  const surface = String(req.headers["x-piki-surface"] || "").toLowerCase();
+  const surface = requestedSurface;
   const requestedRole = parsed.data.role;
   const role = sessionRole(employee, surface, requestedRole);
   if (!role) return res.status(403).json({ error: "SURFACE_ROLE_MISMATCH", message: "Esta cuenta no tiene acceso a esta aplicación." });
