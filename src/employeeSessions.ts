@@ -4,9 +4,13 @@ import { createSessionToken, hashSessionToken } from "./employeeAuth.js";
 import { buildTenantScope } from "./tenantScope.js";
 
 export const OWNER_EMAIL = "rrhh.milchollos@gmail.com";
-// Persistent PWA sessions survive closing/reopening the app while remaining
-// bounded; password changes, suspension and explicit logout still revoke them.
+// Fleet/Admin sessions may remain available across app restarts while bounded;
+// password changes, suspension and explicit logout still revoke them.
 export const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+// Rider credentials must be requested again after the app is closed or stops
+// making authenticated calls. Active Rider apps refresh this sliding window on
+// each API request; Fleet/Admin sessions retain the normal long-lived policy.
+export const RIDER_SESSION_IDLE_TTL_MS = 2 * 60 * 1000;
 const schema = new Schema({
   tokenHash: { type: String, required: true, unique: true, index: true },
   employeeId: { type: Schema.Types.ObjectId, required: true, index: true },
@@ -87,6 +91,7 @@ export async function issueEmployeeSession(employee: any, surface: string, reque
   if (!role || !canIssueEmployeeSession(employee) || (!tenantId && role !== "admin")) return null;
   const token = createSessionToken();
   const now = new Date();
+  const expiresAt = new Date(now.getTime() + (role === "rider" ? RIDER_SESSION_IDLE_TTL_MS : SESSION_TTL_MS));
   await EmployeeSession.create({
     tokenHash: hashSessionToken(token),
     employeeId: employee._id,
@@ -94,10 +99,10 @@ export async function issueEmployeeSession(employee: any, surface: string, reque
     role,
     surface: surface || employee.apiRole,
     issuedAt: now,
-    expiresAt: new Date(now.getTime() + SESSION_TTL_MS),
+    expiresAt,
   });
   await EmployeeAccount.updateOne({ _id: employee._id }, { $set: { lastLoginAt: now } }).exec();
-  return { token, role };
+  return { token, role, expiresAt };
 }
 
 export async function resolveEmployeeSession(token: string) {
@@ -123,6 +128,13 @@ export async function resolveEmployeeSession(token: string) {
   if (session.role === "rider") {
     const riderScope = buildTenantScope(tenantId);
     if (!(await Rider.exists({ email: employee.email, ...riderScope }))) return null;
+    // Sliding idle timeout: a live app keeps the session alive through its
+    // normal API traffic, while a closed/backgrounded app must authenticate
+    // again instead of reusing a token from a previous launch.
+    await EmployeeSession.updateOne(
+      { _id: session._id, expiresAt: { $gt: new Date() } },
+      { $set: { expiresAt: new Date(Date.now() + RIDER_SESSION_IDLE_TTL_MS) } },
+    ).exec();
   }
   return {
     role: session.role,
