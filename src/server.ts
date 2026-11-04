@@ -619,10 +619,15 @@ async function releaseRiderOrderSlot(orderId: mongoose.Types.ObjectId, riderId: 
 
 const pikiSplashPath = fileURLToPath(new URL("./assets/piki-splash.webp", import.meta.url));
 const pikiFaviconPath = fileURLToPath(new URL("./assets/piki-favicon.webp", import.meta.url));
+const startShiftSoundPath = fileURLToPath(new URL("./assets/start_shift.wav", import.meta.url));
 const sendPikiAsset = (path: string, res: express.Response) => res.type("webp").sendFile(path);
 app.get("/piki-splash.webp", (_req, res) => sendPikiAsset(pikiSplashPath, res));
 app.get("/favicon.webp", (_req, res) => sendPikiAsset(pikiFaviconPath, res));
 app.get("/favicon.ico", (_req, res) => sendPikiAsset(pikiFaviconPath, res));
+app.get("/assets/start_shift.wav", (_req, res) => {
+  res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
+  res.type("wav").sendFile(startShiftSoundPath);
+});
 app.get("/", (_req, res) => {
   res.setHeader("Content-Security-Policy", "default-src 'self'; style-src 'unsafe-inline'; img-src 'self'; frame-ancestors 'none'; base-uri 'self'");
   res.type("html").send(`<!doctype html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="application-name" content="Pikidelivery.com"><link rel="icon" type="image/webp" href="/favicon.webp"><title>PIKI Delivery API</title><style>html,body{margin:0;min-height:100%;background:#ffd72e;font-family:Arial,sans-serif;color:#172238}body{display:grid;place-items:center;min-height:100dvh;overflow:hidden}.splash{text-align:center}.splash img{display:block;width:min(92vw,930px);height:min(74dvh,620px);object-fit:contain}.splash strong{display:block;font-size:clamp(18px,3vw,28px);letter-spacing:.12em;text-transform:uppercase}.api{display:none;margin-top:1rem;font-size:14px}.api a{color:#172238;font-weight:700}</style></head><body><main class="splash" role="status" aria-label="PIKI Delivery API"><img src="/piki-splash.webp" alt="PIKI Delivery"><strong>Pikidelivery.com</strong><p class="api">API activa · <a href="/health">comprobar estado</a></p></main><script>window.setTimeout(()=>{document.querySelector('.api').style.display='block'},5000)</script></body></html>`);
@@ -765,15 +770,29 @@ app.post("/api/v1/push/subscriptions", rateLimit(20, 60_000, "push-subscribe"), 
 app.post("/api/v1/push/native-subscriptions", rateLimit(20, 60_000, "native-push-subscribe"), async (req, res) => {
   const surface = requestedSurface(req);
   const parsed = nativePushSubscriptionSchema.safeParse(req.body);
-  if (surface !== "customer") return res.status(400).json({ error: "NATIVE_PUSH_CUSTOMER_ONLY" });
+  if (!surface || !["customer", "rider"].includes(surface)) return res.status(400).json({ error: "NATIVE_PUSH_SURFACE_UNSUPPORTED" });
   if (!parsed.success) return res.status(400).json({ error: "INVALID_NATIVE_PUSH_SUBSCRIPTION" });
-  const customer = await currentCustomer(req) as any;
-  if (!customer) return res.status(401).json({ error: "AUTHENTICATION_REQUIRED" });
   try {
+    if (surface === "customer") {
+      const customer = await currentCustomer(req) as any;
+      if (!customer) return res.status(401).json({ error: "AUTHENTICATION_REQUIRED" });
+      return res.status(201).json(await saveFcmSubscription({
+        surface: "customer",
+        ownerType: "customer",
+        ownerId: String(customer._id),
+        tenantId: customer.tenantId ? String(customer.tenantId) : null,
+        token: parsed.data.token,
+        platform: parsed.data.platform,
+      }));
+    }
+    const auth = await resolveRole(req);
+    if (!auth?.employeeId || auth.role !== "rider") return res.status(403).json({ error: "RIDER_AUTHENTICATION_REQUIRED" });
+    const employee = await EmployeeAccount.findById(auth.employeeId).select("tenantId").lean().exec() as any;
     return res.status(201).json(await saveFcmSubscription({
-      surface: "customer",
-      ownerId: String(customer._id),
-      tenantId: customer.tenantId ? String(customer.tenantId) : null,
+      surface: "rider",
+      ownerType: "employee",
+      ownerId: auth.employeeId,
+      tenantId: employee?.tenantId ? String(employee.tenantId) : null,
       token: parsed.data.token,
       platform: parsed.data.platform,
     }));

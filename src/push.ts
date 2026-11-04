@@ -11,7 +11,7 @@ type SubscriptionPayload = {
   keys: { p256dh: string; auth: string };
 };
 
-type PushPayload = { title: string; body: string; url: string; tag?: string; renotify?: boolean; sound?: string };
+type PushPayload = { title: string; body: string; url: string; tag?: string; renotify?: boolean; sound?: string; soundUrl?: string };
 type FirebaseServiceAccount = { project_id: string; client_email: string; private_key: string };
 
 const vapid = {
@@ -126,11 +126,11 @@ export async function savePushSubscription(input: { surface: PikiSurface; ownerT
   return { id: String(saved._id), status: saved.status, provider: "webpush" as const };
 }
 
-export async function saveFcmSubscription(input: { surface: "customer"; ownerId: string; tenantId?: string | null; token: string; platform: "android" | "ios" }) {
+export async function saveFcmSubscription(input: { surface: "customer" | "rider"; ownerType: "customer" | "employee"; ownerId: string; tenantId?: string | null; token: string; platform: "android" | "ios" }) {
   if (!fcmPushConfigured()) throw new Error("FCM_NOT_CONFIGURED");
   const hash = endpointHash(`fcm:${input.token}`);
   const saved = await PushSubscription.findOneAndUpdate(
-    { ownerType: "customer", ownerId: input.ownerId, surface: input.surface, endpointHash: hash },
+    { ownerType: input.ownerType, ownerId: input.ownerId, surface: input.surface, endpointHash: hash },
     {
       $set: {
         tenantId: input.tenantId || null,
@@ -146,7 +146,7 @@ export async function saveFcmSubscription(input: { surface: "customer"; ownerId:
         failureCount: 0,
         lastFailureAt: null,
       },
-      $setOnInsert: { surface: input.surface, ownerType: "customer", ownerId: input.ownerId },
+      $setOnInsert: { surface: input.surface, ownerType: input.ownerType, ownerId: input.ownerId },
     },
     { upsert: true, new: true, setDefaultsOnInsert: true },
   ).exec();
@@ -174,6 +174,7 @@ async function sendFcmPush(subscription: any, payload: PushPayload, surface: Pik
       tag: payload.tag || "piki-order",
       surface,
       ...(payload.sound ? { sound: payload.sound } : {}),
+      ...(payload.soundUrl ? { soundUrl: payload.soundUrl } : {}),
     },
     android: {
       priority: "high",

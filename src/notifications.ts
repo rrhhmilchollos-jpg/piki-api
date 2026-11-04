@@ -84,6 +84,8 @@ type RealtimeNotificationInput = {
 type Recipient = NotificationPrincipal;
 type NoticeCopy = { category: string; title: string; body: string; url: string; entityType: string; entityId: string; sound?: string };
 
+const startShiftSoundUrl = () => `${String(process.env.PUBLIC_API_URL || process.env.API_PUBLIC_URL || "https://api.pikidelivery.com").replace(/\/$/, "")}/assets/start_shift.wav`;
+
 function validId(value: unknown): string | null {
   const id = typeof value === "string" ? value : value == null ? "" : String(value);
   return mongoose.isValidObjectId(id) ? id : null;
@@ -444,6 +446,7 @@ export async function processNotificationPushBatch(batchSize = 20): Promise<numb
           tag: String(notification.dedupeKey),
           renotify: true,
           sound: notification.sound || undefined,
+          soundUrl: notification.sound === "start_shift" ? startShiftSoundUrl() : undefined,
         },
       });
       if (delivery.delivered > 0) {
