@@ -922,7 +922,9 @@ async function sendEmployeePasswordLink(employee: any, surface: EmployeeCredenti
   const action = purpose === "activation" ? "Crear acceso" : "Crear contraseña nueva";
   const delivery = await sendCorporateEmail({
     recipientEmail: String(employee.email).trim().toLowerCase(),
-    department: corporateEmailDepartmentForRole(employee.primaryRole || employee.apiRole || employee.jobRole),
+    // Credential recovery is an HR-controlled workflow. Use the real
+    // Nominalia mailbox instead of a role-derived alias such as operations@.
+    department: "hr",
     subject: `${appLabel} · ${purpose === "activation" ? "Activa tu acceso" : "Recupera tu contraseña"}`,
     idempotencyKey: `piki-employee-password-${purpose}-${reset.tokenHash}`,
     text: `Hola ${employee.name || "equipo PIKI"},\n\n${purpose === "activation" ? `Tu acceso a ${appLabel} ha sido autorizado.` : `Hemos recibido una solicitud para recuperar tu acceso a ${appLabel}.`}\n\n${action}: ${reset.resetUrl}\n\nEl enlace caduca en ${expiryText} y solo puede utilizarse una vez. Si no esperabas este correo, ignóralo y avisa a RRHH.\n\nEquipo PIKI`,
