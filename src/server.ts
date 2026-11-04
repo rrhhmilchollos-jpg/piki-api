@@ -7318,22 +7318,6 @@ async function ensureMrRoosterOperational() {
     : Array.isArray(existing?.menu) ? existing.menu.length : 0;
   if (result.matchedCount > 0) console.log(JSON.stringify({ event: "mr_rooster_operational", slug: "rooster-kebab-xativa", modified: result.modifiedCount > 0, menuCount, menuSeeded: shouldSeedMenu || process.env.REPAIR_MR_ROOSTER_MENU === "true", menuPreserved: !shouldSeedMenu && process.env.REPAIR_MR_ROOSTER_MENU !== "true", commissionRateBps: 2500, cashPaymentsEnabled: true }));
 }
-async function runConfiguredEmployeeEmailMigration() {
-  if (process.env.RUN_EMPLOYEE_EMAIL_MIGRATION !== "true") return;
-  const oldEmail = String(process.env.EMPLOYEE_EMAIL_OLD || "").trim().toLowerCase();
-  const newEmail = String(process.env.EMPLOYEE_EMAIL_NEW || "").trim().toLowerCase();
-  if (!oldEmail || !newEmail || oldEmail === newEmail) throw new Error("EMPLOYEE_EMAIL_MIGRATION_REQUIRES_DISTINCT_OLD_AND_NEW_EMAIL");
-  const employee = await EmployeeAccount.findOne({ email: oldEmail, active: true, authorizationStatus: "approved" }).select("_id email name tenantId apiRole jobRole roles primaryRole").lean().exec() as any;
-  if (!employee) throw new Error("EMPLOYEE_EMAIL_MIGRATION_SOURCE_NOT_FOUND");
-  const duplicate = await EmployeeAccount.findOne({ email: newEmail, _id: { $ne: employee._id } }).select("_id").lean().exec() as any;
-  if (duplicate) throw new Error("EMPLOYEE_EMAIL_MIGRATION_DESTINATION_ALREADY_IN_USE");
-  const employeeResult = await EmployeeAccount.updateOne({ _id: employee._id, email: oldEmail }, { $set: { email: newEmail }, $unset: { sessionHash: "" } }).exec();
-  const riderResult = await Rider.updateOne({ email: oldEmail, ...(employee.tenantId ? { tenantId: employee.tenantId } : {}) }, { $set: { email: newEmail } }).exec();
-  await EmployeePasswordReset.updateMany({ employeeId: employee._id, usedAt: null }, { $set: { usedAt: new Date() } }).exec();
-  await EmployeeSession.deleteMany({ employeeId: employee._id }).exec();
-  await recordGovernanceEvent({ actor: { role: "system", tenantId: employee.tenantId }, action: "employee_email_changed", targetType: "employee", targetId: employee._id, before: { email: oldEmail }, after: { email: newEmail, riderDocumentsUpdated: riderResult.modifiedCount }, reason: "Migración única autorizada para corregir el correo de acceso del Rider." });
-  console.log(JSON.stringify({ event: "employee_email_migration_completed", employeeId: String(employee._id), oldEmail, newEmail, employeeModified: employeeResult.modifiedCount, riderModified: riderResult.modifiedCount }));
-}
 async function start() {
   const uri = process.env.MONGODB_URI;
   if (uri) {
@@ -7355,7 +7339,6 @@ async function start() {
     await ensureMrRoosterOperational();
     await backfillPartnerOperationalLocations();
     await purgeTestDataIfEnabled();
-    await runConfiguredEmployeeEmailMigration();
     databaseReady = true;
     if (process.env.RUN_TENANT_MIGRATION === "true") {
       if (process.env.ALLOW_TENANT_MIGRATION !== "true") throw new Error("RUN_TENANT_MIGRATION requires ALLOW_TENANT_MIGRATION=true");
