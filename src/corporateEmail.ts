@@ -1,11 +1,26 @@
 import nodemailer from "nodemailer";
 import { createHash } from "node:crypto";
-type CorporateEmail = { recipientEmail: string; subject: string; text: string; html: string; idempotencyKey: string; fromEmail?: string };
+export type CorporateEmailDepartment = "support" | "hr" | "admin" | "finance" | "operations";
+type CorporateEmail = { recipientEmail: string; subject: string; text: string; html: string; idempotencyKey: string; fromEmail?: string; department?: CorporateEmailDepartment };
 export type CorporateEmailResult = { sent: boolean; error?: string; providerId?: string };
+const senderDefaults: Record<CorporateEmailDepartment, string> = { support: "support@pikidelivery.com", hr: "rrhh@pikidelivery.com", admin: "administracion@pikidelivery.com", finance: "finanzas@pikidelivery.com", operations: "operaciones@pikidelivery.com" };
+const senderEnvironmentKeys: Record<CorporateEmailDepartment, string> = { support: "PIKI_EMAIL_FROM_SUPPORT", hr: "PIKI_EMAIL_FROM_HR", admin: "PIKI_EMAIL_FROM_ADMIN", finance: "PIKI_EMAIL_FROM_FINANCE", operations: "PIKI_EMAIL_FROM_OPERATIONS" };
+export function corporateEmailSender(department: CorporateEmailDepartment = "support") {
+  if (department === "support" && process.env.PIKI_EMAIL_FROM?.trim()) return process.env.PIKI_EMAIL_FROM.trim();
+  return String(process.env[senderEnvironmentKeys[department]] || senderDefaults[department]).trim();
+}
+export function corporateEmailDepartmentForRole(role: unknown): CorporateEmailDepartment {
+  const normalized = String(role || "").trim().toLowerCase();
+  if (normalized === "admin") return "admin";
+  if (normalized === "finance") return "finance";
+  if (normalized === "support") return "support";
+  if (["rider", "fleet", "commercial", "gerente_comercial_zona"].includes(normalized)) return "operations";
+  return "admin";
+}
 export function corporateEmailConfiguration() {
   const smtp = Boolean(process.env.SMTP_HOST?.trim() && process.env.SMTP_USER?.trim() && (process.env.SMTP_PASSWORD || process.env.SMTP_PASS));
   const resend = Boolean(process.env.RESEND_API_KEY?.trim());
-  return { configured: smtp || resend, provider: smtp ? "smtp" : resend ? "resend" : "none", from: String(process.env.PIKI_EMAIL_FROM || "PIKI · Recursos Humanos <rrhh@pikidelivery.com>").trim(), replyTo: "rrhh@pikidelivery.com" };
+  return { configured: smtp || resend, provider: smtp ? "smtp" : resend ? "resend" : "none", from: String(process.env.PIKI_EMAIL_FROM || corporateEmailSender("support")).trim(), replyTo: corporateEmailSender("support") };
 }
 export async function verifyCorporateEmailConnection(): Promise<{ provider: string; configured: boolean; authenticated: boolean; error?: string }> {
   const configuration = corporateEmailConfiguration();
@@ -23,7 +38,7 @@ export function escapeCorporateHtml(value: string) {
 }
 export async function sendCorporateEmail(input: CorporateEmail): Promise<CorporateEmailResult> {
   const configuration = corporateEmailConfiguration();
-  const from = input.fromEmail ? input.fromEmail.trim() : configuration.from;
+  const from = input.fromEmail ? input.fromEmail.trim() : corporateEmailSender(input.department || "support");
   const deliveryKey = createHash("sha256").update(input.idempotencyKey).digest("hex");
   if (!configuration.configured) return { sent: false, error: "CORPORATE_EMAIL_NOT_CONFIGURED" };
   if (configuration.provider === "smtp") {
@@ -64,5 +79,5 @@ export async function sendCorporateEmail(input: CorporateEmail): Promise<Corpora
 export async function sendLeadContactEmail(input: { leadId: string; recipientEmail: string; recipientName: string; kind: "rider" | "partner"; subject: string; message: string; key: string }) {
   const name = escapeCorporateHtml(input.recipientName);
   const body = escapeCorporateHtml(input.message).replace(/\n/g, "<br>");
-  return sendCorporateEmail({ recipientEmail: input.recipientEmail, subject: input.subject, idempotencyKey: `piki-lead-contact-${input.leadId}-${input.key}`, text: `Hola ${input.recipientName},\n\n${input.message}\n\nEquipo de RRHH · PIKI Delivery\nrrhh@pikidelivery.com`, html: `<div style="background:#f4f6f8;padding:24px;font-family:Arial,sans-serif;color:#172238"><div style="max-width:620px;margin:auto;background:white;border-radius:16px;overflow:hidden"><div style="background:#d2ff59;padding:24px"><strong style="font-size:24px">PIKI DELIVERY</strong><p>${input.kind === "rider" ? "PIKI Riders" : "PIKI Partner Orders"} · Tu solicitud de alta</p></div><div style="padding:28px;line-height:1.6"><h2>Hola ${name}</h2><p>${body}</p><p>Si necesitas ayuda, responde a este correo. Para enviar documentación sensible utiliza exclusivamente el enlace individual de tu expediente.</p><p><strong>Equipo de RRHH · PIKI Delivery</strong><br>rrhh@pikidelivery.com</p></div></div></div>` });
+  return sendCorporateEmail({ department: "hr", recipientEmail: input.recipientEmail, subject: input.subject, idempotencyKey: `piki-lead-contact-${input.leadId}-${input.key}`, text: `Hola ${input.recipientName},\n\n${input.message}\n\nEquipo de RRHH · PIKI Delivery\nrrhh@pikidelivery.com`, html: `<div style="background:#f4f6f8;padding:24px;font-family:Arial,sans-serif;color:#172238"><div style="max-width:620px;margin:auto;background:white;border-radius:16px;overflow:hidden"><div style="background:#d2ff59;padding:24px"><strong style="font-size:24px">PIKI DELIVERY</strong><p>${input.kind === "rider" ? "PIKI Riders" : "PIKI Partner Orders"} · Tu solicitud de alta</p></div><div style="padding:28px;line-height:1.6"><h2>Hola ${name}</h2><p>${body}</p><p>Si necesitas ayuda, responde a este correo. Para enviar documentación sensible utiliza exclusivamente el enlace individual de tu expediente.</p><p><strong>Equipo de RRHH · PIKI Delivery</strong><br>rrhh@pikidelivery.com</p></div></div></div>` });
 }

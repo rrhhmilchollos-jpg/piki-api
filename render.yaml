@@ -21,7 +21,25 @@ services:
       - key: PIKI_NATIVE_FORCE_UPDATE_ENABLED
         value: "false"
       - key: PIKI_EMAIL_FROM
+        value: "PIKI Soporte <support@pikidelivery.com>"
+      - key: PIKI_EMAIL_FROM_SUPPORT
+        value: "PIKI Soporte <support@pikidelivery.com>"
+      - key: PIKI_EMAIL_FROM_HR
         value: "PIKI Recursos Humanos <rrhh@pikidelivery.com>"
+      - key: PIKI_EMAIL_FROM_ADMIN
+        value: "PIKI Administración <administracion@pikidelivery.com>"
+      - key: PIKI_EMAIL_FROM_FINANCE
+        value: "PIKI Finanzas <finanzas@pikidelivery.com>"
+      - key: PIKI_EMAIL_FROM_OPERATIONS
+        value: "PIKI Operaciones <operaciones@pikidelivery.com>"
+      - key: SMTP_HOST
+        sync: false
+      - key: SMTP_PORT
+        value: "465"
+      - key: SMTP_USER
+        sync: false
+      - key: SMTP_PASSWORD
+        sync: false
       - key: RESEND_API_KEY
         sync: false
       - key: CORS_ORIGINS

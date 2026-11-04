@@ -44,11 +44,11 @@ export async function sendDocumentRequestEmail(input: DocumentRequestEmailInput)
   const safeName = escapeEmailHtml(input.recipientName);
   const safeMessage = escapeEmailHtml(input.message).replace(/\n/g, "<br>");
   const safeUrl = escapeEmailHtml(input.uploadUrl);
-  const from = String(process.env.PIKI_EMAIL_FROM || "PIKI · Recursos Humanos <rrhh@pikidelivery.com>").trim();
   const subject = kind === "Rider" ? "PIKI · Completa tu expediente de repartidor" : "PIKI · Completa el expediente de tu negocio";
   const intro = kind === "Rider" ? "Para continuar con tu proceso de alta como repartidor/a" : "Para continuar con el alta de tu negocio como partner";
-  const payload = { from, reply_to: "rrhh@pikidelivery.com", to: [input.recipientEmail], subject, text: `Hola ${input.recipientName},\n\n${intro}.\n\n${input.message}\n\nSube tu documentación aquí: ${input.uploadUrl}\n\nEl enlace caduca el ${input.expiresAt.toLocaleDateString("es-ES")}.\n\nEquipo PIKI`, html: `<div style="background:#f7f3ed;padding:32px;font-family:Arial,sans-serif;color:#171715"><div style="max-width:620px;margin:auto;background:#fff;padding:32px;border-radius:18px"><div style="font-size:26px;font-weight:800">PIKI<span style="color:#dc5c35">.</span></div><p style="color:#dc5c35;font-size:12px;font-weight:700;letter-spacing:2px;text-transform:uppercase">${kind === "Rider" ? "Expediente rider" : "Expediente partner"}</p><h1 style="font-size:28px">Hola ${safeName}</h1><p>${intro} necesitamos que completes la documentación solicitada.</p><div style="background:#fff7d6;padding:18px;border-radius:12px;line-height:1.6">${safeMessage}</div><p style="text-align:center;margin:28px 0"><a href="${safeUrl}" style="background:#171715;color:#fff;text-decoration:none;padding:14px 22px;border-radius:10px;font-weight:700">Subir documentación segura</a></p><p style="font-size:13px;color:#66736a">Este enlace es individual, seguro y caduca el <strong>${input.expiresAt.toLocaleDateString("es-ES")}</strong>. Si tienes dudas, responde a este correo corporativo.</p><hr style="border:0;border-top:1px solid #eadfd3"><p style="font-size:12px;color:#66736a">Equipo PIKI · Pide. Recibe. Disfruta.</p></div></div>` };
-  const result = await sendCorporateEmail({ recipientEmail: input.recipientEmail, subject, text: payload.text, html: payload.html, idempotencyKey: `piki-document-request-${input.requestId}` });
+  const text = `Hola ${input.recipientName},\n\n${intro}.\n\n${input.message}\n\nSube tu documentación aquí: ${input.uploadUrl}\n\nEl enlace caduca el ${input.expiresAt.toLocaleDateString("es-ES")}.\n\nEquipo PIKI`;
+  const html = `<div style="background:#f7f3ed;padding:32px;font-family:Arial,sans-serif;color:#171715"><div style="max-width:620px;margin:auto;background:#fff;padding:32px;border-radius:18px"><div style="font-size:26px;font-weight:800">PIKI<span style="color:#dc5c35">.</span></div><p style="color:#dc5c35;font-size:12px;font-weight:700;letter-spacing:2px;text-transform:uppercase">${kind === "Rider" ? "Expediente rider" : "Expediente partner"}</p><h1 style="font-size:28px">Hola ${safeName}</h1><p>${intro} necesitamos que completes la documentación solicitada.</p><div style="background:#fff7d6;padding:18px;border-radius:12px;line-height:1.6">${safeMessage}</div><p style="text-align:center;margin:28px 0"><a href="${safeUrl}" style="background:#171715;color:#fff;text-decoration:none;padding:14px 22px;border-radius:10px;font-weight:700">Subir documentación segura</a></p><p style="font-size:13px;color:#66736a">Este enlace es individual, seguro y caduca el <strong>${input.expiresAt.toLocaleDateString("es-ES")}</strong>. Si tienes dudas, responde a este correo corporativo.</p><hr style="border:0;border-top:1px solid #eadfd3"><p style="font-size:12px;color:#66736a">Equipo PIKI · Pide. Recibe. Disfruta.</p></div></div>`;
+  const result = await sendCorporateEmail({ department: "hr", recipientEmail: input.recipientEmail, subject, text, html, idempotencyKey: `piki-document-request-${input.requestId}` });
   return result.sent;
 }
 
@@ -61,17 +61,15 @@ export async function sendDocumentUploadEmail(input: DocumentUploadEmailInput): 
   const safeName = escapeEmailHtml(input.subjectName || kind);
   const safeFiles = input.uploadedFiles.map(escapeEmailHtml).join(", ");
   const status = input.completed ? "El expediente ya tiene todos los documentos solicitados." : "El expediente todavía tiene documentos pendientes.";
-  const from = String(process.env.PIKI_EMAIL_FROM || "PIKI <noreply@pikidelivery.com>").trim();
   const dedupeKey = `piki-document-upload-${input.requestId}-${input.uploadedTypes.slice().sort().join("-")}-${input.uploadedFiles.slice().sort().join("-")}`.slice(0, 240);
   const payload = {
-        from,
         to: recipients,
         subject: `PIKI · Documentación recibida · ${kind} · ${input.subjectName}`,
         html: `<div style="font-family:Arial,sans-serif;line-height:1.5;color:#172033"><h2>Documentación recibida</h2><p>Se han subido documentos para <strong>${safeName}</strong> (${kind}).</p><p><strong>Archivos:</strong> ${safeFiles || "No indicado"}</p><p>${escapeEmailHtml(status)}</p><p>Accede a PIKI Admin para revisar y validar el expediente.</p></div>`,
         text: `Documentación recibida para ${input.subjectName} (${kind}). Archivos: ${input.uploadedFiles.join(", ")}. ${status} Accede a PIKI Admin para revisar el expediente.`,
         headers: { "X-PIKI-Document-Request": input.requestId },
       };
-  for (const recipientEmail of recipients) await sendCorporateEmail({ recipientEmail, subject: payload.subject, text: payload.text, html: payload.html, idempotencyKey: `${dedupeKey}-${recipientEmail}`.slice(0, 240) });
+  for (const recipientEmail of recipients) await sendCorporateEmail({ department: "admin", recipientEmail, subject: payload.subject, text: payload.text, html: payload.html, idempotencyKey: `${dedupeKey}-${recipientEmail}`.slice(0, 240) });
 }
 
 type RealtimeNotificationInput = {

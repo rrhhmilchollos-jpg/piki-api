@@ -47,7 +47,7 @@ import { onboardingScope } from "./onboardingScope.js";
 import { ORDER_ALERT_RECIPIENT, notifyOrderCancelled, notifyOrderPlaced } from "./orderAlerts.js";
 import { startDailySummaryWorker, stopDailySummaryWorker } from "./dailySummaryWorker.js";
 import { BUSINESS_SUMMARY_RECIPIENT, sendDailyBusinessSummary } from "./dailyBusinessSummary.js";
-import { corporateEmailConfiguration, escapeCorporateHtml, sendCorporateEmail, sendLeadContactEmail, verifyCorporateEmailConnection } from "./corporateEmail.js";
+import { corporateEmailConfiguration, corporateEmailDepartmentForRole, escapeCorporateHtml, sendCorporateEmail, sendLeadContactEmail, verifyCorporateEmailConnection } from "./corporateEmail.js";
 import { activeOperationalOrderStatuses, dispatchableOrderStatuses, dispatchablePaymentFilter, isDispatchableOrderStatus, isDispatchablePayment } from "./dispatchEligibility.js";
 import { canReceivePartnerLocations, partnerCan, partnerPermissions, partnerRolesForEmployee, permissionsForPartnerRoles, type PartnerPermission } from "./partnerAccess.js";
 import { awardRiderRecruitmentMilestones, claimRiderReferralCode, completeRiderShiftIncentiveTracking, incentiveProgramStatus, loadRiderIncentiveSnapshot, trackRiderLocationForIncentive, trackRiderShiftStart } from "./riderIncentives.js";
@@ -922,6 +922,7 @@ async function sendEmployeePasswordLink(employee: any, surface: EmployeeCredenti
   const action = purpose === "activation" ? "Crear acceso" : "Crear contraseña nueva";
   const delivery = await sendCorporateEmail({
     recipientEmail: String(employee.email).trim().toLowerCase(),
+    department: corporateEmailDepartmentForRole(employee.primaryRole || employee.apiRole || employee.jobRole),
     subject: `${appLabel} · ${purpose === "activation" ? "Activa tu acceso" : "Recupera tu contraseña"}`,
     idempotencyKey: `piki-employee-password-${purpose}-${reset.tokenHash}`,
     text: `Hola ${employee.name || "equipo PIKI"},\n\n${purpose === "activation" ? `Tu acceso a ${appLabel} ha sido autorizado.` : `Hemos recibido una solicitud para recuperar tu acceso a ${appLabel}.`}\n\n${action}: ${reset.resetUrl}\n\nEl enlace caduca en ${expiryText} y solo puede utilizarse una vez. Si no esperabas este correo, ignóralo y avisa a RRHH.\n\nEquipo PIKI`,
