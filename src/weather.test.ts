@@ -1,6 +1,38 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { adjustEtaLabel, conditionFromWeatherCode, deliveryPolicyFor, distanceKm, snapshotFromProvider } from "./weather.js";
+import { adjustEtaLabel, conditionFromWeatherCode, currentWeather, deliveryPolicyFor, distanceKm, snapshotFromProvider } from "./weather.js";
+
+test("la clave comercial usa customer-api y se envía como apikey", async () => {
+  let requestUrl = "";
+  const weather = await currentWeather(38.99, -0.51, {
+    force: true,
+    apiKey: "licensed-test-key",
+    fetchImpl: async (input) => {
+      requestUrl = String(input);
+      return new Response(JSON.stringify({ current: { temperature_2m: 17, precipitation: 0, weather_code: 0, wind_speed_10m: 8 } }), { status: 200 });
+    },
+  });
+  const requested = new URL(requestUrl);
+  assert.equal(requested.hostname, "customer-api.open-meteo.com");
+  assert.equal(requested.searchParams.get("apikey"), "licensed-test-key");
+  assert.equal(weather.source, "open-meteo");
+});
+
+test("sin clave no consulta el endpoint público y devuelve fallback neutral", async () => {
+  let requests = 0;
+  const weather = await currentWeather(38.98, -0.52, {
+    force: true,
+    apiKey: "",
+    allowPublicEndpoint: false,
+    fetchImpl: async () => {
+      requests += 1;
+      throw new Error("No debe ejecutarse");
+    },
+  });
+  assert.equal(requests, 0);
+  assert.equal(weather.source, "unavailable");
+  assert.equal(weather.banner, null);
+});
 
 test("los códigos WMO se agrupan en los estados que PIKI usa", () => {
   assert.equal(conditionFromWeatherCode(0), "clear");

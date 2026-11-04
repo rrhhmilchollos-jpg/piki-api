@@ -6,9 +6,9 @@
  * restaurants first? So this module keeps a tiny, cached, fail-open contract
  * instead of a full meteorological model.
  *
- * Provider: Open-Meteo, no API key, no PII. If the provider is slow or down we
- * return `null` and the app behaves exactly as before; weather must never break
- * an order.
+ * Provider: Open-Meteo customer API for commercial use. The public endpoint is
+ * allowed only by explicit opt-in outside production. Without a licensed key in
+ * production, we return a neutral snapshot; weather must never break an order.
  */
 
 export type WeatherCondition = "clear" | "cloudy" | "rain" | "storm";
@@ -29,7 +29,8 @@ export type WeatherSnapshot = {
 
 export type DeliveryWeatherPolicy = Pick<WeatherSnapshot, "condition" | "severity" | "etaExtraMinutes" | "preferNearby" | "banner" | "label">;
 
-const PROVIDER_URL = "https://api.open-meteo.com/v1/forecast";
+const CUSTOMER_PROVIDER_URL = "https://customer-api.open-meteo.com/v1/forecast";
+const PUBLIC_PROVIDER_URL = "https://api.open-meteo.com/v1/forecast";
 const CACHE_TTL_MS = 10 * 60_000;
 const FETCH_TIMEOUT_MS = 2_500;
 
@@ -120,16 +121,32 @@ export function unavailableSnapshot(): WeatherSnapshot {
  * Cached snapshot for a point. Never throws: a provider failure returns a
  * neutral snapshot marked `unavailable`, which the UI renders as "no banner".
  */
-export async function currentWeather(lat: number, lon: number, options: { force?: boolean; now?: Date } = {}): Promise<WeatherSnapshot> {
+export async function currentWeather(lat: number, lon: number, options: {
+  force?: boolean;
+  now?: Date;
+  apiKey?: string;
+  allowPublicEndpoint?: boolean;
+  fetchImpl?: typeof fetch;
+} = {}): Promise<WeatherSnapshot> {
   if (!Number.isFinite(lat) || !Number.isFinite(lon) || Math.abs(lat) > 90 || Math.abs(lon) > 180) return unavailableSnapshot();
   const now = options.now || new Date();
   const key = cacheKey(lat, lon);
   const cached = cache.get(key);
   if (!options.force && cached && cached.expiresAt > now.getTime()) return cached.snapshot;
 
-  const url = `${PROVIDER_URL}?latitude=${lat.toFixed(4)}&longitude=${lon.toFixed(4)}&current=temperature_2m,precipitation,weather_code,wind_speed_10m&timezone=Europe%2FMadrid`;
+  const apiKey = String(options.apiKey ?? process.env.OPEN_METEO_API_KEY ?? "").trim();
+  const publicEndpointAllowed = process.env.NODE_ENV !== "production"
+    && (options.allowPublicEndpoint ?? process.env.OPEN_METEO_ALLOW_PUBLIC_ENDPOINT === "true");
+  if (!apiKey && !publicEndpointAllowed) return unavailableSnapshot();
+
+  const url = new URL(apiKey ? CUSTOMER_PROVIDER_URL : PUBLIC_PROVIDER_URL);
+  url.searchParams.set("latitude", lat.toFixed(4));
+  url.searchParams.set("longitude", lon.toFixed(4));
+  url.searchParams.set("current", "temperature_2m,precipitation,weather_code,wind_speed_10m");
+  url.searchParams.set("timezone", "Europe/Madrid");
+  if (apiKey) url.searchParams.set("apikey", apiKey);
   try {
-    const response = await fetch(url, { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
+    const response = await (options.fetchImpl ?? fetch)(url, { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
     if (!response.ok) throw new Error(`WEATHER_HTTP_${response.status}`);
     const payload = await response.json();
     const snapshot = snapshotFromProvider(payload, now);

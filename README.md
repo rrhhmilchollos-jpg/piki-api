@@ -12,6 +12,10 @@ La conexión de Atlas no se guarda en el repositorio. La variable `MONGODB_URI` 
 
 La sincronización de horarios usa OAuth de Google Business Profile. En Render deben configurarse `GOOGLE_BUSINESS_CLIENT_ID`, `GOOGLE_BUSINESS_CLIENT_SECRET`, `GOOGLE_BUSINESS_REDIRECT_URI` y `GOOGLE_BUSINESS_TOKEN_ENCRYPTION_KEY`. El callback de producción es `https://api.pikidelivery.com/api/v1/partners/google-business/callback`. El partner conecta su cuenta, selecciona la ubicación real y puede importar horarios desde Google o publicar los horarios de PIKI. Los tokens se guardan cifrados y nunca se exponen en respuestas HTTP. El worker periódico está apagado por defecto: requiere `GOOGLE_BUSINESS_SYNC_ENABLED=true`, sólo procesa conexiones OAuth con ubicación seleccionada y admite `GOOGLE_BUSINESS_SYNC_CADENCE_MINUTES` (mínimo 5; 15 por defecto). Un horario guardado por PIKI queda marcado como fuente `piki` y no es sobrescrito automáticamente por Google.
 
+### Proveedor meteorológico y licencia comercial
+
+En producción, configura `OPEN_METEO_API_KEY` con una clave licenciada de Open-Meteo Customer API en el gestor de secretos de Render. Sin esa clave, la API no consulta el endpoint público gratuito y responde con clima neutral/fallback: pedidos y precios continúan sin cambios. `OPEN_METEO_ALLOW_PUBLIC_ENDPOINT=true` solo está pensado para pruebas locales no comerciales y se ignora con `NODE_ENV=production`. Cuando se muestre el aviso climático, PIKI Customer debe incluir atribución enlazada a [Open-Meteo](https://open-meteo.com/). El clima solo modifica el ETA preventivo y la prioridad de cercanía; no introduce recargos ni altera Stripe.
+
 ## Migración formal a tenants
 
 La API incorpora `tenants`, `tenant_memberships` y `tenantId` indexado en las entidades operativas. La migración es idempotente y crea el tenant raíz `piki-platform` para los datos existentes.
