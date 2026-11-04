@@ -936,7 +936,10 @@ app.post("/api/v1/auth/employee/password-reset/request", rateLimit(3, 15 * 60_00
   const employee = await EmployeeAccount.findOne({ email, active: true, authorizationStatus: "approved" }).select("_id email name jobRole apiRole roles primaryRole ownerProtected authorizationStatus").lean().exec() as any;
   if (employee && employeeCanUseCredentialSurface(employee, surface)) {
     const { delivery } = await sendEmployeePasswordLink(employee, surface, "recovery");
-    if (!delivery.sent) console.warn("Employee password reset email was not delivered", { error: delivery.error });
+    if (!delivery.sent) {
+      console.warn("Employee password reset email was not delivered", { error: delivery.error, surface });
+      return res.status(503).json({ message: "El correo de Recursos Humanos no está disponible ahora. Inténtalo de nuevo en unos minutos o contacta con Administración." });
+    }
   }
   return res.status(202).json({ message: passwordResetMessage });
 });
