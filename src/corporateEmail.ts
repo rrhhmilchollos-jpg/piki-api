@@ -1,8 +1,11 @@
 import nodemailer from "nodemailer";
+import type { SendMailOptions } from "nodemailer";
+import { ImapFlow } from "imapflow";
+import MailComposer from "nodemailer/lib/mail-composer/index.js";
 import { createHash } from "node:crypto";
 export type CorporateEmailDepartment = "support" | "hr" | "admin" | "finance" | "operations";
 type CorporateEmail = { recipientEmail: string; subject: string; text: string; html: string; idempotencyKey: string; fromEmail?: string; department?: CorporateEmailDepartment };
-export type CorporateEmailResult = { sent: boolean; error?: string; providerId?: string };
+export type CorporateEmailResult = { sent: boolean; error?: string; providerId?: string; sentCopySaved?: boolean };
 const senderDefaults: Record<CorporateEmailDepartment, string> = { support: "support@pikidelivery.com", hr: "rrhh@pikidelivery.com", admin: "administracion@pikidelivery.com", finance: "finanzas@pikidelivery.com", operations: "operaciones@pikidelivery.com" };
 const senderEnvironmentKeys: Record<CorporateEmailDepartment, string> = { support: "PIKI_EMAIL_FROM_SUPPORT", hr: "PIKI_EMAIL_FROM_HR", admin: "PIKI_EMAIL_FROM_ADMIN", finance: "PIKI_EMAIL_FROM_FINANCE", operations: "PIKI_EMAIL_FROM_OPERATIONS" };
 export function corporateEmailSender(department: CorporateEmailDepartment = "support") {
@@ -36,6 +39,28 @@ export async function verifyCorporateEmailConnection(): Promise<{ provider: stri
 export function escapeCorporateHtml(value: string) {
   return value.replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c] || c);
 }
+async function saveCorporateSentCopy(mailOptions: SendMailOptions) {
+  if (process.env.SMTP_IMAP_SAVE_SENT !== "true") return false;
+  const imap = new ImapFlow({
+    host: (process.env.SMTP_IMAP_HOST || "pop.securemail.pro").trim(),
+    port: Number(process.env.SMTP_IMAP_PORT || 993),
+    secure: true,
+    auth: { user: (process.env.SMTP_IMAP_USER || process.env.SMTP_USER || "").trim(), pass: process.env.SMTP_IMAP_PASSWORD || process.env.SMTP_PASSWORD || process.env.SMTP_PASS || "" },
+    connectionTimeout: 8_000, greetingTimeout: 8_000, socketTimeout: 12_000,
+    tls: { minVersion: "TLSv1.2", rejectUnauthorized: true },
+  });
+  try {
+    const raw = await new MailComposer(mailOptions).compile().build();
+    await imap.connect();
+    const folders = await imap.list();
+    const sentFolder = folders.find(folder => folder.specialUse?.toLowerCase() === "\\sent")?.path || process.env.SMTP_SENT_FOLDER || "INBOX.Sent";
+    await imap.append(sentFolder, raw, ["\\Seen"], new Date());
+    console.info("Corporate IMAP sent copy saved", { provider: "imap", folder: sentFolder, messageId: mailOptions.messageId });
+    return true;
+  } finally {
+    await imap.logout().catch(() => undefined);
+  }
+}
 export async function sendCorporateEmail(input: CorporateEmail): Promise<CorporateEmailResult> {
   const configuration = corporateEmailConfiguration();
   const from = input.fromEmail ? input.fromEmail.trim() : corporateEmailSender(input.department || "support");
@@ -51,11 +76,15 @@ export async function sendCorporateEmail(input: CorporateEmail): Promise<Corpora
       tls: { minVersion: "TLSv1.2", rejectUnauthorized: true },
     });
     try {
-      const result = await transport.sendMail({ from, sender: from, replyTo: configuration.replyTo, to: input.recipientEmail, subject: input.subject, text: input.text, html: input.html, messageId: `<${deliveryKey}@pikidelivery.com>`, headers: { "X-PIKI-Delivery-Key": deliveryKey, "X-Mailer": "PIKI Delivery", "X-Auto-Response-Suppress": "All" }, envelope: { from: process.env.SMTP_USER!.trim(), to: input.recipientEmail } });
+      const mailOptions = { from, sender: from, replyTo: configuration.replyTo, to: input.recipientEmail, subject: input.subject, text: input.text, html: input.html, messageId: `<${deliveryKey}@pikidelivery.com>`, headers: { "X-PIKI-Delivery-Key": deliveryKey, "X-Mailer": "PIKI Delivery", "X-Auto-Response-Suppress": "All" }, envelope: { from: process.env.SMTP_USER!.trim(), to: input.recipientEmail } };
+      const result = await transport.sendMail(mailOptions);
       const smtpResult = { provider: "smtp", recipient: input.recipientEmail, from, department: input.department || "support", port, secure: port === 465, messageId: result.messageId, envelope: result.envelope, accepted: result.accepted, rejected: result.rejected, response: result.response };
       console.info("Corporate SMTP delivery response", smtpResult);
       if (!(result.accepted || []).some((address: string) => String(address).toLowerCase() === input.recipientEmail.toLowerCase())) return { sent: false, error: "CORPORATE_EMAIL_RECIPIENT_REJECTED" };
-      return { sent: true, providerId: String(result.messageId) };
+      let sentCopySaved = false;
+      try { sentCopySaved = await saveCorporateSentCopy(mailOptions); }
+      catch (error) { console.warn("Corporate IMAP sent copy unavailable", { code: (error as { code?: string }).code || "IMAP_ARCHIVE_FAILED", message: error instanceof Error ? error.message : "unknown" }); }
+      return { sent: true, providerId: String(result.messageId), sentCopySaved };
     } catch (error) {
       const code = (error as { code?: string }).code || "UNKNOWN";
       const smtpError = error as { code?: string; responseCode?: number; response?: string; command?: string };

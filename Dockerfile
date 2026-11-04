@@ -10,6 +10,7 @@ RUN npx esbuild scripts/seed-alibaba-staging.ts --platform=node --packages=exter
 RUN npx esbuild scripts/seed-staging-qa.ts --platform=node --packages=external --bundle --format=esm --outfile=dist/seed-staging-qa.mjs
 RUN npx esbuild scripts/test-smtp-nominalia.mjs --platform=node --packages=external --bundle --format=esm --outfile=dist/test-smtp-nominalia.mjs
 RUN npx esbuild scripts/force-smtp-password-reset.mjs --platform=node --packages=external --bundle --format=esm --outfile=dist/force-smtp-password-reset.mjs
+RUN npx esbuild scripts/check-nominalia-mail.mjs --platform=node --packages=external --bundle --format=esm --outfile=dist/check-nominalia-mail.mjs
 
 FROM node:22-alpine
 WORKDIR /app
