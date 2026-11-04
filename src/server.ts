@@ -4551,6 +4551,18 @@ app.get("/api/v1/weather/current", async (req, res) => {
   res.setHeader("Cache-Control", "public, max-age=300");
   return res.json({ weather });
 });
+app.get("/api/v1/weather", async (req, res) => {
+  const lat = Number(req.query.lat ?? req.query.latitude ?? 38.9908);
+  const lon = Number(req.query.lng ?? req.query.lon ?? req.query.longitude ?? -0.5185);
+  const weather = await currentWeather(lat, lon);
+  const customer = await currentCustomer(req) as any;
+  const passCovered = Boolean(customer && await PikiPassSubscription.exists({ customerId: String(customer._id), status: "active", expiresAt: { $gt: new Date() } }));
+  const isInclement = weather.preferNearby;
+  const etaAdjustmentMinutes = weather.etaExtraMinutes;
+  const surchargeCents = weather.severity >= 2 ? 150 : weather.severity === 1 ? 100 : 0;
+  res.setHeader("Cache-Control", "public, max-age=300");
+  return res.json({ weatherCondition: weather.condition, isInclement, etaAdjustmentMinutes, surchargeCents, passCovered, banner: weather.banner, weather });
+});
 app.get("/api/v1/customer/checkout/price-breakdown", async (req, res) => {
   const customer = await currentCustomer(req) as any;
   if (!customer) return res.status(401).json({ error: "AUTH_REQUIRED" });
