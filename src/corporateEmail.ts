@@ -52,11 +52,14 @@ export async function sendCorporateEmail(input: CorporateEmail): Promise<Corpora
     });
     try {
       const result = await transport.sendMail({ from, sender: from, replyTo: configuration.replyTo, to: input.recipientEmail, subject: input.subject, text: input.text, html: input.html, messageId: `<${deliveryKey}@pikidelivery.com>`, headers: { "X-PIKI-Delivery-Key": deliveryKey, "X-Mailer": "PIKI Delivery", "X-Auto-Response-Suppress": "All" }, envelope: { from: process.env.SMTP_USER!.trim(), to: input.recipientEmail } });
+      const smtpResult = { provider: "smtp", recipient: input.recipientEmail, from, department: input.department || "support", port, secure: port === 465, messageId: result.messageId, envelope: result.envelope, accepted: result.accepted, rejected: result.rejected, response: result.response };
+      console.info("Corporate SMTP delivery response", smtpResult);
       if (!(result.accepted || []).some((address: string) => String(address).toLowerCase() === input.recipientEmail.toLowerCase())) return { sent: false, error: "CORPORATE_EMAIL_RECIPIENT_REJECTED" };
       return { sent: true, providerId: String(result.messageId) };
     } catch (error) {
       const code = (error as { code?: string }).code || "UNKNOWN";
-      console.warn("Corporate SMTP delivery unavailable", { code });
+      const smtpError = error as { code?: string; responseCode?: number; response?: string; command?: string };
+      console.warn("Corporate SMTP delivery error", { provider: "smtp", recipient: input.recipientEmail, from, department: input.department || "support", port, secure: port === 465, code, responseCode: smtpError.responseCode || null, response: smtpError.response || null, command: smtpError.command || null });
       return { sent: false, error: code === "EAUTH" ? "CORPORATE_EMAIL_CONFIGURATION_REJECTED" : "CORPORATE_EMAIL_UNAVAILABLE" };
     } finally { transport.close(); }
   }
