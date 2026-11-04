@@ -664,12 +664,12 @@ function requestedSurface(req: express.Request): PikiSurface | null {
   const value = String(req.header("x-piki-surface") || req.query.surface || "").toLowerCase();
   return isPikiSurface(value) ? value : null;
 }
-function isNativeCustomerContainer(req: express.Request, surface: PikiSurface | null = requestedSurface(req)): boolean {
-  if (surface !== "customer") return false;
+function isNativePikiContainer(req: express.Request, surface: PikiSurface | null = requestedSurface(req)): boolean {
+  if (!surface) return false;
   if (String(req.header("x-piki-native-container") || "").toLowerCase() === "capacitor") return true;
   const origin = String(req.header("origin") || "").toLowerCase();
   const referer = String(req.header("referer") || "").toLowerCase();
-  return origin === "https://localhost" || referer.startsWith("https://localhost/");
+  return surface === "customer" && (origin === "https://localhost" || referer.startsWith("https://localhost/"));
 }
 async function currentNotificationPrincipal(req: express.Request): Promise<NotificationPrincipal | null> {
   const surface = requestedSurface(req);
@@ -699,10 +699,12 @@ app.get("/api/v1/app-version", async (req, res) => {
   // Return that legacy sentinel only for its unversioned request so it can boot,
   // register the recovery worker, and receive the current network shell. All
   // versioned clients continue to receive the real, semver-based policy.
-  const responsePolicy = isNativeCustomerContainer(req, surface)
+  const responsePolicy = isNativePikiContainer(req, surface)
     // Capacitor ships a versioned Android bundle through Google Play. A web PWA
     // release must never trap that native shell behind an in-browser worker gate.
     ? nativeReleasePolicy(policy, clientVersion, clientBuildId)
+    : surface === "rider"
+    ? { ...policy, minimumVersion: "0.0.0", forceUpdate: false }
     : clientVersion
     ? policy
     : surface === "customer"
