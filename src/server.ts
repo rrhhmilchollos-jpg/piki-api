@@ -3408,6 +3408,25 @@ app.patch("/api/v1/admin/riders/:id/lifecycle", requireRole("admin"), async (req
 });
 
 // Envío del enlace de activación sin sesión de empleado (token de entorno).
+app.patch("/api/v1/admin/maintenance/employees/:id/email", requireRole("admin"), async (req, res) => {
+  const id = objectId(String(req.params.id));
+  const parsed = z.object({ email: z.string().trim().email().max(254) }).safeParse(req.body);
+  if (!id) return res.status(400).json({ error: "INVALID_EMPLOYEE_ID" });
+  if (!parsed.success) return res.status(400).json({ error: "INVALID_EMPLOYEE_EMAIL" });
+  const email = parsed.data.email.toLowerCase();
+  const employee = await EmployeeAccount.findById(id).select("_id email name apiRole jobRole roles primaryRole tenantId active authorizationStatus").lean().exec() as any;
+  if (!employee) return res.status(404).json({ error: "EMPLOYEE_NOT_FOUND" });
+  if (String(employee.email).toLowerCase() === email) return res.json({ updated: false, employee: { id: String(employee._id), email } });
+  const duplicate = await EmployeeAccount.findOne({ email, _id: { $ne: id } }).select("_id").lean().exec() as any;
+  if (duplicate) return res.status(409).json({ error: "EMPLOYEE_EMAIL_ALREADY_IN_USE" });
+  const previousEmail = String(employee.email).trim().toLowerCase();
+  await EmployeeAccount.updateOne({ _id: id }, { $set: { email }, $unset: { sessionHash: "" } }).exec();
+  const riderUpdate = await Rider.updateOne({ email: previousEmail, ...(employee.tenantId ? { tenantId: employee.tenantId } : {}) }, { $set: { email } }).exec();
+  await EmployeePasswordReset.updateMany({ employeeId: id, usedAt: null }, { $set: { usedAt: new Date() } }).exec();
+  await EmployeeSession.deleteMany({ employeeId: id }).exec();
+  await recordGovernanceEvent({ actor: { employeeId: req.auth?.employeeId, role: req.auth?.role, tenantId: req.auth?.tenantId }, action: "employee_email_changed", targetType: "employee", targetId: id, before: { email: previousEmail }, after: { email, riderDocumentsUpdated: riderUpdate.modifiedCount }, reason: "Correo de acceso corregido por solicitud administrativa; enlaces de recuperación anteriores invalidados." });
+  return res.json({ updated: true, employee: { id: String(id), email }, riderDocumentsUpdated: riderUpdate.modifiedCount });
+});
 app.post("/api/v1/admin/maintenance/employees/:id/send-activation", requireRole("admin"), async (req, res) => {
   const id = objectId(String(req.params.id));
   if (!id) return res.status(400).json({ error: "INVALID_EMPLOYEE_ID" });
