@@ -62,7 +62,12 @@ async function riderScope(request: Request, riderId: mongoose.Types.ObjectId) {
   const tenant = buildTenantScope(request.auth?.tenantId);
   if (request.auth?.role === "rider") {
     const employee = await employeeScope(request);
-    return employee?.email ? { _id: riderId, email: employee.email, ...tenant } : { _id: null };
+    // EmployeeAccount and Rider are separate documents. A Rider session may
+    // arrive with the employee id in the URL, so bind ownership by email and
+    // accept the requested id only when it is the actual Rider id.
+    return employee?.email
+      ? { $or: [{ _id: riderId, email: employee.email }, { email: employee.email }], ...tenant }
+      : { _id: null };
   }
   if (request.auth?.role === "fleet") {
     const employee = await employeeScope(request);
@@ -78,7 +83,7 @@ export function mountShiftRoutes(app: Express): void {
     if (!riderId) return response.status(400).json({ error: "INVALID_RIDER_ID" });
     const rider = (await Rider.findOne(await riderScope(request, riderId)).select("_id name email status fleetId").lean().exec()) as any;
     if (!rider) return response.status(403).json({ error: "RIDER_ACCESS_DENIED" });
-    const snapshot = await buildShiftSnapshot(String(riderId));
+    const snapshot = await buildShiftSnapshot(String(rider._id));
     return response.json({ rider: { id: String(rider._id), name: rider.name, email: rider.email, status: rider.status }, shift: snapshot, contractHours: [10, 20, 30, 40] });
   });
 
@@ -91,14 +96,14 @@ export function mountShiftRoutes(app: Express): void {
     const rider = (await Rider.findOne(await riderScope(request, riderId)).select("_id name email tenantId").lean().exec()) as any;
     if (!rider) return response.status(403).json({ error: "RIDER_ACCESS_DENIED" });
     const result = await saveShiftPlan({
-      riderId: String(riderId),
+      riderId: String(rider._id),
       tenantId: rider.tenantId ? String(rider.tenantId) : request.auth?.tenantId ?? null,
       weeklyHours: parsed.data.weeklyHours,
       shifts: parsed.data.shifts,
       updatedBy: request.auth?.employeeId ?? null,
     });
     if (!result.ok) return response.status(422).json({ error: result.error, message: result.message });
-    const snapshot = await buildShiftSnapshot(String(riderId));
+    const snapshot = await buildShiftSnapshot(String(rider._id));
     return response.json({
       message: `Contrato de ${snapshot.weeklyHours} h guardado con ${parsed.data.shifts.length} tramo(s).`,
       shift: snapshot,
@@ -109,9 +114,9 @@ export function mountShiftRoutes(app: Express): void {
   app.delete("/api/v1/riders/:id/shift-plan", requireRole("admin", "fleet"), async (request: Request, response: Response) => {
     const riderId = riderIdParam(request);
     if (!riderId) return response.status(400).json({ error: "INVALID_RIDER_ID" });
-    const rider = await Rider.findOne(await riderScope(request, riderId)).select("_id").lean().exec();
+    const rider = await Rider.findOne(await riderScope(request, riderId)).select("_id").lean().exec() as any;
     if (!rider) return response.status(403).json({ error: "RIDER_ACCESS_DENIED" });
-    const removed = await deleteShiftPlan(String(riderId));
+    const removed = await deleteShiftPlan(String(rider._id));
     return response.json({ removed, message: removed ? "Contrato de jornada retirado." : "El rider no tenía contrato guardado." });
   });
 
@@ -119,10 +124,10 @@ export function mountShiftRoutes(app: Express): void {
   app.post("/api/v1/riders/:id/shift-plan/cut", requireRole("admin", "fleet"), async (request: Request, response: Response) => {
     const riderId = riderIdParam(request);
     if (!riderId) return response.status(400).json({ error: "INVALID_RIDER_ID" });
-    const rider = await Rider.findOne(await riderScope(request, riderId)).select("_id").lean().exec();
+    const rider = await Rider.findOne(await riderScope(request, riderId)).select("_id").lean().exec() as any;
     if (!rider) return response.status(403).json({ error: "RIDER_ACCESS_DENIED" });
     const reason = String((request.body as any)?.reason || "manual").slice(0, 120);
-    const cut = await cutRiderShift({ riderId: String(riderId), reason });
+    const cut = await cutRiderShift({ riderId: String(rider._id), reason });
     const swept = await runShiftSweep({ apply: true, source: "manual", actorId: request.auth?.employeeId ?? null });
     return response.json({
       message: cut

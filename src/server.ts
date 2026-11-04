@@ -4097,8 +4097,18 @@ app.patch("/api/v1/riders/:id/zone", requireRole("admin", "fleet"), async (req, 
 });
 
 app.get("/api/v1/rider-slots", requireRole("admin", "fleet", "rider"), async (req, res) => {
-  const riderId = typeof req.query.riderId === "string" ? objectId(req.query.riderId) : null;
-  const filter = riderId ? { riderId, ...tenantScope(req) } : { ...tenantScope(req) };
+  let riderId = typeof req.query.riderId === "string" ? objectId(req.query.riderId) : null;
+  // EmployeeAccount and Rider use different ids. For a Rider session, never
+  // rely on a frontend-supplied id: resolve the operational Rider by the
+  // authenticated employee email and keep the query tenant-scoped.
+  if (req.auth?.role === "rider") {
+    const employee = await employeeScope(req);
+    const rider = employee?.email
+      ? await Rider.findOne({ email: employee.email, ...tenantScope(req) }).select("_id").lean().exec() as any
+      : null;
+    riderId = rider?._id || null;
+  }
+  const filter = riderId ? { riderId, ...tenantScope(req) } : req.auth?.role === "rider" ? { riderId: null, ...tenantScope(req) } : { ...tenantScope(req) };
   const slots = await RiderSlot.find(filter).sort({ date: 1, startTime: 1 }).limit(500).lean().exec();
   return res.json({ slots });
 });
