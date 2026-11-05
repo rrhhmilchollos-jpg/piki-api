@@ -204,7 +204,6 @@ app.use((_req, res, next) => {
   next();
 });
 app.use(cors(corsOptions));
-app.use(waitlistRouter);
 app.options("*", cors(corsOptions));
 
 const requestBuckets = new Map<string, { startedAt: number; count: number }>();
@@ -365,6 +364,7 @@ app.post("/api/v1/integrations/vercel/webhook", express.raw({ type: "application
 });
 mountStripeWebhook(app);
 app.use(express.json({ limit: "20mb" }));
+app.use(waitlistRouter);
 mountAdminSecuritySettings(app);
 
 // Se montan después de CORS y del parseo de JSON: si van antes, el navegador
