@@ -34,9 +34,9 @@ import { startCodHoldSweepWorker, stopCodHoldSweepWorker } from "./codHoldSweepW
 import { EmployeeSession, issueEmployeeSession, revokeEmployeeSessions, sessionRole } from "./employeeSessions.js";
 import { isStripeSignatureError, processStripeWebhook, stripeConfigured, createSignaturitSignature, signaturitBaseUrl, signaturitConfigured, signaturitMode, signatureWebhookUrl, webhookDigest, handleCustomerTrpc, currentCustomer, issueCustomerSession, setCustomerOrderDispatcher } from "./integrations/index.js";
 import { getVersionPolicy, isPikiSurface, requiresUpdate, setVersionPolicy, syncVersionPolicy, versionPolicySchema, type PikiSurface } from "./appVersion.js";
-import { publicPushConfig, revokePushSubscription, saveFcmSubscription, savePushSubscription } from "./push.js";
+import { fcmPushConfigured, pushConfigured, publicPushConfig, revokePushSubscription, saveFcmSubscription, savePushSubscription, sendPushToOwner } from "./push.js";
 import { publishOrderStatusEvents, publishOrderIntakeEvents, publishRiderOfferEvent, publishRiderHeadingToPartnerEvent, publishRiderArrivalEvent, publishRiderLocationEvents, publishRiderScheduleEvent, publishRiderCustomerMessageEvent, publishRealtimeEvent, serveRealtimeEvents, startRealtimeRelay, tenantAudienceKey } from "./realtime.js";
-import { listNotifications, markAllNotificationsRead, markNotificationRead, sendDocumentRequestEmail, sendDocumentUploadEmail, startNotificationWorker, stopNotificationWorker, processExpiringCustomerCreditNotifications, type NotificationPrincipal } from "./notifications.js";
+import { listNotifications, markAllNotificationsRead, markNotificationRead, sendDocumentRequestEmail, sendDocumentUploadEmail, startNotificationWorker, startShiftSoundAssetUrl, stopNotificationWorker, processExpiringCustomerCreditNotifications, type NotificationPrincipal } from "./notifications.js";
 import { captureStripePaymentIntent, createCheckoutSession, createPartnerStripeOnboardingLink, createTipCheckoutSession } from "./stripe.js";
 import { rankDispatchCandidates, evaluateDispatchVehicleEligibility, computeMobilityAdvice, calculateSanctionDecision, defaultSanctionPolicy } from "./algorithms/index.js";
 import { createSessionToken, generateTemporaryPassword, hashPassword, hashSessionToken, verifyPassword } from "./employeeAuth.js";
@@ -816,6 +816,73 @@ app.delete("/api/v1/push/subscriptions", rateLimit(20, 60_000, "push-unsubscribe
     await revokePushSubscription({ surface, ownerType: "employee", ownerId: auth.employeeId, endpoint });
   }
   return res.status(204).end();
+});
+// Herramientas de diagnóstico push para Administración. Solo lectura de
+// contadores y una prueba dirigida a un Rider concreto del mismo tenant: no
+// permite destinatarios arbitrarios ni modifica turnos, pedidos o cuentas.
+const pushShiftTestSchema = z.object({ riderId: z.string().regex(/^[a-f\d]{24}$/i) }).strict();
+app.get("/api/v1/admin/push/status", requireRole("admin"), rateLimit(30, 60_000, "admin-push-status"), async (req, res) => {
+  const tenantId = req.auth?.tenantId;
+  const scope = tenantId && mongoose.isValidObjectId(tenantId) ? { tenantId: new mongoose.Types.ObjectId(tenantId) } : {};
+  const [riderFcmSubscriptions, riderWebSubscriptions] = await Promise.all([
+    PushSubscription.countDocuments({ ...scope, surface: "rider", provider: "fcm", status: "active" }).exec(),
+    PushSubscription.countDocuments({ ...scope, surface: "rider", provider: "webpush", status: "active" }).exec(),
+  ]);
+  res.setHeader("Cache-Control", "no-store, max-age=0");
+  return res.json({
+    fcmConfigured: fcmPushConfigured(),
+    webPushConfigured: pushConfigured(),
+    riderFcmSubscriptions,
+    riderWebSubscriptions,
+    shiftSoundUrl: startShiftSoundAssetUrl(),
+  });
+});
+app.post("/api/v1/admin/push/shift-start-test", requireRole("admin"), rateLimit(6, 60_000, "admin-push-shift-test"), async (req, res) => {
+  const parsed = pushShiftTestSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "INVALID_PAYLOAD", message: "Indica el riderId del Rider al que quieres enviar la prueba." });
+  if (!fcmPushConfigured() && !pushConfigured()) return res.status(503).json({ error: "PUSH_NOT_CONFIGURED" });
+  const rider = await Rider.findOne({ _id: parsed.data.riderId, ...tenantScope(req) }).select("_id name email tenantId").lean().exec() as any;
+  if (!rider) return res.status(404).json({ error: "RIDER_NOT_FOUND" });
+  const employee = await EmployeeAccount.findOne({ email: String(rider.email || "").toLowerCase(), ...tenantScope(req) }).select("_id tenantId").lean().exec() as any;
+  if (!employee) return res.status(409).json({ error: "RIDER_WITHOUT_ACCESS_ACCOUNT", message: "El Rider no tiene cuenta de acceso con la que registrar notificaciones push." });
+  let delivery: { attempted: number; delivered: number; failed: number };
+  try {
+    delivery = await sendPushToOwner({
+      surface: "rider",
+      ownerType: "employee",
+      ownerId: String(employee._id),
+      tenantId: employee.tenantId ? String(employee.tenantId) : null,
+      payload: {
+        title: "[PRUEBA] Hora de empezar tu jornada",
+        body: "Notificación de prueba del sonido de inicio de jornada. No tienes que hacer nada.",
+        url: "/?section=Jornada",
+        tag: `piki-shift-start-test-${Date.now()}`,
+        renotify: true,
+        sound: "start_shift",
+        soundUrl: startShiftSoundAssetUrl(),
+      },
+    });
+  } catch (error) {
+    return res.status(503).json({ error: "PUSH_DELIVERY_FAILED", message: error instanceof Error ? error.message : "No se pudo enviar la notificación de prueba." });
+  }
+  await recordGovernanceEvent({
+    actor: { employeeId: req.auth?.employeeId, role: req.auth?.role, tenantId: req.auth?.tenantId },
+    action: "push_shift_start_tested",
+    targetType: "rider",
+    targetId: rider._id,
+    after: { attempted: delivery.attempted, delivered: delivery.delivered, failed: delivery.failed, channel: "piki_shift_start" },
+    reason: "Prueba manual del aviso sonoro de inicio de jornada solicitada por Administración.",
+  }).catch(() => undefined);
+  console.log(JSON.stringify({ event: "admin_push_shift_start_test", riderId: String(rider._id), attempted: delivery.attempted, delivered: delivery.delivered, failed: delivery.failed }));
+  return res.json({
+    riderId: String(rider._id),
+    riderName: rider.name ?? null,
+    ...delivery,
+    fcmConfigured: fcmPushConfigured(),
+    message: delivery.attempted === 0
+      ? "El Rider no tiene ningún dispositivo suscrito a notificaciones."
+      : `${delivery.delivered} dispositivo(s) aceptaron la notificación y ${delivery.failed} fallaron.`,
+  });
 });
 app.get("/api/v1/notifications", rateLimit(90, 60_000, "notifications-list"), async (req, res) => {
   const surface = requestedSurface(req);

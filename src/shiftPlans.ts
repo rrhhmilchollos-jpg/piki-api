@@ -633,6 +633,7 @@ export type ShiftSweepReport = {
   loggedOut: number;
   released: number;
   applied: number;
+  reminders: number;
   actions: SweepAction[];
   details: ShiftSweepDetail[];
   errors: string[];
@@ -649,7 +650,12 @@ export async function runShiftSweep(options: {
 }): Promise<ShiftSweepReport> {
   const now = options.now ?? new Date();
   const startedAt = now.toISOString();
-  if (options.apply) await notifyUpcomingRiderShiftStarts(now).catch((error) => console.warn("No se pudo notificar el inicio de turnos Rider", error instanceof Error ? error.message : error));
+  const reminders = options.apply
+    ? await notifyUpcomingRiderShiftStarts(now).catch((error) => {
+      console.warn("No se pudo notificar el inicio de turnos Rider", error instanceof Error ? error.message : error);
+      return 0;
+    })
+    : 0;
   const plans = (await RiderShiftPlanModel.find({}).lean().exec()) as any[];
   const riders = plans
     .filter((plan) => mongoose.isValidObjectId(plan.riderId))
@@ -805,6 +811,7 @@ export async function runShiftSweep(options: {
     loggedOut: result.loggedOut,
     released: result.released,
     applied,
+    reminders,
     actions: result.actions,
     details: [...details.values()],
     errors,

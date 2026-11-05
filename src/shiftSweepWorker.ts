@@ -29,6 +29,7 @@ export function shiftSweepWorkerStatus() {
     lastApplied: lastReport?.applied ?? 0,
     lastReleased: lastReport?.released ?? 0,
     lastLoggedOut: lastReport?.loggedOut ?? 0,
+    lastReminders: lastReport?.reminders ?? 0,
   };
 }
 
@@ -42,18 +43,20 @@ export async function runShiftSweepOnce(): Promise<ShiftSweepReport | null> {
     lastReport = report;
     lastError = null;
     runs += 1;
-    if (report.applied || report.loggedOut) {
-      console.log(
-        JSON.stringify({
-          event: "shift_sweep_applied",
-          checked: report.checked,
-          loggedOut: report.loggedOut,
-          released: report.released,
-          applied: report.applied,
-          errors: report.errors,
-        }),
-      );
-    }
+    // One line per run so a support engineer can confirm in Render logs that
+    // the sweep actually scanned shifts and whether a start reminder fired.
+    console.log(
+      JSON.stringify({
+        event: report.applied || report.loggedOut ? "shift_sweep_applied" : "shift_sweep_run",
+        run: runs,
+        checked: report.checked,
+        reminders: report.reminders,
+        loggedOut: report.loggedOut,
+        released: report.released,
+        applied: report.applied,
+        errors: report.errors,
+      }),
+    );
     return report;
   } catch (error) {
     lastError = error instanceof Error ? error.message : String(error);

@@ -503,3 +503,4 @@ export function startNotificationWorker() {
 export function stopNotificationWorker() {
   notificationWorkerStarted = false;
 }
+export const startShiftSoundAssetUrl = startShiftSoundUrl;
