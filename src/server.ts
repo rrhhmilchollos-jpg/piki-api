@@ -7300,6 +7300,68 @@ app.get("/api/v1/fleets/overview", requireRole("admin", "fleet"), async (_req, r
   res.json({ service: "piki-api", overview: { active_fleets: fleets, assigned_riders: assignedRiders, active_zones: zones, live_orders: liveOrders } });
 });
 
+/**
+ * Utilidades de operaciones para QA. Solo responden si PIKI_OPS_TOKEN está
+ * definido y coincide; sin variable de entorno la ruta devuelve 404 y queda
+ * inerte. Permiten preparar y limpiar un turno de prueba sin abrir el panel.
+ */
+function opsAuthorized(req: any): boolean {
+  const expected = String(process.env.PIKI_OPS_TOKEN || "");
+  const supplied = String(req.headers["x-piki-ops"] || "");
+  if (!expected || !supplied || supplied.length !== expected.length) return false;
+  return timingSafeEqual(Buffer.from(supplied), Buffer.from(expected));
+}
+function madridClock(instant = new Date()): { date: string; minutes: number } {
+  const values: Record<string, string> = {};
+  for (const part of new Intl.DateTimeFormat("en-GB", { timeZone: "Europe/Madrid", year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hourCycle: "h23" }).formatToParts(instant)) {
+    if (part.type !== "literal") values[part.type] = part.value;
+  }
+  const hour = values.hour === "24" ? "00" : values.hour;
+  return { date: `${values.year}-${values.month}-${values.day}`, minutes: Number(hour) * 60 + Number(values.minute) };
+}
+function clockLabel(totalMinutes: number): string {
+  const wrapped = ((totalMinutes % 1440) + 1440) % 1440;
+  return `${String(Math.floor(wrapped / 60)).padStart(2, "0")}:${String(wrapped % 60).padStart(2, "0")}`;
+}
+app.get("/api/v1/ops/riders", async (req, res) => {
+  if (!opsAuthorized(req)) return res.status(404).end();
+  const riders = await Rider.find({}).select("_id name email zoneSlug zoneSlugs").limit(100).lean().exec() as any[];
+  res.setHeader("Cache-Control", "no-store, max-age=0");
+  return res.json({ riders: riders.map((rider) => ({ id: String(rider._id), name: rider.name ?? null, email: rider.email ?? null, zones: rider.zoneSlugs?.length ? rider.zoneSlugs : rider.zoneSlug ? [rider.zoneSlug] : [] })) });
+});
+app.post("/api/v1/ops/test-shift", async (req, res) => {
+  if (!opsAuthorized(req)) return res.status(404).end();
+  const parsed = z.object({
+    email: z.string().email(),
+    minutesAhead: z.number().int().min(1).max(720).default(8),
+    durationMinutes: z.number().int().min(15).max(600).default(120),
+  }).strict().safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "INVALID_PAYLOAD" });
+  const rider = await Rider.findOne({ email: parsed.data.email.trim().toLowerCase() }).select("_id name email tenantId zoneSlug zoneSlugs").lean().exec() as any;
+  if (!rider) return res.status(404).json({ error: "RIDER_NOT_FOUND", message: `No existe ningún Rider con el correo ${parsed.data.email}` });
+  const clock = madridClock();
+  const startTime = clockLabel(clock.minutes + parsed.data.minutesAhead);
+  const endTime = clockLabel(clock.minutes + parsed.data.minutesAhead + parsed.data.durationMinutes);
+  const created = await RiderSlot.create({
+    tenantId: rider.tenantId ?? null,
+    riderId: rider._id,
+    zoneSlug: String(rider.zoneSlugs?.[0] || rider.zoneSlug || "xativa"),
+    date: clock.date,
+    startTime,
+    endTime,
+    status: "planned",
+    notes: "PIKI_TEST_SHIFT",
+  });
+  console.log(JSON.stringify({ event: "ops_test_shift_created", riderId: String(rider._id), slotId: String(created._id), date: clock.date, startTime, endTime }));
+  return res.status(201).json({ riderId: String(rider._id), riderName: rider.name ?? null, slotId: String(created._id), date: clock.date, startTime, endTime, message: "El worker detectará el turno en la próxima pasada (cada 5 minutos)." });
+});
+app.post("/api/v1/ops/test-shift/clean", async (req, res) => {
+  if (!opsAuthorized(req)) return res.status(404).end();
+  const result = await RiderSlot.deleteMany({ notes: "PIKI_TEST_SHIFT" }).exec();
+  console.log(JSON.stringify({ event: "ops_test_shift_cleaned", deleted: result.deletedCount }));
+  return res.json({ deleted: result.deletedCount });
+});
+
 app.use((_req, res) => res.status(404).json({ error: "NOT_FOUND" }));
 app.use((error: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
   if (res.headersSent) return next(error);
@@ -7576,64 +7638,3 @@ async function start() {
 
 if (process.env.PIKI_NO_LISTEN !== "true") start().catch((error) => { console.error("Unable to start PIKI API", error); process.exit(1); });
 import { activeCustomerCoupons, activeShareChallenges, claimShareChallenge, createShareChallenge, CustomerCoupon, CustomerShareChallenge, issueCustomerCoupon, redeemBestCoupon, registerShareVisit, restoreCustomerCoupon, shareFingerprint } from "./customerEngagement.js";
-/**
- * Utilidades de operaciones para QA. Solo responden si PIKI_OPS_TOKEN está
- * definido y coincide; sin variable de entorno la ruta devuelve 404 y queda
- * inerte. Permiten preparar y limpiar un turno de prueba sin abrir el panel.
- */
-function opsAuthorized(req: any): boolean {
-  const expected = String(process.env.PIKI_OPS_TOKEN || "");
-  const supplied = String(req.headers["x-piki-ops"] || "");
-  if (!expected || !supplied || supplied.length !== expected.length) return false;
-  return timingSafeEqual(Buffer.from(supplied), Buffer.from(expected));
-}
-function madridClock(instant = new Date()): { date: string; minutes: number } {
-  const values: Record<string, string> = {};
-  for (const part of new Intl.DateTimeFormat("en-GB", { timeZone: "Europe/Madrid", year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hourCycle: "h23" }).formatToParts(instant)) {
-    if (part.type !== "literal") values[part.type] = part.value;
-  }
-  const hour = values.hour === "24" ? "00" : values.hour;
-  return { date: `${values.year}-${values.month}-${values.day}`, minutes: Number(hour) * 60 + Number(values.minute) };
-}
-function clockLabel(totalMinutes: number): string {
-  const wrapped = ((totalMinutes % 1440) + 1440) % 1440;
-  return `${String(Math.floor(wrapped / 60)).padStart(2, "0")}:${String(wrapped % 60).padStart(2, "0")}`;
-}
-app.get("/api/v1/ops/riders", async (req, res) => {
-  if (!opsAuthorized(req)) return res.status(404).end();
-  const riders = await Rider.find({}).select("_id name email zoneSlug zoneSlugs").limit(100).lean().exec() as any[];
-  res.setHeader("Cache-Control", "no-store, max-age=0");
-  return res.json({ riders: riders.map((rider) => ({ id: String(rider._id), name: rider.name ?? null, email: rider.email ?? null, zones: rider.zoneSlugs?.length ? rider.zoneSlugs : rider.zoneSlug ? [rider.zoneSlug] : [] })) });
-});
-app.post("/api/v1/ops/test-shift", async (req, res) => {
-  if (!opsAuthorized(req)) return res.status(404).end();
-  const parsed = z.object({
-    email: z.string().email(),
-    minutesAhead: z.number().int().min(1).max(720).default(8),
-    durationMinutes: z.number().int().min(15).max(600).default(120),
-  }).strict().safeParse(req.body);
-  if (!parsed.success) return res.status(400).json({ error: "INVALID_PAYLOAD" });
-  const rider = await Rider.findOne({ email: parsed.data.email.trim().toLowerCase() }).select("_id name email tenantId zoneSlug zoneSlugs").lean().exec() as any;
-  if (!rider) return res.status(404).json({ error: "RIDER_NOT_FOUND", message: `No existe ningún Rider con el correo ${parsed.data.email}` });
-  const clock = madridClock();
-  const startTime = clockLabel(clock.minutes + parsed.data.minutesAhead);
-  const endTime = clockLabel(clock.minutes + parsed.data.minutesAhead + parsed.data.durationMinutes);
-  const created = await RiderSlot.create({
-    tenantId: rider.tenantId ?? null,
-    riderId: rider._id,
-    zoneSlug: String(rider.zoneSlugs?.[0] || rider.zoneSlug || "xativa"),
-    date: clock.date,
-    startTime,
-    endTime,
-    status: "planned",
-    notes: "PIKI_TEST_SHIFT",
-  });
-  console.log(JSON.stringify({ event: "ops_test_shift_created", riderId: String(rider._id), slotId: String(created._id), date: clock.date, startTime, endTime }));
-  return res.status(201).json({ riderId: String(rider._id), riderName: rider.name ?? null, slotId: String(created._id), date: clock.date, startTime, endTime, message: "El worker detectará el turno en la próxima pasada (cada 5 minutos)." });
-});
-app.post("/api/v1/ops/test-shift/clean", async (req, res) => {
-  if (!opsAuthorized(req)) return res.status(404).end();
-  const result = await RiderSlot.deleteMany({ notes: "PIKI_TEST_SHIFT" }).exec();
-  console.log(JSON.stringify({ event: "ops_test_shift_cleaned", deleted: result.deletedCount }));
-  return res.json({ deleted: result.deletedCount });
-});
