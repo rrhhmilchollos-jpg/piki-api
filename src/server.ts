@@ -6326,10 +6326,10 @@ async function assignOrderAutomatically(orderId: mongoose.Types.ObjectId, prefer
     const order = await Order.findById(orderId).lean().exec() as any;
     if (!order) return { state: "not_found" as const };
     const tenantFilter: Record<string, unknown> = order.tenantId ? { tenantId: order.tenantId } : {};
-    if (!isDispatchablePayment(order.paymentState, order.paymentMethod, Number(order.totalCents)) || !isDispatchableOrderStatus(order.status)) return { state: "not_dispatchable" as const };
+    if (!isDispatchablePayment(order.paymentState, order.paymentMethod, Number(order.totalCents)) || !isDispatchableOrderStatus(order.status)) { console.log("[dispatch-diag]", JSON.stringify({ orderId: String(order._id), state: "not_dispatchable", status: order.status, paymentState: order.paymentState, paymentMethod: order.paymentMethod, totalCents: order.totalCents, isTestOrder: order.isTestOrder })); return { state: "not_dispatchable" as const }; }
     if (order.riderId || order.assignmentState === "assigned" || order.assignmentState === "offered") return { state: "already_assigned" as const, riderId: order.riderId };
     const restaurant = await Restaurant.findOne({ _id: order.restaurantId, ...tenantFilter }).lean().exec() as any;
-    if (!validOperationalCoordinates(restaurant?.location?.coordinates) || !validOperationalCoordinates(order.deliveryLocation?.coordinates)) return { state: "missing_geolocation" as const };
+    if (!validOperationalCoordinates(restaurant?.location?.coordinates) || !validOperationalCoordinates(order.deliveryLocation?.coordinates)) { console.log("[dispatch-diag]", JSON.stringify({ orderId: String(order._id), state: "missing_geolocation" })); return { state: "missing_geolocation" as const }; }
     const policy = await dispatchLoadPolicy();
     const freshness = new Date(Date.now() - 90_000);
     const currentRiderIds = await currentSlotRiderIds(tenantFilter);
@@ -6354,7 +6354,7 @@ async function assignOrderAutomatically(orderId: mongoose.Types.ObjectId, prefer
     const capacity = policy.maxConcurrentOrders;
     const capacityEligibleRiders = riders.filter((rider) => (counts.get(String(rider._id)) || 0) < capacity);
     const ranked = rankDispatchCandidates(capacityEligibleRiders.map((rider) => ({ id: String(rider._id), status: rider.status, vehicle: rider.vehicle, location: rider.location, lastLocationAt: rider.lastLocationAt, reliabilityScore: rider.reliabilityScore, ratingScore: rider.ratingScore ?? rider.reliabilityScore, activeOrderCount: counts.get(String(rider._id)) || 0, zoneFit: 1, servicePriority: preferredRiderId && String(rider._id) === String(preferredRiderId) ? 1 : 0.5 })), { restaurantLocation: [restaurant.location.coordinates[0], restaurant.location.coordinates[1]], customerLocation: [order.deliveryLocation.coordinates[0], order.deliveryLocation.coordinates[1]], ...dispatchVehicleInputForOrder(order), preparationMinutes: PARTNER_PREPARATION_LIMIT_MINUTES, maxCustomerEtaMinutes: CUSTOMER_DELIVERY_TARGET_MINUTES, maxConcurrentOrders: capacity });
-    if (!ranked.length) return { state: "no_eligible_rider" as const, candidatesConsidered: riders.length };
+    if (!ranked.length) { console.log("[dispatch-diag]", JSON.stringify({ orderId: String(order._id), state: "no_eligible_rider", candidates: riders.length, slotRiders: currentRiderIds.length, qaRider: useQaRider })); return { state: "no_eligible_rider" as const, candidatesConsidered: riders.length }; }
     for (const decision of ranked) {
       const riderId = objectId(decision.riderId); if (!riderId) continue;
       const assignmentReservation = await reserveRiderOrderSlot(riderId, order._id, tenantFilter, policy.maxConcurrentOrders);
