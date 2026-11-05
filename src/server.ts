@@ -189,7 +189,7 @@ async function reversePhoton(latitude: number, longitude: number) {
   const label = [address.road, [address.postcode, address.locality].filter(Boolean).join(" ")].filter(Boolean).join(", ");
   return { label: label || `Ubicación GPS ${latitude.toFixed(5)}, ${longitude.toFixed(5)}`, latitude, longitude, locality: address.locality || null, address: properties };
 }
-mongoose.connection.on("connected", () => { databaseReady = true; void import("./riderRepair.js").then((m) => m.runRiderRepairOnce()).catch(() => {}); startShiftSweepWorker(); startCodHoldSweepWorker()
+mongoose.connection.on("connected", () => { databaseReady = true; startShiftSweepWorker(); startCodHoldSweepWorker()
   startDailySummaryWorker();; startRealtimeRelay(); startCatalogRelay(); startGoogleBusinessSyncWorker(); void processExpiringCustomerCreditNotifications().catch((error) => console.warn("Credit expiry worker failed", error)); setInterval(() => void processExpiringCustomerCreditNotifications().catch((error) => console.warn("Credit expiry worker failed", error)), 15 * 60_000).unref(); void syncPublicIds().catch((error) => console.error("Public ID sync failed", error)); void ensurePikiPrlCourse().catch((error) => console.error("PIKI PRL course seed failed", error)); });
 mongoose.connection.on("disconnected", () => { databaseReady = false; console.warn("MongoDB disconnected; API entering not-ready state"); });
 mongoose.connection.on("error", (error) => { databaseReady = false; console.error("MongoDB connection error", error instanceof Error ? error.message : error); });
