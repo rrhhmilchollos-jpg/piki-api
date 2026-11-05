@@ -206,7 +206,6 @@ app.use((_req, res, next) => {
 });
 app.use(cors(corsOptions));
 app.use(waitlistRouter);
-app.use(adminConfigRouter);
 app.options("*", cors(corsOptions));
 mountAdminSecuritySettings(app);
 
@@ -823,6 +822,7 @@ app.delete("/api/v1/push/subscriptions", rateLimit(20, 60_000, "push-unsubscribe
 // contadores y una prueba dirigida a un Rider concreto del mismo tenant: no
 // permite destinatarios arbitrarios ni modifica turnos, pedidos o cuentas.
 const pushShiftTestSchema = z.object({ riderId: z.string().regex(/^[a-f\d]{24}$/i) }).strict();
+app.use(adminConfigRouter);
 app.get("/api/v1/admin/push/status", requireRole("admin"), rateLimit(30, 60_000, "admin-push-status"), async (req, res) => {
   const tenantId = req.auth?.tenantId;
   const scope = tenantId && mongoose.isValidObjectId(tenantId) ? { tenantId: new mongoose.Types.ObjectId(tenantId) } : {};
