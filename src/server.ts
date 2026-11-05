@@ -34,7 +34,7 @@ import { startCodHoldSweepWorker, stopCodHoldSweepWorker } from "./codHoldSweepW
 import { EmployeeSession, issueEmployeeSession, revokeEmployeeSessions, sessionRole } from "./employeeSessions.js";
 import { isStripeSignatureError, processStripeWebhook, stripeConfigured, createSignaturitSignature, signaturitBaseUrl, signaturitConfigured, signaturitMode, signatureWebhookUrl, webhookDigest, handleCustomerTrpc, currentCustomer, issueCustomerSession, setCustomerOrderDispatcher } from "./integrations/index.js";
 import { getVersionPolicy, isPikiSurface, requiresUpdate, setVersionPolicy, syncVersionPolicy, versionPolicySchema, type PikiSurface } from "./appVersion.js";
-import { fcmPushConfigured, pushConfigured, publicPushConfig, revokePushSubscription, saveFcmSubscription, savePushSubscription, sendPushToOwner } from "./push.js";
+import { fcmPushConfigured, pushConfigured, publicPushConfig, revokePushSubscription, saveFcmSubscription, savePushSubscription, sendPushToOwner, type PushDeliveryReport } from "./push.js";
 import { publishOrderStatusEvents, publishOrderIntakeEvents, publishRiderOfferEvent, publishRiderHeadingToPartnerEvent, publishRiderArrivalEvent, publishRiderLocationEvents, publishRiderScheduleEvent, publishRiderCustomerMessageEvent, publishRealtimeEvent, serveRealtimeEvents, startRealtimeRelay, tenantAudienceKey } from "./realtime.js";
 import { listNotifications, markAllNotificationsRead, markNotificationRead, sendDocumentRequestEmail, sendDocumentUploadEmail, startNotificationWorker, startShiftSoundAssetUrl, stopNotificationWorker, processExpiringCustomerCreditNotifications, type NotificationPrincipal } from "./notifications.js";
 import { captureStripePaymentIntent, createCheckoutSession, createPartnerStripeOnboardingLink, createTipCheckoutSession } from "./stripe.js";
@@ -845,7 +845,7 @@ app.post("/api/v1/admin/push/shift-start-test", requireRole("admin"), rateLimit(
   if (!rider) return res.status(404).json({ error: "RIDER_NOT_FOUND" });
   const employee = await EmployeeAccount.findOne({ email: String(rider.email || "").toLowerCase(), ...tenantScope(req) }).select("_id tenantId").lean().exec() as any;
   if (!employee) return res.status(409).json({ error: "RIDER_WITHOUT_ACCESS_ACCOUNT", message: "El Rider no tiene cuenta de acceso con la que registrar notificaciones push." });
-  let delivery: { attempted: number; delivered: number; failed: number };
+  let delivery: PushDeliveryReport;
   try {
     delivery = await sendPushToOwner({
       surface: "rider",
@@ -870,18 +870,56 @@ app.post("/api/v1/admin/push/shift-start-test", requireRole("admin"), rateLimit(
     action: "push_shift_start_tested",
     targetType: "rider",
     targetId: rider._id,
-    after: { attempted: delivery.attempted, delivered: delivery.delivered, failed: delivery.failed, channel: "piki_shift_start" },
+    after: { attempted: delivery.attempted, delivered: delivery.delivered, failed: delivery.failed, invalid: delivery.invalid, results: delivery.results, channel: "piki_shift_start" },
     reason: "Prueba manual del aviso sonoro de inicio de jornada solicitada por Administración.",
   }).catch(() => undefined);
-  console.log(JSON.stringify({ event: "admin_push_shift_start_test", riderId: String(rider._id), attempted: delivery.attempted, delivered: delivery.delivered, failed: delivery.failed }));
-  return res.json({
+  console.log(JSON.stringify({
+    event: "admin_push_shift_start_test",
+    riderId: String(rider._id),
+    attempted: delivery.attempted,
+    delivered: delivery.delivered,
+    failed: delivery.failed,
+    invalid: delivery.invalid,
+    results: delivery.results,
+  }));
+  const body = {
     riderId: String(rider._id),
     riderName: rider.name ?? null,
     ...delivery,
     fcmConfigured: fcmPushConfigured(),
-    message: delivery.attempted === 0
-      ? "El Rider no tiene ningún dispositivo suscrito a notificaciones."
-      : `${delivery.delivered} dispositivo(s) aceptaron la notificación y ${delivery.failed} fallaron.`,
+    shiftSoundUrl: startShiftSoundAssetUrl(),
+  };
+  if (delivery.attempted === 0) {
+    return res.status(409).json({
+      ...body,
+      error: "PUSH_NO_ACTIVE_DEVICE",
+      message: "El Rider no tiene ningún dispositivo suscrito a notificaciones. Debe abrir la app nueva e iniciar sesión para registrar el token.",
+    });
+  }
+  if (delivery.delivered === 0 && delivery.invalid > 0) {
+    return res.status(409).json({
+      ...body,
+      error: "PUSH_DEVICE_TOKEN_INVALID",
+      message: "El token del dispositivo ya no es válido: se ha marcado como caducado. El Rider debe volver a abrir la app para registrar uno nuevo.",
+    });
+  }
+  if (delivery.delivered === 0 && delivery.failed > 0) {
+    return res.status(502).json({
+      ...body,
+      error: "PUSH_PROVIDER_ERROR",
+      message: "El proveedor rechazó la entrega por un fallo temporal. Se puede reintentar.",
+    });
+  }
+  if (delivery.delivered === 0) {
+    return res.status(503).json({
+      ...body,
+      error: "PUSH_NOT_CONFIGURED",
+      message: "FCM o Web Push no están configurados correctamente en el servidor.",
+    });
+  }
+  return res.json({
+    ...body,
+    message: `${delivery.delivered} dispositivo(s) aceptaron la notificación, ${delivery.invalid} tenían un token caducado y ${delivery.failed} fallaron.`,
   });
 });
 app.get("/api/v1/notifications", rateLimit(90, 60_000, "notifications-list"), async (req, res) => {

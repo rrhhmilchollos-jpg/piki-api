@@ -187,35 +187,80 @@ async function sendFcmPush(subscription: any, payload: PushPayload, surface: Pik
   });
 }
 
-function terminalPushFailure(error: any, provider: string): boolean {
+/**
+ * Clasifica un fallo de entrega para no confundir un token caducado con una
+ * caída temporal del proveedor:
+ * - invalid: el token ya no sirve y debe pedirse uno nuevo al abrir la app.
+ * - failed: fallo transitorio, tiene sentido reintentar.
+ * - config: credenciales o cifrado mal configurados en el servidor.
+ */
+export type PushFailureKind = "invalid" | "failed" | "config";
+
+export function classifyPushFailure(error: any, provider: "webpush" | "fcm"): PushFailureKind {
+  const message = String(error?.message || "");
+  if (message === "FCM_NOT_CONFIGURED" || message === "PUSH_NOT_CONFIGURED" || message === "PUSH_CIPHERTEXT_INVALID") return "config";
   if (provider === "webpush") {
     const statusCode = Number(error?.statusCode || 0);
-    return statusCode === 404 || statusCode === 410;
+    if (statusCode === 404 || statusCode === 410) return "invalid";
+    if (statusCode === 401 || statusCode === 403) return "config";
+    return "failed";
   }
   const code = String(error?.code || "");
-  return code.includes("registration-token-not-registered") || code.includes("invalid-registration-token");
+  if (code.includes("registration-token-not-registered")) return "invalid";
+  if (code.includes("invalid-registration-token")) return "invalid";
+  // El token tiene forma válida pero no fue emitido para estas credenciales
+  // (otra app u otro proyecto Firebase): no se arregla reintentando.
+  if (code.includes("mismatched-credential") || code.includes("sender-id-mismatch")) return "invalid";
+  // Argumento inválido en FCM: token corrupto o cuerpo mal formado.
+  if (code === "messaging/invalid-argument") return "invalid";
+  if (code.includes("authentication-error") || code.includes("third-party-auth-error")) return "config";
+  return "failed";
 }
+
+export type PushDeliveryOutcome = {
+  provider: "fcm" | "webpush";
+  status: "delivered" | PushFailureKind;
+  code?: string;
+};
+
+export type PushDeliveryReport = {
+  attempted: number;
+  delivered: number;
+  failed: number;
+  invalid: number;
+  results: PushDeliveryOutcome[];
+};
+
 
 export async function sendPushToOwner(input: { surface: PikiSurface; ownerType: "customer" | "employee"; ownerId: string; tenantId?: string | null; payload: PushPayload }) {
   const subscriptions = await PushSubscription.find({ surface: input.surface, ownerType: input.ownerType, ownerId: input.ownerId, tenantId: input.tenantId || null, status: "active" }).select("+endpoint +keys.p256dh +keys.auth +fcmToken provider").exec();
   let delivered = 0;
   let failed = 0;
+  let invalid = 0;
+  const results: PushDeliveryOutcome[] = [];
   await Promise.all(subscriptions.map(async (subscription: any) => {
-    const provider = subscription.provider === "fcm" ? "fcm" : "webpush";
+    const provider: "fcm" | "webpush" = subscription.provider === "fcm" ? "fcm" : "webpush";
     try {
       if (provider === "fcm") await sendFcmPush(subscription, input.payload, input.surface);
       else await sendWebPush(subscription, input.payload);
       delivered += 1;
+      results.push({ provider, status: "delivered" });
       await PushSubscription.updateOne({ _id: subscription._id }, { $set: { lastSuccessAt: new Date(), failureCount: 0 } }).exec();
     } catch (error: any) {
-      const terminal = terminalPushFailure(error, provider);
-      if (!terminal && error?.message !== "FCM_NOT_CONFIGURED" && error?.message !== "PUSH_NOT_CONFIGURED") failed += 1;
+      const kind = classifyPushFailure(error, provider);
+      if (kind === "invalid") invalid += 1;
+      else if (kind === "failed") failed += 1;
+      results.push({
+        provider,
+        status: kind,
+        ...(error?.code ? { code: String(error.code) } : error?.statusCode ? { code: String(error.statusCode) } : {}),
+      });
       await PushSubscription.updateOne({ _id: subscription._id }, {
-        $set: { status: terminal ? "expired" : "active", lastFailureAt: new Date() },
-        $inc: { failureCount: 1 },
+        $set: { status: kind === "invalid" ? "expired" : "active", lastFailureAt: new Date() },
+        ...(kind === "config" ? {} : { $inc: { failureCount: 1 } }),
       }).exec();
       console.warn(`${provider === "fcm" ? "FCM" : "Web Push"} delivery failed`, { surface: input.surface, code: error?.code, statusCode: error?.statusCode });
     }
   }));
-  return { attempted: subscriptions.length, delivered, failed };
+  return { attempted: subscriptions.length, delivered, failed, invalid, results };
 }
