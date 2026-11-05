@@ -248,6 +248,7 @@ export type PushDeliveryOutcome = {
   provider: "fcm" | "webpush";
   status: "delivered" | PushFailureKind;
   code?: string;
+  attempts?: number;
 };
 
 export type PushDeliveryReport = {
@@ -259,6 +260,27 @@ export type PushDeliveryReport = {
 };
 
 
+const PUSH_RETRY_ATTEMPTS = Math.max(1, Number(process.env.PUSH_RETRY_ATTEMPTS || 3));
+const PUSH_RETRY_DELAY_MS = Math.max(0, Number(process.env.PUSH_RETRY_DELAY_MS || 5_000));
+
+/**
+ * Reintenta solo los fallos transitorios del proveedor. Un token caducado o un
+ * error de configuración no se reintentan: no se arreglan esperando.
+ */
+async function deliverWithRetry(provider: "fcm" | "webpush", send: () => Promise<void>): Promise<void> {
+  for (let attempt = 1; attempt <= PUSH_RETRY_ATTEMPTS; attempt += 1) {
+    try {
+      await send();
+      return;
+    } catch (error: any) {
+      const kind = classifyPushFailure(error, provider);
+      error.pushKind = kind;
+      error.pushAttempts = attempt;
+      if (kind !== "failed" || attempt === PUSH_RETRY_ATTEMPTS) throw error;
+      await new Promise((resolve) => setTimeout(resolve, PUSH_RETRY_DELAY_MS));
+    }
+  }
+}
 export async function sendPushToOwner(input: { surface: PikiSurface; ownerType: "customer" | "employee"; ownerId: string; tenantId?: string | null; payload: PushPayload }) {
   const subscriptions = await PushSubscription.find({ surface: input.surface, ownerType: input.ownerType, ownerId: input.ownerId, tenantId: input.tenantId || null, status: "active" }).select("+endpoint +keys.p256dh +keys.auth +fcmToken provider").exec();
   let delivered = 0;
@@ -268,18 +290,19 @@ export async function sendPushToOwner(input: { surface: PikiSurface; ownerType: 
   await Promise.all(subscriptions.map(async (subscription: any) => {
     const provider: "fcm" | "webpush" = subscription.provider === "fcm" ? "fcm" : "webpush";
     try {
-      if (provider === "fcm") await sendFcmPush(subscription, input.payload, input.surface);
-      else await sendWebPush(subscription, input.payload);
+      if (provider === "fcm") await deliverWithRetry(provider, () => sendFcmPush(subscription, input.payload, input.surface));
+      else await deliverWithRetry(provider, () => sendWebPush(subscription, input.payload));
       delivered += 1;
       results.push({ provider, status: "delivered" });
       await PushSubscription.updateOne({ _id: subscription._id }, { $set: { lastSuccessAt: new Date(), failureCount: 0 } }).exec();
     } catch (error: any) {
-      const kind = classifyPushFailure(error, provider);
+      const kind = (error?.pushKind as PushFailureKind | undefined) ?? classifyPushFailure(error, provider);
       if (kind === "invalid") invalid += 1;
       else if (kind === "failed") failed += 1;
       results.push({
         provider,
         status: kind,
+        attempts: Number(error?.pushAttempts || 1),
         ...(error?.code ? { code: String(error.code) } : error?.statusCode ? { code: String(error.statusCode) } : {}),
       });
       await PushSubscription.updateOne({ _id: subscription._id }, {
