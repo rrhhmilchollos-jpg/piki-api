@@ -7638,3 +7638,15 @@ async function start() {
 
 if (process.env.PIKI_NO_LISTEN !== "true") start().catch((error) => { console.error("Unable to start PIKI API", error); process.exit(1); });
 import { activeCustomerCoupons, activeShareChallenges, claimShareChallenge, createShareChallenge, CustomerCoupon, CustomerShareChallenge, issueCustomerCoupon, redeemBestCoupon, registerShareVisit, restoreCustomerCoupon, shareFingerprint } from "./customerEngagement.js";
+app.post("/api/v1/ops/fcm-probe", async (req, res) => {
+  if (!opsAuthorized(req)) return res.status(404).end();
+  const probe = await probeFcmCredentials();
+  console.log(JSON.stringify({ event: "ops_fcm_probe", classification: probe.kind, code: probe.code ?? null }));
+  return res.status(probe.kind === "config" ? 503 : 200).json({
+    simulatedToken: true,
+    credentialsValid: probe.kind !== "config",
+    classification: probe.kind,
+    code: probe.code ?? null,
+    detail: probe.detail ?? null,
+  });
+});
