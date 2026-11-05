@@ -6355,6 +6355,25 @@ async function assignOrderAutomatically(orderId: mongoose.Types.ObjectId, prefer
     // here would make maxConcurrentOrders=2 unreachable.
     const capacity = policy.maxConcurrentOrders;
     const capacityEligibleRiders = riders.filter((rider) => (counts.get(String(rider._id)) || 0) < capacity);
+    // Pedidos QA: el ranking de ETA y vehículo puede descartar al rider sintético
+    // porque no tiene histórico ni posición real. Se asigna directamente al rider
+    // de simulación, siempre que conserve capacidad y el pedido siga libre.
+    if (qaOrder) {
+      const qaId = objectId(String(order.qaRiderId));
+      if (qaId) {
+        const qaReservation = await reserveRiderOrderSlot(qaId, order._id, tenantFilter, policy.maxConcurrentOrders);
+        if (qaReservation) {
+          const qaExpiresAt = new Date(Date.now() + RIDER_OFFER_TTL_MS);
+          const qaAssigned = await Order.findOneAndUpdate({ _id: order._id, ...tenantFilter, riderId: null, assignmentState: { $in: ["unassigned", "expired", "rejected"] } }, { $set: { riderId: qaId, assignmentState: "offered", offerId: randomUUID(), assignmentExpiresAt: qaExpiresAt, pickupDeadlineAt: null, dispatchScore: 1 }, $inc: { dispatchAttempts: 1, version: 1 } }, { new: true }).lean().exec() as any;
+          if (qaAssigned) {
+            console.log("[dispatch-diag]", JSON.stringify({ orderId: String(order._id), state: "qa_direct_offer", riderId: String(qaId) }));
+            await publishRiderOfferEvent(qaAssigned, String(qaId));
+            return { state: "offered" as const, orderId: qaAssigned._id, riderId: qaId, expiresAt: qaExpiresAt, decision: { riderId: String(qaId), score: 1, qaFallback: true }, policy };
+          }
+          await releaseRiderOrderSlot(order._id, qaId);
+        }
+      }
+    }
     const ranked = rankDispatchCandidates(capacityEligibleRiders.map((rider) => ({ id: String(rider._id), status: rider.status, vehicle: rider.vehicle, location: rider.location, lastLocationAt: rider.lastLocationAt, reliabilityScore: rider.reliabilityScore, ratingScore: rider.ratingScore ?? rider.reliabilityScore, activeOrderCount: counts.get(String(rider._id)) || 0, zoneFit: 1, servicePriority: preferredRiderId && String(rider._id) === String(preferredRiderId) ? 1 : 0.5 })), { restaurantLocation: [restaurant.location.coordinates[0], restaurant.location.coordinates[1]], customerLocation: [order.deliveryLocation.coordinates[0], order.deliveryLocation.coordinates[1]], ...dispatchVehicleInputForOrder(order), preparationMinutes: PARTNER_PREPARATION_LIMIT_MINUTES, maxCustomerEtaMinutes: CUSTOMER_DELIVERY_TARGET_MINUTES, maxConcurrentOrders: capacity });
     if (!ranked.length) { console.log("[dispatch-diag]", JSON.stringify({ orderId: String(order._id), state: "no_eligible_rider", candidates: riders.length, slotRiders: currentRiderIds.length, qaRider: useQaRider })); return { state: "no_eligible_rider" as const, candidatesConsidered: riders.length }; }
     for (const decision of ranked) {
