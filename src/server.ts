@@ -839,7 +839,14 @@ app.get("/api/v1/admin/push/status", requireRole("admin"), rateLimit(30, 60_000,
 });
 // Comprueba credenciales FCM con un token inexistente: no escribe en MongoDB y
 // no puede notificar a nadie. Devuelve cómo se clasifica el error real de Firebase.
-app.post("/api/v1/admin/push/fcm-probe", requireRole("admin"), rateLimit(10, 60_000, "admin-push-fcm-probe"), async (_req, res) => {
+// Los diagnósticos push aceptan sesión de administrador o el token temporal de
+// operaciones (PIKI_OPS_TOKEN). Sin ese token, la comprobación falla y se exige
+// el rol admin como siempre.
+const requireAdminOrOps = (req: any, res: any, next: any) => {
+  if (opsAuthorized(req)) return next();
+  return (requireRole("admin") as any)(req, res, next);
+};
+app.post("/api/v1/admin/push/fcm-probe", requireAdminOrOps, rateLimit(10, 60_000, "admin-push-fcm-probe"), async (_req, res) => {
   const probe = await probeFcmCredentials();
   res.setHeader("Cache-Control", "no-store, max-age=0");
   const ok = probe.delivered || probe.kind === "invalid";
