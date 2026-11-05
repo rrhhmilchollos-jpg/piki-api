@@ -10,7 +10,7 @@ export const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 // Rider credentials must be requested again after the app is closed or stops
 // making authenticated calls. Active Rider apps refresh this sliding window on
 // each API request; Fleet/Admin sessions retain the normal long-lived policy.
-export const RIDER_SESSION_IDLE_TTL_MS = 2 * 60 * 1000;
+export const RIDER_SESSION_IDLE_TTL_MS = 12 * 60 * 60 * 1000;
 const schema = new Schema({
   tokenHash: { type: String, required: true, unique: true, index: true },
   employeeId: { type: Schema.Types.ObjectId, required: true, index: true },
