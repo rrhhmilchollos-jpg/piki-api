@@ -9,6 +9,7 @@
 
 import mongoose from "mongoose";
 import { runShiftSweep, type ShiftSweepReport } from "./shiftPlans.js";
+import { acquireWorkerLease, releaseWorkerLease } from "./workerLease.js";
 
 export const DEFAULT_SHIFT_SWEEP_INTERVAL_MS = 5 * 60_000;
 export const SHIFT_SWEEP_START_DELAY_MS = 45_000;
@@ -38,7 +39,15 @@ export async function runShiftSweepOnce(): Promise<ShiftSweepReport | null> {
   if (running) return null;
   if (mongoose.connection.readyState !== 1) return null;
   running = true;
+  const leaseOwner = `${process.env.RENDER_INSTANCE_ID || process.env.HOSTNAME || "api"}:${process.pid}`;
   try {
+    // Render sirve varias instancias y todas arrancan el worker. Sin lease, dos
+    // instancias procesaban el mismo turno y el aviso salía (y se contaba) dos
+    // veces. Solo la que consigue el lease trabaja en esta pasada.
+    if (!(await acquireWorkerLease("shift_sweep", 4 * 60_000, leaseOwner))) {
+      console.log(JSON.stringify({ event: "shift_sweep_skipped", reason: "lease_held_by_other_instance" }));
+      return null;
+    }
     const report = await runShiftSweep({ apply: true, source: "worker" });
     lastReport = report;
     lastError = null;
@@ -63,6 +72,7 @@ export async function runShiftSweepOnce(): Promise<ShiftSweepReport | null> {
     console.error(JSON.stringify({ event: "shift_sweep_failed", error: lastError }));
     return null;
   } finally {
+    await releaseWorkerLease("shift_sweep", leaseOwner).catch(() => undefined);
     running = false;
   }
 }
