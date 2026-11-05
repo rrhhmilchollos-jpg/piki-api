@@ -209,8 +209,9 @@ export function classifyPushFailure(error: any, provider: "webpush" | "fcm"): Pu
   if (code.includes("registration-token-not-registered")) return "invalid";
   if (code.includes("invalid-registration-token")) return "invalid";
   // El token tiene forma válida pero no fue emitido para estas credenciales
-  // (otra app u otro proyecto Firebase): no se arregla reintentando.
-  if (code.includes("mismatched-credential") || code.includes("sender-id-mismatch")) return "invalid";
+  // (otra app u otro proyecto Firebase). El dispositivo no está caducado: el
+  // fallo es de configuración, así que no se marca la suscripción como expirada.
+  if (code.includes("mismatched-credential") || code.includes("sender-id-mismatch")) return "config";
   // Argumento inválido en FCM: token corrupto o cuerpo mal formado.
   if (code === "messaging/invalid-argument") return "invalid";
   if (code.includes("authentication-error") || code.includes("third-party-auth-error")) return "config";

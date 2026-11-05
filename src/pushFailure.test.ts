@@ -7,8 +7,11 @@ test("un token FCM dado de baja se clasifica como inválido", () => {
   assert.equal(classifyPushFailure({ code: "messaging/invalid-registration-token" }, "fcm"), "invalid");
 });
 
-test("un token de otro proyecto Firebase no se reintenta", () => {
-  assert.equal(classifyPushFailure({ code: "messaging/mismatched-credential" }, "fcm"), "invalid");
+test("un token de otro proyecto Firebase es un fallo de configuración, no un token caducado", () => {
+  assert.equal(classifyPushFailure({ code: "messaging/mismatched-credential" }, "fcm"), "config");
+});
+
+test("un token con formato corrupto se descarta", () => {
   assert.equal(classifyPushFailure({ code: "messaging/invalid-argument" }, "fcm"), "invalid");
 });
 
