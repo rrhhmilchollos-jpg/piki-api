@@ -84,7 +84,7 @@ async function main() {
   const deadline = Date.now() + 30_000;
   while (!assigned && Date.now() < deadline) {
     await new Promise((resolve) => setTimeout(resolve, 5_000));
-    const refreshed = await api(`/api/v1/admin/orders/${orderId}`);
+    const refreshed = await api(`/api/v1/admin/qa/dispatch-orders/${orderId}`);
     if (refreshed.status === 200) {
       order = refreshed.body?.order || refreshed.body || order;
       assigned = Boolean(order.riderId);
@@ -92,7 +92,7 @@ async function main() {
     console.log(`    esperando asignación… riderId=${assigned ? "sí" : "no"}`);
   }
 
-  const dispatch = created.body?.dispatch || null;
+  const dispatch = created.body?.qa?.dispatch || null;
   console.log(`    dispatch: ${JSON.stringify(dispatch)}`);
   console.log(`    estado: ${order.status || "(desconocido)"} · rider: ${order.riderId || "sin asignar"}`);
 

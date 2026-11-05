@@ -6500,6 +6500,15 @@ app.post("/api/v1/admin/qa/dispatch-orders", requireRole("admin"), async (req, r
   return res.status(201).json({ order: current, qa: { riderId: String(qaRider._id), ticketId: String(supportTicket._id), ticketNumber: supportTicket.ticketNumber, expiresAt: expiresAt.toISOString(), dispatch } });
 });
 
+app.get("/api/v1/admin/qa/dispatch-orders/:id", requireRole("admin"), async (req, res) => {
+  const orderId = objectId(String(req.params.id));
+  if (!orderId) return res.status(400).json({ error: "INVALID_ORDER_ID" });
+  const order = await Order.findOne({ _id: orderId, ...tenantScope(req), isTestOrder: true })
+    .select("_id publicCode status assignmentState riderId qaRiderId dispatchAttempts assignmentExpiresAt version")
+    .lean().exec() as any;
+  if (!order) return res.status(404).json({ error: "QA_ORDER_NOT_FOUND" });
+  return res.json({ order });
+});
 app.delete("/api/v1/admin/qa/dispatch-orders/:id", requireRole("admin"), async (req, res) => {
   const orderId = objectId(String(req.params.id));
   if (!orderId) return res.status(400).json({ error: "INVALID_ORDER_ID" });
