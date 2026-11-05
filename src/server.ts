@@ -25,6 +25,7 @@ import { RiderShiftIncentiveMetric } from "./riderIncentivesModels.js";
 import { normalizeLeadEmail, partnerLeadSubmissionSchema, riderLeadSubmissionSchema, webLeadReviewSchema, webLeadStatusSchema } from "./webLeads.js";
 import { assertTransition, calculateEtaRange, transitionSchema, validateCoordinates } from "./algorithms/index.js";
 import { configuredAuthRoles, requireOwner, requireRole, resolveRole } from "./auth.js";
+import { mountAdminSecuritySettings } from "./adminSecuritySettings.js";
 import { mountRiderTracking, ensureTrackingIndexes } from "./riderTrackingRoutes.js";
 import { mountStripeRoutes, mountStripeWebhook } from "./stripeRoutes.js";
 import { mountShiftRoutes } from "./shiftRoutes.js";
@@ -205,6 +206,7 @@ app.use((_req, res, next) => {
 app.use(cors(corsOptions));
 app.use(waitlistRouter);
 app.options("*", cors(corsOptions));
+mountAdminSecuritySettings(app);
 
 const requestBuckets = new Map<string, { startedAt: number; count: number }>();
 let mongoRateLimitIndexReady = false;
