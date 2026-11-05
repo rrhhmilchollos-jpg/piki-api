@@ -188,6 +188,32 @@ async function sendFcmPush(subscription: any, payload: PushPayload, surface: Pik
 }
 
 /**
+ * Prueba las credenciales FCM con un token deliberadamente inválido.
+ *
+ * No escribe en MongoDB y no puede entregar nada a nadie: sirve para confirmar
+ * que el servidor habla con Firebase y que un token caducado se clasifica como
+ * `invalid` en lugar de perderse como si la entrega hubiera ido bien.
+ */
+export async function probeFcmCredentials(): Promise<{ delivered: boolean; kind: PushFailureKind | "ok"; code?: string; detail?: string }> {
+  if (!firebaseServiceAccount() || !encryptionKey()) return { delivered: false, kind: "config", detail: "FCM_NOT_CONFIGURED" };
+  try {
+    await fcmMessaging().send({
+      token: `piki-probe-${randomBytes(12).toString("hex")}`,
+      notification: { title: "PIKI probe", body: "Diagnóstico interno de credenciales FCM" },
+      android: { priority: "high" },
+    });
+    return { delivered: true, kind: "ok" };
+  } catch (error: any) {
+    return {
+      delivered: false,
+      kind: classifyPushFailure(error, "fcm"),
+      code: error?.code ? String(error.code) : undefined,
+      detail: String(error?.message || "").slice(0, 200),
+    };
+  }
+}
+
+/**
  * Clasifica un fallo de entrega para no confundir un token caducado con una
  * caída temporal del proveedor:
  * - invalid: el token ya no sirve y debe pedirse uno nuevo al abrir la app.

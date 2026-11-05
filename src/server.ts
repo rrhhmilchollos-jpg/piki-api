@@ -34,7 +34,7 @@ import { startCodHoldSweepWorker, stopCodHoldSweepWorker } from "./codHoldSweepW
 import { EmployeeSession, issueEmployeeSession, revokeEmployeeSessions, sessionRole } from "./employeeSessions.js";
 import { isStripeSignatureError, processStripeWebhook, stripeConfigured, createSignaturitSignature, signaturitBaseUrl, signaturitConfigured, signaturitMode, signatureWebhookUrl, webhookDigest, handleCustomerTrpc, currentCustomer, issueCustomerSession, setCustomerOrderDispatcher } from "./integrations/index.js";
 import { getVersionPolicy, isPikiSurface, requiresUpdate, setVersionPolicy, syncVersionPolicy, versionPolicySchema, type PikiSurface } from "./appVersion.js";
-import { fcmPushConfigured, pushConfigured, publicPushConfig, revokePushSubscription, saveFcmSubscription, savePushSubscription, sendPushToOwner, type PushDeliveryReport } from "./push.js";
+import { fcmPushConfigured, probeFcmCredentials, pushConfigured, publicPushConfig, revokePushSubscription, saveFcmSubscription, savePushSubscription, sendPushToOwner, type PushDeliveryReport } from "./push.js";
 import { publishOrderStatusEvents, publishOrderIntakeEvents, publishRiderOfferEvent, publishRiderHeadingToPartnerEvent, publishRiderArrivalEvent, publishRiderLocationEvents, publishRiderScheduleEvent, publishRiderCustomerMessageEvent, publishRealtimeEvent, serveRealtimeEvents, startRealtimeRelay, tenantAudienceKey } from "./realtime.js";
 import { listNotifications, markAllNotificationsRead, markNotificationRead, sendDocumentRequestEmail, sendDocumentUploadEmail, startNotificationWorker, startShiftSoundAssetUrl, stopNotificationWorker, processExpiringCustomerCreditNotifications, type NotificationPrincipal } from "./notifications.js";
 import { captureStripePaymentIntent, createCheckoutSession, createPartnerStripeOnboardingLink, createTipCheckoutSession } from "./stripe.js";
@@ -835,6 +835,27 @@ app.get("/api/v1/admin/push/status", requireRole("admin"), rateLimit(30, 60_000,
     riderFcmSubscriptions,
     riderWebSubscriptions,
     shiftSoundUrl: startShiftSoundAssetUrl(),
+  });
+});
+// Comprueba credenciales FCM con un token inexistente: no escribe en MongoDB y
+// no puede notificar a nadie. Devuelve cómo se clasifica el error real de Firebase.
+app.post("/api/v1/admin/push/fcm-probe", requireRole("admin"), rateLimit(10, 60_000, "admin-push-fcm-probe"), async (_req, res) => {
+  const probe = await probeFcmCredentials();
+  res.setHeader("Cache-Control", "no-store, max-age=0");
+  const ok = probe.delivered || probe.kind === "invalid";
+  return res.status(ok ? 200 : probe.kind === "config" ? 503 : 502).json({
+    simulatedToken: true,
+    credentialsValid: probe.kind !== "config",
+    classification: probe.kind,
+    code: probe.code ?? null,
+    detail: probe.detail ?? null,
+    message: probe.kind === "invalid"
+      ? "Credenciales correctas: Firebase rechazó el token simulado como inválido, que es el comportamiento esperado."
+      : probe.kind === "config"
+        ? "Las credenciales FCM del servidor no son válidas o falta configuración."
+        : probe.kind === "failed"
+          ? "Firebase devolvió un error temporal; conviene reintentar."
+          : "El token simulado fue aceptado, lo cual no debería ocurrir.",
   });
 });
 app.post("/api/v1/admin/push/shift-start-test", requireRole("admin"), rateLimit(6, 60_000, "admin-push-shift-test"), async (req, res) => {
