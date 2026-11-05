@@ -1,3 +1,4 @@
+import mongoose from "mongoose";
 import { EmployeeAccount } from "./models.js";
 import { hashPassword } from "./employeeAuth.js";
 
@@ -18,9 +19,12 @@ export async function runOwnerBootstrapOnce(): Promise<void> {
   }
   alreadyRan = true;
   try {
-    const before = await EmployeeAccount.findOne({ email: OWNER_EMAIL }).select("_id apiRole accessLevel active").lean();
-    const passwordHash = hashPassword(password);
-    const updated = await EmployeeAccount.findOneAndUpdate(
+    const before: any = await EmployeeAccount.findOne({ email: OWNER_EMAIL })
+      .select("_id name apiRole accessLevel active")
+      .lean()
+      .exec();
+
+    const updated: any = await EmployeeAccount.findOneAndUpdate(
       { email: OWNER_EMAIL },
       {
         $set: {
@@ -35,30 +39,35 @@ export async function runOwnerBootstrapOnce(): Promise<void> {
           active: true,
           ownerProtected: true,
           mustChangePassword: false,
-          passwordHash,
+          passwordHash: hashPassword(password),
         },
         $setOnInsert: { employeeCode: "PIKI-OWNER" },
       },
       { upsert: true, new: true, setDefaultsOnInsert: true },
-    ).lean();
+    ).lean().exec();
+
     await EmployeeAccount.updateMany(
       { email: OWNER_EMAIL, _id: { $ne: updated?._id } },
       { $set: { active: false } },
     ).exec();
-    await (await import("mongoose")).default.connection
-      .collection("governance_audit_events")
-      .insertOne({
-        actorEmployeeId: updated?._id ?? null,
-        actorRole: "admin",
-        action: before ? "owner_password_reset" : "owner_bootstrapped",
-        targetType: "employee",
-        targetId: updated?._id ?? null,
-        before: before ? { apiRole: before.apiRole, active: before.active } : null,
-        after: { apiRole: "admin", accessLevel: "superadmin", active: true },
-        reason: "Alta de la cuenta raíz para operar el panel y lanzar la prueba E2E",
-        createdAt: new Date(),
-      });
-    console.log("[owner-bootstrap] ok", JSON.stringify({ email: OWNER_EMAIL, created: !before, employeeId: String(updated?._id ?? "") }));
+
+    await mongoose.connection.collection("governance_audit_events").insertOne({
+      actorEmployeeId: updated?._id ?? null,
+      actorRole: "admin",
+      action: before ? "owner_password_reset" : "owner_bootstrapped",
+      targetType: "employee",
+      targetId: updated?._id ?? null,
+      before: before ? { apiRole: before.apiRole, active: before.active } : null,
+      after: { apiRole: "admin", accessLevel: "superadmin", active: true },
+      reason: "Alta de la cuenta raíz para operar el panel y lanzar la prueba E2E",
+      createdAt: new Date(),
+    });
+
+    console.log("[owner-bootstrap] ok", JSON.stringify({
+      email: OWNER_EMAIL,
+      created: !before,
+      employeeId: String(updated?._id ?? ""),
+    }));
   } catch (error) {
     console.error("[owner-bootstrap] error", error instanceof Error ? error.message : error);
   }
