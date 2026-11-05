@@ -32,6 +32,20 @@ export async function runRiderRepairOnce(): Promise<void> {
         await Rider.updateOne({ _id: rider.id }, { $set: { lifecycleStatus: "merged", status: "inactive" } }).exec();
       }
     }
+
+    // El corte por caducidad de sesión dejó el turno de hoy en "completed".
+    // Se reabre para que el rider pueda volver a estar disponible sin esperar
+    // a que Fleet le asigne un tramo nuevo.
+    if (canonical) {
+      const reopened: any[] = [];
+      const todaySlots = await RiderSlot.find({ riderId: canonical.id, date: today }).select("_id startTime endTime status").lean().exec();
+      for (const slot of todaySlots) {
+        if (String((slot as any).status) === "active") continue;
+        await RiderSlot.updateOne({ _id: (slot as any)._id }, { $set: { status: "active", endTime: "23:59" } }).exec();
+        reopened.push(`${(slot as any).startTime}-23:59`);
+      }
+      console.log("[rider-repair] reopened", JSON.stringify({ riderId: canonical.id, reopened }));
+    }
     console.log("[rider-repair]", JSON.stringify({ ownerEmail: OWNER_EMAIL, roles, today, canonical: canonical?.id || null, riders: withSlots }));
   } catch (error) {
     console.error("[rider-repair] error", error instanceof Error ? error.message : error);
