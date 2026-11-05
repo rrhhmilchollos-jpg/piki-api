@@ -17,7 +17,6 @@ import { MalwareDetectedError, MalwareScannerUnavailableError, DOCUMENT_UPLOAD_M
 import { fileURLToPath } from "node:url";
 import cors from "cors";
 import { waitlistRouter } from "./waitlist.js";
-import { adminConfigRouter } from "./adminConfig.js";
 import express from "express";
 import mongoose from "mongoose";
 import { z } from "zod";
@@ -207,7 +206,6 @@ app.use((_req, res, next) => {
 app.use(cors(corsOptions));
 app.use(waitlistRouter);
 app.options("*", cors(corsOptions));
-mountAdminSecuritySettings(app);
 
 const requestBuckets = new Map<string, { startedAt: number; count: number }>();
 let mongoRateLimitIndexReady = false;
@@ -367,6 +365,7 @@ app.post("/api/v1/integrations/vercel/webhook", express.raw({ type: "application
 });
 mountStripeWebhook(app);
 app.use(express.json({ limit: "20mb" }));
+mountAdminSecuritySettings(app);
 
 // Se montan después de CORS y del parseo de JSON: si van antes, el navegador
 // bloquea las llamadas desde Fleet con "Failed to fetch".
@@ -822,7 +821,6 @@ app.delete("/api/v1/push/subscriptions", rateLimit(20, 60_000, "push-unsubscribe
 // contadores y una prueba dirigida a un Rider concreto del mismo tenant: no
 // permite destinatarios arbitrarios ni modifica turnos, pedidos o cuentas.
 const pushShiftTestSchema = z.object({ riderId: z.string().regex(/^[a-f\d]{24}$/i) }).strict();
-app.use(adminConfigRouter);
 app.get("/api/v1/admin/push/status", requireRole("admin"), rateLimit(30, 60_000, "admin-push-status"), async (req, res) => {
   const tenantId = req.auth?.tenantId;
   const scope = tenantId && mongoose.isValidObjectId(tenantId) ? { tenantId: new mongoose.Types.ObjectId(tenantId) } : {};
