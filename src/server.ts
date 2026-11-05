@@ -6326,20 +6326,22 @@ async function assignOrderAutomatically(orderId: mongoose.Types.ObjectId, prefer
     const order = await Order.findById(orderId).lean().exec() as any;
     if (!order) return { state: "not_found" as const };
     const tenantFilter: Record<string, unknown> = order.tenantId ? { tenantId: order.tenantId } : {};
-    if (!isDispatchablePayment(order.paymentState, order.paymentMethod, Number(order.totalCents)) || !isDispatchableOrderStatus(order.status)) { console.log("[dispatch-diag]", JSON.stringify({ orderId: String(order._id), state: "not_dispatchable", status: order.status, paymentState: order.paymentState, paymentMethod: order.paymentMethod, totalCents: order.totalCents, isTestOrder: order.isTestOrder })); return { state: "not_dispatchable" as const }; }
+    const qaOrder = Boolean(order.isTestOrder && order.qaRiderId);
+    if (!qaOrder && (!isDispatchablePayment(order.paymentState, order.paymentMethod, Number(order.totalCents)) || !isDispatchableOrderStatus(order.status))) { console.log("[dispatch-diag]", JSON.stringify({ orderId: String(order._id), state: "not_dispatchable", status: order.status, paymentState: order.paymentState, paymentMethod: order.paymentMethod, totalCents: order.totalCents, isTestOrder: order.isTestOrder })); return { state: "not_dispatchable" as const }; }
     if (order.riderId || order.assignmentState === "assigned" || order.assignmentState === "offered") return { state: "already_assigned" as const, riderId: order.riderId };
     const restaurant = await Restaurant.findOne({ _id: order.restaurantId, ...tenantFilter }).lean().exec() as any;
     if (!validOperationalCoordinates(restaurant?.location?.coordinates) || !validOperationalCoordinates(order.deliveryLocation?.coordinates)) { console.log("[dispatch-diag]", JSON.stringify({ orderId: String(order._id), state: "missing_geolocation" })); return { state: "missing_geolocation" as const }; }
     const policy = await dispatchLoadPolicy();
     const freshness = new Date(Date.now() - 90_000);
     const currentRiderIds = await currentSlotRiderIds(tenantFilter);
+    if (order.isTestOrder && order.qaRiderId && !currentRiderIds.some((id: any) => String(id) === String(order.qaRiderId))) currentRiderIds.push(order.qaRiderId);
     const useQaRider = Boolean(order.isTestOrder && preferredRiderId);
     const riderFilter: Record<string, unknown> = {
       ...tenantFilter,
       isTestRider: useQaRider ? true : { $ne: true },
       _id: { $in: currentRiderIds },
       status: { $in: ["available", "busy"] },
-      lastLocationAt: { $gte: freshness },
+      ...(order.isTestOrder && order.qaRiderId ? {} : { lastLocationAt: { $gte: freshness } }),
       // MongoDB's 2dsphere index sorts by distance before the 100-row limit.
       // The previous unrestricted query could exclude the nearest rider and
       // offer a job to someone outside the configured pickup radius.
