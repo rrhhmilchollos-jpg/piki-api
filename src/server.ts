@@ -17,6 +17,7 @@ import { MalwareDetectedError, MalwareScannerUnavailableError, DOCUMENT_UPLOAD_M
 import { fileURLToPath } from "node:url";
 import cors from "cors";
 import { waitlistRouter } from "./waitlist.js";
+import { adminConfigRouter } from "./adminConfig.js";
 import express from "express";
 import mongoose from "mongoose";
 import { z } from "zod";
@@ -205,6 +206,7 @@ app.use((_req, res, next) => {
 });
 app.use(cors(corsOptions));
 app.use(waitlistRouter);
+app.use(adminConfigRouter);
 app.options("*", cors(corsOptions));
 mountAdminSecuritySettings(app);
 
