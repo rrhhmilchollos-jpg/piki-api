@@ -73,6 +73,7 @@ import { purgeTestDataIfEnabled } from "./purgeTestData.js";
 import { validateDocumentRequestSubmission } from "./onboardingDocumentPolicy.js";
 import { PIKI_PRL_COURSE_SLUG, RiderTrainingAssignment, RiderTrainingCourse, RiderTrainingResponse, ensurePikiPrlCourse, publicTrainingQuestions, scoreTrainingAnswers, trainingToken, trainingTokenHash } from "./riderTraining.js";
 import { deadLetterDispatchError, dispatchInitialIdempotencyKey, dispatchRecoveryIdempotencyKey, dispatchRequeueIdempotencyKey, enqueueDispatchOutbox, isRetryableDispatchState, processDispatchOutboxBatch, rearmDeadLetterDispatchEvent, type DispatchOutboxEvent } from "./dispatchOutbox.js";
+import { assignedScheduleFields, expandWeeklySchedule, isValidScheduleWindow, nextScheduleRevision } from "./riderSchedulePolicy.js";
 import { buildFleetEntityScope, buildFleetRiderPickerScope, buildTenantScope } from "./tenantScope.js";
 import { parseRiderListPagination } from "./riderListPagination.js";
 import { authenticationOptions, registrationOptions, verifyAuthentication, verifyRegistration } from "./passkeys.js";
@@ -4254,24 +4255,25 @@ app.patch("/api/v1/riders/:id/zone", requireRole("admin", "fleet"), async (req, 
 
 app.get("/api/v1/rider-slots", requireRole("admin", "fleet", "rider"), async (req, res) => {
   let riderId = typeof req.query.riderId === "string" ? objectId(req.query.riderId) : null;
-  // EmployeeAccount and Rider use different ids. For a Rider session, never
-  // rely on a frontend-supplied id: resolve the operational Rider by the
-  // authenticated employee email and keep the query tenant-scoped.
+  if (req.query.riderId !== undefined && !riderId) return res.status(400).json({ error: "INVALID_RIDER_ID" });
   if (req.auth?.role === "rider") {
     const employee = await employeeScope(req);
-    const rider = employee?.email
-      ? await Rider.findOne({ email: employee.email, ...tenantScope(req) }).select("_id").lean().exec() as any
-      : null;
-    riderId = rider?._id || null;
+    const ownRider = employee?.email ? await Rider.findOne({ email: employee.email, ...tenantScope(req) }).select("_id").lean().exec() as any : null;
+    if (!ownRider || (riderId && String(ownRider._id) !== String(riderId))) return res.status(403).json({ error: "RIDER_ACCESS_DENIED" });
+    riderId = ownRider._id;
   }
-  const filter = riderId ? { riderId, ...tenantScope(req) } : req.auth?.role === "rider" ? { riderId: null, ...tenantScope(req) } : { ...tenantScope(req) };
+  if (req.auth?.role === "fleet" && riderId && !(await fleetCanAccessRider(req, riderId))) return res.status(403).json({ error: "FLEET_RIDER_ACCESS_DENIED" });
+  const fleetScope = req.auth?.role === "fleet" && !riderId ? await fleetRiderFilter(req) : {};
+  const filter = riderId ? { riderId, ...tenantScope(req) } : { ...tenantScope(req), ...fleetScope };
   const slots = await RiderSlot.find(filter).sort({ date: 1, startTime: 1 }).limit(500).lean().exec();
+  res.setHeader("Cache-Control", "no-store, max-age=0");
   return res.json({ slots });
 });
 
 app.post("/api/v1/rider-slots", requireRole("admin", "fleet"), async (req, res) => {
   const parsed = riderSlotCreateSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_RIDER_SLOT", details: parsed.error.flatten() });
+  if (!isValidScheduleWindow(parsed.data.startTime, parsed.data.endTime)) return res.status(400).json({ error: "INVALID_SLOT_TIME_RANGE" });
   const riderId = objectId(parsed.data.riderId); if (!riderId) return res.status(400).json({ error: "INVALID_RIDER_ID" });
   const rider = await Rider.findOne({ _id: riderId, ...tenantScope(req) }).lean().exec() as any; if (!rider) return res.status(404).json({ error: "RIDER_NOT_FOUND" });
   if (req.auth?.role === "fleet") {
@@ -4281,15 +4283,19 @@ app.post("/api/v1/rider-slots", requireRole("admin", "fleet"), async (req, res) 
     if (!rider.fleetId) await Rider.updateOne({ _id: riderId, fleetId: null }, { $set: { fleetId: employee.fleetId } }).exec();
   }
   const zone = await Zone.findOne({ ...tenantScope(req), slug: parsed.data.zoneSlug, isActive: true }).lean().exec() as any; if (!zone) return res.status(404).json({ error: "ZONE_NOT_FOUND" });
-  const { riderId: _riderId, ...slotData } = parsed.data;
-  const slot = await RiderSlot.findOneAndUpdate({ riderId, ...tenantScope(req), date: parsed.data.date, startTime: parsed.data.startTime }, { $set: { ...slotData, ...tenantScope(req), riderId, zoneSlug: zone.slug } }, { upsert: true, new: true }).lean().exec();
+  const existing = await RiderSlot.findOne({ riderId, ...tenantScope(req), date: parsed.data.date, startTime: parsed.data.startTime }).select("assignmentRevision assignedAt").lean().exec() as any;
+  const now = new Date();
+  const actorId = objectId(String(req.auth?.employeeId || ""));
+  const assignment = assignedScheduleFields({ ...parsed.data, zoneSlug: zone.slug });
+  const slot = await RiderSlot.findOneAndUpdate({ riderId, ...tenantScope(req), date: parsed.data.date, startTime: parsed.data.startTime }, { $set: { ...assignment, ...tenantScope(req), riderId, assignmentRevision: nextScheduleRevision(existing?.assignmentRevision), ...(existing ? {} : { assignedAt: now, assignedByEmployeeId: actorId, assignedByRole: req.auth?.role || null }), lastModifiedAt: now, lastModifiedByEmployeeId: actorId, lastModifiedByRole: req.auth?.role || null } }, { upsert: true, new: true, setDefaultsOnInsert: true }).lean().exec();
+  await recordGovernanceEvent({ actor: { employeeId: actorId, role: req.auth?.role || "fleet", tenantId: (req.auth as any)?.tenantId }, action: existing ? "rider_schedule_updated" : "rider_schedule_assigned", targetType: "rider", targetId: riderId, before: existing ? { assignmentRevision: existing.assignmentRevision } : null, after: { slotId: String((slot as any)?._id), date: parsed.data.date, startTime: parsed.data.startTime, endTime: parsed.data.endTime, zoneSlug: zone.slug, assignmentRevision: (slot as any)?.assignmentRevision }, reason: existing ? "Horario Rider modificado por Fleet/Admin." : "Horario Rider asignado por Fleet/Admin." });
   await publishRiderScheduleEvent({ riderId: String(riderId), tenantId: (slot as any)?.tenantId, action: "updated" });
   return res.status(201).json({ slot });
 });
 app.post("/api/v1/rider-slots/week", requireRole("admin", "fleet"), async (req, res) => {
   const parsed = riderSlotWeekSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_RIDER_SLOT", details: parsed.error.flatten() });
-  if (parsed.data.startTime === parsed.data.endTime) return res.status(400).json({ error: "INVALID_SLOT_TIME_RANGE" });
+  if (!isValidScheduleWindow(parsed.data.startTime, parsed.data.endTime)) return res.status(400).json({ error: "INVALID_SLOT_TIME_RANGE" });
   const riderId = objectId(parsed.data.riderId); if (!riderId) return res.status(400).json({ error: "INVALID_RIDER_ID" });
   const rider = await Rider.findOne({ _id: riderId, ...tenantScope(req) }).lean().exec() as any;
   if (!rider) return res.status(404).json({ error: "RIDER_NOT_FOUND" });
@@ -4306,7 +4312,7 @@ app.post("/api/v1/rider-slots/week", requireRole("admin", "fleet"), async (req, 
     const allowedZones = Array.isArray(fleetEmployee.zoneSlugs) && fleetEmployee.zoneSlugs.length ? fleetEmployee.zoneSlugs : fleet?.serviceZones || [];
     if (allowedZones.length && !allowedZones.includes(zone.slug)) return res.status(403).json({ error: "ZONE_ACCESS_DENIED", message: "La flota no tiene habilitada la zona seleccionada." });
   }
-  const start = new Date(`${parsed.data.date}T12:00:00Z`);
+  const dates = expandWeeklySchedule(parsed.data.date, parsed.data.weekdays);
   const session = await mongoose.startSession();
   const slots: any[] = [];
   try {
@@ -4319,17 +4325,21 @@ app.post("/api/v1/rider-slots/week", requireRole("admin", "fleet"), async (req, 
         ).select("_id").lean().exec();
         if (!assigned) throw new Error("FLEET_RIDER_ACCESS_DENIED");
       }
-      for (const day of parsed.data.weekdays) {
-        const date = new Date(start); date.setUTCDate(start.getUTCDate() + day);
-        const dateString = date.toISOString().slice(0, 10);
+      for (const dateString of dates) {
+        const existing = await RiderSlot.findOne({ riderId, ...tenantScope(req), date: dateString, startTime: parsed.data.startTime }).select("assignmentRevision assignedAt").session(session).lean().exec() as any;
+        const now = new Date();
+        const actorId = objectId(String(req.auth?.employeeId || ""));
+        const assignment = assignedScheduleFields({ ...parsed.data, date: dateString, zoneSlug: zone.slug });
         const slot = await RiderSlot.findOneAndUpdate(
           { riderId, ...tenantScope(req), date: dateString, startTime: parsed.data.startTime },
-          { $set: { zoneSlug: zone.slug, date: dateString, startTime: parsed.data.startTime, endTime: parsed.data.endTime, status: parsed.data.status, notes: parsed.data.notes, ...tenantScope(req), riderId } },
+          { $set: { ...assignment, ...tenantScope(req), riderId, assignmentRevision: nextScheduleRevision(existing?.assignmentRevision), ...(existing ? {} : { assignedAt: now, assignedByEmployeeId: actorId, assignedByRole: req.auth?.role || null }), lastModifiedAt: now, lastModifiedByEmployeeId: actorId, lastModifiedByRole: req.auth?.role || null } },
           { upsert: true, new: true, setDefaultsOnInsert: true, session },
         ).lean().exec();
         slots.push(slot);
       }
     });
+    const actorId = objectId(String(req.auth?.employeeId || ""));
+    await recordGovernanceEvent({ actor: { employeeId: actorId, role: req.auth?.role || "fleet", tenantId: (req.auth as any)?.tenantId }, action: "rider_schedule_week_saved", targetType: "rider", targetId: riderId, after: { slotIds: slots.map((slot) => String(slot?._id)), dates, startTime: parsed.data.startTime, endTime: parsed.data.endTime, zoneSlug: zone.slug, count: slots.length }, reason: "Asignación semanal confirmada en una transacción y persistida en la base de datos." });
     await publishRiderScheduleEvent({ riderId: String(riderId), tenantId: (slots[0] as any)?.tenantId, action: "weekly_updated" });
     return res.status(201).json({ slots, count: slots.length, weekdays: parsed.data.weekdays, message: `${slots.length} turnos semanales guardados.` });
   } catch (error: any) {
@@ -4346,14 +4356,17 @@ app.patch("/api/v1/rider-slots/:id", requireRole("admin", "fleet"), async (req, 
   if (!slotId) return res.status(400).json({ error: "INVALID_RIDER_SLOT_ID" });
   const parsed = riderSlotSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_RIDER_SLOT", details: parsed.error.flatten() });
-  if (parsed.data.startTime === parsed.data.endTime) return res.status(400).json({ error: "INVALID_SLOT_TIME_RANGE" });
+  if (!isValidScheduleWindow(parsed.data.startTime, parsed.data.endTime)) return res.status(400).json({ error: "INVALID_SLOT_TIME_RANGE" });
   const existing = await RiderSlot.findOne({ _id: slotId, ...tenantScope(req) }).lean().exec() as any;
   if (!existing) return res.status(404).json({ error: "RIDER_SLOT_NOT_FOUND" });
   if (req.auth?.role === "fleet" && !(await fleetCanAccessRider(req, existing.riderId))) return res.status(403).json({ error: "FLEET_RIDER_ACCESS_DENIED" });
   const zone = await Zone.findOne({ ...tenantScope(req), slug: parsed.data.zoneSlug, isActive: true }).select("slug").lean().exec() as any;
   if (!zone) return res.status(404).json({ error: "ZONE_NOT_FOUND" });
   try {
-    const slot = await RiderSlot.findOneAndUpdate({ _id: slotId, ...tenantScope(req) }, { $set: { ...parsed.data, zoneSlug: zone.slug } }, { new: true }).lean().exec();
+    const actorId = objectId(String(req.auth?.employeeId || ""));
+    const assignment = assignedScheduleFields({ ...parsed.data, zoneSlug: zone.slug });
+    const slot = await RiderSlot.findOneAndUpdate({ _id: slotId, ...tenantScope(req) }, { $set: { ...assignment, assignmentRevision: nextScheduleRevision(existing.assignmentRevision), lastModifiedAt: new Date(), lastModifiedByEmployeeId: actorId, lastModifiedByRole: req.auth?.role || null } }, { new: true }).lean().exec();
+    await recordGovernanceEvent({ actor: { employeeId: actorId, role: req.auth?.role || "fleet", tenantId: (req.auth as any)?.tenantId }, action: "rider_schedule_updated", targetType: "rider", targetId: existing.riderId, before: { slotId: String(existing._id), date: existing.date, startTime: existing.startTime, endTime: existing.endTime, zoneSlug: existing.zoneSlug, assignmentRevision: existing.assignmentRevision }, after: { slotId: String((slot as any)?._id), date: parsed.data.date, startTime: parsed.data.startTime, endTime: parsed.data.endTime, zoneSlug: zone.slug, assignmentRevision: (slot as any)?.assignmentRevision }, reason: "Horario Rider modificado por Fleet/Admin." });
     await publishRiderScheduleEvent({ riderId: String(existing.riderId), tenantId: (slot as any)?.tenantId, action: "updated" });
     return res.json({ slot });
   } catch (error: any) {
@@ -4367,7 +4380,9 @@ app.delete("/api/v1/rider-slots/:id", requireRole("admin", "fleet"), async (req,
   const existing = await RiderSlot.findOne({ _id: slotId, ...tenantScope(req) }).lean().exec() as any;
   if (!existing) return res.status(404).json({ error: "RIDER_SLOT_NOT_FOUND" });
   if (req.auth?.role === "fleet" && !(await fleetCanAccessRider(req, existing.riderId))) return res.status(403).json({ error: "FLEET_RIDER_ACCESS_DENIED" });
-  const slot = await RiderSlot.findOneAndUpdate({ _id: slotId, ...tenantScope(req) }, { $set: { status: "cancelled" } }, { new: true }).lean().exec();
+  const actorId = objectId(String(req.auth?.employeeId || ""));
+  const slot = await RiderSlot.findOneAndUpdate({ _id: slotId, ...tenantScope(req) }, { $set: { status: "cancelled", assignmentRevision: nextScheduleRevision(existing.assignmentRevision), lastModifiedAt: new Date(), lastModifiedByEmployeeId: actorId, lastModifiedByRole: req.auth?.role || null } }, { new: true }).lean().exec();
+  await recordGovernanceEvent({ actor: { employeeId: actorId, role: req.auth?.role || "fleet", tenantId: (req.auth as any)?.tenantId }, action: "rider_schedule_cancelled", targetType: "rider", targetId: existing.riderId, before: { slotId: String(existing._id), date: existing.date, startTime: existing.startTime, endTime: existing.endTime, zoneSlug: existing.zoneSlug, assignmentRevision: existing.assignmentRevision }, after: { slotId: String((slot as any)?._id), status: "cancelled", assignmentRevision: (slot as any)?.assignmentRevision }, reason: "Horario Rider cancelado por Fleet/Admin." });
   await publishRiderScheduleEvent({ riderId: String(existing.riderId), tenantId: (slot as any)?.tenantId, action: "cancelled" });
   return res.json({ slot, message: "Turno eliminado" });
 });
@@ -6169,9 +6184,9 @@ app.post("/api/v1/riders/:id/slots", requireRole("admin", "fleet"), async (req, 
   const riderIdParam = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
   const riderId = objectId(riderIdParam); if (!riderId) return res.status(400).json({ error: "INVALID_RIDER_ID" });
   const parsed = riderSlotSchema.safeParse(req.body); if (!parsed.success) return res.status(400).json({ error: "INVALID_RIDER_SLOT", details: parsed.error.flatten() });
-  if (parsed.data.endTime === parsed.data.startTime) return res.status(400).json({ error: "INVALID_SLOT_TIME_RANGE" });
+  if (!isValidScheduleWindow(parsed.data.startTime, parsed.data.endTime)) return res.status(400).json({ error: "INVALID_SLOT_TIME_RANGE" });
   const rider = await Rider.findOne(await riderResourceScope(req, riderId)).lean().exec(); if (!rider) return res.status(403).json({ error: "RIDER_ACCESS_DENIED" });
-  const zone = await Zone.findOne({ ...tenantScope(req), slug: parsed.data.zoneSlug, isActive: true }).select("slug").lean().exec();
+  const zone = await Zone.findOne({ ...tenantScope(req), slug: parsed.data.zoneSlug, isActive: true }).select("slug").lean().exec() as any;
   if (!zone) return res.status(404).json({ error: "ZONE_NOT_FOUND" });
   const limits = await tenantLimits(req);
   const [dailyForRider, dailyForTenant] = await Promise.all([
@@ -6183,7 +6198,9 @@ app.post("/api/v1/riders/:id/slots", requireRole("admin", "fleet"), async (req, 
   const overlap = await RiderSlot.findOne({ riderId, ...tenantScope(req), date: parsed.data.date, status: { $nin: ["cancelled", "completed"] }, $or: [{ startTime: { $lt: parsed.data.endTime }, endTime: { $gt: parsed.data.startTime } }] }).lean().exec();
   if (overlap) return res.status(409).json({ error: "RIDER_SLOT_OVERLAP", slot: overlap });
   try {
-    const slot = await RiderSlot.create({ ...parsed.data, ...tenantScope(req), riderId });
+    const actorId = objectId(String(req.auth?.employeeId || ""));
+    const slot = await RiderSlot.create({ ...assignedScheduleFields({ ...parsed.data, zoneSlug: zone.slug }), ...tenantScope(req), riderId, status: "planned", assignedByEmployeeId: actorId, assignedByRole: req.auth?.role || null, lastModifiedByEmployeeId: actorId, lastModifiedByRole: req.auth?.role || null });
+    await recordGovernanceEvent({ actor: { employeeId: actorId, role: req.auth?.role || "fleet", tenantId: (req.auth as any)?.tenantId }, action: "rider_schedule_assigned", targetType: "rider", targetId: riderId, after: { slotId: String((slot as any)?._id), date: parsed.data.date, startTime: parsed.data.startTime, endTime: parsed.data.endTime, zoneSlug: zone.slug, assignmentRevision: (slot as any)?.assignmentRevision }, reason: "Horario Rider asignado por Fleet/Admin." });
     await publishRiderScheduleEvent({ riderId: String(riderId), tenantId: (slot as any)?.tenantId, action: "updated" });
     return res.status(201).json({ slot });
   } catch (error: any) {
