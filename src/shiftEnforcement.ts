@@ -62,7 +62,7 @@ export function isValidPlan(plan: RiderShiftPlan): boolean {
       shift.weekday <= 6 &&
       start !== null &&
       end !== null &&
-      end > start
+      end !== start
     );
   });
 }
@@ -72,7 +72,8 @@ export function plannedMinutes(plan: RiderShiftPlan): number {
   return plan.shifts.reduce((total, shift) => {
     const start = toMinutes(shift.start) ?? 0;
     const end = toMinutes(shift.end) ?? 0;
-    return total + Math.max(0, end - start);
+    const duration = end > start ? end - start : end + 1440 - start;
+    return total + duration;
   }, 0);
 }
 
@@ -120,10 +121,19 @@ export function evaluateShift(
     .filter((shift) => shift.weekday === weekday)
     .map((shift) => ({ start: toMinutes(shift.start)!, end: toMinutes(shift.end)! }))
     .sort((a, b) => a.start - b.start);
-
-  const activo = today.find((shift) => minutes >= shift.start && minutes < shift.end);
+  const previousWeekday = (weekday + 6) % 7;
+  const previousOvernight = plan.shifts
+    .filter((shift) => shift.weekday === previousWeekday)
+    .map((shift) => ({ start: toMinutes(shift.start)!, end: toMinutes(shift.end)! }))
+    .filter((shift) => shift.end <= shift.start && minutes < shift.end)
+    .sort((a, b) => b.start - a.start)[0];
+  const activo = previousOvernight || today.find((shift) =>
+    shift.end > shift.start ? minutes >= shift.start && minutes < shift.end : minutes >= shift.start || minutes < shift.end,
+  );
   if (activo) {
-    const restanteDelTramo = activo.end - minutes;
+    const restanteDelTramo = activo.end > activo.start
+      ? activo.end - minutes
+      : minutes >= activo.start ? (1440 - minutes) + activo.end : activo.end - minutes;
     return {
       onlineAllowed: true,
       reason: "dentro_de_jornada",

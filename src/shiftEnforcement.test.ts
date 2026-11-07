@@ -53,3 +53,11 @@ test("los minutos restantes nunca superan lo que queda de tramo", () => {
   const d = evaluateShift(plan, 0, lunes);
   assert.equal(d.minutesRemaining, 30);
 });
+
+test("acepta y activa un turno nocturno 12:00–00:00", () => {
+  const nocturno = { ...plan, shifts: [{ weekday: 6, start: "12:00", end: "00:00" }] };
+  assert.equal(isValidPlan(nocturno), true);
+  assert.equal(plannedMinutes(nocturno), 720);
+  const saturday = new Date("2026-11-07T13:00:00Z"); // 14:00 en Madrid
+  assert.equal(evaluateShift(nocturno, 0, saturday).onlineAllowed, true);
+});
