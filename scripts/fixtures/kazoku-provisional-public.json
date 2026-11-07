@@ -1,0 +1,42 @@
+{
+  "source": "Fuentes públicas consultadas el 2026-11-07: Glovo, Google Maps/Google Business y perfiles públicos de Kazoku",
+  "sourceUrls": [
+    "https://glovoapp.com/es/es/xativa/stores/kazoku-xativa",
+    "https://maps.app.goo.gl/VkmrMzYVnZFgodVQ7",
+    "https://www.mapquest.com/es/comunidad-valenciana/kazoku-822009513",
+    "https://www.instagram.com/kazoku.algemesii/"
+  ],
+  "provisionalOnly": true,
+  "legalStatus": "pending_owner_documents",
+  "commissionRateBps": 1800,
+  "stores": [
+    {
+      "slug": "kazoku-xativa",
+      "name": "Kazoku",
+      "cuisine": "Japonesa",
+      "category": "Sushi, wok y ramen",
+      "locality": "Xàtiva",
+      "postalCode": "46800",
+      "address": "C. Abén Hazam, 5, 46800 Xàtiva, Valencia, España",
+      "phone": "+34 615 92 09 39",
+      "image": "",
+      "menuSource": "https://glovoapp.com/es/es/xativa/stores/kazoku-xativa",
+      "menuImportPolicy": "No se copia la carta de Glovo sin autorización expresa; se deja pendiente de carta autorizada del partner.",
+      "menu": []
+    },
+    {
+      "slug": "kazoku-algemesi",
+      "name": "Kazoku Algemesí",
+      "cuisine": "Japonesa",
+      "category": "Sushi, wok y buffet",
+      "locality": "Algemesí",
+      "postalCode": "46680",
+      "address": "Ronda del Calvari, 59, 46680 Algemesí, Valencia, España",
+      "phone": "+34 680 609 234",
+      "image": "",
+      "menuSource": "https://www.instagram.com/kazoku.algemesii/",
+      "menuImportPolicy": "No se copia una carta de terceros sin autorización expresa; se deja pendiente de carta autorizada del partner.",
+      "menu": []
+    }
+  ]
+}

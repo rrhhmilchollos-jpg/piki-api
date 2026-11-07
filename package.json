@@ -14,6 +14,7 @@
     "migrate:tenants": "tsx scripts/migrate-tenants.ts",
     "migrate:authorizations": "tsx scripts/migrate-legacy-authorizations.ts",
     "catalog:import:xativa": "tsx scripts/import-xativa-local-catalog.ts",
+    "catalog:import:kazoku-public": "tsx scripts/import-kazoku-public-provisional.ts",
     "catalog:verify:xativa": "tsx scripts/verify-xativa-catalog-mapping.ts",
     "catalog:approve:xativa": "tsx scripts/approve-xativa-local-stores.ts",
     "provision:joar-fleet": "node scripts/provision-joar-fleet.mjs",
