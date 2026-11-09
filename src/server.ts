@@ -473,6 +473,26 @@ if (process.env.NODE_ENV === "production" && !deliveryQrSecret) throw new Error(
 const deliveryQrSignature = (orderCode: string) => createHmac("sha256", deliveryQrSecret || "development-only-delivery-qr-secret").update(`delivery:${orderCode}`).digest("hex").slice(0, 24);
 const deliveryPin = (orderCode: string) => deliveryQrSignature(orderCode).slice(-6).toUpperCase();
 const deliveryQrUrl = (orderCode: string) => `${(process.env.CUSTOMER_APP_URL || "https://pikidelivery.com").replace(/\/$/, "")}/?order_id=${encodeURIComponent(orderCode)}&delivery_token=${deliveryQrSignature(orderCode)}`;
+const pickupQrSecret = String(process.env.PICKUP_QR_SECRET || "").trim();
+if (process.env.NODE_ENV === "production" && !pickupQrSecret) throw new Error("PICKUP_QR_SECRET is required in production");
+const pickupQrSignature = (orderCode: string) => createHmac("sha256", pickupQrSecret || "development-only-pickup-qr-secret").update(`pickup:${orderCode}`).digest("hex").slice(0, 24);
+const pickupPinAlphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+const pickupQrPin = (orderCode: string) => {
+  const digest = createHmac("sha256", pickupQrSecret || "development-only-pickup-qr-secret").update(`pickup-pin:${orderCode}`).digest();
+  return Array.from({ length: 4 }, (_, index) => pickupPinAlphabet[digest[index] % pickupPinAlphabet.length]).join("");
+};
+const pickupQrUrl = (orderCode: string) => `${(process.env.PARTNER_APP_URL || "https://partners.pikidelivery.com").replace(/\/$/, "")}/?order_id=${encodeURIComponent(orderCode)}&pickup_token=${pickupQrSignature(orderCode)}`;
+const pickupQrIsValid = (orderCode: string, raw: unknown) => {
+  const value = String(raw || "").trim();
+  if (!value) return false;
+  if (value.toUpperCase() === pickupQrPin(orderCode)) return true;
+  try {
+    const url = new URL(value);
+    return url.searchParams.get("order_id") === orderCode && url.searchParams.get("pickup_token") === pickupQrSignature(orderCode);
+  } catch {
+    return false;
+  }
+};
 const checkoutTokenSecret = String(process.env.CHECKOUT_TOKEN_SECRET || deliveryQrSecret).trim();
 const checkoutToken = (orderCode: string) => createHmac("sha256", checkoutTokenSecret || "development-only-checkout-secret").update(`checkout:${orderCode}`).digest("base64url");
 const checkoutTokenIsValid = (orderCode: string, raw: unknown) => typeof raw === "string" && raw.length >= 20 && raw === checkoutToken(orderCode);
@@ -2306,6 +2326,8 @@ app.get("/api/v1/partners/kitchen/orders", requireRole("partner"), async (req, r
       // Código de entrega: las tres últimas cifras del número de pedido, el que
       // el rider canta en el mostrador y el cliente ve en su pantalla.
       deliveryCode: order.displayCode || String(order.publicCode || "").slice(-3) || null,
+      pickupQrUrl: order.status === "ready_for_pickup" ? pickupQrUrl(order.publicCode) : null,
+      pickupPin: order.status === "ready_for_pickup" ? pickupQrPin(order.publicCode) : null,
       restaurant: restaurant ? { name: restaurant.name, address: restaurant.address || "", phone: restaurant.phone || "", cuisine: restaurant.cuisine || "" } : null,
       customer: customerName ? { name: customerName, email: linkedCustomer?.email || "" } : null,
       partnerPrepDeadlineAt: order.partnerPrepDeadlineAt || null,
@@ -5692,6 +5714,9 @@ app.post("/api/v1/riders/:riderId/orders/:orderId/confirm-pickup", requireRole("
     return res.json({ message: "La recogida ya estaba confirmada. Ya puedes continuar hacia el cliente.", order });
   }
   if (order.status !== "ready_for_pickup") return res.status(409).json({ error: "PARTNER_NOT_READY", message: "El Partner todavía no ha marcado el pedido como listo para recoger." });
+  const pickupCredential = String(req.body?.pickupQr || req.body?.pickupPin || "").trim();
+  if (!pickupCredential) return res.status(422).json({ error: "PICKUP_QR_REQUIRED", message: "Escanea el QR o introduce el PIN que proporciona el Partner antes de confirmar la recogida." });
+  if (!pickupQrIsValid(order.publicCode, pickupCredential)) return res.status(422).json({ error: "PICKUP_QR_INVALID", message: "El QR o PIN de recogida no es válido." });
   const [rider, restaurant] = await Promise.all([
     Rider.findById(riderId).select("_id location lastLocationAt").lean().exec(),
     Restaurant.findById(order.restaurantId).select("_id location").lean().exec(),

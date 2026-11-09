@@ -77,10 +77,10 @@ export function deliveryPolicyFor(condition: WeatherCondition, precipitationMm: 
     return {
       condition: "rain",
       severity: 1,
-      etaExtraMinutes: 10,
+      etaExtraMinutes: 5,
       preferNearby: true,
       label: WEATHER_LABELS.rain,
-      banner: "Está lloviendo. El tiempo estimado sube unos 10 minutos para que los riders vayan con margen.",
+      banner: "Está lloviendo. El tiempo estimado sube unos 5 minutos para que los riders vayan con margen.",
     };
   }
   if (condition === "cloudy") {

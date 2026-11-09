@@ -50,6 +50,8 @@ services:
         sync: false
       - key: CHECKOUT_TOKEN_SECRET
         sync: false
+      - key: PICKUP_QR_SECRET
+        sync: false
       - key: STRIPE_SECRET_KEY
         sync: false
       - key: STRIPE_WEBHOOK_SECRET
@@ -91,3 +93,5 @@ services:
         value: "1000"
       - key: PIKI_DISPATCH_WORKER_BATCH_SIZE
         value: "25"
+      - key: PICKUP_QR_SECRET
+        sync: false
