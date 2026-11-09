@@ -60,4 +60,6 @@ test("acepta y activa un turno nocturno 12:00–00:00", () => {
   assert.equal(plannedMinutes(nocturno), 720);
   const saturday = new Date("2026-11-07T13:00:00Z"); // 14:00 en Madrid
   assert.equal(evaluateShift(nocturno, 0, saturday).onlineAllowed, true);
+  const sundayMidnight = new Date("2026-11-07T23:00:00Z"); // domingo 00:00 en Madrid
+  assert.equal(evaluateShift(nocturno, 0, sundayMidnight).onlineAllowed, false);
 });

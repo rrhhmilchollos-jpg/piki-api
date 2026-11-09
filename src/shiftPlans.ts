@@ -180,6 +180,11 @@ function toMinutes(hhmm: string): number | null {
   return Number(match[1]) * 60 + Number(match[2]);
 }
 
+function shiftEndMinutes(start: number, end: number): number {
+  // 00:00 como fin representa el límite del día (24:00), no su inicio.
+  return end === 0 && start > 0 ? 24 * 60 : end;
+}
+
 export type WorkedSlot = {
   riderId: string;
   date: string;
@@ -310,11 +315,12 @@ export function validateShiftPlan(input: ShiftPlanInput): PlanValidation {
     if (start === null || end === null) {
       return { ok: false, error: "SHIFT_TIME_INVALID", message: "Las horas de los tramos deben tener formato HH:MM." };
     }
-    if (end <= start) {
+    const effectiveEnd = shiftEndMinutes(start, end);
+    if (effectiveEnd <= start) {
       return {
         ok: false,
         error: "SHIFT_TIME_RANGE_INVALID",
-        message: `El tramo del ${WEEKDAY_NAMES[weekday]} termina antes de empezar. Un tramo no puede cruzar la medianoche.`,
+        message: `El tramo del ${WEEKDAY_NAMES[weekday]} termina antes de empezar. Solo se permite acabar exactamente a las 00:00; un tramo no puede continuar pasada la medianoche.`,
       };
     }
     normalized.push({ weekday, start: String(shift.start).trim(), end: String(shift.end).trim() });
@@ -331,7 +337,9 @@ export function validateShiftPlan(input: ShiftPlanInput): PlanValidation {
     for (let index = 1; index < shifts.length; index += 1) {
       const previous = shifts[index - 1];
       const current = shifts[index];
-      if ((toMinutes(current.start) ?? 0) < (toMinutes(previous.end) ?? 0)) {
+      const previousStart = toMinutes(previous.start) ?? 0;
+      const previousEnd = shiftEndMinutes(previousStart, toMinutes(previous.end) ?? 0);
+      if ((toMinutes(current.start) ?? 0) < previousEnd) {
         return {
           ok: false,
           error: "SHIFT_OVERLAP",

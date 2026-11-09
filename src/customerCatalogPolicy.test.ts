@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { CUSTOMER_CATALOG_RESTAURANT_FILTER, CUSTOMER_ORDERABLE_RESTAURANT_FILTER, COMING_SOON_SLUGS, presentCustomerCatalogRestaurant, restaurantIsWithinOpeningHours } from './customerCatalogPolicy.js';
+import { customerMenuForRestaurant } from './customerCatalogPolicy.js';
 
 test('los partners próximos son visibles pero no son operables ni indexables como catálogo activo', () => {
   assert.equal(COMING_SOON_SLUGS.length, 2);
@@ -39,6 +40,21 @@ test('el catálogo customer permanece operativo 24/7 aunque exista un horario pa
   assert.equal(restaurantIsWithinOpeningHours(hours, new Date('2026-10-19T10:00:00Z')), true);
   assert.equal(restaurantIsWithinOpeningHours(hours, new Date('2026-10-19T15:00:00Z')), true);
   assert.equal(restaurantIsWithinOpeningHours(hours, new Date('2026-10-19T19:00:00Z')), true);
+});
+
+test('la comisión se aplica una sola vez cuando el precio guardado ya la incluye', () => {
+  const menu = [{
+    id: 'burger', name: 'Burger', price: 10, available: true,
+    modifiers: [{ id: 'extra', name: 'Extra', price: 1, options: [{ id: 'cheese', name: 'Queso', price: 2 }] }],
+  }];
+  const basePriced = customerMenuForRestaurant({ slug: 'pizzeria', menu, priceIncludesCommission: false });
+  assert.equal(basePriced[0].price, 12);
+  assert.equal(basePriced[0].modifiers[0].price, 1.2);
+  assert.equal(basePriced[0].modifierGroups[0].options[0].price, 2.4);
+
+  const commissionIncluded = customerMenuForRestaurant({ slug: 'pizzeria', menu, priceIncludesCommission: true });
+  assert.deepEqual(commissionIncluded, menu);
+  assert.equal(menu[0].price, 10, 'el cálculo no debe mutar el menú almacenado');
 });
 
 test('Alibaba conserva el configurador cuando el registro legacy trae complementos vacíos', () => {

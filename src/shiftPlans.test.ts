@@ -46,6 +46,36 @@ test("un plan válido se acepta y calcula los minutos planificados", () => {
   if (result.ok) assert.equal(result.plannedMinutes, 12 * 60);
 });
 
+test("permite finalizar a medianoche y cuenta 12:00–00:00 como doce horas", () => {
+  const result = validateShiftPlan({
+    weeklyHours: 20,
+    shifts: [{ weekday: 1, start: "12:00", end: "00:00" }],
+  });
+  assert.equal(result.ok, true);
+  if (result.ok) assert.equal(result.plannedMinutes, 12 * 60);
+});
+
+test("un turno que continúa pasada medianoche sigue siendo inválido", () => {
+  const result = validateShiftPlan({
+    weeklyHours: 20,
+    shifts: [{ weekday: 1, start: "20:00", end: "02:00" }],
+  });
+  assert.equal(result.ok, false);
+  if (!result.ok) assert.equal(result.error, "SHIFT_TIME_RANGE_INVALID");
+});
+
+test("el turno que termina a medianoche solapa con otro tramo tardío", () => {
+  const result = validateShiftPlan({
+    weeklyHours: 20,
+    shifts: [
+      { weekday: 1, start: "12:00", end: "00:00" },
+      { weekday: 1, start: "23:00", end: "23:30" },
+    ],
+  });
+  assert.equal(result.ok, false);
+  if (!result.ok) assert.equal(result.error, "SHIFT_OVERLAP");
+});
+
 test("una hora mal escrita invalida el tramo", () => {
   const result = validateShiftPlan({ weeklyHours: 10, shifts: [{ weekday: 1, start: "25:00", end: "14:00" }] });
   assert.equal(result.ok, false);

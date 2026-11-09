@@ -19,7 +19,7 @@ export function restaurantIsWithinOpeningHours(openingHours: unknown, now = new 
   return CUSTOMER_OPERATING_24_7;
 }
 export function customerCatalogRestaurantName(restaurant: { name: string; slug?: string }) { return restaurant.name; }
-export function presentCustomerCatalogRestaurant<T extends { name: string; slug?: string; listingType?: string; goldFounder?: boolean; menu?: any[]; availabilityStatus?: string; upcomingMessage?: string; isActive?: boolean; onboardingStatus?: string; cashPaymentsEnabled?: boolean; partnerProfile?: { openingHours?: unknown } }>(restaurant: T) {
+export function presentCustomerCatalogRestaurant<T extends { name: string; slug?: string; listingType?: string; goldFounder?: boolean; menu?: any[]; priceIncludesCommission?: boolean; availabilityStatus?: string; upcomingMessage?: string; isActive?: boolean; onboardingStatus?: string; cashPaymentsEnabled?: boolean; partnerProfile?: { openingHours?: unknown } }>(restaurant: T) {
   const comingSoon = restaurant.availabilityStatus === "coming_soon";
   const withinHours = restaurantIsWithinOpeningHours(restaurant.partnerProfile?.openingHours);
   const listingType = restaurant.listingType === "local_directory" ? "local_directory" : "official_partner";
@@ -114,10 +114,11 @@ function applyPartnerMenuPricing<T extends Record<string, any>>(item: T, rate: n
 export function menuItemIsAvailable(item: { available?: boolean } | null | undefined): boolean {
   return Boolean(item) && item?.available !== false;
 }
-export function customerMenuForRestaurant<T extends { slug?: string; menu?: any[] }>(restaurant: T): any[] {
+export function customerMenuForRestaurant<T extends { slug?: string; menu?: any[]; priceIncludesCommission?: boolean }>(restaurant: T): any[] {
   const menu = Array.isArray(restaurant.menu) ? restaurant.menu.filter(menuItemIsAvailable) : [];
   // Si la carta ya guarda el precio final con comision incluida, no se vuelve a
   // aplicar el margen: una sola cifra para la ficha, la cesta y el ticket.
+  if (restaurant.priceIncludesCommission === true) return menu;
   const rate = customerCommissionRate(restaurant as T & { partnerProfile?: { commissionRateBps?: number } });
   return rate > 0 ? menu.map((item) => applyPartnerMenuPricing(item, rate, restaurant.slug || "")) : menu;
 }

@@ -340,6 +340,7 @@ restaurantSchema.index({ location: "2dsphere" }, { sparse: true });
 restaurantSchema.index({ isActive: 1, category: 1, rating: -1 });
 restaurantSchema.index({ isActive: 1, onboardingStatus: 1, promoted: -1, rating: -1, reviews: -1 });
 restaurantSchema.index({ isActive: 1, cuisine: 1, promoted: -1, rating: -1, reviews: -1 });
+restaurantSchema.add({ priceIncludesCommission: { type: Boolean, default: false } });
 restaurantSchema.index({ tenantId: 1, onboardingStatus: 1, createdAt: -1 });
 
 const riderSchema = new Schema({
