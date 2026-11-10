@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { assignedScheduleFields, expandWeeklySchedule, isValidScheduleWindow, nextScheduleRevision } from "./riderSchedulePolicy.js";
+import { assignedScheduleFields, expandWeeklySchedule, isValidScheduleWindow, nextScheduleRevision, normalizedScheduleRanges, scheduleWindowsOverlap } from "./riderSchedulePolicy.js";
 
 test("expande de forma determinista una semana completa de lunes a domingo", () => {
   assert.deepEqual(expandWeeklySchedule("2026-11-02", [0, 1, 2, 3, 4, 5, 6]), [
@@ -11,6 +11,15 @@ test("expande de forma determinista una semana completa de lunes a domingo", () 
 test("el horario nocturno 12:00–00:00 es válido y el horario idéntico no lo es", () => {
   assert.equal(isValidScheduleWindow("12:00", "00:00"), true);
   assert.equal(isValidScheduleWindow("12:00", "12:00"), false);
+  assert.equal(isValidScheduleWindow("12:00", "25:00"), false);
+  assert.deepEqual(normalizedScheduleRanges("12:00", "00:00"), [[720, 1440]]);
+});
+
+test("detecta solapes dentro de una ventana nocturna y no mezcla fechas", () => {
+  const overnight = { date: "2026-11-10", startTime: "12:00", endTime: "00:00" };
+  assert.equal(scheduleWindowsOverlap(overnight, { date: "2026-11-10", startTime: "18:00", endTime: "23:00" }), true);
+  assert.equal(scheduleWindowsOverlap(overnight, { date: "2026-11-10", startTime: "00:00", endTime: "08:00" }), false);
+  assert.equal(scheduleWindowsOverlap(overnight, { date: "2026-11-11", startTime: "12:00", endTime: "00:00" }), false);
 });
 
 test("los campos persistidos de asignación no incluyen el estado operativo enviado por el cliente", () => {

@@ -73,7 +73,7 @@ import { purgeTestDataIfEnabled } from "./purgeTestData.js";
 import { validateDocumentRequestSubmission } from "./onboardingDocumentPolicy.js";
 import { PIKI_PRL_COURSE_SLUG, RiderTrainingAssignment, RiderTrainingCourse, RiderTrainingResponse, ensurePikiPrlCourse, publicTrainingQuestions, scoreTrainingAnswers, trainingToken, trainingTokenHash } from "./riderTraining.js";
 import { deadLetterDispatchError, dispatchInitialIdempotencyKey, dispatchRecoveryIdempotencyKey, dispatchRequeueIdempotencyKey, enqueueDispatchOutbox, isRetryableDispatchState, processDispatchOutboxBatch, rearmDeadLetterDispatchEvent, type DispatchOutboxEvent } from "./dispatchOutbox.js";
-import { assignedScheduleFields, expandWeeklySchedule, isValidScheduleWindow, nextScheduleRevision } from "./riderSchedulePolicy.js";
+import { assignedScheduleFields, expandWeeklySchedule, isValidScheduleWindow, nextScheduleRevision, scheduleWindowsOverlap } from "./riderSchedulePolicy.js";
 import { buildFleetEntityScope, buildFleetRiderPickerScope, buildTenantScope } from "./tenantScope.js";
 import { parseRiderListPagination } from "./riderListPagination.js";
 import { authenticationOptions, registrationOptions, verifyAuthentication, verifyRegistration } from "./passkeys.js";
@@ -6220,7 +6220,8 @@ app.post("/api/v1/riders/:id/slots", requireRole("admin", "fleet"), async (req, 
   ]);
   if (dailyForRider >= limits.maxSlotsPerRiderPerDay) return res.status(409).json({ error: "RIDER_DAILY_SLOT_LIMIT", limit: limits.maxSlotsPerRiderPerDay });
   if (dailyForTenant >= limits.maxDailySlots) return res.status(409).json({ error: "TENANT_DAILY_SLOT_CAPACITY_REACHED", limit: limits.maxDailySlots });
-  const overlap = await RiderSlot.findOne({ riderId, ...tenantScope(req), date: parsed.data.date, status: { $nin: ["cancelled", "completed"] }, $or: [{ startTime: { $lt: parsed.data.endTime }, endTime: { $gt: parsed.data.startTime } }] }).lean().exec();
+  const existingSlots = await RiderSlot.find({ riderId, ...tenantScope(req), date: parsed.data.date, status: { $nin: ["cancelled", "completed"] } }).select("_id date startTime endTime").lean().exec() as any[];
+  const overlap = existingSlots.find((slot) => scheduleWindowsOverlap(parsed.data, slot));
   if (overlap) return res.status(409).json({ error: "RIDER_SLOT_OVERLAP", slot: overlap });
   try {
     const actorId = objectId(String(req.auth?.employeeId || ""));

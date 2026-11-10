@@ -4,8 +4,34 @@ export type RiderScheduleWindow = {
   endTime: string;
 };
 
+const CLOCK_TIME = /^(?:[01]\d|2[0-3]):[0-5]\d$/;
+
+function minutesSinceMidnight(value: string): number | null {
+  if (!CLOCK_TIME.test(value)) return null;
+  const [hours, minutes] = value.split(":").map(Number);
+  return hours * 60 + minutes;
+}
+
 export function isValidScheduleWindow(startTime: string, endTime: string): boolean {
-  return startTime !== endTime;
+  const start = minutesSinceMidnight(startTime);
+  const end = minutesSinceMidnight(endTime);
+  return start !== null && end !== null && start !== end;
+}
+
+/** Returns same-day ranges for overlap checks; a reversed clock range crosses midnight. */
+export function normalizedScheduleRanges(startTime: string, endTime: string): Array<[number, number]> {
+  const start = minutesSinceMidnight(startTime);
+  const end = minutesSinceMidnight(endTime);
+  if (start === null || end === null || start === end) return [];
+  if (end > start) return [[start, end]];
+  return end === 0 ? [[start, 1440]] : [[start, 1440], [0, end]];
+}
+
+export function scheduleWindowsOverlap(left: RiderScheduleWindow, right: RiderScheduleWindow): boolean {
+  if (left.date !== right.date) return false;
+  const leftRanges = normalizedScheduleRanges(left.startTime, left.endTime);
+  const rightRanges = normalizedScheduleRanges(right.startTime, right.endTime);
+  return leftRanges.some(([leftStart, leftEnd]) => rightRanges.some(([rightStart, rightEnd]) => leftStart < rightEnd && rightStart < leftEnd));
 }
 
 export function expandWeeklySchedule(startDate: string, weekdays: number[]): string[] {
