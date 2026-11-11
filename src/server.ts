@@ -35,7 +35,7 @@ import { EmployeeSession, issueEmployeeSession, revokeEmployeeSessions, sessionR
 import { isStripeSignatureError, processStripeWebhook, stripeConfigured, createSignaturitSignature, signaturitBaseUrl, signaturitConfigured, signaturitMode, signatureWebhookUrl, webhookDigest, handleCustomerTrpc, currentCustomer, issueCustomerSession, setCustomerOrderDispatcher } from "./integrations/index.js";
 import { getVersionPolicy, isPikiSurface, requiresUpdate, setVersionPolicy, syncVersionPolicy, versionPolicySchema, type PikiSurface } from "./appVersion.js";
 import { fcmPushConfigured, probeFcmCredentials, pushConfigured, publicPushConfig, revokePushSubscription, saveFcmSubscription, savePushSubscription, sendPushToOwner, type PushDeliveryReport } from "./push.js";
-import { publishOrderStatusEvents, publishOrderIntakeEvents, publishRiderOfferEvent, publishRiderHeadingToPartnerEvent, publishRiderArrivalEvent, publishRiderLocationEvents, publishRiderScheduleEvent, publishRiderCustomerMessageEvent, publishRealtimeEvent, serveRealtimeEvents, startRealtimeRelay, tenantAudienceKey } from "./realtime.js";
+import { publishOrderStatusEvents, publishOrderIntakeEvents, publishRiderOfferEvent, publishRiderHeadingToPartnerEvent, publishRiderArrivalEvent, publishRiderLocationEvents, publishRiderScheduleEvent, publishRiderCustomerMessageEvent, publishRealtimeEvent, serveRealtimeEvents, startRealtimeRelay, stopRealtimeRelay, tenantAudienceKey } from "./realtime.js";
 import { listNotifications, markAllNotificationsRead, markNotificationRead, sendDocumentRequestEmail, sendDocumentUploadEmail, startNotificationWorker, startShiftSoundAssetUrl, stopNotificationWorker, processExpiringCustomerCreditNotifications, type NotificationPrincipal } from "./notifications.js";
 import { captureStripePaymentIntent, createCheckoutSession, createPartnerStripeOnboardingLink, createTipCheckoutSession } from "./stripe.js";
 import { rankDispatchCandidates, evaluateDispatchVehicleEligibility, computeMobilityAdvice, calculateSanctionDecision, defaultSanctionPolicy } from "./algorithms/index.js";
@@ -73,7 +73,7 @@ import { purgeTestDataIfEnabled } from "./purgeTestData.js";
 import { validateDocumentRequestSubmission } from "./onboardingDocumentPolicy.js";
 import { PIKI_PRL_COURSE_SLUG, RiderTrainingAssignment, RiderTrainingCourse, RiderTrainingResponse, ensurePikiPrlCourse, publicTrainingQuestions, scoreTrainingAnswers, trainingToken, trainingTokenHash } from "./riderTraining.js";
 import { deadLetterDispatchError, dispatchInitialIdempotencyKey, dispatchRecoveryIdempotencyKey, dispatchRequeueIdempotencyKey, enqueueDispatchOutbox, isRetryableDispatchState, processDispatchOutboxBatch, rearmDeadLetterDispatchEvent, type DispatchOutboxEvent } from "./dispatchOutbox.js";
-import { assignedScheduleFields, expandWeeklySchedule, isValidScheduleWindow, nextScheduleRevision, scheduleWindowsOverlap } from "./riderSchedulePolicy.js";
+import { assignedScheduleFields, expandWeeklySchedule, isValidScheduleWindow, nextScheduleRevision, scheduleWindowsOverlap, riderSlotHasEnded, riderSlotIsCurrent } from "./riderSchedulePolicy.js";
 import { buildFleetEntityScope, buildFleetRiderPickerScope, buildTenantScope } from "./tenantScope.js";
 import { parseRiderListPagination } from "./riderListPagination.js";
 import { authenticationOptions, registrationOptions, verifyAuthentication, verifyRegistration } from "./passkeys.js";
@@ -82,7 +82,7 @@ import { legacyOpeningHoursProjection, normalizeOpeningHours, openingHoursSchema
 import { PRL_COURSE_VERSION, PRL_PASS_MARK, PrlEnrollment, certificateIssuer, certificateMode, createPrlToken, hashPrlToken, prlQuestions, publicPrlEnrollment } from "./prlTraining.js";
 import { GoogleBusinessConnection, GoogleOauthState, MunicipalExpansion } from "./expansionModels.js";
 import { decryptGoogleSecret, exchangeGoogleCode, fromGoogleLocationHours, googleAuthorizationUrl, googleBusinessConfiguration, googleBusinessConfigured, googleBusinessScopes, listGoogleAccounts, listGoogleLocations, readGoogleLocation, toGoogleLocationHours, updateGoogleLocationHours, encryptGoogleSecret } from "./googleBusinessProfile.js";
-import { deliveredConfirmationResponse, deliveryCredentialNotLockedFilter, deliveryFailureAtomicUpdate, deliveryFailureLock, parseDeliveryCredential } from "./deliveryConfirmation.js";
+import { deliveredConfirmationResponse, deliveryCredentialNotLockedFilter, deliveryFailureAtomicUpdate, deliveryFailureLock, parseDeliveryCredential, stripeDeliveryPaymentAction } from "./deliveryConfirmation.js";
 import { fleetPublicView } from "./fleetView.js";
 import { prepareTrackingBatch } from "./riderLocationPolicy.js";
 import { activeRecruitmentProvinces, resolveRecruitmentSelection } from "./recruitmentAreas.js";
@@ -4805,8 +4805,25 @@ app.post("/api/v1/internal/customer-orders/sync", async (req, res) => {
   if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_AVAILABLE" });
   if (input.paymentMethod === "cash" && !isCashPaymentEnabledForRestaurant(restaurant)) return res.status(409).json(cashPaymentDisabledError(restaurant));
   const existing = await Order.findOne({ publicCode: input.publicCode }).lean().exec() as any;
-  const location = input.deliveryLocation ? { type: "Point", coordinates: [input.deliveryLocation.longitude, input.deliveryLocation.latitude] } : restaurant.location;
-  if (!location?.coordinates?.length) return res.status(409).json({ error: "DELIVERY_LOCATION_REQUIRED" });
+  // A payment-only replay can omit coordinates; it must preserve the real
+  // destination, never substitute the restaurant for the customer's address.
+  const location = input.deliveryLocation ? { type: "Point", coordinates: [input.deliveryLocation.longitude, input.deliveryLocation.latitude] } : existing?.deliveryLocation;
+  if (!validOperationalCoordinates(location?.coordinates)) return res.status(409).json({ error: "DELIVERY_LOCATION_REQUIRED" });
+  if (existing && (String(existing.restaurantId) !== String(restaurant._id) || !validOperationalCoordinates(existing.deliveryLocation?.coordinates) || existing.deliveryLocation.coordinates[0] !== location.coordinates[0] || existing.deliveryLocation.coordinates[1] !== location.coordinates[1])) {
+    // Changing geography needs a separate requote/reassignment flow. Retaining a
+    // short old route for a new destination could bypass the light-vehicle gate.
+    return res.status(409).json({ error: "SYNC_GEOGRAPHY_CHANGE_REQUIRES_REQUOTE" });
+  }
+  let syncGeography: Record<string, unknown> = {};
+  if (!existing) {
+    if (!validOperationalCoordinates(restaurant.location?.coordinates)) return res.status(409).json({ error: "RESTAURANT_LOCATION_UNAVAILABLE" });
+    const origin: [number, number] = [Number(restaurant.location.coordinates[0]), Number(restaurant.location.coordinates[1])];
+    const destination: [number, number] = [Number(location.coordinates[0]), Number(location.coordinates[1])];
+    const coverage = evaluateXativaCoverage(destination);
+    if (!coverage.covered) return res.status(409).json({ error: "DELIVERY_OUTSIDE_COVERAGE" });
+    const route = await quoteDeliveryRoute(origin, destination);
+    syncGeography = { pickupLocation: { type: "Point", coordinates: origin }, withinMunicipality: withinSameOperationalCity(origin, destination), ...route };
+  }
   const freeDelivery = await freeDeliveryState(restaurant);
   const effectiveDeliveryFeeCents = freeDelivery.eligible ? 0 : input.deliveryFeeCents;
   if (!isCashOrderWithinLimit(input.paymentMethod, input.totalCents)) return res.status(422).json(cashOrderLimitError(input.totalCents));
@@ -4830,7 +4847,7 @@ app.post("/api/v1/internal/customer-orders/sync", async (req, res) => {
   const canonicalSubtotalCents = canonicalItems.reduce((sum, item) => sum + item.unitPriceCents * item.quantity, 0);
   const canonicalTotalCents = canonicalSubtotalCents + effectiveDeliveryFeeCents + input.serviceFeeCents;
   if (!isCashOrderWithinLimit(input.paymentMethod, canonicalTotalCents)) return res.status(422).json(cashOrderLimitError(canonicalTotalCents));
-  const order = await Order.findOneAndUpdate({ publicCode: input.publicCode }, { $set: { tenantId: restaurant.tenantId || null, restaurantId: restaurant._id, customerId: input.customerId || null, ...(input.customerName !== undefined ? { customerName: input.customerName || "" } : {}), items: canonicalItems, deliveryAddress: input.deliveryAddress, deliveryNote: input.deliveryNote, deliveryLocation: location, subtotalCents: canonicalSubtotalCents, deliveryFeeCents: effectiveDeliveryFeeCents, serviceFeeCents: input.serviceFeeCents, totalCents: canonicalTotalCents, marketplaceCommissionRateBps: marketplace.commissionRateBps, marketplaceCommissionCents: marketplace.platformCommissionCents, partnerPayoutCents: marketplace.partnerPayoutCents, riderEarningsCents: marketplace.riderEarningsCents, platformNetBeforeProcessingCents: marketplace.platformNetBeforeProcessingCents, payoutStatus: "pending", paymentMethod: input.paymentMethod, paymentState: input.paymentState, ...(input.stripeCheckoutSessionId !== undefined ? { stripeCheckoutSessionId: input.stripeCheckoutSessionId } : {}), ...(input.stripePaymentIntentId !== undefined ? { stripePaymentIntentId: input.stripePaymentIntentId } : {}), ...(["authorized", "paid"].includes(input.paymentState) && !["authorized", "paid"].includes(existing?.paymentState || "") ? { status: "pending", assignmentState: "unassigned" } : {}) }, $setOnInsert: { publicCode: input.publicCode, status: "pending", assignmentState: "unassigned", statusHistory: [{ status: "pending", actorRole: "system", reason: "Pedido sincronizado desde PIKI Customer" }] } }, { upsert: true, new: true, setDefaultsOnInsert: true }).lean().exec() as any;
+  const order = await Order.findOneAndUpdate({ publicCode: input.publicCode }, { $set: { tenantId: restaurant.tenantId || null, restaurantId: restaurant._id, customerId: input.customerId || null, ...(input.customerName !== undefined ? { customerName: input.customerName || "" } : {}), items: canonicalItems, deliveryAddress: input.deliveryAddress, deliveryNote: input.deliveryNote, deliveryLocation: location, subtotalCents: canonicalSubtotalCents, deliveryFeeCents: effectiveDeliveryFeeCents, serviceFeeCents: input.serviceFeeCents, totalCents: canonicalTotalCents, marketplaceCommissionRateBps: marketplace.commissionRateBps, marketplaceCommissionCents: marketplace.platformCommissionCents, partnerPayoutCents: marketplace.partnerPayoutCents, riderEarningsCents: marketplace.riderEarningsCents, platformNetBeforeProcessingCents: marketplace.platformNetBeforeProcessingCents, payoutStatus: "pending", paymentMethod: input.paymentMethod, paymentState: input.paymentState, ...(input.stripeCheckoutSessionId !== undefined ? { stripeCheckoutSessionId: input.stripeCheckoutSessionId } : {}), ...(input.stripePaymentIntentId !== undefined ? { stripePaymentIntentId: input.stripePaymentIntentId } : {}) }, $setOnInsert: { publicCode: input.publicCode, ...syncGeography, status: "pending", assignmentState: "unassigned", statusHistory: [{ status: "pending", actorRole: "system", reason: "Pedido sincronizado desde PIKI Customer" }] } }, { upsert: true, new: true, setDefaultsOnInsert: true }).lean().exec() as any;
   const newlyPaid = ["authorized", "paid"].includes(input.paymentState) && !["authorized", "paid"].includes(existing?.paymentState || "");
   const newCashOrder = input.paymentMethod === "cash" && !existing;
   if (newlyPaid || newCashOrder) {
@@ -5782,9 +5799,12 @@ app.post("/api/v1/riders/:riderId/orders/:orderId/confirm-delivery", requireRole
   if (deliveryDistanceMeters == null) return res.status(409).json({ error: "DELIVERY_LOCATION_REQUIRED", message: "No se puede verificar la entrega: falta una ubicación GPS válida del cliente." });
   const outsideGpsRadius = deliveryDistanceMeters > DELIVERY_CONFIRMATION_RADIUS_METERS;
   if (confirmedOrder.paymentMethod === "stripe") {
-    if (!confirmedOrder.stripePaymentIntentId || confirmedOrder.paymentState !== "authorized") return res.status(409).json({ error: "PAYMENT_NOT_AUTHORIZED", message: "El pago online todavía no está autorizado para capturarse." });
-    try { await captureStripePaymentIntent(confirmedOrder.stripePaymentIntentId); }
-    catch (error) { return res.status(409).json({ error: "PAYMENT_CAPTURE_FAILED", message: error instanceof Error ? error.message : "No se pudo capturar el pago." }); }
+    const paymentAction = stripeDeliveryPaymentAction(confirmedOrder);
+    if (paymentAction === "reject") return res.status(409).json({ error: "PAYMENT_NOT_AUTHORIZED", message: "El pago online todavía no está pagado ni autorizado para capturarse." });
+    if (paymentAction === "capture_authorization") {
+      try { await captureStripePaymentIntent(confirmedOrder.stripePaymentIntentId); }
+      catch (error) { return res.status(409).json({ error: "PAYMENT_CAPTURE_FAILED", message: error instanceof Error ? error.message : "No se pudo capturar el pago." }); }
+    }
   }
   if (confirmedOrder.paymentMethod === "cash") {
     const cashEntry = await recordCashCollection(confirmedOrder, riderId, "rider");
@@ -6080,30 +6100,22 @@ async function archivePreviousDayPartnerOrders() {
   if (result.modifiedCount) console.log(JSON.stringify({ event: "partner_previous_day_orders_archived", madridDate, count: result.modifiedCount }));
   return result.modifiedCount;
 }
-function minutesOfDay(value: string) { const [hours, minutes] = String(value || "00:00").split(":").map(Number); return Math.max(0, Math.min(1440, hours * 60 + minutes)); }
-function isOvernightSlot(slot: { startTime: string; endTime: string }) { return minutesOfDay(slot.endTime) <= minutesOfDay(slot.startTime); }
-function slotContainsTime(slot: { startTime: string; endTime: string }, time: string) {
-  const start = minutesOfDay(slot.startTime); const current = minutesOfDay(time); const rawEnd = minutesOfDay(slot.endTime);
-  const end = rawEnd === 0 ? 1440 : rawEnd;
-  return start < end ? start <= current && current < end : current >= start || current < end;
-}
 
 async function expireRiderSlots(riderId: mongoose.Types.ObjectId, now: ReturnType<typeof madridNow>) {
-  const candidates = await RiderSlot.find({ riderId, date: { $in: [now.date, previousCalendarDate(now.date)] }, status: "active" }).select("_id date startTime endTime").lean().exec() as any[];
-  const expired = candidates.filter((slot) => {
-    if (slot.date === now.date) return !isOvernightSlot(slot) && !slotContainsTime(slot, now.time);
-    return !isOvernightSlot(slot) || !slotContainsTime(slot, now.time);
-  });
+  const candidates = await RiderSlot.find({ riderId, date: { $lte: now.date }, status: "active" }).select("_id date startTime endTime").lean().exec() as any[];
+  const expired = candidates.filter((slot) => riderSlotHasEnded(slot, now));
   if (!expired.length) return false;
   await RiderSlot.updateMany({ _id: { $in: expired.map((slot) => slot._id) }, status: "active" }, { $set: { status: "completed" } }).exec();
-  await Rider.findOneAndUpdate({ _id: riderId, activeOrderId: null }, { $set: { status: "offline" } }).exec();
+  if (!candidates.some((slot) => riderSlotIsCurrent(slot, now))) {
+    await Rider.findOneAndUpdate({ _id: riderId, activeOrderId: null }, { $set: { status: "offline" } }).exec();
+  }
   return true;
 }
 async function findCurrentRiderSlot(riderId: mongoose.Types.ObjectId) {
   const now = madridNow();
   await expireRiderSlots(riderId, now);
   const candidates = await RiderSlot.find({ riderId, date: { $in: [now.date, previousCalendarDate(now.date)] }, status: { $in: ["planned", "active"] } }).sort({ date: 1, startTime: 1 }).lean().exec();
-  const slot = candidates.find((candidate: any) => slotContainsTime(candidate, now.time) && (candidate.date === now.date || isOvernightSlot(candidate)));
+  const slot = candidates.find((candidate: any) => riderSlotIsCurrent(candidate, now));
   return { now, slot, selfStartAllowed: false };
 }
 async function findNextRiderSlot(riderId: mongoose.Types.ObjectId, now: ReturnType<typeof madridNow>) {
@@ -6114,7 +6126,7 @@ async function findNextRiderSlot(riderId: mongoose.Types.ObjectId, now: ReturnTy
 async function currentSlotRiderIds(scope: Record<string, unknown> = {}) {
   const now = madridNow();
   const candidates = await RiderSlot.find({ ...scope, date: { $in: [now.date, previousCalendarDate(now.date)] }, status: { $in: ["planned", "active"] } }).select("riderId date startTime endTime").lean().exec();
-  return [...new Set(candidates.filter((candidate: any) => slotContainsTime(candidate, now.time) && (candidate.date === now.date || isOvernightSlot(candidate))).map((candidate: any) => candidate.riderId))];
+  return [...new Set(candidates.filter((candidate: any) => riderSlotIsCurrent(candidate, now)).map((candidate: any) => candidate.riderId))];
 }
 
 async function canAccessRiderShift(riderId: mongoose.Types.ObjectId, req: express.Request) {
@@ -6129,8 +6141,7 @@ app.get("/api/v1/riders/session", requireRole("rider"), async (req, res) => {
   const rider = employee ? await Rider.findOne({ email: employee.email, ...tenant }).lean().exec() as any : null;
   if (!rider) return res.status(404).json({ error: "RIDER_ACCOUNT_NOT_LINKED" });
   const { now, slot } = await findCurrentRiderSlot(rider._id);
-  // A previous browser session must never keep a rider online after its slot ended.
-  await RiderSlot.updateMany({ ...tenant, riderId: rider._id, status: "active", date: { $lt: now.date } }, { $set: { status: "completed" } }).exec();
+  // findCurrentRiderSlot expires only ended intervals, including overnight tails.
   const hasActiveOrder = Boolean(await Order.exists({ ...tenant, riderId: rider._id, status: { $nin: ["delivered", "cancelled"] }, assignmentState: { $in: ["offered", "assigned"] } }));
   const effectiveStatus = hasActiveOrder ? "busy" : (slot as any)?.status === "active" ? rider.status : "offline";
   const update: Record<string, unknown> = { status: effectiveStatus };
@@ -6366,7 +6377,15 @@ async function assignOrderAutomatically(orderId: mongoose.Types.ObjectId, prefer
     const tenantFilter: Record<string, unknown> = order.tenantId ? { tenantId: order.tenantId } : {};
     const qaOrder = Boolean(order.isTestOrder && order.qaRiderId);
     if (!qaOrder && (!isDispatchablePayment(order.paymentState, order.paymentMethod, Number(order.totalCents)) || !isDispatchableOrderStatus(order.status))) { console.log("[dispatch-diag]", JSON.stringify({ orderId: String(order._id), state: "not_dispatchable", status: order.status, paymentState: order.paymentState, paymentMethod: order.paymentMethod, totalCents: order.totalCents, isTestOrder: order.isTestOrder })); return { state: "not_dispatchable" as const }; }
-    if (order.riderId || order.assignmentState === "assigned" || order.assignmentState === "offered") return { state: "already_assigned" as const, riderId: order.riderId };
+    if (order.riderId || order.assignmentState === "assigned" || order.assignmentState === "offered") {
+      // The dispatch outbox/lease is durable even if the process dies after saving
+      // the offer. A retry must repair publication before acknowledging its intent.
+      // The existing realtime unique dedupe key makes this cross-instance safe.
+      if (order.riderId && order.assignmentState === "offered" && order.assignmentExpiresAt && new Date(order.assignmentExpiresAt).getTime() > Date.now()) {
+        await publishRiderOfferEvent(order, String(order.riderId));
+      }
+      return { state: "already_assigned" as const, riderId: order.riderId };
+    }
     const restaurant = await Restaurant.findOne({ _id: order.restaurantId, ...tenantFilter }).lean().exec() as any;
     if (!validOperationalCoordinates(restaurant?.location?.coordinates) || !validOperationalCoordinates(order.deliveryLocation?.coordinates)) { console.log("[dispatch-diag]", JSON.stringify({ orderId: String(order._id), state: "missing_geolocation" })); return { state: "missing_geolocation" as const }; }
     const policy = await dispatchLoadPolicy();
@@ -7703,7 +7722,7 @@ async function start() {
   // persistent dispatch_outbox with atomic leases and retry/backoff.
   const shutdown = () => {
     stopGoogleBusinessSyncWorker(); stopNotificationWorker(); stopCodHoldSweepWorker();
-  stopDailySummaryWorker(); databaseReady = false;
+  stopDailySummaryWorker(); stopRealtimeRelay(); databaseReady = false;
     server.close(() => { void mongoose.disconnect().finally(() => process.exit(0)); });
     setTimeout(() => process.exit(0), 25_000).unref();
   };

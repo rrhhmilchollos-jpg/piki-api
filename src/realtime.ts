@@ -5,6 +5,7 @@ import { EmployeeAccount, Order, RealtimeEvent, Restaurant, Rider, Tenant } from
 import { currentCustomer } from "./customerCompat.js";
 import { resolveRole } from "./auth.js";
 import { publishInboxNotification } from "./notifications.js";
+import { createRealtimeRelay } from "./realtimeRelay.js";
 
 export type RealtimeChannel = "partner" | "fleet" | "admin" | "rider" | "customer";
 export type RealtimeEventPayload = Record<string, unknown>;
@@ -16,7 +17,6 @@ stream.setMaxListeners(0);
 const HEARTBEAT_MS = 20_000;
 const REPLAY_LIMIT = 100;
 const emittedIds = new Set<string>();
-let relayStarted = false;
 
 function validTenantId(value: unknown): mongoose.Types.ObjectId | null {
   const stringValue = value == null ? "" : String(value);
@@ -40,23 +40,16 @@ function emitOnce(event: PersistedRealtimeEvent) {
  * MongoDB change streams distribute the durable outbox across Render instances.
  * The local emit below remains a safe fallback while Mongo is reconnecting.
  */
-export function startRealtimeRelay() {
-  if (relayStarted || mongoose.connection.readyState !== 1) return;
-  relayStarted = true;
-  try {
-    const changes = RealtimeEvent.watch([], { fullDocument: "default" });
-    changes.on("change", (change: any) => {
-      if (change.operationType === "insert" && change.fullDocument) emitOnce(change.fullDocument as PersistedRealtimeEvent);
-    });
-    changes.on("error", (error) => {
-      relayStarted = false;
-      console.warn("Realtime change-stream relay unavailable; local relay remains active", error instanceof Error ? error.message : error);
-    });
-  } catch (error) {
-    relayStarted = false;
-    console.warn("Realtime change-stream relay could not start; local relay remains active", error instanceof Error ? error.message : error);
-  }
-}
+const relay = createRealtimeRelay({
+  isConnected: () => mongoose.connection.readyState === 1,
+  open: () => RealtimeEvent.watch([], { fullDocument: "default" }),
+  onChange: (change) => {
+    if (change.operationType === "insert" && change.fullDocument) emitOnce(change.fullDocument as PersistedRealtimeEvent);
+  },
+  onError: (error) => console.warn("Realtime change-stream relay unavailable; retry scheduled; local relay remains active", error instanceof Error ? error.message : error),
+});
+export function startRealtimeRelay() { relay.start(); }
+export function stopRealtimeRelay() { relay.stop(); }
 
 function writeEvent(response: Response, event: PersistedRealtimeEvent) {
   response.write(`id: ${String(event._id)}\n`);

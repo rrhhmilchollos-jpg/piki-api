@@ -61,3 +61,24 @@ export function nextScheduleRevision(current: unknown): number {
   const revision = typeof current === "number" && Number.isInteger(current) && current >= 1 ? current : 0;
   return revision + 1;
 }
+
+type LocalSlotClock = { date: string; time: string };
+
+function scheduleEndDate(slot: RiderScheduleWindow): string {
+  if (slot.endTime > slot.startTime) return slot.date;
+  const next = new Date(`${slot.date}T12:00:00Z`);
+  next.setUTCDate(next.getUTCDate() + 1);
+  return next.toISOString().slice(0, 10);
+}
+
+/** Half-open civil-time interval in the same time zone as the server clock. */
+export function riderSlotHasEnded(slot: RiderScheduleWindow, now: LocalSlotClock): boolean {
+  if (!isValidScheduleWindow(slot.startTime, slot.endTime)) return true;
+  const endDate = scheduleEndDate(slot);
+  return now.date > endDate || (now.date === endDate && now.time >= slot.endTime);
+}
+
+export function riderSlotIsCurrent(slot: RiderScheduleWindow, now: LocalSlotClock): boolean {
+  if (!isValidScheduleWindow(slot.startTime, slot.endTime) || riderSlotHasEnded(slot, now)) return false;
+  return now.date > slot.date || (now.date === slot.date && now.time >= slot.startTime);
+}
