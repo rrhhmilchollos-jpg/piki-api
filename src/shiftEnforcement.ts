@@ -26,6 +26,7 @@ export type RiderShiftPlan = {
   riderId: string;
   weeklyHours: ContractHours;
   shifts: Shift[];
+  /** Campo legado de persistencia; el reloj oficial es siempre Europe/Madrid. */
   timezoneOffsetMinutes?: number;
 };
 
@@ -85,11 +86,18 @@ export function planFitsContract(plan: RiderShiftPlan): boolean {
   return plannedMinutes(plan) <= plan.weeklyHours * 60;
 }
 
-function localNow(now: Date, offsetMinutes: number) {
-  const shifted = new Date(now.getTime() + offsetMinutes * 60_000);
+const madridClockFormatter = new Intl.DateTimeFormat("en-GB", {
+  timeZone: "Europe/Madrid",
+  year: "numeric", month: "2-digit", day: "2-digit",
+  hour: "2-digit", minute: "2-digit", hourCycle: "h23",
+});
+
+function localNow(now: Date) {
+  const parts = Object.fromEntries(madridClockFormatter.formatToParts(now)
+    .filter((part) => part.type !== "literal").map((part) => [part.type, part.value]));
   return {
-    weekday: shifted.getUTCDay(),
-    minutes: shifted.getUTCHours() * 60 + shifted.getUTCMinutes(),
+    weekday: new Date(`${parts.year}-${parts.month}-${parts.day}T12:00:00Z`).getUTCDay(),
+    minutes: Number(parts.hour) * 60 + Number(parts.minute),
   };
 }
 
@@ -108,8 +116,7 @@ export function evaluateShift(
   if (!isValidPlan(plan)) {
     return { onlineAllowed: false, reason: "plan_invalido", minutesRemaining: 0 };
   }
-  const offset = plan.timezoneOffsetMinutes ?? 60; // España peninsular
-  const { weekday, minutes } = localNow(now, offset);
+  const { weekday, minutes } = localNow(now);
   const capacity = plan.weeklyHours * 60;
   const remaining = Math.max(0, capacity - Math.max(0, workedMinutesThisWeek));
 
@@ -173,10 +180,10 @@ export function evaluateShift(
  * Minutos de esta semana desde el lunes a las 00:00 locales. Se calcula a partir
  * de los tramos de conexión reales, no de lo que el rider diga.
  */
-export function minutesSinceWeekStart(now: Date, offsetMinutes = 60): number {
-  const shifted = new Date(now.getTime() + offsetMinutes * 60_000);
-  const dayFromMonday = (shifted.getUTCDay() + 6) % 7;
-  return dayFromMonday * 1440 + shifted.getUTCHours() * 60 + shifted.getUTCMinutes();
+export function minutesSinceWeekStart(now: Date, _legacyOffsetMinutes?: number): number {
+  const { weekday, minutes } = localNow(now);
+  const dayFromMonday = (weekday + 6) % 7;
+  return dayFromMonday * 1440 + minutes;
 }
 
 /** Recorta un exceso de conexión al límite legal de la semana. */

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { evaluateShift, isValidPlan, planFitsContract, plannedMinutes } from "./shiftEnforcement.js";
+import { evaluateShift, isValidPlan, minutesSinceWeekStart, planFitsContract, plannedMinutes } from "./shiftEnforcement.js";
 
 const plan = {
   riderId: "r1",
@@ -62,4 +62,30 @@ test("acepta y activa un turno nocturno 12:00–00:00", () => {
   assert.equal(evaluateShift(nocturno, 0, saturday).onlineAllowed, true);
   const sundayMidnight = new Date("2026-11-07T23:00:00Z"); // domingo 00:00 en Madrid
   assert.equal(evaluateShift(nocturno, 0, sundayMidnight).onlineAllowed, false);
+});
+
+test("12:00–00:00 usa Madrid en invierno y verano, con fin exclusivo", () => {
+  for (const [start, beforeEnd, end] of [
+    ["2026-11-02T11:00:00Z", "2026-11-02T22:59:00Z", "2026-11-02T23:00:00Z"],
+    ["2026-07-06T10:00:00Z", "2026-07-06T21:59:00Z", "2026-07-06T22:00:00Z"],
+  ]) {
+    const middayToMidnight = { ...plan, shifts: [{ weekday: 1, start: "12:00", end: "00:00" }] };
+    assert.equal(evaluateShift(middayToMidnight, 0, new Date(start)).onlineAllowed, true);
+    assert.equal(evaluateShift(middayToMidnight, 0, new Date(beforeEnd)).minutesRemaining, 1);
+    assert.equal(evaluateShift(middayToMidnight, 0, new Date(end)).onlineAllowed, false);
+    // El offset persistido, incluso obsoleto, no sustituye el reloj oficial.
+    assert.equal(evaluateShift({ ...middayToMidnight, timezoneOffsetMinutes: -300 }, 0, new Date(start)).onlineAllowed, true);
+  }
+});
+
+test("el inicio semanal es lunes 00:00 de Madrid también en verano", () => {
+  assert.equal(minutesSinceWeekStart(new Date("2026-11-01T23:00:00Z")), 0);
+  assert.equal(minutesSinceWeekStart(new Date("2026-07-05T22:00:00Z"), 60), 0);
+  assert.equal(minutesSinceWeekStart(new Date("2026-07-05T21:59:00Z")), 10079);
+});
+
+test("los domingos de cambio horario no aplican un offset fijo", () => {
+  const sunday = { ...plan, shifts: [{ weekday: 0, start: "12:00", end: "00:00" }] };
+  assert.equal(evaluateShift(sunday, 0, new Date("2026-03-29T10:00:00Z")).onlineAllowed, true);
+  assert.equal(evaluateShift(sunday, 0, new Date("2026-10-25T11:00:00Z")).onlineAllowed, true);
 });
