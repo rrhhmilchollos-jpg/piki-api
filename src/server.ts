@@ -2562,7 +2562,7 @@ app.post("/api/v1/admin/restaurants", requireOwner(), async (req, res) => {
     if (!objectId(actorTenantId)) return res.status(409).json({ error: "TENANT_CONTEXT_REQUIRED" });
     const restaurant = await Restaurant.create(pendingPartnerDraft(parsed.data, slug, actorTenantId));
     await ensurePartnerOperationalLocation(restaurant.toObject());
-    await AccessAuthorization.create({ employeeId: objectId(String(req.auth!.employeeId!)), action: "partner_created", previousStatus: null, nextStatus: "pending_review", previousRole: null, nextRole: "partner", accessLevel: "superadmin", actorEmployeeId: objectId(String(req.auth!.employeeId!)), reason: `Partner creado por superadmin: ${restaurant.name}.` });
+    await GovernanceAuditEvent.create({ tenantId: objectId(actorTenantId), actorEmployeeId: objectId(String(req.auth!.employeeId!)), actorRole: req.auth!.role, action: "partner_created", targetType: "restaurant", targetId: restaurant._id, before: null, after: { onboardingStatus: "pending_review", isActive: false, commissionRateBps: parsed.data.commissionRateBps }, reason: `Partner creado por superadmin: ${restaurant.name}.` });
     return res.status(201).json({ created: true, restaurant: { ...restaurant.toObject(), id: String(restaurant._id), partnerCode: publicPartnerCode(restaurant._id), commissionRateBps: parsed.data.commissionRateBps, commissionPercent: parsed.data.commissionRateBps / 100 } });
   } catch (error: any) {
     if (error?.code === 11000) return res.status(409).json({ error: "PARTNER_SLUG_ALREADY_EXISTS" });

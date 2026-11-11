@@ -25,3 +25,13 @@ test('commission accepted for draft is persisted without legal consent',()=>{
  assert.equal(draft.get('draftCommissionRateBps'),0);
  assert.equal(draft.toObject().partnerProfile,null);
 });
+
+import {AccessAuthorization,GovernanceAuditEvent} from './models.js';
+test('legacy access-audit enum rejects partner_created; no live write',()=>{
+ const audit=new AccessAuthorization({employeeId:'000000000000000000000001',actorEmployeeId:'000000000000000000000001',action:'partner_created',nextStatus:'pending_review',nextRole:'partner',accessLevel:'superadmin'});
+ assert.ok(audit.validateSync()?.errors.action);
+});
+test('restaurant creation uses valid governance audit, not a role grant',()=>{
+ const audit=new GovernanceAuditEvent({tenantId:tenant,actorEmployeeId:'000000000000000000000001',actorRole:'admin',action:'partner_created',targetType:'restaurant',targetId:'000000000000000000000002',before:null,after:{isActive:false,onboardingStatus:'pending_review'}});
+ assert.equal(audit.validateSync(),undefined);
+});
