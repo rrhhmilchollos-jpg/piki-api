@@ -1,6 +1,6 @@
 import "dotenv/config";
 
-const api = String(process.env.PIKI_API_ORIGIN || "https://piki-api-37nr.onrender.com").replace(/\/$/, "");
+const api = String(process.env.PIKI_API_ORIGIN || "https://api.pikidelivery.com").replace(/\/$/, "");
 const token = String(process.env.PIKI_ADMIN_TOKEN || "").trim();
 const confirm = process.env.PIKI_CONFIRM === "CREATE";
 const managerEmail = "paduanyjoar9@gmail.com";

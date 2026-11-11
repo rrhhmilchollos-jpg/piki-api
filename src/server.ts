@@ -126,11 +126,13 @@ const databaseName = process.env.MONGODB_DB || "piki";
 let databaseReady = false;
 const catalogCache = new Map<string, { expiresAt: number; body: { restaurants: unknown[] } }>();
 const geocodeCache = new Map<string, { expiresAt: number; body: any }>();
-const CATALOG_CACHE_MS = 30_000;
+// Customer must see a MongoDB write as soon as the write commits. The public
+// catalogue is small enough to read directly and its response is explicitly
+// no-store, so neither a process-local cache nor a CDN can serve old menus.
+const CATALOG_CACHE_MS = 0;
 const GEOCODE_CACHE_MS = 300_000;
 function invalidateCatalogCache() {
   catalogCache.clear();
-  void sharedCacheDelete("piki:catalog:|");
 }
 const boundedFetch = (input: string | URL, init: RequestInit = {}) => fetch(input, { ...init, signal: AbortSignal.timeout(1_200) });
 const geocoderHeaders = { "User-Agent": "PIKI-Delivery/0.2 (+https://pikidelivery.com)" };
@@ -286,10 +288,6 @@ async function sharedCacheGet<T>(key: string): Promise<T | null> {
 async function sharedCacheSet(key: string, value: unknown, ttlSeconds: number): Promise<void> {
   if (!upstashRedisUrl || !upstashRedisToken) return;
   try { await fetch(`${upstashRedisUrl}/set/${encodeURIComponent(key)}/${encodeURIComponent(JSON.stringify(value))}/EX/${ttlSeconds}`, { method: "POST", headers: { Authorization: `Bearer ${upstashRedisToken}` }, signal: AbortSignal.timeout(250) }); } catch { /* local cache fallback */ }
-}
-async function sharedCacheDelete(key: string): Promise<void> {
-  if (!upstashRedisUrl || !upstashRedisToken) return;
-  try { await fetch(`${upstashRedisUrl}/del/${encodeURIComponent(key)}`, { method: "POST", headers: { Authorization: `Bearer ${upstashRedisToken}` }, signal: AbortSignal.timeout(250) }); } catch { /* local cache fallback */ }
 }
 const rateLimit = (limit: number, windowMs: number, keyPrefix: string) => async (req: express.Request, res: express.Response, next: express.NextFunction) => {
   const surfaceKey = String(req.header("x-piki-surface") || req.query.surface || "-").toLowerCase();
@@ -1474,9 +1472,10 @@ app.get("/api/v1/catalog/restaurants", async (req, res) => {
   const locality = typeof req.query.locality === "string" ? req.query.locality.trim().slice(0, 120) : "";
   const cacheKey = `${query}|${category}|${postalCode}|${locality.toLocaleLowerCase()}`;
   const cached = catalogCache.get(cacheKey);
-  if (cached && cached.expiresAt > Date.now()) { res.setHeader("Cache-Control", "public, max-age=30, s-maxage=30, stale-while-revalidate=60, stale-if-error=120"); return res.json(cached.body); }
-  const shared = await sharedCacheGet<{ restaurants: unknown[] }>(`piki:catalog:${cacheKey}`);
-  if (shared) { catalogCache.set(cacheKey, { expiresAt: Date.now() + CATALOG_CACHE_MS, body: shared }); res.setHeader("Cache-Control", "public, max-age=30, s-maxage=30, stale-while-revalidate=60, stale-if-error=120"); return res.json(shared); }
+  if (CATALOG_CACHE_MS > 0 && cached && cached.expiresAt > Date.now()) {
+    res.setHeader("Cache-Control", "no-store, no-cache, max-age=0, must-revalidate");
+    return res.json(cached.body);
+  }
   const clauses: Record<string, unknown>[] = [CUSTOMER_CATALOG_RESTAURANT_FILTER];
   if (category && category !== "Todos") clauses.push({ category });
   if (query) clauses.push({ $or: [{ name: { $regex: query, $options: "i" } }, { cuisine: { $regex: query, $options: "i" } }, { category: { $regex: query, $options: "i" } }] });
@@ -1506,9 +1505,8 @@ app.get("/api/v1/catalog/restaurants", async (req, res) => {
     const launchWindow = isFreeDeliveryLaunchWindow();
     return { ...presented, minimumOrderCents: Number(process.env.PIKI_MINIMUM_ORDER_CENTS || 500), fulfillmentMode: presented.fulfillmentMode || restaurant.fulfillmentMode || (restaurant.listingType === "local_directory" ? "assisted_purchase" : "partner_delivery"), freeDeliveryEligible: launchWindow && remaining > 0, freeDeliveryOrdersRemaining: launchWindow ? remaining : 0 };
   }) };
-  catalogCache.set(cacheKey, { expiresAt: Date.now() + CATALOG_CACHE_MS, body });
-  void sharedCacheSet(`piki:catalog:${cacheKey}`, body, 30);
-  res.setHeader("Cache-Control", "public, max-age=30, s-maxage=30, stale-while-revalidate=60, stale-if-error=120");
+  if (CATALOG_CACHE_MS > 0) catalogCache.set(cacheKey, { expiresAt: Date.now() + CATALOG_CACHE_MS, body });
+  res.setHeader("Cache-Control", "no-store, no-cache, max-age=0, must-revalidate");
   res.json(body);
 });
 
@@ -2128,6 +2126,8 @@ app.patch("/api/v1/partners/profile", requireRole("partner"), async (req, res) =
     ...(parsed.data.category !== undefined ? { category: parsed.data.category } : {}),
   };
   const updated = await Restaurant.findOneAndUpdate(scope, { $set: update }, { new: true }).select("_id partnerCode name email phone address locality cuisine category deliveryFeeCents promoted availabilityStatus isActive partnerProfile.commissionRateBps").lean().exec() as any;
+  invalidateCatalogCache();
+  void publishCatalogUpdate(updated._id, "partner.restaurant.profile.updated");
   await AccessAuthorization.create({ employeeId: access.employee._id, action: "profile_updated", previousStatus: "approved", nextStatus: "approved", previousRole: "partner", nextRole: "partner", accessLevel: "subadmin", actorEmployeeId: access.employee._id, reason: "El Partner actualizó sus datos básicos de contacto." });
   await recordGovernanceEvent({ actor: { employeeId: access.employee._id, role: "partner", tenantId: (req.auth as any)?.tenantId }, action: "partner_basic_profile_updated", targetType: "restaurant", targetId: restaurant._id, before: { name: restaurant.name, email: restaurant.email, phone: restaurant.phone, address: restaurant.address, locality: restaurant.locality, cuisine: restaurant.cuisine, category: restaurant.category }, after: { name: updated.name, email: updated.email, phone: updated.phone, address: updated.address, locality: updated.locality, cuisine: updated.cuisine, category: updated.category }, reason: "El Partner actualizó sus datos básicos del establecimiento; sin acceso a comisión, tarifa, promoción ni estado comercial." });
   return res.json({ updated: true, profile: { id: String(updated._id), partnerCode: updated.partnerCode || publicPartnerCode(updated._id), name: updated.name, email: updated.email, phone: updated.phone, address: updated.address, locality: updated.locality, cuisine: updated.cuisine, category: updated.category, deliveryFeeCents: Number(updated.deliveryFeeCents || 0), promoted: Boolean(updated.promoted), availabilityStatus: updated.availabilityStatus, isOpen: Boolean(updated.isActive), commissionRateBps: Number(updated.partnerProfile?.commissionRateBps ?? DEFAULT_PARTNER_COMMISSION_BPS), commissionPercent: Number(updated.partnerProfile?.commissionRateBps ?? DEFAULT_PARTNER_COMMISSION_BPS) / 100 } });
@@ -2141,6 +2141,8 @@ app.patch("/api/v1/partners/store/status", requireRole("partner"), async (req, r
   if (!parsed.success) return res.status(400).json({ error: "INVALID_STORE_STATUS" });
   const restaurant = await Restaurant.findOneAndUpdate({ _id: restaurantId, onboardingStatus: "approved" }, { $set: { isActive: parsed.data.status === "open" } }, { new: true }).select("_id name isActive").lean().exec() as any;
   if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
+  invalidateCatalogCache();
+  void publishCatalogUpdate(restaurant._id, "partner.store.status.updated");
   return res.json({ restaurant: { id: String(restaurant._id), name: restaurant.name }, status: restaurant.isActive ? "open" : "paused", isOpen: Boolean(restaurant.isActive) });
 });
 app.get("/api/v1/partners/store/profile", requireRole("partner"), async (req, res) => {
@@ -2181,6 +2183,8 @@ app.patch("/api/v1/partners/store/hours", requireRole("partner"), async (req, re
   const openingHours = pikiManagedOpeningHours(parsed.data);
   const restaurant = await Restaurant.findOneAndUpdate({ _id: restaurantId, onboardingStatus: "approved", ...tenantScope(req) }, { $set: { "partnerProfile.openingHours": openingHours } }, { new: true }).select("_id name isActive partnerProfile.openingHours").lean().exec() as any;
   if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
+  invalidateCatalogCache();
+  void publishCatalogUpdate(restaurant._id, "partner.store.hours.updated");
   return res.json({ restaurantId: String(restaurant._id), name: restaurant.name, isOpen: partnerIsOpenNow(restaurant), paused: !restaurant.isActive, openingHours: restaurant.partnerProfile?.openingHours || openingHours });
 });
 app.get("/api/v1/partners/google-business/status", requireRole("partner"), async (req, res) => {
@@ -2255,7 +2259,7 @@ app.patch("/api/v1/partners/google-business/publish-hours", requireRole("partner
   const parsed = openingHoursSchema.safeParse(req.body?.openingHours ?? req.body); if (!parsed.success) return res.status(400).json({ error: "INVALID_OPENING_HOURS", details: parsed.error.flatten() });
   const connection = await GoogleBusinessConnection.findOne({ restaurantId: objectId(restaurantId), ...tenantScope(req) }).select("+accessTokenEncrypted +refreshTokenEncrypted").exec() as any; if (!connection?.googleLocationName) return res.status(409).json({ error: "GOOGLE_LOCATION_NOT_SELECTED" });
   const openingHours = pikiManagedOpeningHours(parsed.data);
-  try { const result = await updateGoogleLocationHours(connection, connection.googleLocationName, toGoogleLocationHours(openingHours)); await Restaurant.updateOne({ _id: objectId(restaurantId), ...tenantScope(req) }, { $set: { "partnerProfile.openingHours": openingHours } }); connection.lastSyncAt = new Date(); connection.nextSyncAt = new Date(Date.now() + googleBusinessSyncSettings().cadenceMs); connection.lastSyncStatus = "success"; connection.lastSyncError = ""; await connection.save(); return res.json({ synced: true, direction: "piki_to_google", result }); } catch (error) { return res.status(502).json({ error: "GOOGLE_PUBLISH_FAILED", message: error instanceof Error ? error.message : "GOOGLE_PUBLISH_FAILED" }); }
+  try { const result = await updateGoogleLocationHours(connection, connection.googleLocationName, toGoogleLocationHours(openingHours)); const writeResult = await Restaurant.updateOne({ _id: objectId(restaurantId), ...tenantScope(req) }, { $set: { "partnerProfile.openingHours": openingHours } }); if (writeResult.modifiedCount > 0) { invalidateCatalogCache(); void publishCatalogUpdate(restaurantId, "restaurant.opening_hours.google_publish"); } connection.lastSyncAt = new Date(); connection.nextSyncAt = new Date(Date.now() + googleBusinessSyncSettings().cadenceMs); connection.lastSyncStatus = "success"; connection.lastSyncError = ""; await connection.save(); return res.json({ synced: true, direction: "piki_to_google", result }); } catch (error) { return res.status(502).json({ error: "GOOGLE_PUBLISH_FAILED", message: error instanceof Error ? error.message : "GOOGLE_PUBLISH_FAILED" }); }
 });
 app.get("/api/v1/partners/menu", requireRole("partner"), async (req, res) => {
   setPartnerMenuResponseHeaders(res);
@@ -2321,6 +2325,7 @@ app.put("/api/v1/admin/restaurants/:id/menu", requireOwner(), async (req, res) =
   ).select("_id slug name menu").lean().exec() as any;
   if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND_OR_NOT_APPROVED" });
   invalidateCatalogCache();
+  void publishCatalogUpdate(restaurant._id, "owner.menu.updated");
   return res.json({ updated: true, restaurant, menu: restaurant.menu || [] });
 });
 
@@ -2606,6 +2611,7 @@ app.patch("/api/v1/admin/restaurants/:id/settings", requireOwner(), async (req, 
   if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
   if (settings.address !== undefined || settings.locality !== undefined) await ensurePartnerOperationalLocation(restaurant, true);
   invalidateCatalogCache();
+  void publishCatalogUpdate(restaurant._id, "owner.restaurant.settings.updated");
   await AccessAuthorization.create({ employeeId: objectId(String(req.auth!.employeeId!)), action: "settings_updated", previousStatus: "approved", nextStatus: "approved", previousRole: "partner", nextRole: "partner", accessLevel: "superadmin", actorEmployeeId: objectId(String(req.auth!.employeeId!)), reason: `Configuración protegida actualizada para ${restaurant.name}; comisión definida por PIKI superadmin.` });
   return res.json({ updated: true, restaurant: { ...restaurant, id: String(restaurant._id), partnerCode: restaurant.partnerCode || publicPartnerCode(restaurant._id), commissionRateBps: Number(restaurant.partnerProfile?.commissionRateBps ?? DEFAULT_PARTNER_COMMISSION_BPS), commissionPercent: Number(restaurant.partnerProfile?.commissionRateBps ?? DEFAULT_PARTNER_COMMISSION_BPS) / 100 } });
 });
@@ -2622,6 +2628,8 @@ app.patch("/api/v1/admin/restaurants/:id/customer-name", requireOwner(), async (
     { new: true },
   ).select("_id slug name").lean().exec() as any;
   if (!restaurant) return res.status(404).json({ error: "TARGET_RESTAURANT_NOT_FOUND" });
+  invalidateCatalogCache();
+  void publishCatalogUpdate(restaurant._id, "owner.restaurant.name.updated");
   return res.json({ restaurant: { id: String(restaurant._id), slug: restaurant.slug, name: restaurant.name } });
 });
 
@@ -2659,6 +2667,8 @@ app.patch("/api/v1/admin/restaurants/:id/status", requireRole("admin"), async (r
       notifyOnboarding({ channel: "fleet", type: "onboarding.partner_application.approved", entityId: String(restaurant._id), tenantId: (restaurant as any).tenantId, payload }),
     ]);
   }
+  invalidateCatalogCache();
+  void publishCatalogUpdate(restaurant._id, "owner.restaurant.status.updated");
   return res.json({ restaurant, partnerAccount: partnerAccount ? { id: String(partnerAccount._id), access: parsed.data.status === "approved" ? "enabled" : "disabled" } : null });
 });
 
@@ -2667,6 +2677,8 @@ app.delete("/api/v1/admin/restaurants/:id", requireOwner(), async (req, res) => 
   if (!id) return res.status(400).json({ error: "INVALID_RESTAURANT_ID" });
   const restaurant = await Restaurant.findOneAndUpdate({ _id: id, ...tenantScope(req) }, { $set: { isActive: false, onboardingStatus: "suspended", availabilityStatus: "coming_soon", upcomingMessage: "Archivado por PIKI" } }, { new: true }).select("_id name slug isActive onboardingStatus availabilityStatus").lean().exec() as any;
   if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
+  invalidateCatalogCache();
+  void publishCatalogUpdate(restaurant._id, "owner.restaurant.archived");
   await AccessAuthorization.create({ employeeId: objectId(String(req.auth!.employeeId!)), action: "partner_archived", previousStatus: "approved", nextStatus: "suspended", previousRole: "partner", nextRole: "partner", accessLevel: "superadmin", actorEmployeeId: objectId(String(req.auth!.employeeId!)), reason: `Partner archivado de forma reversible: ${restaurant.name}.` });
   return res.json({ archived: true, restaurant });
 });
@@ -2683,7 +2695,8 @@ app.patch("/api/v1/admin/restaurants/:id/profile", requireOwner(), async (req, r
     { new: true },
   ).select("_id slug name image tagline onboardingStatus isActive").lean().exec() as any;
   if (!restaurant) return res.status(404).json({ error: "APPROVED_RESTAURANT_NOT_FOUND" });
-  catalogCache.clear();
+  invalidateCatalogCache();
+  void publishCatalogUpdate(restaurant._id, "owner.restaurant.profile.updated");
   return res.json({ updated: true, restaurant });
 });
 
@@ -2699,6 +2712,8 @@ app.patch("/api/v1/admin/restaurants/:id/demo-visibility", requireOwner(), async
     { new: true },
   ).select("_id slug name isActive onboardingStatus category cuisine locality menu").lean().exec() as any;
   if (!restaurant) return res.status(404).json({ error: "PIKI_PRUEBA_NOT_FOUND_OR_NOT_APPROVED" });
+  invalidateCatalogCache();
+  void publishCatalogUpdate(restaurant._id, "owner.restaurant.visibility.updated");
   return res.json({ updated: true, restaurant });
 });
 
@@ -2716,6 +2731,8 @@ app.patch("/api/v1/admin/restaurants/:id/commission", requireOwner(), async (req
   if (!parsed.success) return res.status(400).json({ error: "INVALID_PARTNER_COMMISSION", details: parsed.error.flatten() });
   const restaurant = await Restaurant.findOneAndUpdate({ _id: id, ...tenantScope(req) }, { $set: { "partnerProfile.commissionRateBps": parsed.data.commissionRateBps } }, { new: true }).select("_id name slug partnerProfile.commissionRateBps").lean().exec() as any;
   if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
+  invalidateCatalogCache();
+  void publishCatalogUpdate(restaurant._id, "owner.restaurant.commission.updated");
   const commissionRateBps = Number(restaurant.partnerProfile?.commissionRateBps ?? parsed.data.commissionRateBps);
   return res.json({ restaurant: { id: String(restaurant._id), name: restaurant.name, slug: restaurant.slug, commissionRateBps, commissionPercent: commissionRateBps / 100 } });
 });
@@ -2731,6 +2748,8 @@ app.patch("/api/v1/admin/restaurants/:id/configuration", requireOwner(), async (
   if (parsed.data.availabilityStatus === "coming_soon") changes.isActive = false;
   const restaurant = await Restaurant.findOneAndUpdate({ _id: id, ...tenantScope(req) }, { $set: changes }, { new: true, runValidators: true }).select("_id name slug cuisine category locality email phone address deliveryFeeCents promoted availabilityStatus isActive partnerProfile.commissionRateBps").lean().exec() as any;
   if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
+  invalidateCatalogCache();
+  void publishCatalogUpdate(restaurant._id, "owner.restaurant.configuration.updated");
   return res.json({ saved: true, restaurant: { ...restaurant, id: String(restaurant._id), commissionRateBps: Number(restaurant.partnerProfile?.commissionRateBps ?? 0), commissionPercent: Number(restaurant.partnerProfile?.commissionRateBps ?? 0) / 100 } });
 });
 app.get("/api/v1/admin/restaurants/:id/documents", requireRole("admin"), async (req, res) => {
@@ -5276,6 +5295,7 @@ app.post("/api/v1/admin/maintenance/menus/commission-flag", requireRole("admin")
   const value = req.body?.priceIncludesCommission === true;
   const result = await Restaurant.updateMany({}, { $set: { priceIncludesCommission: value } }).exec();
   invalidateCatalogCache();
+  void publishCatalogUpdate(null, "owner.menu.commission_flag.updated");
   return res.json({ priceIncludesCommission: value, matched: result.matchedCount ?? null, modified: result.modifiedCount ?? null });
 });
 app.get("/api/v1/admin/orders", requireRole("admin"), async (req, res) => {
@@ -5359,6 +5379,7 @@ app.post("/api/v1/admin/maintenance/menus/apply-commission", requireRole("admin"
     }
     report.push({ slug: restaurant.slug, skipped: false, items: next.length, first: { before: menu[0]?.price, after: next[0]?.price } });
   }
+  if (!dryRun) void publishCatalogUpdate(null, "owner.menu.commission.updated");
   return res.json({ dryRun, restaurants: report });
 });
 app.put("/api/v1/admin/maintenance/restaurants/:id/menu", requireRole("admin"), async (req, res) => {
@@ -5373,6 +5394,7 @@ app.put("/api/v1/admin/maintenance/restaurants/:id/menu", requireRole("admin"), 
   ).select("_id slug name menu").lean().exec() as any;
   if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND_OR_NOT_APPROVED" });
   invalidateCatalogCache();
+  void publishCatalogUpdate(restaurant._id, "owner.maintenance.menu.updated");
   return res.json({ updated: true, menu: restaurant.menu || [] });
 });
 app.post("/api/v1/admin/maintenance/daily-summary", requireRole("admin"), async (_req, res) => {
