@@ -13,6 +13,7 @@ import mongoose, { Schema } from "mongoose";
 import { EmployeeAccount, Order, Rider, RiderSlot } from "./models.js";
 import { revokeEmployeeSessions } from "./employeeSessions.js";
 import { publishRealtimeEvent } from "./realtime.js";
+import { riderSlotIsCurrent } from "./riderSchedulePolicy.js";
 import { dispatchRequeueIdempotencyKey, enqueueDispatchOutbox } from "./dispatchOutbox.js";
 import {
   CONTRACT_HOURS,
@@ -191,17 +192,67 @@ export type WorkedSlot = {
   startTime: string;
   endTime: string;
   status: string;
+  startedAt?: Date | string | null;
   stoppedAt?: Date | string | null;
+  tenantId?: unknown;
 };
 
-function slotDuration(start: number, end: number): number {
-  return end > start ? end - start : end + 1440 - start;
+const offsetFormatter = new Intl.DateTimeFormat("en-GB", {
+  timeZone: OPERATIONS_TIME_ZONE, timeZoneName: "longOffset",
+});
+
+/** Resuelve límites civiles en Madrid, sin fijar CET ni CEST para todo el año. */
+function localSlotInstant(date: string, minutes: number, boundary: "start" | "end"): number | null {
+  const local = new Date(`${date}T00:00:00Z`).getTime() + minutes * 60_000;
+  if (!Number.isFinite(local)) return null;
+  const targetDate = new Date(local).toISOString().slice(0, 10);
+  const targetTime = new Date(local).toISOString().slice(11, 16);
+  const candidates = new Set<number>();
+  // Incluye los offsets a ambos lados de un cambio horario. En la hora
+  // repetida, el inicio más temprano y el fin más tardío son conservadores.
+  for (const delta of [-86400000, 0, 86400000]) {
+    const offset = offsetFormatter.formatToParts(new Date(local + delta))
+      .find((part) => part.type === "timeZoneName")?.value;
+    const match = /^GMT([+-])(\d{2}):(\d{2})$/.exec(offset || "");
+    if (!match) continue;
+    const offsetMinutes = (match[1] === "+" ? 1 : -1) * (Number(match[2]) * 60 + Number(match[3]));
+    const instant = local - offsetMinutes * 60_000;
+    const clock = operationsClock(new Date(instant));
+    if (clock.date === targetDate && clock.time === targetTime) candidates.add(instant);
+  }
+  if (!candidates.size) return null;
+  return boundary === "start" ? Math.min(...candidates) : Math.max(...candidates);
+}
+
+/** Solo reemplaza la franja; el contrato original se valida antes de usar slots. */
+export function shiftPlanForSweep(
+  plan: RiderShiftPlan,
+  slots: WorkedSlot[],
+  now = new Date(),
+  tenantId?: unknown,
+): RiderShiftPlan {
+  if (!isValidPlan(plan)) return plan;
+  if (!planFitsContract(plan)) return { ...plan, shifts: [] };
+  const clock = operationsClock(now);
+  const current = slots.find((slot) => String(slot.riderId) === plan.riderId
+    && (tenantId === undefined || String(slot.tenantId ?? "") === String(tenantId ?? ""))
+    && ["planned", "active"].includes(slot.status)
+    && riderSlotIsCurrent(slot, clock));
+  if (!current) return plan; // Sin slot vigente se conserva el fallback al plan.
+  return {
+    ...plan,
+    shifts: [{
+      weekday: new Date(`${current.date}T12:00:00Z`).getUTCDay(),
+      start: current.startTime,
+      end: current.endTime,
+    }],
+  };
 }
 
 /**
- * Horas trabajadas esta semana según los turnos realmente iniciados. No se
- * fía de lo que declare el rider: solo cuentan los turnos activos o cerrados,
- * y un turno activo cuenta hasta el minuto actual.
+ * Minutos reales, recortados por slot, semana y ahora. Legacy sin startedAt
+ * conserva explícitamente el inicio programado: no se reconstruyen fichajes.
+ * Un completed sin stoppedAt (caducidad natural/legacy) termina al fin asignado.
  */
 export function workedMinutesFromSlots(
   slots: WorkedSlot[],
@@ -209,29 +260,26 @@ export function workedMinutesFromSlots(
   riderId?: string,
 ): number {
   const clock = operationsClock(now);
-  const start = weekStart(clock.date);
-  const end = addDays(start, 6);
+  const weekDate = weekStart(clock.date);
+  const weekFrom = localSlotInstant(weekDate, 0, "start")!;
+  const weekTo = localSlotInstant(addDays(weekDate, 7), 0, "end")!;
   let total = 0;
   for (const slot of slots) {
     if (riderId && String(slot.riderId) !== riderId) continue;
-    if (!slot.date || slot.date < start || slot.date > end) continue;
+    if (!slot.date || slot.date < addDays(weekDate, -1) || slot.date > addDays(weekDate, 6)) continue;
     if (!["active", "completed"].includes(String(slot.status))) continue;
     const slotStart = toMinutes(slot.startTime);
     const slotEnd = toMinutes(slot.endTime);
-    if (slotStart === null || slotEnd === null) continue;
-    const duration = slotDuration(slotStart, slotEnd);
-    if (slot.status === "active") {
-      // Un turno que sigue abierto cuenta lo transcurrido, nunca más que su
-      // franja: un rider olvidado conectado no infla la nómina de la semana.
-      total += slot.date === clock.date ? Math.max(0, Math.min(duration, clock.minutes - slotStart)) : duration;
-      continue;
-    }
-    if (slot.stoppedAt && slot.date === clock.date) {
-      const stopped = operationsClock(new Date(slot.stoppedAt)).minutes;
-      total += Math.max(0, Math.min(duration, stopped - slotStart));
-      continue;
-    }
-    total += duration;
+    if (slotStart === null || slotEnd === null || slotStart === slotEnd) continue;
+    const scheduledFrom = localSlotInstant(slot.date, slotStart, "start");
+    const scheduledTo = localSlotInstant(slot.date, slotEnd > slotStart ? slotEnd : slotEnd + 1440, "end");
+    if (scheduledFrom === null || scheduledTo === null) continue;
+    const realFrom = slot.startedAt == null ? scheduledFrom : new Date(slot.startedAt).getTime();
+    const realTo = slot.stoppedAt == null ? scheduledTo : new Date(slot.stoppedAt).getTime();
+    if (!Number.isFinite(realFrom) || !Number.isFinite(realTo)) continue;
+    const from = Math.max(scheduledFrom, realFrom, weekFrom);
+    const to = Math.min(scheduledTo, realTo, now.getTime(), weekTo);
+    total += Math.max(0, to - from) / 60_000;
   }
   return Math.round(total);
 }
@@ -241,8 +289,9 @@ export async function computeWorkedMinutesThisWeek(
   now = new Date(),
 ): Promise<Map<string, number>> {
   const clock = operationsClock(now);
-  const start = weekStart(clock.date);
-  const end = addDays(start, 6);
+  const weekDate = weekStart(clock.date);
+  const start = addDays(weekDate, -1); // Cola nocturna del domingo anterior.
+  const end = addDays(weekDate, 6);
   const oids = riderIds.filter((id) => mongoose.isValidObjectId(id)).map((id) => new mongoose.Types.ObjectId(id));
   const result = new Map<string, number>();
   if (!oids.length) return result;
@@ -251,7 +300,7 @@ export async function computeWorkedMinutesThisWeek(
     date: { $gte: start, $lte: end },
     status: { $in: ["active", "completed"] },
   })
-    .select("riderId date startTime endTime status stoppedAt")
+    .select("riderId date startTime endTime status startedAt stoppedAt")
     .lean()
     .exec()) as any[];
   const grouped = new Map<string, WorkedSlot[]>();
@@ -264,6 +313,7 @@ export async function computeWorkedMinutesThisWeek(
       startTime: slot.startTime,
       endTime: slot.endTime,
       status: slot.status,
+      startedAt: slot.startedAt ?? null,
       stoppedAt: slot.stoppedAt ?? null,
     });
     grouped.set(key, list);
@@ -675,6 +725,7 @@ export async function runShiftSweep(options: {
         shifts: (plan.shifts || []).map((shift: any) => ({ weekday: Number(shift.weekday), start: String(shift.start), end: String(shift.end) })),
         timezoneOffsetMinutes: Number(plan.timezoneOffsetMinutes ?? 60),
       } as RiderShiftPlan,
+      tenantId: plan.tenantId ?? null,
     }));
 
   const workedByRider = await computeWorkedMinutesThisWeek(riders.map((rider) => rider.riderId), now);
@@ -700,23 +751,32 @@ export async function runShiftSweep(options: {
   // se le corte nada cada cinco minutos.
   const activeRiderIds = new Set<string>();
   const planRiderIds = riders.map((rider) => rider.riderId).filter((riderId) => mongoose.isValidObjectId(riderId));
+  let sweepSlots: WorkedSlot[] = [];
   if (planRiderIds.length) {
     const planObjectIds = planRiderIds.map((riderId) => new mongoose.Types.ObjectId(riderId));
-    const [riderDocs, openSlots] = await Promise.all([
+    const clock = operationsClock(now);
+    const [riderDocs, slotDocs] = await Promise.all([
       Rider.find({ _id: { $in: planObjectIds } }).select("_id status activeOrderId").lean().exec() as Promise<any[]>,
-      RiderSlot.find({ riderId: { $in: planObjectIds }, status: "active" }).select("riderId").lean().exec() as Promise<any[]>,
+      RiderSlot.find({
+        riderId: { $in: planObjectIds },
+        $or: [
+          { status: "active" },
+          { status: "planned", date: { $in: [clock.date, addDays(clock.date, -1)] } },
+        ],
+      }).select("riderId tenantId date startTime endTime status").lean().exec() as Promise<any[]>,
     ]);
+    sweepSlots = slotDocs.map((slot) => ({ ...slot, riderId: String(slot.riderId) }));
     for (const doc of riderDocs) {
       if (String(doc.status || "") !== "offline" || doc.activeOrderId) activeRiderIds.add(String(doc._id));
     }
-    for (const slot of openSlots) activeRiderIds.add(String(slot.riderId));
+    for (const slot of sweepSlots) if (slot.status === "active") activeRiderIds.add(slot.riderId);
   }
 
   const result = planSweep({
     now,
     riders: riders.filter((rider) => activeRiderIds.has(rider.riderId)).map((rider) => ({
       riderId: rider.riderId,
-      plan: rider.plan,
+      plan: shiftPlanForSweep(rider.plan, sweepSlots, now, rider.tenantId),
       workedMinutesThisWeek: workedByRider.get(rider.riderId) ?? 0,
     })),
     // Los pedidos ya en ruta los resuelve la pasada de "en ruta abandonado".

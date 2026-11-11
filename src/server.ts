@@ -6235,7 +6235,21 @@ if (!slot) {
       serverClock: now,
     });
   }
-  const updatedSlot = await RiderSlot.findOneAndUpdate({ _id: currentSlot._id, status: { $in: ["planned", "active"] } }, { $set: { status: "active" } }, { new: true }).lean().exec();
+  // Solo la transición planned -> active fija el fichaje. Reintentos activos
+  // conservan startedAt; un slot legacy activo no recibe un inicio inventado.
+  const updatedSlot = await RiderSlot.findOneAndUpdate(
+    { _id: currentSlot._id, riderId, status: { $in: ["planned", "active"] } },
+    [{ $set: {
+      startedAt: { $cond: [
+        { $eq: ["$status", "planned"] },
+        { $ifNull: ["$startedAt", new Date(now.iso)] },
+        { $ifNull: ["$startedAt", null] },
+      ] },
+      status: "active",
+    } }],
+    { new: true },
+  ).lean().exec();
+  if (!updatedSlot) return res.status(409).json({ error: "SHIFT_OUTSIDE_SCHEDULE", serverClock: now });
   await trackRiderShiftStart(updatedSlot || currentSlot, rider).catch((error) => console.error("Rider incentive shift tracking start failed", error instanceof Error ? error.message : error));
   const hasOrders = await Order.exists({ riderId, status: { $nin: ["delivered", "cancelled"] }, assignmentState: { $in: ["offered", "assigned"] } });
   const status = hasOrders ? "busy" : "available";
@@ -6252,8 +6266,11 @@ app.post("/api/v1/riders/:id/shift/stop", requireRole("admin", "rider", "fleet")
   const activeSlot = slot || await RiderSlot.findOne({ riderId, ...tenantScope(req), date: { $in: [now.date, previousCalendarDate(now.date)] }, status: "active" }).sort({ date: -1, startTime: -1 }).lean().exec();
   if (activeSlot) {
     const completedAt = new Date();
-    await RiderSlot.updateOne({ _id: (activeSlot as any)._id }, { $set: { status: "completed" } }).exec();
-    await completeRiderShiftIncentiveTracking(activeSlot, completedAt).catch((error) => console.error("Rider hourly guarantee settlement failed", error instanceof Error ? error.message : error));
+    const closed = await RiderSlot.updateOne(
+      { _id: (activeSlot as any)._id, riderId, status: "active" },
+      { $set: { status: "completed", stoppedAt: completedAt, stoppedReason: "rider_stopped" } },
+    ).exec();
+    if (closed.modifiedCount) await completeRiderShiftIncentiveTracking(activeSlot, completedAt).catch((error) => console.error("Rider hourly guarantee settlement failed", error instanceof Error ? error.message : error));
   }
   const rider = await Rider.findByIdAndUpdate(riderId, { $set: { status: "offline", activeOrderId: null } }, { new: true }).lean().exec() as any;
   if (!rider) return res.status(404).json({ error: "RIDER_NOT_FOUND" });
