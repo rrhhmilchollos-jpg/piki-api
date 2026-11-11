@@ -200,7 +200,7 @@ function restaurantView(row: any) {
       category: item.category || "Carta",
       image: item.image || item.imageUrl || item.photoUrl || "",
       requestOnly: Boolean(item.requestOnly),
-      allergens: Array.isArray(item.allergens) ? item.allergens : [],
+      allergens: Array.isArray(item.allergens) ? item.allergens : null,
       vegetarian: Boolean(item.vegetarian),
       popular: Boolean(item.popular),
       modifierGroups: modifierGroupsForItem(item, useReferenceFallback),

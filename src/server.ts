@@ -1,3 +1,4 @@
+import { pendingPartnerDraft } from "./partnerDrafts.js";
 import { nativeReleasePolicy } from "./nativeReleasePolicy.js";
 import { registerEmployeeDeletionRoutes } from "./employeeDeletion.js";
 import { dispatchVehicleInputForOrder } from "./dispatchVehiclePolicy.js";
@@ -68,6 +69,7 @@ import { calculateMarketplaceBreakdown, DEFAULT_PARTNER_COMMISSION_BPS } from ".
 import { postMarketplaceOrderLedger, preparePartnerPayoutBatch } from "./marketplaceLedger.js";
 import { extractAndParseMenu, readAssetBytes } from "./menuImport.js";
 import { canonicalRestaurantMenu, normalizePartnerMenuItems, partnerMenuItemsSchema } from "./menuContract.js";
+import { registerControlledMenuImportRoutes } from "./menuSafeImport.js";
 import { publishCatalogUpdate, serveCatalogEvents, startCatalogRelay } from "./catalogRealtime.js";
 import { purgeTestDataIfEnabled } from "./purgeTestData.js";
 import { validateDocumentRequestSubmission } from "./onboardingDocumentPolicy.js";
@@ -1980,12 +1982,13 @@ app.post("/api/v1/partners/menu/assets", requireRole("partner"), async (req, res
     if (error instanceof MalwareScannerUnavailableError) return res.status(503).json({ error: "MALWARE_SCANNER_UNAVAILABLE", message: "La subida queda temporalmente bloqueada hasta que el analizador antivirus esté disponible." });
     return res.status(503).json({ error: "MALWARE_SCANNER_ERROR", message: "No se ha podido completar el análisis antivirus." });
   }
-  const restaurant = await Restaurant.findById(restaurantId).select("locality partnerGroupKey").lean().exec() as any;
+  const restaurant = await Restaurant.findOne({ _id: objectId(restaurantId), ...tenantScope(req), onboardingStatus: "approved" }).select("tenantId locality partnerGroupKey").lean().exec() as any;
   if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
+  if (!objectId(String(restaurant.tenantId || ""))) return res.status(409).json({ error: "RESTAURANT_TENANT_REQUIRED" });
   const locality = restaurant.locality || "Sin localidad";
-  const asset = await PartnerAsset.create({ restaurantId: objectId(restaurantId), organizationKey: restaurantId, folderKey: organizationFolder(locality, restaurantId), locality, kind: parsed.data.kind, fileName: safeAssetFileName(parsed.data.fileName), mimeType: parsed.data.mimeType, sizeBytes: bytes.length, sha256: digest, contentBase64: rawBase64, scanStatus: "clean", scanEngine: "ClamAV", scannedAt: new Date() });
+  const asset = await PartnerAsset.create({ tenantId: restaurant.tenantId, restaurantId: objectId(restaurantId), organizationKey: restaurantId, folderKey: organizationFolder(locality, restaurantId), locality, kind: parsed.data.kind, fileName: safeAssetFileName(parsed.data.fileName), mimeType: parsed.data.mimeType, sizeBytes: bytes.length, sha256: digest, contentBase64: rawBase64, scanStatus: "clean", scanEngine: "ClamAV", scannedAt: new Date() });
   const groupKey = localityKey(locality);
-  await PartnerLocalityGroup.findOneAndUpdate({ localityKey: groupKey }, { $set: { localityName: locality, province: "Valencia", isActive: true }, $addToSet: { restaurantIds: objectId(restaurantId) } }, { upsert: true, new: true });
+  await PartnerLocalityGroup.findOneAndUpdate({ ...buildTenantScope(restaurant.tenantId), localityKey: groupKey }, { $set: { localityName: locality, province: "Valencia", isActive: true }, $addToSet: { restaurantIds: objectId(restaurantId) } }, { upsert: true, new: true });
   return res.status(201).json({ asset: assetResponse(asset) });
 });
 function menuImportResponse(draft: any) {
@@ -2284,9 +2287,26 @@ app.put("/api/v1/partners/menu", requireRole("partner"), async (req, res) => {
 app.get("/api/v1/admin/restaurants/:id/menu", requireOwner(), async (req, res) => {
   const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
   if (!id) return res.status(400).json({ error: "INVALID_RESTAURANT_ID" });
-  const restaurant = await Restaurant.findOne({ _id: id, onboardingStatus: "approved" }).select("_id slug name menu").lean().exec() as any;
+  const restaurant = await Restaurant.findOne({ _id: id, ...tenantScope(req), onboardingStatus: "approved" }).select("_id slug name menu").lean().exec() as any;
   if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND_OR_NOT_APPROVED" });
   return res.json({ restaurant, menu: restaurant.menu || [] });
+});
+
+registerControlledMenuImportRoutes(app, {
+  requireOwner,
+  isRootOwner: hasExplicitPlatformSuperadminScope,
+  tenantScope,
+  objectId,
+  // Native collection is intentional: no casting/stripping of retained legacy.
+  restaurants: Restaurant.collection,
+  assets: PartnerAsset.collection,
+  startSession: () => mongoose.startSession(),
+  publicAssetUrl,
+  imageMimeTypes: MENU_IMAGE_MIME_TYPES,
+  afterApply: (id) => {
+    invalidateCatalogCache();
+    void publishCatalogUpdate(id, "owner.menu.import.applied").catch(() => console.warn("Catalog update notification failed"));
+  },
 });
 
 app.put("/api/v1/admin/restaurants/:id/menu", requireOwner(), async (req, res) => {
@@ -2295,7 +2315,7 @@ app.put("/api/v1/admin/restaurants/:id/menu", requireOwner(), async (req, res) =
   const parsed = z.object({ items: partnerMenuItemsSchema }).safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_MENU", details: parsed.error.flatten() });
   const restaurant = await Restaurant.findOneAndUpdate(
-    { _id: id, onboardingStatus: "approved" },
+    { _id: id, ...tenantScope(req), onboardingStatus: "approved" },
     { $set: { menu: parsed.data.items } },
     { new: true },
   ).select("_id slug name menu").lean().exec() as any;
@@ -2538,7 +2558,9 @@ app.post("/api/v1/admin/restaurants", requireOwner(), async (req, res) => {
   const baseSlug = parsed.data.name.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "") || "partner";
   const slug = `${baseSlug}-${Date.now().toString(36)}`;
   try {
-    const restaurant = await Restaurant.create({ ...parsed.data, slug, tenantId: (req.auth as any)?.tenantId || null, onboardingStatus: "pending_review", isActive: false, availabilityStatus: "coming_soon", partnerProfile: { commissionRateBps: parsed.data.commissionRateBps } });
+    const actorTenantId = String(req.auth?.tenantId || "");
+    if (!objectId(actorTenantId)) return res.status(409).json({ error: "TENANT_CONTEXT_REQUIRED" });
+    const restaurant = await Restaurant.create(pendingPartnerDraft(parsed.data, slug, actorTenantId));
     await ensurePartnerOperationalLocation(restaurant.toObject());
     await AccessAuthorization.create({ employeeId: objectId(String(req.auth!.employeeId!)), action: "partner_created", previousStatus: null, nextStatus: "pending_review", previousRole: null, nextRole: "partner", accessLevel: "superadmin", actorEmployeeId: objectId(String(req.auth!.employeeId!)), reason: `Partner creado por superadmin: ${restaurant.name}.` });
     return res.status(201).json({ created: true, restaurant: { ...restaurant.toObject(), id: String(restaurant._id), partnerCode: publicPartnerCode(restaurant._id), commissionRateBps: parsed.data.commissionRateBps, commissionPercent: parsed.data.commissionRateBps / 100 } });

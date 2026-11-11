@@ -12,7 +12,7 @@ export type ImportedMenuItem = {
   price: number;
   category: string;
   image: string;
-  allergens: string[];
+  allergens: string[] | null;
   modifiers: [];
   available: boolean;
   vegetarian: boolean;
@@ -68,7 +68,7 @@ export function parseMenuText(text: string): { items: ImportedMenuItem[]; warnin
       price: Math.round(price * 100) / 100,
       category,
       image: "",
-      allergens: [],
+      allergens: null,
       modifiers: [],
       available: true,
       vegetarian: false,

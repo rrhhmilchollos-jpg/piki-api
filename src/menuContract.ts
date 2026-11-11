@@ -34,7 +34,8 @@ export const partnerMenuItemSchema = z.object({
   price: z.number().min(0).max(1000),
   category: z.string().max(100).default("General"),
   image: z.string().max(1200).refine((value) => value === "" || value.startsWith("https://api.pikidelivery.com/api/v1/catalog/assets/"), "La imagen debe proceder del almacenamiento de PIKI").default(""),
-  allergens: z.array(z.string().max(80)).max(30).default([]),
+  // null/omission means unknown; [] is an explicit declaration, never a fallback.
+  allergens: z.array(z.string().max(80)).max(30).nullable().default(null),
   modifiers: z.array(menuModifierSchema).max(20).default([]),
   available: z.boolean().default(true),
   vegetarian: z.boolean().default(false),

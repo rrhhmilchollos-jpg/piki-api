@@ -21,7 +21,7 @@ const tenantMembershipSchema = new Schema({
 tenantMembershipSchema.index({ tenantId: 1, employeeId: 1 }, { unique: true });
 const geoPoint = new Schema({ type: { type: String, enum: ["Point"], default: "Point" }, coordinates: { type: [Number], default: [0, 0] } }, { _id: false });
 const menuModifier = new Schema({ id: { type: String, required: true }, name: { type: String, required: true }, description: { type: String, default: "" }, price: { type: Number, required: true, min: 0, default: 0 }, required: { type: Boolean, default: false }, minSelections: { type: Number, min: 0, default: 0 }, maxSelections: { type: Number, min: 1, default: 1 }, options: { type: [Schema.Types.Mixed], default: [] } }, { _id: false });
-const menuItem = new Schema({ id: { type: String, required: true }, name: { type: String, required: true }, description: { type: String, default: "" }, price: { type: Number, required: true, min: 0 }, category: { type: String, default: "General" }, image: { type: String, default: "" }, allergens: { type: [String], default: [] }, modifiers: { type: [menuModifier], default: [] }, available: { type: Boolean, default: true }, vegetarian: { type: Boolean, default: false }, popular: { type: Boolean, default: false } }, { _id: false });
+const menuItem = new Schema({ id: { type: String, required: true }, name: { type: String, required: true }, description: { type: String, default: "" }, price: { type: Number, required: true, min: 0 }, category: { type: String, default: "General" }, image: { type: String, default: "" }, allergens: { type: [String], default: null }, modifiers: { type: [menuModifier], default: [] }, available: { type: Boolean, default: true }, vegetarian: { type: Boolean, default: false }, popular: { type: Boolean, default: false } }, { _id: false });
 const partnerAssetSchema = new Schema({
   tenantId: { type: Schema.Types.ObjectId, ref: "Tenant", default: null, index: true },
   restaurantId: { type: Schema.Types.ObjectId, ref: "Restaurant", required: true, index: true },
@@ -432,6 +432,7 @@ zoneSchema.index({ polygon: "2dsphere" });
 export type RestaurantDocument = InferSchemaType<typeof restaurantSchema>;
 export const Tenant = mongoose.models.Tenant || mongoose.model("Tenant", tenantSchema);
 export const TenantMembership = mongoose.models.TenantMembership || mongoose.model("TenantMembership", tenantMembershipSchema);
+restaurantSchema.add({ draftCommissionRateBps: { type: Number, min: 0, max: 5000 } });
 export const Restaurant = mongoose.models.Restaurant || mongoose.model("Restaurant", restaurantSchema);
 export const PartnerAsset = mongoose.models.PartnerAsset || mongoose.model("PartnerAsset", partnerAssetSchema);
 export const PartnerLocalityGroup = mongoose.models.PartnerLocalityGroup || mongoose.model("PartnerLocalityGroup", partnerLocalityGroupSchema);

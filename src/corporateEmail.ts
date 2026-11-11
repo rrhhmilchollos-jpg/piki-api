@@ -39,6 +39,9 @@ export async function verifyCorporateEmailConnection(): Promise<{ provider: stri
 export function escapeCorporateHtml(value: string) {
   return value.replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c] || c);
 }
+export function corporateRecipientAccepted(accepted: ReadonlyArray<string | { address: string; name?: string }>, recipient: string): boolean {
+  return accepted.some(value => (typeof value === "string" ? value : value.address).toLowerCase() === recipient.toLowerCase());
+}
 async function saveCorporateSentCopy(mailOptions: SendMailOptions) {
   if (process.env.SMTP_IMAP_SAVE_SENT !== "true") return false;
   const imap = new ImapFlow({
@@ -80,7 +83,7 @@ export async function sendCorporateEmail(input: CorporateEmail): Promise<Corpora
       const result = await transport.sendMail(mailOptions);
       const smtpResult = { provider: "smtp", recipient: input.recipientEmail, from, department: input.department || "support", port, secure: port === 465, messageId: result.messageId, envelope: result.envelope, accepted: result.accepted, rejected: result.rejected, response: result.response };
       console.info("Corporate SMTP delivery response", smtpResult);
-      if (!(result.accepted || []).some((address: string) => String(address).toLowerCase() === input.recipientEmail.toLowerCase())) return { sent: false, error: "CORPORATE_EMAIL_RECIPIENT_REJECTED" };
+      if (!corporateRecipientAccepted(result.accepted || [], input.recipientEmail)) return { sent: false, error: "CORPORATE_EMAIL_RECIPIENT_REJECTED" };
       let sentCopySaved = false;
       try { sentCopySaved = await saveCorporateSentCopy(mailOptions); }
       catch (error) { console.warn("Corporate IMAP sent copy unavailable", { code: (error as { code?: string }).code || "IMAP_ARCHIVE_FAILED", message: error instanceof Error ? error.message : "unknown" }); }
