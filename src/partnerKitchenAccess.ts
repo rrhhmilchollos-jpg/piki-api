@@ -41,6 +41,14 @@ export type KitchenAccessDependencies = {
   startSession: () => Promise<Session>;
   sendActivation: (employee: any) => Promise<{ sent: boolean; error?: string }>;
 };
+/** Runtime authorization needs only persisted reads, never setup/mail/transactions. */
+export type KitchenBindingDependencies = {
+  ownerEmail: string;
+  objectId: (id: string) => unknown;
+  restaurants: Pick<Collection, "findOne">;
+  tenants: Pick<Collection, "findOne">;
+  memberships: { find(filter: any, options?: any): { toArray(): Promise<any[]> } };
+};
 const kitchenPermissions = ["orders:read", "orders:prepare"];
 const fail = (code: string, status = 409): never => { throw new KitchenAccessError(status, code); };
 const exactValues = (values: unknown, expected: string[]) => Array.isArray(values)
@@ -62,7 +70,7 @@ function assertRestaurant(restaurant: any, tenantId: unknown, email: string) {
 /** Runtime and activation re-read the real relationship. Membership scopes are
  * persisted coherently, not used as a substitute for the employee's permissions.
  */
-export async function kitchenBindingForEmployee(employee: any, deps: KitchenAccessDependencies, session?: Session) {
+export async function kitchenBindingForEmployee(employee: any, deps: KitchenBindingDependencies, session?: Session) {
   if (!employee || employee.kitchenAccessSetupVersion !== 1 || !isObjectIdLike(employee._id)
     || !isObjectIdLike(employee.tenantId) || !isObjectIdLike(employee.restaurantId)
     || !exactValues(employee.restaurantIds, [String(employee.restaurantId)])

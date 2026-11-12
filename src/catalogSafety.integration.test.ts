@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import mongoose from "mongoose";
-import { CustomerAccount, EmployeeAccount, Order, Restaurant } from "./models.js";
+import { CustomerAccount, EmployeeAccount, Order, Restaurant, Tenant, TenantMembership } from "./models.js";
+import { EmployeeSession } from "./employeeSessions.js";
+import { hashSessionToken } from "./employeeAuth.js";
 import { handleCustomerTrpc } from "./customerCompat.js";
 import { COMING_SOON_SLUGS, CUSTOMER_ORDERABLE_RESTAURANT_FILTER, customerCommissionRate } from "./customerCatalogPolicy.js";
 import { searchLocalities } from "./localities.js";
@@ -55,7 +57,13 @@ test("contratos de catálogo y carta con handlers reales, consultas en memoria y
   let stored = fixture();
   let filters: any[] = [];
   let projections: string[] = [];
-  let employee: any = { _id: employeeId, tenantId, restaurantId, apiRole: "partner", partnerRoles: ["partner_admin"] };
+  let employee: any = { _id: employeeId, tenantId, restaurantId, apiRole: "partner", jobRole: "partner", roles: ["partner"], partnerRoles: ["partner_admin"], active: true, authorizationStatus: "approved", mustChangePassword: false };
+  const bearer = "OFFLINE_CATALOG_PARTNER_SESSION";
+  t.mock.method(EmployeeSession as any, "findOne", (filter: any) => query(filter.tokenHash === hashSessionToken(bearer) ? { employeeId, tenantId, role: "partner", surface: "partner", issuedAt: new Date(Date.now() - 60_000), expiresAt: new Date(Date.now() + 60_000) } : null));
+  t.mock.method(EmployeeAccount as any, "findOne", (filter: any) => query(matches(employee, filter) ? employee : null));
+  t.mock.method(Tenant.collection as any, "findOne", async (filter: any) => String(filter._id) === tenantId && filter.status === "active" ? { _id: tenantId, status: "active" } : null);
+  t.mock.method(TenantMembership.collection as any, "find", () => ({ toArray: async () => [] }));
+  t.mock.method(Restaurant.collection as any, "findOne", async (filter: any) => matches(stored, filter) ? structuredClone(stored) : null);
   let writes: any[] = [];
   t.mock.method(Restaurant as any, "find", (filter: any) => {
     filters.push(filter);
@@ -89,7 +97,7 @@ test("contratos de catálogo y carta con handlers reales, consultas en memoria y
     stored.menuRevision = (stored.menuRevision ?? 0) + 1;
     return query(structuredClone(stored));
   });
-  const menuRequest = (body: any = {}, params: any = {}, role = "partner", requested = restaurantId): any => ({ body, params, auth: { role, tenantId, employeeId }, header: (name: string) => name === "x-piki-restaurant-id" ? requested : undefined });
+  const menuRequest = (body: any = {}, params: any = {}, role = "partner", requested = restaurantId): any => ({ body, params, auth: { role, tenantId, employeeId }, header: (name: string) => name === "x-piki-restaurant-id" ? requested : name === "authorization" ? `Bearer ${bearer}` : undefined });
   const call = async (method: string, path: string, req: any) => { const res = response(); await handler(method, path)(req, res); return res; };
 
   for (const flag of [false, true]) for (const explicit of [undefined, 1800]) await t.test(`REST + tRPC + quote: final=${flag}, perfil=${explicit ?? "legacy20"}`, async () => {
@@ -295,7 +303,7 @@ test("contratos de catálogo y carta con handlers reales, consultas en memoria y
     employee.partnerRoles = ["partner_admin"]; employee.apiRole = "partner";
     assert.equal((await call("patch", path, menuRequest({ available: false }, params, "partner", "64b000000000000000000009"))).statusCode, 403);
     const wrongTenant = menuRequest({ available: false }, params); wrongTenant.auth.tenantId = "64b000000000000000000009";
-    assert.equal((await call("patch", path, wrongTenant)).statusCode, 404);
+    assert.equal((await call("patch", path, wrongTenant)).statusCode, 403, "fresh session rejects the changed request tenant before resource lookup");
     const noAuth = response();
     await route("patch", path).stack[0].handle({ path, header: () => undefined } as any, noAuth, () => { throw new Error("UNAUTHENTICATED_ACCESS"); });
     assert.equal(noAuth.statusCode, 401);

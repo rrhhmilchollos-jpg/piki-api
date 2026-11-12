@@ -1,7 +1,7 @@
 import type { Request } from "express";
 import { isObjectIdLike } from "./tenantScope.js";
 import { canReceivePartnerLocations, partnerRolesForEmployee, permissionsForPartnerRoles } from "./partnerAccess.js";
-import { KitchenAccessError, kitchenBindingForEmployee, type KitchenAccessDependencies } from "./partnerKitchenAccess.js";
+import { KitchenAccessError, kitchenBindingForEmployee, type KitchenAccessDependencies, type KitchenBindingDependencies } from "./partnerKitchenAccess.js";
 
 export class PartnerBindingError extends Error {
   constructor(public status: number, public code: string) { super(code); }
@@ -25,8 +25,20 @@ function assertRestaurant(restaurant: any, tenant: unknown) {
     || !["official_partner", "restaurant"].includes(restaurant.listingType) || restaurant.internalDemo === true) fail("PARTNER_RESTAURANT_SETUP_INVALID");
 }
 
+/** Reuse the existing versioned/optional-legacy membership contract at runtime. */
+export function partnerMembershipForEmployee(employee: any, memberships: any[], ids: string[]) {
+  const matching = memberships.filter((row: any) => same(row.tenantId, employee.tenantId));
+  const membership = matching[0];
+  if (employee.partnerBindingVersion === 1) {
+    if (matching.length !== 1 || membership.status !== "active" || !sameSet(membership.restaurantIds, ids)) fail("PARTNER_MEMBERSHIP_BINDING_REQUIRED");
+  } else if (matching.length > 1 || (membership && (membership.status !== "active" || (membership.restaurantIds?.length && !sameSet(membership.restaurantIds, ids))))) {
+    fail("PARTNER_MEMBERSHIP_BINDING_REQUIRED");
+  }
+  return membership;
+}
+
 /** No lookup by email and no mutation: all credential paths use the persisted relationship. */
-export async function partnerBindingForEmployee(employee: any, deps: KitchenAccessDependencies) {
+export async function partnerBindingForEmployee(employee: any, deps: KitchenBindingDependencies) {
   if (employee?.kitchenAccessSetupVersion === 1) {
     const binding = await kitchenBindingForEmployee(employee, deps);
     return { restaurants: [binding.restaurant], membership: binding.membership };
@@ -41,13 +53,7 @@ export async function partnerBindingForEmployee(employee: any, deps: KitchenAcce
   ]);
   if (!tenant) fail("PARTNER_TENANT_NOT_ACTIVE");
   restaurants.forEach((row) => assertRestaurant(row, employee.tenantId));
-  const matching = memberships.filter((row: any) => same(row.tenantId, employee.tenantId));
-  const membership = matching[0];
-  if (employee.partnerBindingVersion === 1) {
-    if (matching.length !== 1 || membership.status !== "active" || !sameSet(membership.restaurantIds, ids)) fail("PARTNER_MEMBERSHIP_BINDING_REQUIRED");
-  } else if (matching.length > 1 || (membership && (membership.status !== "active" || (membership.restaurantIds?.length && !sameSet(membership.restaurantIds, ids))))) {
-    fail("PARTNER_MEMBERSHIP_BINDING_REQUIRED");
-  }
+  const membership = partnerMembershipForEmployee(employee, memberships, ids);
   // Operational permissions come from the unchanged role resolver, not membership role.
   const permissions = [...permissionsForPartnerRoles(partnerRolesForEmployee(employee))];
   if (!permissions.length) fail("PARTNER_ROLES_REQUIRED");
