@@ -11,6 +11,7 @@ import { operationalZoneInputSchema } from "./coverage/zoneInput.js";
 import { stripeClient } from "./stripePayments.js";
 import { registerRootFleetZoneRepairRoutes } from "./rootFleetZoneRepair.js";
 import { registerRootFleetServiceZonesRoutes } from "./rootFleetServiceZones.js";
+import { registerOwnerOperatingTenantRoutes } from "./ownerOperatingTenant.js";
 import { mountGeofenceRoutes } from "./geofenceRoutes.js";
 import { planWeek, weekStartOf } from "./glovoShiftPlanner.js";
 import { calculatePayroll, payrollGap } from "./payroll.js";
@@ -59,7 +60,7 @@ import { corporateEmailConfiguration, corporateEmailDepartmentForRole, escapeCor
 import { activeOperationalOrderStatuses, dispatchableOrderStatuses, dispatchablePaymentFilter, isDispatchableOrderStatus, isDispatchablePayment } from "./dispatchEligibility.js";
 import { canReceivePartnerLocations, partnerCan, partnerPermissions, partnerRolesForEmployee, permissionsForPartnerRoles, type PartnerPermission } from "./partnerAccess.js";
 import { KitchenAccessError, kitchenBindingForEmployee, registerPartnerKitchenAccessRoutes, validateKitchenActivation, type KitchenAccessDependencies } from "./partnerKitchenAccess.js";
-import { assignedRestaurantIds, partnerAccessForRequest as sharedPartnerAccessForRequest, partnerRequestAccess as sharedPartnerRequestAccess } from "./partnerOperationalAccess.js";
+import { assignedRestaurantIds, partnerAccessForRequest as sharedPartnerAccessForRequest, partnerRequestAccess as sharedPartnerRequestAccess, partnerReadinessReason, requirePartnerSurface } from "./partnerOperationalAccess.js";
 import { awardRiderRecruitmentMilestones, claimRiderReferralCode, completeRiderShiftIncentiveTracking, incentiveProgramStatus, loadRiderIncentiveSnapshot, trackRiderLocationForIncentive, trackRiderShiftStart } from "./riderIncentives.js";
 import { buildApprovedRiderOperationalProfile } from "./riderApproval.js";
 import { COMING_SOON_SLUGS, CUSTOMER_CATALOG_RESTAURANT_FILTER, CUSTOMER_ORDERABLE_RESTAURANT_FILTER, GOLDEN_FOUNDER_SLUGS, customerCommissionRate, customerMenuForRestaurant, presentCustomerCatalogRestaurant, restaurantIsWithinOpeningHours } from "./customerCatalogPolicy.js";
@@ -78,6 +79,7 @@ import { postMarketplaceOrderLedger, preparePartnerPayoutBatch } from "./marketp
 import { extractAndParseMenu, readAssetBytes } from "./menuImport.js";
 import { canonicalRestaurantMenu, normalizePartnerMenuItems, partnerMenuItemsSchema } from "./menuContract.js";
 import { registerControlledMenuImportRoutes } from "./menuSafeImport.js";
+import { registerOwnerDraftMenuAssetRoutes } from "./ownerDraftMenuAssets.js";
 import { registerPublicPartnerInformationRoute } from "./publicPartnerInformation.js";
 import { currentMenuRevision, menuAvailabilitySchema, menuRevisionFilter, menuWriteSchema } from "./menuRevision.js";
 import { searchLocalities } from "./localities.js";
@@ -1226,12 +1228,15 @@ app.post("/api/v1/auth/employee/logout", requireRole("admin", "partner", "rider"
 });
 app.get("/api/v1/auth/employee/me", requireRole("admin", "partner", "rider", "fleet", "commercial", "gerente_comercial_zona", "finance", "support"), async (req, res) => {
   const employee = req.auth?.employeeId ? await EmployeeAccount.findOne({ _id: req.auth.employeeId, ...tenantScope(req) }).select("name email employeeCode tenantId ownerProtected accessLevel authorizationStatus jobRole apiRole roles partnerRoles primaryRole zoneSlugs restaurantId restaurantIds kitchenAccessSetupVersion fleetId").lean().exec() as any : null;
-  const roles = partnerRolesForEmployee(employee);
-  const permissions = [...permissionsForPartnerRoles(roles)];
-  const locations = employee ? await partnerLocationsFor(employee, roles, permissions) : [];
+  const access = ["admin", "partner"].includes(req.auth?.role || "") ? await partnerAccessForRequest(req) : null;
+  const roles = access?.roles || partnerRolesForEmployee(employee);
+  const permissions = access?.permissions || [...permissionsForPartnerRoles(roles)];
+  const locations = access ? await partnerLocationsFor(access.employee, roles, permissions, access)
+    : req.auth?.role === "partner" || req.auth?.role === "admin" ? [] : employee ? await partnerLocationsFor(employee, roles, permissions) : [];
+  res.setHeader?.("Cache-Control", "no-store");
   const employeeFleet = employee?.fleetId ? await Fleet.findById(employee.fleetId).select("name managerName managerEmployeeId city").lean().exec() as any : null;
   const fleetManager = employeeFleet?.managerEmployeeId ? await EmployeeAccount.findById(employeeFleet.managerEmployeeId).select("name email").lean().exec() as any : null;
-  return res.json({ employee: { id: req.auth?.employeeId, employeeCode: employee?.employeeCode || (req.auth?.employeeId ? employeeCodeFor(req.auth.employeeId) : null), name: employee?.name || null, email: employee?.email || null, role: req.auth?.role, accessLevel: employee?.accessLevel || "subadmin", authorizationStatus: employee?.authorizationStatus || "approved", ownerProtected: Boolean(employee?.ownerProtected), jobRole: employee?.jobRole || null, apiRole: employee?.apiRole || req.auth?.role || null, roles, permissions, primaryRole: employee?.primaryRole || employee?.apiRole || req.auth?.role, zoneSlugs: employee?.zoneSlugs || [], locations, fleetId: employee?.fleetId ? String(employee.fleetId) : null, fleetName: employeeFleet?.name || null, fleetCity: employeeFleet?.city || null, fleetManagerName: fleetManager?.name || employeeFleet?.managerName || null, isFleetManager: Boolean(employee?.fleetId && employeeFleet?.managerEmployeeId && String(employeeFleet.managerEmployeeId) === String(employee?._id)), mustChangePassword: Boolean(req.auth?.mustChangePassword) } });
+  return res.json({ employee: { id: req.auth?.employeeId, employeeCode: employee?.employeeCode || (req.auth?.employeeId ? employeeCodeFor(req.auth.employeeId) : null), name: employee?.name || null, email: employee?.email || null, tenantId: access?.tenantId || (employee?.tenantId ? String(employee.tenantId) : null), restaurantIds: access?.restaurantIds || [], role: req.auth?.role, accessLevel: employee?.accessLevel || "subadmin", authorizationStatus: employee?.authorizationStatus || "approved", ownerProtected: Boolean(employee?.ownerProtected), jobRole: employee?.jobRole || null, apiRole: employee?.apiRole || req.auth?.role || null, roles, permissions, primaryRole: employee?.primaryRole || employee?.apiRole || req.auth?.role, zoneSlugs: employee?.zoneSlugs || [], locations, fleetId: employee?.fleetId ? String(employee.fleetId) : null, fleetName: employeeFleet?.name || null, fleetCity: employeeFleet?.city || null, fleetManagerName: fleetManager?.name || employeeFleet?.managerName || null, isFleetManager: Boolean(employee?.fleetId && employeeFleet?.managerEmployeeId && String(employeeFleet.managerEmployeeId) === String(employee?._id)), mustChangePassword: Boolean(req.auth?.mustChangePassword) } });
 });
 app.post("/api/v1/auth/employee/change-password", requireRole("admin", "partner", "rider", "fleet", "commercial", "gerente_comercial_zona", "finance", "support"), async (req, res) => {
   const parsed = z.object({ currentPassword: z.string().min(8), newPassword: z.string().min(12).max(200).regex(/[A-Z]/).regex(/[a-z]/).regex(/[0-9]/) }).safeParse(req.body);
@@ -1303,6 +1308,17 @@ const kitchenAccessDependencies: KitchenAccessDependencies = {
   sendActivation: async (employee) => (await sendEmployeePasswordLink(employee, "partner", "activation")).delivery,
 };
 registerPartnerKitchenAccessRoutes(app, kitchenAccessDependencies);
+registerOwnerOperatingTenantRoutes(app, {
+  requireOwner, resolveAuth: resolveRole, objectId,
+  employees: EmployeeAccount.collection, tenants: Tenant.collection,
+  memberships: TenantMembership.collection, restaurants: Restaurant.collection,
+  fleets: Fleet.collection, riders: Rider.collection, orders: Order.collection, sessions: EmployeeSession.collection,
+  startSession: () => mongoose.startSession(),
+  createMembership: async (row, session) => (await TenantMembership.create([row], { session }))[0].toObject(),
+  createSession: async (row, session) => (await EmployeeSession.create([row], { session }))[0].toObject(),
+  createAuthorization: async (row, session) => AccessAuthorization.create([row], { session }),
+  createAudit: async (row, session) => GovernanceAuditEvent.create([row], { session }),
+});
 const onboardingRequestSchema = z.object({
   requestType: z.enum(["partner", "fleet", "rider"]),
   payload: z.record(z.string(), z.unknown()).refine((value) => Object.keys(value).length > 0, "payload_required"),
@@ -1964,40 +1980,54 @@ app.post("/api/v1/admin/partners/manual", requireOwner(), async (req, res) => {
   });
 });
 
-async function partnerLocationsFor(employee: any, roles = partnerRolesForEmployee(employee), permissions = [...permissionsForPartnerRoles(roles)]) {
-  const ids = assignedRestaurantIds(employee);
+async function partnerLocationsFor(employee: any, roles = partnerRolesForEmployee(employee), permissions = [...permissionsForPartnerRoles(roles)], access?: Awaited<ReturnType<typeof partnerAccessForRequest>>) {
+  const ids = access?.restaurantIds || assignedRestaurantIds(employee);
   if (!employee?.tenantId) return [];
   // The Owner kitchen contract never discovers a location from email.
   if (employee.kitchenAccessSetupVersion === 1 && (ids.length !== 1 || String(employee.restaurantId) !== ids[0] || employee.restaurantIds?.length !== 1)) return [];
   const tenantFilter = { tenantId: employee.tenantId };
   let restaurants = ids.length
-    ? await Restaurant.find({ _id: { $in: ids }, ...tenantFilter }).select("_id name cuisine category locality address email phone deliveryFeeCents promoted availabilityStatus isActive onboardingStatus partnerProfile.commissionRateBps").lean().exec() as any[]
+    ? await Restaurant.find({ _id: { $in: ids }, ...tenantFilter }).select("_id tenantId name cuisine category locality address email phone deliveryFeeCents promoted availabilityStatus isActive onboardingStatus partnerProfile.commissionRateBps").lean().exec() as any[]
     : [];
   if (!restaurants.length) return [];
   const byId = new Map(restaurants.map((restaurant) => [String(restaurant._id), restaurant]));
   const ordered = ids.length ? ids.map((id) => byId.get(id)).filter(Boolean) : restaurants;
-  return ordered.map((restaurant: any) => ({
-    id: String(restaurant._id),
-    partnerCode: onboardingCode("P", restaurant._id),
-    name: restaurant.name,
-    cuisine: restaurant.cuisine || "",
-    category: restaurant.category || "",
-    locality: restaurant.locality || "",
-    address: restaurant.address || "",
-    email: restaurant.email || "",
-    phone: restaurant.phone || "",
-    deliveryFeeCents: Number(restaurant.deliveryFeeCents || 0),
-    commissionRateBps: Number(restaurant.partnerProfile?.commissionRateBps ?? 0),
-    promoted: Boolean(restaurant.promoted),
-    availabilityStatus: restaurant.availabilityStatus || "available",
-    isOpen: Boolean(restaurant.isActive && restaurant.onboardingStatus === "approved"),
-    roles,
-    permissions,
-  }));
+  return ordered.map((restaurant: any) => {
+    const bound = access?.kitchenRestaurant || access?.bindingRestaurants?.find((row) => String(row._id) === String(restaurant._id));
+    const reason = bound ? partnerReadinessReason(bound) : restaurant.onboardingStatus !== "approved" ? "not_approved" : restaurant.isActive ? "open" : "paused";
+    const readOnly = Boolean(access?.ownerPortfolio && reason !== "open");
+    return {
+      id: String(restaurant._id),
+      tenantId: String(employee.tenantId),
+      partnerCode: onboardingCode("P", restaurant._id),
+      name: restaurant.name,
+      cuisine: restaurant.cuisine || "",
+      category: restaurant.category || "",
+      locality: restaurant.locality || "",
+      address: restaurant.address || "",
+      email: restaurant.email || "",
+      phone: restaurant.phone || "",
+      deliveryFeeCents: Number(restaurant.deliveryFeeCents || 0),
+      commissionRateBps: Number(restaurant.partnerProfile?.commissionRateBps ?? 0),
+      promoted: Boolean(restaurant.promoted),
+      availabilityStatus: restaurant.availabilityStatus || "available",
+      isOpen: Boolean(restaurant.isActive && restaurant.onboardingStatus === "approved" && reason === "open"),
+      ordersEnabled: reason === "open",
+      reason,
+      readOnly,
+      roles,
+      permissions: readOnly ? ["menu:read"] : permissions,
+    };
+  });
 }
 
 async function partnerAccessForRequest(req: express.Request) {
   return sharedPartnerAccessForRequest(req);
+}
+
+// Root-admin privileges never remove the private tenant of the Partner surface.
+function partnerTenantScope(req: express.Request) {
+  return buildTenantScope(req.auth?.tenantId);
 }
 
 async function employeeRestaurant(req: express.Request, access?: Awaited<ReturnType<typeof partnerAccessForRequest>>) {
@@ -2049,14 +2079,16 @@ app.get("/api/v1/catalog/assets/:id", async (req, res) => {
   res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
   return res.send(Buffer.from(asset.contentBase64, "base64"));
 });
-app.get("/api/v1/partners/menu/assets", requireRole("partner"), async (req, res) => {
+app.get("/api/v1/partners/menu/assets", requirePartnerSurface(), async (req, res) => {
   const restaurantId = await employeeRestaurant(req);
   if (!restaurantId) return res.status(403).json({ error: "PARTNER_RESTAURANT_NOT_ASSIGNED" });
   const assets = await PartnerAsset.find({ restaurantId: objectId(restaurantId), kind: { $in: MENU_ASSET_KINDS }, scanStatus: "clean" }).sort({ createdAt: -1 }).limit(100).lean().exec();
   return res.json({ assets: assets.map(assetResponse) });
 });
-app.post("/api/v1/partners/menu/assets", requireRole("partner"), async (req, res) => {
-  const restaurantId = await employeeRestaurant(req);
+app.post("/api/v1/partners/menu/assets", requirePartnerSurface(), async (req, res) => {
+  const { access, allowed } = await partnerRequestAccess(req, "menu:write");
+  if (!allowed) return res.status(403).json({ error: "PARTNER_PERMISSION_DENIED", permission: "menu:write" });
+  const restaurantId = await employeeRestaurant(req, access);
   if (!restaurantId) return res.status(403).json({ error: "PARTNER_RESTAURANT_NOT_ASSIGNED" });
   const parsed = z.object({ fileName: z.string().min(1).max(180), mimeType: z.enum(MENU_ASSET_MIME_TYPES), sizeBytes: z.number().int().positive().max(MAX_MENU_FILE_BYTES), sha256: z.string().regex(/^[a-f0-9]{64}$/i), contentBase64: z.string().min(1).max(5_800_000), kind: z.enum(MENU_ASSET_KINDS).default("menu_image") }).safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_MENU_ASSET", maxImageBytes: MAX_MENU_IMAGE_BYTES, maxFileBytes: MAX_MENU_FILE_BYTES, allowedTypes: MENU_ASSET_MIME_TYPES, details: parsed.error.flatten() });
@@ -2079,7 +2111,7 @@ app.post("/api/v1/partners/menu/assets", requireRole("partner"), async (req, res
     if (error instanceof MalwareScannerUnavailableError) return res.status(503).json({ error: "MALWARE_SCANNER_UNAVAILABLE", message: "La subida queda temporalmente bloqueada hasta que el analizador antivirus esté disponible." });
     return res.status(503).json({ error: "MALWARE_SCANNER_ERROR", message: "No se ha podido completar el análisis antivirus." });
   }
-  const restaurant = await Restaurant.findOne({ _id: objectId(restaurantId), ...tenantScope(req), onboardingStatus: "approved" }).select("tenantId locality partnerGroupKey").lean().exec() as any;
+  const restaurant = await Restaurant.findOne({ _id: objectId(restaurantId), ...partnerTenantScope(req), onboardingStatus: "approved" }).select("tenantId locality partnerGroupKey").lean().exec() as any;
   if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
   if (!objectId(String(restaurant.tenantId || ""))) return res.status(409).json({ error: "RESTAURANT_TENANT_REQUIRED" });
   const locality = restaurant.locality || "Sin localidad";
@@ -2104,7 +2136,7 @@ function menuImportResponse(draft: any) {
   };
 }
 const importedMenuItemsSchema = partnerMenuItemsSchema;
-app.post("/api/v1/partners/menu/imports", requireRole("partner"), async (req, res) => {
+app.post("/api/v1/partners/menu/imports", requirePartnerSurface(), async (req, res) => {
   const { access, allowed } = await partnerRequestAccess(req, "menu:write");
   if (!allowed) return res.status(403).json({ error: "PARTNER_PERMISSION_DENIED", permission: "menu:write" });
   const restaurantId = await employeeRestaurant(req, access);
@@ -2124,7 +2156,7 @@ app.post("/api/v1/partners/menu/imports", requireRole("partner"), async (req, re
     return res.status(422).json({ error: "MENU_EXTRACTION_FAILED", message: "No se ha podido extraer texto de la carta. Comprueba que el PDF sea legible o que el OCR esté disponible." });
   }
 });
-app.get("/api/v1/partners/menu/imports/:id", requireRole("partner"), async (req, res) => {
+app.get("/api/v1/partners/menu/imports/:id", requirePartnerSurface(), async (req, res) => {
   const { access, allowed } = await partnerRequestAccess(req, "menu:read");
   if (!allowed) return res.status(403).json({ error: "PARTNER_PERMISSION_DENIED", permission: "menu:read" });
   const restaurantId = await employeeRestaurant(req, access);
@@ -2134,7 +2166,7 @@ app.get("/api/v1/partners/menu/imports/:id", requireRole("partner"), async (req,
   if (!draft) return res.status(404).json({ error: "MENU_IMPORT_NOT_FOUND" });
   return res.json({ draft: menuImportResponse(draft) });
 });
-app.put("/api/v1/partners/menu/imports/:id", requireRole("partner"), async (req, res) => {
+app.put("/api/v1/partners/menu/imports/:id", requirePartnerSurface(), async (req, res) => {
   const { access, allowed } = await partnerRequestAccess(req, "menu:write");
   if (!allowed) return res.status(403).json({ error: "PARTNER_PERMISSION_DENIED", permission: "menu:write" });
   const restaurantId = await employeeRestaurant(req, access);
@@ -2145,7 +2177,7 @@ app.put("/api/v1/partners/menu/imports/:id", requireRole("partner"), async (req,
   if (!draft) return res.status(404).json({ error: "MENU_IMPORT_NOT_FOUND_OR_CLOSED" });
   return res.json({ draft: menuImportResponse(draft) });
 });
-app.post("/api/v1/partners/menu/imports/:id/publish", requireRole("partner"), async (req, res) => {
+app.post("/api/v1/partners/menu/imports/:id/publish", requirePartnerSurface(), async (req, res) => {
   const { access, allowed } = await partnerRequestAccess(req, "menu:write");
   if (!allowed) return res.status(403).json({ error: "PARTNER_PERMISSION_DENIED", permission: "menu:write" });
   const restaurantId = await employeeRestaurant(req, access);
@@ -2159,7 +2191,7 @@ app.post("/api/v1/partners/menu/imports/:id/publish", requireRole("partner"), as
     let restaurant: any = null;
     let published: any = null;
     await session.withTransaction(async () => {
-      restaurant = await Restaurant.findOneAndUpdate({ _id: objectId(restaurantId), ...tenantScope(req), onboardingStatus: "approved" }, { $set: { menu: normalizePartnerMenuItems(draft.items) }, $inc: { menuRevision: 1 } }, { new: true, session }).select("name menu menuRevision").lean().exec() as any;
+      restaurant = await Restaurant.findOneAndUpdate({ _id: objectId(restaurantId), ...partnerTenantScope(req), onboardingStatus: "approved" }, { $set: { menu: normalizePartnerMenuItems(draft.items) }, $inc: { menuRevision: 1 } }, { new: true, session }).select("name menu menuRevision").lean().exec() as any;
       if (!restaurant) throw new Error("RESTAURANT_NOT_APPROVED");
       published = await MenuImportDraft.findOneAndUpdate({ _id: id, restaurantId: objectId(restaurantId), status: "draft" }, { $set: { status: "published", publishedAt: new Date(), reviewedBy: objectId(String(req.auth?.employeeId || "")) } }, { new: true, session }).lean().exec();
       if (!published) throw new Error("MENU_IMPORT_NOT_FOUND_OR_CLOSED");
@@ -2177,8 +2209,10 @@ app.post("/api/v1/partners/menu/imports/:id/publish", requireRole("partner"), as
     await session.endSession();
   }
 });
-app.delete("/api/v1/partners/menu/assets/:id", requireRole("partner"), async (req, res) => {
-  const restaurantId = await employeeRestaurant(req);
+app.delete("/api/v1/partners/menu/assets/:id", requirePartnerSurface(), async (req, res) => {
+  const { access, allowed } = await partnerRequestAccess(req, "menu:write");
+  if (!allowed) return res.status(403).json({ error: "PARTNER_PERMISSION_DENIED", permission: "menu:write" });
+  const restaurantId = await employeeRestaurant(req, access);
   const assetId = objectId(String(req.params.id));
   if (!restaurantId) return res.status(403).json({ error: "PARTNER_RESTAURANT_NOT_ASSIGNED" });
   if (!assetId) return res.status(400).json({ error: "INVALID_ASSET_ID" });
@@ -2190,31 +2224,33 @@ app.delete("/api/v1/partners/menu/assets/:id", requireRole("partner"), async (re
   return res.status(204).send();
 });
 app.get("/api/v1/admin/partner-groups/locality", requireRole("admin"), async (_req, res) => res.json({ groups: await PartnerLocalityGroup.find({ isActive: true }).sort({ localityName: 1 }).lean().exec() }));
-app.get("/api/v1/partners/locations", requireRole("partner"), async (req, res) => {
+app.get("/api/v1/partners/locations", requirePartnerSurface(), async (req, res) => {
   const access = await partnerAccessForRequest(req);
-  return res.json({ locations: access ? await partnerLocationsFor(access.employee, access.roles, access.permissions) : [] });
+  res.setHeader("Cache-Control", "no-store");
+  return res.json({ locations: access ? await partnerLocationsFor(access.employee, access.roles, access.permissions, access) : [] });
 });
-app.get("/api/v1/partners/profile", requireRole("partner"), async (req, res) => {
+app.get("/api/v1/partners/profile", requirePartnerSurface(), async (req, res) => {
   const access = await partnerAccessForRequest(req);
   if (!access || !partnerCan(access.roles, "store:write")) return res.status(403).json({ error: "PARTNER_PERMISSION_DENIED", permission: "store:write" });
   const restaurantId = await employeeRestaurant(req, access);
   if (!restaurantId) return res.status(403).json({ error: "PARTNER_RESTAURANT_NOT_ASSIGNED" });
-  const restaurant = await Restaurant.findOne({ _id: objectId(restaurantId), ...tenantScope(req) }).select("_id partnerCode name email phone address locality cuisine category deliveryFeeCents promoted availabilityStatus isActive partnerProfile.commissionRateBps").lean().exec() as any;
+  const restaurant = await Restaurant.findOne({ _id: objectId(restaurantId), ...partnerTenantScope(req) }).select("_id partnerCode name email phone address locality cuisine category deliveryFeeCents promoted availabilityStatus isActive partnerProfile.commissionRateBps").lean().exec() as any;
   if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
-  return res.json({ profile: { id: String(restaurant._id), partnerCode: restaurant.partnerCode || publicPartnerCode(restaurant._id), name: restaurant.name, email: restaurant.email, phone: restaurant.phone, address: restaurant.address, locality: restaurant.locality, cuisine: restaurant.cuisine, category: restaurant.category, deliveryFeeCents: Number(restaurant.deliveryFeeCents || 0), promoted: Boolean(restaurant.promoted), availabilityStatus: restaurant.availabilityStatus, isOpen: Boolean(restaurant.isActive), commissionRateBps: Math.round(customerCommissionRate(restaurant) * 10_000), commissionPercent: Number(restaurant.partnerProfile?.commissionRateBps ?? DEFAULT_PARTNER_COMMISSION_BPS) / 100 } });
+  const reason = access.ownerPortfolio ? partnerReadinessReason(access.bindingRestaurants?.find((row) => String(row._id) === restaurantId)) : undefined;
+  return res.json({ profile: { id: String(restaurant._id), partnerCode: restaurant.partnerCode || publicPartnerCode(restaurant._id), name: restaurant.name, email: restaurant.email, phone: restaurant.phone, address: restaurant.address, locality: restaurant.locality, cuisine: restaurant.cuisine, category: restaurant.category, deliveryFeeCents: Number(restaurant.deliveryFeeCents || 0), promoted: Boolean(restaurant.promoted), availabilityStatus: restaurant.availabilityStatus, isOpen: Boolean(restaurant.isActive && (!access.ownerPortfolio || reason === "open")), ...(access.ownerPortfolio ? { reason, ordersEnabled: reason === "open", readOnly: reason !== "open" } : {}), commissionRateBps: Math.round(customerCommissionRate(restaurant) * 10_000), commissionPercent: Number(restaurant.partnerProfile?.commissionRateBps ?? DEFAULT_PARTNER_COMMISSION_BPS) / 100 } });
 });
-app.patch("/api/v1/partners/profile", requireRole("partner"), async (req, res) => {
-  const access = await partnerAccessForRequest(req);
-  if (!access || !partnerCan(access.roles, "store:write")) return res.status(403).json({ error: "PARTNER_PERMISSION_DENIED", permission: "store:write" });
+app.patch("/api/v1/partners/profile", requirePartnerSurface(), async (req, res) => {
+  const { access, allowed } = await partnerRequestAccess(req, "store:write");
+  if (!access || !allowed) return res.status(403).json({ error: "PARTNER_PERMISSION_DENIED", permission: "store:write" });
   const restaurantId = await employeeRestaurant(req, access);
   const parsed = partnerBasicProfileSchema.safeParse(req.body);
   if (!restaurantId || !parsed.success || !Object.keys(parsed.data).length) return res.status(400).json({ error: "INVALID_PARTNER_PROFILE", details: parsed.success ? undefined : parsed.error.flatten() });
-  const scope = { _id: objectId(restaurantId), ...tenantScope(req) };
+  const scope = { _id: objectId(restaurantId), ...partnerTenantScope(req) };
   const restaurant = await Restaurant.findOne(scope).select("_id partnerCode name email phone address locality cuisine category deliveryFeeCents promoted availabilityStatus isActive partnerProfile.commissionRateBps").lean().exec() as any;
   if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
   const email = parsed.data.email?.trim().toLowerCase();
   if (email && email !== String(restaurant.email || "").toLowerCase() && await EmployeeAccount.exists({ email, _id: { $ne: access.employee._id } })) return res.status(409).json({ error: "EMAIL_ALREADY_IN_USE" });
-  if (email) await EmployeeAccount.updateOne({ _id: access.employee._id, ...tenantScope(req) }, { $set: { email } }).exec();
+  if (email && !access.ownerPortfolio) await EmployeeAccount.updateOne({ _id: access.employee._id, ...partnerTenantScope(req) }, { $set: { email } }).exec();
   const update: Record<string, unknown> = {
     ...(parsed.data.name !== undefined ? { name: parsed.data.name } : {}),
     ...(email ? { email } : {}),
@@ -2231,25 +2267,25 @@ app.patch("/api/v1/partners/profile", requireRole("partner"), async (req, res) =
   await recordGovernanceEvent({ actor: { employeeId: access.employee._id, role: "partner", tenantId: (req.auth as any)?.tenantId }, action: "partner_basic_profile_updated", targetType: "restaurant", targetId: restaurant._id, before: { name: restaurant.name, email: restaurant.email, phone: restaurant.phone, address: restaurant.address, locality: restaurant.locality, cuisine: restaurant.cuisine, category: restaurant.category }, after: { name: updated.name, email: updated.email, phone: updated.phone, address: updated.address, locality: updated.locality, cuisine: updated.cuisine, category: updated.category }, reason: "El Partner actualizó sus datos básicos del establecimiento; sin acceso a comisión, tarifa, promoción ni estado comercial." });
   return res.json({ updated: true, profile: { id: String(updated._id), partnerCode: updated.partnerCode || publicPartnerCode(updated._id), name: updated.name, email: updated.email, phone: updated.phone, address: updated.address, locality: updated.locality, cuisine: updated.cuisine, category: updated.category, deliveryFeeCents: Number(updated.deliveryFeeCents || 0), promoted: Boolean(updated.promoted), availabilityStatus: updated.availabilityStatus, isOpen: Boolean(updated.isActive), commissionRateBps: Number(updated.partnerProfile?.commissionRateBps ?? DEFAULT_PARTNER_COMMISSION_BPS), commissionPercent: Number(updated.partnerProfile?.commissionRateBps ?? DEFAULT_PARTNER_COMMISSION_BPS) / 100 } });
 });
-app.patch("/api/v1/partners/store/status", requireRole("partner"), async (req, res) => {
+app.patch("/api/v1/partners/store/status", requirePartnerSurface(), async (req, res) => {
   const { access, allowed } = await partnerRequestAccess(req, "store:write");
   if (!allowed) return res.status(403).json({ error: "PARTNER_PERMISSION_DENIED", permission: "store:write" });
   const restaurantId = await employeeRestaurant(req, access);
   if (!restaurantId) return res.status(403).json({ error: access?.restaurantIds.length ? "PARTNER_RESTAURANT_ACCESS_DENIED" : "PARTNER_RESTAURANT_NOT_ASSIGNED" });
   const parsed = z.object({ status: z.enum(["open", "paused"]) }).safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_STORE_STATUS" });
-  const restaurant = await Restaurant.findOneAndUpdate({ _id: restaurantId, onboardingStatus: "approved" }, { $set: { isActive: parsed.data.status === "open" } }, { new: true }).select("_id name isActive").lean().exec() as any;
+  const restaurant = await Restaurant.findOneAndUpdate({ _id: restaurantId, onboardingStatus: "approved", ...partnerTenantScope(req) }, { $set: { isActive: parsed.data.status === "open" } }, { new: true }).select("_id name isActive").lean().exec() as any;
   if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
   invalidateCatalogCache();
   void publishCatalogUpdate(restaurant._id, "partner.store.status.updated");
   return res.json({ restaurant: { id: String(restaurant._id), name: restaurant.name }, status: restaurant.isActive ? "open" : "paused", isOpen: Boolean(restaurant.isActive) });
 });
-app.get("/api/v1/partners/store/profile", requireRole("partner"), async (req, res) => {
+app.get("/api/v1/partners/store/profile", requirePartnerSurface(), async (req, res) => {
   const { access, allowed } = await partnerRequestAccess(req, "orders:read");
   if (!allowed) return res.status(403).json({ error: "PARTNER_PERMISSION_DENIED", permission: "orders:read" });
   const restaurantId = await employeeRestaurant(req, access);
   if (!restaurantId) return res.status(403).json({ error: "PARTNER_RESTAURANT_NOT_ASSIGNED" });
-  const restaurant = await Restaurant.findOne({ _id: restaurantId, onboardingStatus: "approved", ...tenantScope(req) }).select("_id name slug cuisine category locality email phone address deliveryFeeCents promoted availabilityStatus isActive partnerProfile.commissionRateBps").lean().exec() as any;
+  const restaurant = await Restaurant.findOne({ _id: restaurantId, onboardingStatus: "approved", ...partnerTenantScope(req) }).select("_id name slug cuisine category locality email phone address deliveryFeeCents promoted availabilityStatus isActive partnerProfile.commissionRateBps").lean().exec() as any;
   if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
   return res.json({ restaurant: { ...restaurant, id: String(restaurant._id), commissionRateBps: Number(restaurant.partnerProfile?.commissionRateBps || 0) } });
 });
@@ -2263,16 +2299,16 @@ function pikiManagedOpeningHours(value: unknown) {
 // Partner dashboard aligned instead of reporting a legacy saved schedule as
 // closed while the store is active.
 function partnerIsOpenNow(restaurant: any) { return Boolean(restaurant?.isActive); }
-app.get("/api/v1/partners/store/hours", requireRole("partner"), async (req, res) => {
+app.get("/api/v1/partners/store/hours", requirePartnerSurface(), async (req, res) => {
   const { access, allowed } = await partnerRequestAccess(req, "store:write");
   if (!allowed) return res.status(403).json({ error: "PARTNER_PERMISSION_DENIED", permission: "store:write" });
   const restaurantId = await employeeRestaurant(req, access);
   if (!restaurantId) return res.status(403).json({ error: "PARTNER_RESTAURANT_NOT_ASSIGNED" });
-  const restaurant = await Restaurant.findOne({ _id: restaurantId, onboardingStatus: "approved", ...tenantScope(req) }).select("_id name isActive partnerProfile.openingHours").lean().exec() as any;
+  const restaurant = await Restaurant.findOne({ _id: restaurantId, onboardingStatus: "approved", ...partnerTenantScope(req) }).select("_id name isActive partnerProfile.openingHours").lean().exec() as any;
   if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
   return res.json({ restaurantId: String(restaurant._id), name: restaurant.name, isOpen: partnerIsOpenNow(restaurant), paused: !restaurant.isActive, openingHours: restaurant.partnerProfile?.openingHours || {} });
 });
-app.patch("/api/v1/partners/store/hours", requireRole("partner"), async (req, res) => {
+app.patch("/api/v1/partners/store/hours", requirePartnerSurface(), async (req, res) => {
   const { access, allowed } = await partnerRequestAccess(req, "store:write");
   if (!allowed) return res.status(403).json({ error: "PARTNER_PERMISSION_DENIED", permission: "store:write" });
   const restaurantId = await employeeRestaurant(req, access);
@@ -2280,22 +2316,22 @@ app.patch("/api/v1/partners/store/hours", requireRole("partner"), async (req, re
   if (!restaurantId) return res.status(403).json({ error: "PARTNER_RESTAURANT_NOT_ASSIGNED" });
   if (!parsed.success) return res.status(400).json({ error: "INVALID_OPENING_HOURS", details: parsed.error.flatten() });
   const openingHours = pikiManagedOpeningHours(parsed.data);
-  const restaurant = await Restaurant.findOneAndUpdate({ _id: restaurantId, onboardingStatus: "approved", ...tenantScope(req) }, { $set: { "partnerProfile.openingHours": openingHours } }, { new: true }).select("_id name isActive partnerProfile.openingHours").lean().exec() as any;
+  const restaurant = await Restaurant.findOneAndUpdate({ _id: restaurantId, onboardingStatus: "approved", ...partnerTenantScope(req) }, { $set: { "partnerProfile.openingHours": openingHours } }, { new: true }).select("_id name isActive partnerProfile.openingHours").lean().exec() as any;
   if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
   invalidateCatalogCache();
   void publishCatalogUpdate(restaurant._id, "partner.store.hours.updated");
   return res.json({ restaurantId: String(restaurant._id), name: restaurant.name, isOpen: partnerIsOpenNow(restaurant), paused: !restaurant.isActive, openingHours: restaurant.partnerProfile?.openingHours || openingHours });
 });
-app.get("/api/v1/partners/google-business/status", requireRole("partner"), async (req, res) => {
+app.get("/api/v1/partners/google-business/status", requirePartnerSurface(), async (req, res) => {
   const { access, allowed } = await partnerRequestAccess(req, "store:write");
   if (!allowed) return res.status(403).json({ error: "PARTNER_PERMISSION_DENIED", permission: "store:write" });
   const restaurantId = await employeeRestaurant(req, access); if (!restaurantId) return res.status(403).json({ error: "PARTNER_RESTAURANT_NOT_ASSIGNED" });
-  const connection = await GoogleBusinessConnection.findOne({ restaurantId: objectId(restaurantId), ...tenantScope(req) }).select("restaurantId googleAccountName googleLocationName googleLocationTitle status scopes lastSyncAt lastSyncStatus lastSyncError lastGoogleUpdatedAt").lean().exec() as any;
+  const connection = await GoogleBusinessConnection.findOne({ restaurantId: objectId(restaurantId), ...partnerTenantScope(req) }).select("restaurantId googleAccountName googleLocationName googleLocationTitle status scopes lastSyncAt lastSyncStatus lastSyncError lastGoogleUpdatedAt").lean().exec() as any;
   const configuration = googleBusinessConfiguration();
   const syncSettings = googleBusinessSyncSettings();
   return res.json({ configured: configuration.configured, configuration: { enabled: syncSettings.enabled, missing: configuration.missing, syncCadenceMinutes: syncSettings.cadenceMinutes }, scopes: googleBusinessScopes(), connected: Boolean(connection), connection: connection ? { ...connection, restaurantId: String(connection.restaurantId) } : null });
 });
-app.get("/api/v1/partners/google-business/connect", requireRole("partner"), async (req, res) => {
+app.get("/api/v1/partners/google-business/connect", requirePartnerSurface(), async (req, res) => {
   const { access, allowed } = await partnerRequestAccess(req, "store:write");
   if (!allowed) return res.status(403).json({ error: "PARTNER_PERMISSION_DENIED", permission: "store:write" });
   if (!googleBusinessConfigured()) return res.status(503).json({ error: "GOOGLE_BUSINESS_NOT_CONFIGURED", message: "Faltan las credenciales OAuth de Google Business Profile." });
@@ -2304,16 +2340,16 @@ app.get("/api/v1/partners/google-business/connect", requireRole("partner"), asyn
   await GoogleOauthState.create({ stateHash: createHash("sha256").update(rawState).digest("hex"), restaurantId: objectId(restaurantId), employeeId: access.employee._id, tenantId: (req.auth as any)?.tenantId || null, expiresAt: new Date(Date.now() + 10 * 60_000) });
   return res.json({ authorizationUrl: googleAuthorizationUrl(rawState) });
 });
-app.get("/api/v1/partners/google-business/locations", requireRole("partner"), async (req, res) => {
+app.get("/api/v1/partners/google-business/locations", requirePartnerSurface(), async (req, res) => {
   const { access, allowed } = await partnerRequestAccess(req, "store:write"); if (!allowed) return res.status(403).json({ error: "PARTNER_PERMISSION_DENIED", permission: "store:write" });
   const restaurantId = await employeeRestaurant(req, access); if (!restaurantId) return res.status(403).json({ error: "PARTNER_RESTAURANT_NOT_ASSIGNED" });
-  const connection = await GoogleBusinessConnection.findOne({ restaurantId: objectId(restaurantId), ...tenantScope(req) }).select("+accessTokenEncrypted +refreshTokenEncrypted googleAccountName googleLocationName").exec() as any; if (!connection) return res.status(409).json({ error: "GOOGLE_NOT_CONNECTED" });
+  const connection = await GoogleBusinessConnection.findOne({ restaurantId: objectId(restaurantId), ...partnerTenantScope(req) }).select("+accessTokenEncrypted +refreshTokenEncrypted googleAccountName googleLocationName").exec() as any; if (!connection) return res.status(409).json({ error: "GOOGLE_NOT_CONNECTED" });
   try { const accounts = await listGoogleAccounts(connection); const locations = (await Promise.all(accounts.map(async (account: any) => (await listGoogleLocations(connection, String(account.name))).map((location: any) => ({ ...location, accountName: account.name }))))).flat(); return res.json({ accounts, locations }); } catch (error) { return res.status(502).json({ error: "GOOGLE_LOCATIONS_FAILED", message: error instanceof Error ? error.message : "GOOGLE_LOCATIONS_FAILED" }); }
 });
-app.patch("/api/v1/partners/google-business/location", requireRole("partner"), async (req, res) => {
+app.patch("/api/v1/partners/google-business/location", requirePartnerSurface(), async (req, res) => {
   const { access, allowed } = await partnerRequestAccess(req, "store:write"); if (!allowed) return res.status(403).json({ error: "PARTNER_PERMISSION_DENIED", permission: "store:write" });
   const restaurantId = await employeeRestaurant(req, access); const parsed = z.object({ accountName: z.string().regex(/^accounts\/[^/]+$/), locationName: z.string().regex(/^locations\/[^/]+$/), title: z.string().trim().max(200).optional() }).safeParse(req.body); if (!restaurantId || !parsed.success) return res.status(400).json({ error: "INVALID_GOOGLE_LOCATION" });
-  const connection = await GoogleBusinessConnection.findOne({ restaurantId: objectId(restaurantId), ...tenantScope(req) }).select("+accessTokenEncrypted +refreshTokenEncrypted").exec() as any; if (!connection) return res.status(409).json({ error: "GOOGLE_NOT_CONNECTED" });
+  const connection = await GoogleBusinessConnection.findOne({ restaurantId: objectId(restaurantId), ...partnerTenantScope(req) }).select("+accessTokenEncrypted +refreshTokenEncrypted").exec() as any; if (!connection) return res.status(409).json({ error: "GOOGLE_NOT_CONNECTED" });
   try {
     const locations = await listGoogleLocations(connection, parsed.data.accountName);
     if (!locations.some((location: any) => String(location?.name || "") === parsed.data.locationName)) return res.status(403).json({ error: "GOOGLE_LOCATION_NOT_IN_ACCOUNT" });
@@ -2340,39 +2376,39 @@ app.get("/api/v1/partners/google-business/callback", async (req, res) => {
     const target = String(process.env.PARTNER_GOOGLE_SUCCESS_URL || "https://partners.pikidelivery.com/?google=connected"); return res.redirect(target);
   } catch (error) { console.error("Google Business OAuth callback failed", error instanceof Error ? error.message : error); return res.redirect(`${process.env.PARTNER_GOOGLE_ERROR_URL || "https://partners.pikidelivery.com/?google=error"}&reason=oauth_failed`); }
 });
-app.post("/api/v1/partners/google-business/sync", requireRole("partner"), async (req, res) => {
+app.post("/api/v1/partners/google-business/sync", requirePartnerSurface(), async (req, res) => {
   const { access, allowed } = await partnerRequestAccess(req, "store:write"); if (!allowed) return res.status(403).json({ error: "PARTNER_PERMISSION_DENIED", permission: "store:write" });
   if (!googleBusinessConfigured()) return res.status(503).json({ error: "GOOGLE_BUSINESS_NOT_CONFIGURED", configuration: googleBusinessConfiguration() });
   const restaurantId = await employeeRestaurant(req, access); if (!restaurantId) return res.status(403).json({ error: "PARTNER_RESTAURANT_NOT_ASSIGNED" });
-  const connection = await GoogleBusinessConnection.findOne({ restaurantId: objectId(restaurantId), ...tenantScope(req) }).select("+accessTokenEncrypted +refreshTokenEncrypted").exec() as any; if (!connection?.googleLocationName) return res.status(409).json({ error: "GOOGLE_LOCATION_NOT_SELECTED", message: "Selecciona primero la ubicación de Google Business Profile." });
+  const connection = await GoogleBusinessConnection.findOne({ restaurantId: objectId(restaurantId), ...partnerTenantScope(req) }).select("+accessTokenEncrypted +refreshTokenEncrypted").exec() as any; if (!connection?.googleLocationName) return res.status(409).json({ error: "GOOGLE_LOCATION_NOT_SELECTED", message: "Selecciona primero la ubicación de Google Business Profile." });
   // A signed-in Partner's manual import is the explicit conflict-resolution
   // action that switches the source back to Google. The background worker
   // still refuses to overwrite schedules whose source remains `piki`.
-  try { const restaurant = await Restaurant.findOne({ _id: objectId(restaurantId), ...tenantScope(req) }).select("partnerProfile.openingHours").lean().exec() as any; const googleLocation = await readGoogleLocation(connection, connection.googleLocationName); const hours = fromGoogleLocationHours(googleLocation, restaurant?.partnerProfile?.openingHours); const changed = googleBusinessHoursChanged(restaurant?.partnerProfile?.openingHours, hours); const writeResult = await Restaurant.updateOne({ _id: objectId(restaurantId), ...tenantScope(req) }, { $set: { "partnerProfile.openingHours": hours } }); if (changed && writeResult.modifiedCount > 0) await publishCatalogUpdate(restaurantId, "restaurant.opening_hours.google_sync"); connection.lastSyncAt = new Date(); connection.nextSyncAt = new Date(Date.now() + googleBusinessSyncSettings().cadenceMs); connection.lastSyncStatus = "success"; connection.lastSyncError = ""; const googleUpdatedAt = googleLocation?.metadata?.updateTime ? new Date(googleLocation.metadata.updateTime) : new Date(); connection.lastGoogleUpdatedAt = Number.isNaN(googleUpdatedAt.getTime()) ? new Date() : googleUpdatedAt; await connection.save(); return res.json({ synced: true, direction: "google_to_piki", openingHours: hours }); }
+  try { const restaurant = await Restaurant.findOne({ _id: objectId(restaurantId), ...partnerTenantScope(req) }).select("partnerProfile.openingHours").lean().exec() as any; const googleLocation = await readGoogleLocation(connection, connection.googleLocationName); const hours = fromGoogleLocationHours(googleLocation, restaurant?.partnerProfile?.openingHours); const changed = googleBusinessHoursChanged(restaurant?.partnerProfile?.openingHours, hours); const writeResult = await Restaurant.updateOne({ _id: objectId(restaurantId), ...partnerTenantScope(req) }, { $set: { "partnerProfile.openingHours": hours } }); if (changed && writeResult.modifiedCount > 0) await publishCatalogUpdate(restaurantId, "restaurant.opening_hours.google_sync"); connection.lastSyncAt = new Date(); connection.nextSyncAt = new Date(Date.now() + googleBusinessSyncSettings().cadenceMs); connection.lastSyncStatus = "success"; connection.lastSyncError = ""; const googleUpdatedAt = googleLocation?.metadata?.updateTime ? new Date(googleLocation.metadata.updateTime) : new Date(); connection.lastGoogleUpdatedAt = Number.isNaN(googleUpdatedAt.getTime()) ? new Date() : googleUpdatedAt; await connection.save(); return res.json({ synced: true, direction: "google_to_piki", openingHours: hours }); }
   catch (error) { connection.lastSyncAt = new Date(); connection.lastSyncStatus = "error"; connection.lastSyncError = error instanceof Error ? error.message : "GOOGLE_SYNC_FAILED"; connection.status = connection.lastSyncError === "GOOGLE_REAUTH_REQUIRED" ? "needs_reauth" : "error"; await connection.save(); return res.status(502).json({ error: "GOOGLE_SYNC_FAILED", message: connection.lastSyncError }); }
 });
-app.patch("/api/v1/partners/google-business/publish-hours", requireRole("partner"), async (req, res) => {
+app.patch("/api/v1/partners/google-business/publish-hours", requirePartnerSurface(), async (req, res) => {
   const { access, allowed } = await partnerRequestAccess(req, "store:write"); if (!allowed) return res.status(403).json({ error: "PARTNER_PERMISSION_DENIED", permission: "store:write" });
   if (!googleBusinessConfigured()) return res.status(503).json({ error: "GOOGLE_BUSINESS_NOT_CONFIGURED", configuration: googleBusinessConfiguration() });
   const restaurantId = await employeeRestaurant(req, access); if (!restaurantId) return res.status(403).json({ error: "PARTNER_RESTAURANT_NOT_ASSIGNED" });
   const parsed = openingHoursSchema.safeParse(req.body?.openingHours ?? req.body); if (!parsed.success) return res.status(400).json({ error: "INVALID_OPENING_HOURS", details: parsed.error.flatten() });
-  const connection = await GoogleBusinessConnection.findOne({ restaurantId: objectId(restaurantId), ...tenantScope(req) }).select("+accessTokenEncrypted +refreshTokenEncrypted").exec() as any; if (!connection?.googleLocationName) return res.status(409).json({ error: "GOOGLE_LOCATION_NOT_SELECTED" });
+  const connection = await GoogleBusinessConnection.findOne({ restaurantId: objectId(restaurantId), ...partnerTenantScope(req) }).select("+accessTokenEncrypted +refreshTokenEncrypted").exec() as any; if (!connection?.googleLocationName) return res.status(409).json({ error: "GOOGLE_LOCATION_NOT_SELECTED" });
   const openingHours = pikiManagedOpeningHours(parsed.data);
-  try { const result = await updateGoogleLocationHours(connection, connection.googleLocationName, toGoogleLocationHours(openingHours)); const writeResult = await Restaurant.updateOne({ _id: objectId(restaurantId), ...tenantScope(req) }, { $set: { "partnerProfile.openingHours": openingHours } }); if (writeResult.modifiedCount > 0) { invalidateCatalogCache(); void publishCatalogUpdate(restaurantId, "restaurant.opening_hours.google_publish"); } connection.lastSyncAt = new Date(); connection.nextSyncAt = new Date(Date.now() + googleBusinessSyncSettings().cadenceMs); connection.lastSyncStatus = "success"; connection.lastSyncError = ""; await connection.save(); return res.json({ synced: true, direction: "piki_to_google", result }); } catch (error) { return res.status(502).json({ error: "GOOGLE_PUBLISH_FAILED", message: error instanceof Error ? error.message : "GOOGLE_PUBLISH_FAILED" }); }
+  try { const result = await updateGoogleLocationHours(connection, connection.googleLocationName, toGoogleLocationHours(openingHours)); const writeResult = await Restaurant.updateOne({ _id: objectId(restaurantId), ...partnerTenantScope(req) }, { $set: { "partnerProfile.openingHours": openingHours } }); if (writeResult.modifiedCount > 0) { invalidateCatalogCache(); void publishCatalogUpdate(restaurantId, "restaurant.opening_hours.google_publish"); } connection.lastSyncAt = new Date(); connection.nextSyncAt = new Date(Date.now() + googleBusinessSyncSettings().cadenceMs); connection.lastSyncStatus = "success"; connection.lastSyncError = ""; await connection.save(); return res.json({ synced: true, direction: "piki_to_google", result }); } catch (error) { return res.status(502).json({ error: "GOOGLE_PUBLISH_FAILED", message: error instanceof Error ? error.message : "GOOGLE_PUBLISH_FAILED" }); }
 });
-app.get("/api/v1/partners/menu", requireRole("partner"), async (req, res) => {
+app.get("/api/v1/partners/menu", requirePartnerSurface(), async (req, res) => {
   setPartnerMenuResponseHeaders(res);
   const { access, allowed } = await partnerRequestAccess(req, "menu:read");
   if (!allowed) return res.status(403).json({ error: "PARTNER_PERMISSION_DENIED", permission: "menu:read" });
   const restaurantId = await employeeRestaurant(req, access);
   if (!restaurantId) return res.status(403).json({ error: access?.restaurantIds.length ? "PARTNER_RESTAURANT_ACCESS_DENIED" : "PARTNER_RESTAURANT_NOT_ASSIGNED" });
-  const restaurant = await Restaurant.findOne({ _id: objectId(restaurantId), ...tenantScope(req) }).select("name slug internalDemo menu menuRevision").lean().exec() as any;
+  const restaurant = await Restaurant.findOne({ _id: objectId(restaurantId), ...partnerTenantScope(req) }).select("name slug internalDemo menu menuRevision").lean().exec() as any;
   if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
   const menu = canonicalRestaurantMenu(restaurant);
   const menuRevision = currentMenuRevision(restaurant);
   return res.json({ restaurant: { ...restaurant, restaurantId: String(restaurant._id), menu, menuRevision }, restaurantId: String(restaurant._id), menu, menuRevision });
 });
-app.put("/api/v1/partners/menu", requireRole("partner"), async (req, res) => {
+app.put("/api/v1/partners/menu", requirePartnerSurface(), async (req, res) => {
   setPartnerMenuResponseHeaders(res);
   const { access, allowed } = await partnerRequestAccess(req, "menu:write");
   if (!allowed) return res.status(403).json({ error: "PARTNER_PERMISSION_DENIED", permission: "menu:write" });
@@ -2381,7 +2417,7 @@ app.put("/api/v1/partners/menu", requireRole("partner"), async (req, res) => {
   const parsed = menuWriteSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_MENU", details: parsed.error.flatten() });
   const items = normalizePartnerMenuItems(parsed.data.items);
-  const scope = { _id: objectId(restaurantId), ...tenantScope(req) };
+  const scope = { _id: objectId(restaurantId), ...partnerTenantScope(req) };
   const restaurant = await Restaurant.findOneAndUpdate({ ...scope, ...menuRevisionFilter(parsed.data.expectedMenuRevision) }, { $set: { menu: items }, $inc: { menuRevision: 1 } }, { new: true, runValidators: true }).select("name menu slug menuRevision").lean().exec() as any;
   if (!restaurant) {
     const current = await Restaurant.findOne(scope).select("menuRevision").lean().exec() as any;
@@ -2399,6 +2435,24 @@ app.get("/api/v1/admin/restaurants/:id/menu", requireOwner(), async (req, res) =
   const restaurant = await Restaurant.findOne({ _id: id, ...tenantScope(req), onboardingStatus: "approved" }).select("_id slug name menu menuRevision").lean().exec() as any;
   if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND_OR_NOT_APPROVED" });
   return res.json({ restaurant: { ...restaurant, menuRevision: currentMenuRevision(restaurant) }, menu: restaurant.menu || [], menuRevision: currentMenuRevision(restaurant) });
+});
+
+registerOwnerDraftMenuAssetRoutes(app, {
+  requireOwner,
+  isRootOwner: hasExplicitPlatformSuperadminScope,
+  tenantScope,
+  objectId,
+  restaurants: Restaurant.collection,
+  assets: {
+    findOne: (filter, options) => PartnerAsset.collection.findOne(filter, options),
+    storeCleanImage: (filter, document) => PartnerAsset.findOneAndUpdate(filter, { $setOnInsert: document }, { upsert: true, new: true, runValidators: true, timestamps: false }).lean().exec(),
+  },
+  scanUploadBuffer,
+  scanUploadBuffers,
+  publicAssetUrl,
+  organizationFolder,
+  maxImageBytes: MAX_MENU_IMAGE_BYTES,
+  uploadRateLimit: rateLimit(20, 60_000, "owner-draft-menu-assets"),
 });
 
 registerControlledMenuImportRoutes(app, {
@@ -2445,12 +2499,12 @@ app.patch("/api/v1/restaurants/:id/menu/items/:itemId/availability", requireRole
   const itemId = String(req.params.itemId || "");
   const parsed = menuAvailabilitySchema.safeParse(req.body);
   if (!id || !itemId || itemId.length > 80 || !parsed.success) return res.status(400).json({ error: "INVALID_MENU_AVAILABILITY" });
-  if (req.auth?.role === "partner") {
+  if (req.auth?.role === "partner" || String(req.headers?.["x-piki-surface"] || "").toLowerCase() === "partner") {
     const { access, allowed } = await partnerRequestAccess(req, "menu:write");
     if (!allowed) return res.status(403).json({ error: "PARTNER_PERMISSION_DENIED", permission: "menu:write" });
     if (await employeeRestaurant(req, access) !== String(id)) return res.status(403).json({ error: "PARTNER_RESTAURANT_ACCESS_DENIED" });
   }
-  const scope = { _id: id, ...tenantScope(req), ...(req.auth?.role === "admin" ? { onboardingStatus: "approved" } : {}) };
+  const scope = { _id: id, ...(req.auth?.role === "admin" && String(req.headers?.["x-piki-surface"] || "").toLowerCase() !== "partner" ? tenantScope(req) : partnerTenantScope(req)), ...(req.auth?.role === "admin" ? { onboardingStatus: "approved" } : {}) };
   // The product ID and its state are matched in the same array element. The
   // positional update never replaces another product or the complete menu.
   const restaurant = await Restaurant.findOneAndUpdate(
@@ -2469,15 +2523,15 @@ app.patch("/api/v1/restaurants/:id/menu/items/:itemId/availability", requireRole
   return res.json({ updated: true, changed: Boolean(restaurant), restaurantId: String(current._id), itemId, available: item.available !== false, menuRevision: currentMenuRevision(current) });
 });
 
-app.get("/api/v1/partners/kitchen/orders", requireRole("partner"), async (req, res) => {
+app.get("/api/v1/partners/kitchen/orders", requirePartnerSurface(), async (req, res) => {
   const { access, allowed } = await partnerRequestAccess(req, "orders:read");
   if (!allowed) return res.status(403).json({ error: "PARTNER_PERMISSION_DENIED", permission: "orders:read" });
   const restaurantId = await employeeRestaurant(req, access);
   if (!restaurantId) return res.status(403).json({ error: access?.restaurantIds.length ? "PARTNER_RESTAURANT_ACCESS_DENIED" : "PARTNER_RESTAURANT_NOT_ASSIGNED" });
-  const orders = await Order.find({ restaurantId, ...tenantScope(req), ...dispatchablePaymentFilter, archivedAt: null, status: { $in: ["pending", "accepted", "preparing", "ready_for_pickup", "picked_up", "on_the_way"] } }).sort({ createdAt: 1 }).lean().exec() as any[];
+  const orders = await Order.find({ restaurantId, ...partnerTenantScope(req), ...dispatchablePaymentFilter, archivedAt: null, status: { $in: ["pending", "accepted", "preparing", "ready_for_pickup", "picked_up", "on_the_way"] } }).sort({ createdAt: 1 }).lean().exec() as any[];
   const [restaurantRecord, customers, riders] = await Promise.all([
-    Restaurant.findOne({ _id: restaurantId, ...tenantScope(req) }).select("name address phone cuisine location").lean().exec(),
-    CustomerAccount.find({ _id: { $in: orders.map((order) => order.customerId).filter(Boolean) }, ...tenantScope(req) }).select("name email").lean().exec(),
+    Restaurant.findOne({ _id: restaurantId, ...partnerTenantScope(req) }).select("name address phone cuisine location").lean().exec(),
+    CustomerAccount.find({ _id: { $in: orders.map((order) => order.customerId).filter(Boolean) }, ...partnerTenantScope(req) }).select("name email").lean().exec(),
     Rider.find({ _id: { $in: orders.map((order) => order.riderId).filter(Boolean) } }).select("name vehicle location lastLocationAt status").lean().exec(),
   ]);
   const restaurant = restaurantRecord as any;
@@ -2511,7 +2565,7 @@ const partnerPaymentSchema = z.object({
   required: z.boolean(),
   amountCents: z.number().int().min(0).max(1_000_000).nullable().optional(),
 });
-app.patch("/api/v1/partners/kitchen/orders/:id/partner-payment", requireRole("partner"), async (req, res) => {
+app.patch("/api/v1/partners/kitchen/orders/:id/partner-payment", requirePartnerSurface(), async (req, res) => {
   const parsed = partnerPaymentSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_PARTNER_PAYMENT", details: parsed.error.flatten() });
   const { access, allowed } = await partnerRequestAccess(req, "orders:write");
@@ -2520,7 +2574,7 @@ app.patch("/api/v1/partners/kitchen/orders/:id/partner-payment", requireRole("pa
   if (!restaurantId) return res.status(403).json({ error: "PARTNER_RESTAURANT_ACCESS_DENIED" });
   const orderId = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
   if (!orderId) return res.status(400).json({ error: "INVALID_ORDER_ID" });
-  const order = await Order.findOne({ _id: orderId, restaurantId, ...tenantScope(req), status: { $in: ["pending", "accepted", "preparing", "ready_for_pickup"] } });
+  const order = await Order.findOne({ _id: orderId, restaurantId, ...partnerTenantScope(req), status: { $in: ["pending", "accepted", "preparing", "ready_for_pickup"] } });
   if (!order) return res.status(404).json({ error: "ORDER_NOT_FOUND_OR_NOT_EDITABLE" });
   order.partnerPaymentRequired = parsed.data.required;
   order.partnerPaymentCents = parsed.data.required ? (parsed.data.amountCents ?? order.totalCents ?? 0) : null;
@@ -2528,7 +2582,7 @@ app.patch("/api/v1/partners/kitchen/orders/:id/partner-payment", requireRole("pa
   await order.save();
   return res.json({ updated: true, partnerPaymentRequired: order.partnerPaymentRequired, partnerPaymentCents: order.partnerPaymentCents });
 });
-app.get("/api/v1/partners/kitchen/orders/archive", requireRole("partner"), async (req, res) => {
+app.get("/api/v1/partners/kitchen/orders/archive", requirePartnerSurface(), async (req, res) => {
   const { access, allowed } = await partnerRequestAccess(req, "orders:read");
   if (!allowed) return res.status(403).json({ error: "PARTNER_PERMISSION_DENIED", permission: "orders:read" });
   const restaurantId = await employeeRestaurant(req, access);
@@ -2536,17 +2590,17 @@ app.get("/api/v1/partners/kitchen/orders/archive", requireRole("partner"), async
   const requestedLimit = Number(req.query.limit || 50);
   const limit = Number.isFinite(requestedLimit) ? Math.min(100, Math.max(1, Math.trunc(requestedLimit))) : 50;
   const before = typeof req.query.before === "string" && !Number.isNaN(Date.parse(req.query.before)) ? new Date(req.query.before) : null;
-  const filter: Record<string, unknown> = { restaurantId, ...tenantScope(req), status: { $in: ["delivered", "cancelled"] } };
+  const filter: Record<string, unknown> = { restaurantId, ...partnerTenantScope(req), status: { $in: ["delivered", "cancelled"] } };
   if (before) filter.$or = [{ archivedAt: { $lt: before } }, { archivedAt: null, deliveredAt: { $lt: before } }, { archivedAt: null, cancelledAt: { $lt: before } }];
   const orders = await Order.find(filter).sort({ archivedAt: -1, deliveredAt: -1, cancelledAt: -1 }).limit(limit + 1).lean().exec() as any[];
   const hasMore = orders.length > limit;
   const page = orders.slice(0, limit);
-  const customers = await CustomerAccount.find({ _id: { $in: page.map((order) => order.customerId).filter(Boolean) }, ...tenantScope(req) }).select("name email").lean().exec() as any[];
+  const customers = await CustomerAccount.find({ _id: { $in: page.map((order) => order.customerId).filter(Boolean) }, ...partnerTenantScope(req) }).select("name email").lean().exec() as any[];
   const customerMap = new Map(customers.map((customer: any) => [String(customer._id), customer]));
   return res.json({ orders: page.map((order: any) => ({ ...order, customer: order.customerId ? customerMap.get(String(order.customerId)) || null : null })), nextBefore: hasMore && page.length ? (page[page.length - 1].archivedAt || page[page.length - 1].deliveredAt || page[page.length - 1].cancelledAt || null) : null, hasMore });
 });
 
-app.patch("/api/v1/partners/kitchen/orders/:id/status", requireRole("partner"), async (req, res) => {
+app.patch("/api/v1/partners/kitchen/orders/:id/status", requirePartnerSurface(), async (req, res) => {
   const parsed = z.object({ status: z.enum(["accepted", "preparing", "ready_for_pickup", "cancelled"]), preparationMinutes: z.number().int().min(15).max(45).optional() }).safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_KITCHEN_STATUS" });
   const permission: PartnerPermission = parsed.data.status === "cancelled" ? "orders:cancel" : parsed.data.status === "accepted" ? "orders:write" : "orders:prepare";
@@ -2556,7 +2610,7 @@ app.patch("/api/v1/partners/kitchen/orders/:id/status", requireRole("partner"), 
   if (!restaurantId) return res.status(403).json({ error: access?.restaurantIds.length ? "PARTNER_RESTAURANT_ACCESS_DENIED" : "PARTNER_RESTAURANT_NOT_ASSIGNED" });
   const orderId = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
   if (!orderId) return res.status(400).json({ error: "INVALID_ORDER_ID" });
-  const order = await Order.findOne({ _id: orderId, restaurantId, ...tenantScope(req) });
+  const order = await Order.findOne({ _id: orderId, restaurantId, ...partnerTenantScope(req) });
   if (!order) return res.status(404).json({ error: "ORDER_NOT_FOUND" });
   const current = order.status as any;
   const target = parsed.data.status;
@@ -2594,7 +2648,7 @@ app.patch("/api/v1/partners/kitchen/orders/:id/status", requireRole("partner"), 
   return res.json({ order });
 });
 const partnerSupportTicketSchema = z.object({ orderId: z.string().optional(), priority: z.enum(["low", "normal", "high", "urgent"]).default("normal"), subject: z.string().trim().min(3).max(180), description: z.string().trim().min(3).max(4000) });
-app.post("/api/v1/partners/support/tickets", requireRole("partner"), async (req, res) => {
+app.post("/api/v1/partners/support/tickets", requirePartnerSurface(), async (req, res) => {
   const parsed = partnerSupportTicketSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_PARTNER_SUPPORT_TICKET", details: parsed.error.flatten() });
   const { access, allowed } = await partnerRequestAccess(req, "orders:read");
@@ -2602,13 +2656,13 @@ app.post("/api/v1/partners/support/tickets", requireRole("partner"), async (req,
   const restaurantId = await employeeRestaurant(req, access);
   if (!restaurantId) return res.status(403).json({ error: "PARTNER_RESTAURANT_ACCESS_DENIED" });
   const employee = access.employee as any;
-  const restaurant = await Restaurant.findById(restaurantId).select("name").lean().exec() as any;
+  const restaurant = await Restaurant.findOne({ _id: restaurantId, ...partnerTenantScope(req) }).select("name").lean().exec() as any;
   if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
   let order: any = null;
   if (parsed.data.orderId) {
     const id = objectId(parsed.data.orderId);
     if (!id) return res.status(400).json({ error: "INVALID_ORDER_ID" });
-    order = await Order.findOne({ _id: id, restaurantId }).select("_id publicCode displayCode status").lean().exec();
+    order = await Order.findOne({ _id: id, restaurantId, ...partnerTenantScope(req) }).select("_id publicCode displayCode status").lean().exec();
     if (!order) return res.status(404).json({ error: "PARTNER_ORDER_NOT_FOUND" });
   }
   const ticket = await SupportTicket.create({
@@ -2629,7 +2683,7 @@ app.post("/api/v1/partners/support/tickets", requireRole("partner"), async (req,
   await publishRealtimeEvent({ channel: "admin", audienceKey: "role:admin", type: "support.ticket_created", payload: { ticketId: String(ticket._id), ticketNumber: ticket.ticketNumber, sourceSurface: "partner", restaurantId: String(restaurantId), orderId: order?._id ? String(order._id) : null, priority: ticket.priority, subject: ticket.subject } });
   return res.status(201).json({ ticket: { id: String(ticket._id), ticketNumber: ticket.ticketNumber, status: ticket.status, sourceSurface: "partner" } });
 });
-app.get("/api/v1/partners/metrics/overview", requireRole("partner"), async (req, res) => {
+app.get("/api/v1/partners/metrics/overview", requirePartnerSurface(), async (req, res) => {
   const { access, allowed } = await partnerRequestAccess(req, "metrics:read");
   if (!allowed) return res.status(403).json({ error: "PARTNER_PERMISSION_DENIED", permission: "metrics:read" });
   const restaurantId = await employeeRestaurant(req, access);
@@ -2639,8 +2693,8 @@ app.get("/api/v1/partners/metrics/overview", requireRole("partner"), async (req,
   const yesterday = new Date(today);
   yesterday.setDate(yesterday.getDate() - 1);
   const [todayRows, yesterdayCount, restaurant] = await Promise.all([
-    Order.aggregate([{ $match: { restaurantId: objectId(restaurantId), createdAt: { $gte: today } } }, { $group: { _id: null, orders: { $sum: 1 }, cancellations: { $sum: { $cond: [{ $eq: ["$status", "cancelled"] }, 1, 0] } }, revenueCents: { $sum: { $cond: [{ $ne: ["$status", "cancelled"] }, "$totalCents", 0] } } } }]),
-    Order.countDocuments({ restaurantId, createdAt: { $gte: yesterday, $lt: today } }),
+    Order.aggregate([{ $match: { restaurantId: objectId(restaurantId), ...partnerTenantScope(req), createdAt: { $gte: today } } }, { $group: { _id: null, orders: { $sum: 1 }, cancellations: { $sum: { $cond: [{ $eq: ["$status", "cancelled"] }, 1, 0] } }, revenueCents: { $sum: { $cond: [{ $ne: ["$status", "cancelled"] }, "$totalCents", 0] } } } }]),
+    Order.countDocuments({ restaurantId, ...partnerTenantScope(req), createdAt: { $gte: yesterday, $lt: today } }),
     Restaurant.findById(restaurantId).select("rating").lean().exec(),
   ]);
   const overview = todayRows[0] || { orders: 0, cancellations: 0, revenueCents: 0 };
