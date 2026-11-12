@@ -15,7 +15,8 @@ import { dispatchInitialIdempotencyKey, enqueueDispatchOutbox } from "./dispatch
 import { SupportTicket } from "./models.js";
 import { customerSupportCreateSchema, customerSupportTicketNumber, customerSupportTicketView } from "./customerSupportPolicy.js";
 import { checkoutOrigin } from "./checkoutOrigin.js";
-import { Badge, CustomerBadge, PikiPassSubscription, RecommendationProfile, UserStreak, calculatePriceBreakdown, consumeCustomerCredits, restoreCustomerCredits } from "./customerEngagement.js";
+import { Badge, CustomerBadge, PikiPassSubscription, RecommendationProfile, UserStreak, calculatePriceBreakdown } from "./customerEngagement.js";
+import { CustomerQuoteConflict, assertCustomerQuoteExpectation, customerOrderQuote, customerQuotedItems, customerQuoteExpectationSchema, debitQuotedCustomerCredits } from "./customerOrderQuote.js";
 
 const COOKIE = "piki_customer_session";
 let dispatchCustomerOrder: ((orderId: string) => Promise<unknown>) | null = null;
@@ -108,7 +109,8 @@ async function resolveRestaurantPoint(restaurant: any): Promise<[number, number]
   if (cached && cached.expiresAt > Date.now()) return cached.point;
   try {
     const url = new URL("https://nominatim.openstreetmap.org/search");
-    url.searchParams.set("q", `${address}, ${locality}, Comunitat Valenciana, España`);
+    url.searchParams.set("q", `${address}, ${locality}, España`);
+    url.searchParams.set("countrycodes", "es");
     url.searchParams.set("format", "jsonv2");
     url.searchParams.set("limit", "1");
     const response = await fetch(url, { signal: AbortSignal.timeout(1_500), headers: { "User-Agent": "PIKI-Delivery/0.2 (+https://pikidelivery.com)" } });
@@ -164,7 +166,7 @@ function restaurantView(row: any) {
   const availability = customerAvailability({ ...row, comingSoon, listingType: row.listingType || "official_partner", hasMenu: Array.isArray(row.menu) && row.menu.length > 0 });
   // Both tRPC (Vercel/Android) and the REST catalogue read the same persisted
   // restaurant. Keep display fields instead of stripping categories and media.
-  // Preserve this route's pricing contract; billing is not a catalogue repair.
+  // Catalogue and quote share the final customer price and selectable options.
   return {
     id: String(row._id),
     slug: row.slug,
@@ -192,7 +194,7 @@ function restaurantView(row: any) {
     promoted: row.promoted,
     image: row.image || "",
     accent: row.accent || "#FFD72E",
-    menu: comingSoon ? [] : (Array.isArray(row.menu) ? row.menu : []).filter(menuItemIsAvailable).map((item: any) => ({
+    menu: comingSoon ? [] : customerMenuForRestaurant(row).map((item: any) => ({
       id: item.id,
       name: item.name,
       description: item.description || "",
@@ -203,6 +205,8 @@ function restaurantView(row: any) {
       allergens: Array.isArray(item.allergens) ? item.allergens : null,
       vegetarian: Boolean(item.vegetarian),
       popular: Boolean(item.popular),
+      available: item.available !== false,
+      orderable: item.orderable !== false,
       modifierGroups: modifierGroupsForItem(item, useReferenceFallback),
     })),
   };
@@ -400,47 +404,35 @@ async function handleCustomerTrpcSingle(req: Request, res: Response) {
       return reply(res, { id: String(message._id), senderRole: message.senderRole, body: message.body, createdAt: message.createdAt });
     }
     if (procedure === "order.quote") {
-      // Cotización única: la misma que después se cobra en el checkout.
-      // El cliente nunca debe ver un total distinto del que se le pasa al pago.
+      // Read-only quote. Authenticated quotes include only API-confirmed,
+      // unexpired Customer credit. Anonymous legacy previews have no credit.
+      res.setHeader("Cache-Control", "private, no-store, max-age=0");
+      const user = await currentCustomer(req) as any;
       const restaurant = await Restaurant.findOne({ _id: input?.restaurantId, ...CUSTOMER_ORDERABLE_RESTAURANT_FILTER }).lean().exec() as any;
       if (!restaurant) return fail(res, "Restaurante no encontrado", "NOT_FOUND");
-      const requested = Array.isArray(input?.items) ? input.items : [];
-      const customerMenu = customerMenuForRestaurant(restaurant);
-      const useReferenceFallback = usesReferenceAddOns(restaurant);
-      let subtotalCents = 0;
-      for (const line of requested) {
-        const item = customerMenu.find((candidate: any) => candidate.id === line?.id);
-        if (!item) return fail(res, "Un producto de tu cesta ya no está en la carta", "PRODUCT_UNAVAILABLE");
-        const quantity = Number(line.quantity);
-        if (!Number.isInteger(quantity) || quantity < 1) return fail(res, "Cantidad no válida", "BAD_REQUEST");
-        try {
-          subtotalCents += quoteMenuItem(item, line.selections, useReferenceFallback).unitPriceCents * quantity;
-        } catch {
-          return fail(res, "Revisa las opciones del producto", "PRODUCT_UNAVAILABLE");
-        }
-      }
+      let items: ReturnType<typeof customerQuotedItems>;
+      try { items = customerQuotedItems(restaurant, input?.items); }
+      catch { return fail(res, "Revisa los productos y opciones de la cesta", "PRODUCT_UNAVAILABLE"); }
+      const subtotalCents = items.reduce((sum, item) => sum + item.unitPriceCents * item.quantity, 0);
       const latitude = Number(input?.deliveryLocation?.latitude);
       const longitude = Number(input?.deliveryLocation?.longitude);
       if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) {
-        return reply(res, { subtotalCents, deliveryFeeCents: null, serviceFeeCents: null, totalCents: null, needsAddress: true });
+        return reply(res, { subtotalCents, deliveryFeeCents: null, serviceFeeCents: null, creditAppliedCents: 0, totalCents: null, needsAddress: true, expectation: null });
       }
       const coverage = evaluateXativaCoverage([longitude, latitude]);
       if (!coverage.covered || coverage.deliveryFeeCents === null || coverage.serviceFeeCents === null) {
         return fail(res, "Todavía no repartimos en esa dirección.", "DELIVERY_OUTSIDE_COVERAGE");
       }
-      const deliveryFeeCents = coverage.deliveryFeeCents;
-      const serviceFeeCents = coverage.serviceFeeCents;
-      return reply(res, {
-        subtotalCents,
-        deliveryFeeCents,
-        serviceFeeCents,
-        totalCents: subtotalCents + deliveryFeeCents + serviceFeeCents,
-        needsAddress: false,
-      });
+      const paymentMethod = input?.paymentMethod ?? "stripe";
+      const decision = paymentDecision(restaurant, paymentMethod);
+      if (!decision.ok) return fail(res, decision.message, "CONFLICT");
+      return reply(res, customerOrderQuote({ restaurant, customerId: user ? String(user._id) : null, wallet: user, items, deliveryPoint: [longitude, latitude], deliveryFeeCents: coverage.deliveryFeeCents, serviceFeeCents: coverage.serviceFeeCents, paymentMethod }));
     }
     if (procedure === "order.create" || procedure === "order.checkout") {
       const user = await currentCustomer(req) as any;
       if (!user) return fail(res, "Debes iniciar sesión para realizar pedidos", "AUTH_REQUIRED");
+      const parsedExpectation = input?.expectation === undefined ? null : customerQuoteExpectationSchema.safeParse(input.expectation);
+      if (parsedExpectation && !parsedExpectation.success) return fail(res, "La expectativa de cotización no es válida.", "BAD_REQUEST");
       const restaurant = await Restaurant.findOne({ _id: input?.restaurantId, ...CUSTOMER_ORDERABLE_RESTAURANT_FILTER }).lean().exec() as any;
       if (!restaurant) return fail(res, "Restaurante no encontrado", "NOT_FOUND");
       if (!restaurantIsWithinOpeningHours(restaurant.partnerProfile?.openingHours)) return fail(res, "Este establecimiento está cerrado ahora. Elige otro horario para realizar el pedido.", "PARTNER_CLOSED");
@@ -470,18 +462,47 @@ async function handleCustomerTrpcSingle(req: Request, res: Response) {
       const deliveryPoint: [number, number] = [longitude, latitude];
       const coverage = evaluateXativaCoverage(deliveryPoint);
       if (!coverage.covered || coverage.deliveryFeeCents === null || coverage.serviceFeeCents === null) return fail(res, "Todavía no repartimos en esa dirección.", "DELIVERY_OUTSIDE_COVERAGE");
-      const restaurantPoint = await resolveRestaurantPoint(restaurant);
+      const subtotalCents = normalized.reduce((sum, item) => sum + item.unitPriceCents * item.quantity, 0);
+      const deliveryCents = coverage.deliveryFeeCents; const serviceCents = coverage.serviceFeeCents;
+      const quoteMethod = procedure === "order.checkout" ? paymentMethod : `create:${paymentMethod}`;
+      const initialQuote = customerOrderQuote({ restaurant, customerId: String(user._id), wallet: user, items: normalized, deliveryPoint, deliveryFeeCents: deliveryCents, serviceFeeCents: serviceCents, paymentMethod: quoteMethod });
+      const expected = parsedExpectation?.success ? parsedExpectation.data : initialQuote.expectation;
+      try { assertCustomerQuoteExpectation(expected, initialQuote.expectation); }
+      catch { return fail(res, "La cotización ha cambiado. Actualiza la cesta antes de continuar.", "CONFLICT"); }
+      // Canonical checkout never performs the legacy geocode repair before its
+      // transaction can reject a stale quote. Quote itself never geocodes/writes.
+      const restaurantPoint = parsedExpectation ? (validRestaurantPoint(restaurant.location?.coordinates) ? restaurant.location.coordinates as [number, number] : null) : await resolveRestaurantPoint(restaurant);
       if (!restaurantPoint) return fail(res, "El restaurante no tiene una dirección operativa verificable. Contacta con PIKI para completar su ubicación.", "RESTAURANT_LOCATION_UNAVAILABLE");
       const route = await quoteDeliveryRoute(restaurantPoint, deliveryPoint);
-      const subtotalCents = normalized.reduce((sum, item) => sum + item.unitPriceCents * item.quantity, 0);
-      const deliveryCents = coverage.deliveryFeeCents; const serviceCents = coverage.serviceFeeCents; const totalCents = subtotalCents + deliveryCents + serviceCents;
+      const totalCents = initialQuote.totalCents;
+      let creditAppliedCents = initialQuote.creditAppliedCents;
+      let creditExpiresAt = user.pikiCreditsExpiresAt;
       if (!isCashOrderWithinLimit(paymentMethod, totalCents)) return res.status(422).json(cashOrderLimitError(totalCents));
       const code = `PIKI-${Date.now().toString(36).toUpperCase()}`;
       let order: any;
       const orderSession = await mongoose.startSession();
       try {
         await orderSession.withTransaction(async () => {
-      const orderPayload = { publicCode: code, fulfillmentModel: decision.riderPurchase ? "rider_purchase" : "partner_managed", bizumReference: decision.method === "bizum" ? bizumReferenceFor(code) : null, tenantId: restaurant.tenantId || null, restaurantId: restaurant._id, customerId: String(user._id), items: normalized, deliveryAddress: String(input.address || "").trim(), deliveryLocation: { type: "Point", coordinates: deliveryPoint }, pickupLocation: { type: "Point", coordinates: [...restaurantPoint] }, coveragePolicySlug: coverage.policySlug, coveragePolicyVersion: coverage.policyVersion, coverageDecision: coverage.reason, straightLineDistanceKm: coverage.straightLineDistanceKm, withinMunicipality: coverage.withinMunicipality, deliveryBaseFeeCents: coverage.deliveryBaseFeeCents, outsideMunicipalitySurchargeCents: coverage.outsideMunicipalitySurchargeCents, routeDistanceKm: route.routeDistanceKm, routeDurationMinutes: route.routeDurationMinutes, routeProvider: route.routeProvider, routingDegraded: route.routingDegraded, requiredVehicleClasses: route.requiredVehicleClasses, subtotalCents, deliveryFeeCents: deliveryCents, serviceFeeCents: serviceCents, totalCents, paymentMethod, paymentState: "pending", statusHistory: [{ status: "pending", actorRole: "customer", reason: paymentMethod === "cash" ? "Pedido a contrarreembolso; cobro pendiente hasta la entrega" : "Pedido pendiente de confirmación del pago online" }]  };
+          const freshRestaurant = await Restaurant.findOne({ _id: restaurant._id, ...CUSTOMER_ORDERABLE_RESTAURANT_FILTER }).session(orderSession).lean().exec() as any;
+          if (!freshRestaurant || !paymentDecision(freshRestaurant, paymentMethod).ok) throw new CustomerQuoteConflict();
+          let freshItems: ReturnType<typeof customerQuotedItems>;
+          try { freshItems = customerQuotedItems(freshRestaurant, requested); }
+          catch { throw new CustomerQuoteConflict(); }
+          const wallet = quoteMethod === "stripe" ? await CustomerAccount.findById(user._id).select("pikiCreditsCents pikiCreditsExpiresAt").session(orderSession).lean().exec() : null;
+          const freshQuote = customerOrderQuote({ restaurant: freshRestaurant, customerId: String(user._id), wallet, items: freshItems, deliveryPoint, deliveryFeeCents: deliveryCents, serviceFeeCents: serviceCents, paymentMethod: quoteMethod });
+          assertCustomerQuoteExpectation(expected, freshQuote.expectation);
+          // __v is the existing Mongoose document version. A real write locks
+          // this snapshot through commit, including legacy menu writers that do
+          // not increment menuRevision. A write conflict retries the WHOLE
+          // transaction and revalidates the unchanged expectation, never prices.
+          const locked = await Restaurant.updateOne({ _id: restaurant._id, ...CUSTOMER_ORDERABLE_RESTAURANT_FILTER }, { $inc: { __v: 1 } }, { session: orderSession, timestamps: false }).exec();
+          if (locked.matchedCount !== 1) throw new CustomerQuoteConflict();
+          creditAppliedCents = freshQuote.creditAppliedCents;
+          if (quoteMethod === "stripe") {
+            await debitQuotedCustomerCredits(String(user._id), wallet, creditAppliedCents, orderSession);
+            creditExpiresAt = (wallet as any)?.pikiCreditsExpiresAt;
+          }
+          const orderPayload = { publicCode: code, fulfillmentModel: decision.riderPurchase ? "rider_purchase" : "partner_managed", bizumReference: decision.method === "bizum" ? bizumReferenceFor(code) : null, tenantId: restaurant.tenantId || null, restaurantId: restaurant._id, customerId: String(user._id), items: normalized, deliveryAddress: String(input.address || "").trim(), deliveryLocation: { type: "Point", coordinates: deliveryPoint }, pickupLocation: { type: "Point", coordinates: [...restaurantPoint] }, coveragePolicySlug: coverage.policySlug, coveragePolicyVersion: coverage.policyVersion, coverageDecision: coverage.reason, straightLineDistanceKm: coverage.straightLineDistanceKm, withinMunicipality: coverage.withinMunicipality, deliveryBaseFeeCents: coverage.deliveryBaseFeeCents, outsideMunicipalitySurchargeCents: coverage.outsideMunicipalitySurchargeCents, routeDistanceKm: route.routeDistanceKm, routeDurationMinutes: route.routeDurationMinutes, routeProvider: route.routeProvider, routingDegraded: route.routingDegraded, requiredVehicleClasses: route.requiredVehicleClasses, subtotalCents, deliveryFeeCents: deliveryCents, serviceFeeCents: serviceCents, creditAppliedCents, totalCents, paymentMethod, paymentState: "pending", statusHistory: [{ status: "pending", actorRole: "customer", reason: paymentMethod === "cash" ? "Pedido a contrarreembolso; cobro pendiente hasta la entrega" : "Pedido pendiente de confirmación del pago online" }]  };
           const created = await Order.create([orderPayload], { session: orderSession });
           order = created[0];
           if (paymentMethod === "cash") {
@@ -494,6 +515,9 @@ async function handleCustomerTrpcSingle(req: Request, res: Response) {
             });
           }
         });
+      } catch (error) {
+        if (error instanceof CustomerQuoteConflict) return fail(res, "La cotización ha cambiado. Actualiza la cesta antes de continuar.", "CONFLICT");
+        throw error;
       } finally {
         await orderSession.endSession();
       }
@@ -502,21 +526,35 @@ async function handleCustomerTrpcSingle(req: Request, res: Response) {
         if (card) await Order.updateOne({ _id: order._id }, { $set: { virtualCardId: (card as any)._id } }).exec();
       }
       let checkoutUrl: string | null = null;
-      let creditAppliedCents = 0;
       if (procedure === "order.checkout" && paymentMethod === "stripe") {
+        let session: Awaited<ReturnType<typeof createCheckoutSession>>;
         try {
-          creditAppliedCents = await consumeCustomerCredits(String(user._id), totalCents);
-          const session = await createCheckoutSession({ orderId: String(order._id), publicCode: code, origin: checkoutOrigin(input.origin), customerEmail: user.email, items: normalized.map((item) => ({ name: item.name, quantity: item.quantity, unitPriceCents: item.unitPriceCents })), deliveryFeeCents: deliveryCents, serviceFeeCents: serviceCents, discountCents: creditAppliedCents, preferredPaymentMethod: "stripe" });
-          checkoutUrl = session.url;
-          await Order.updateOne({ _id: order._id }, { $set: { stripeCheckoutSessionId: session.id, creditAppliedCents, totalCents: totalCents - creditAppliedCents }, $inc: { version: 1 } }).exec();
+          session = await createCheckoutSession({ orderId: String(order._id), publicCode: code, origin: checkoutOrigin(input.origin), customerEmail: user.email, items: normalized.map((item) => ({ name: item.name, quantity: item.quantity, unitPriceCents: item.unitPriceCents })), deliveryFeeCents: deliveryCents, serviceFeeCents: serviceCents, discountCents: creditAppliedCents, preferredPaymentMethod: "stripe" });
         } catch (error) {
-          await restoreCustomerCredits(String(user._id), creditAppliedCents).catch(() => undefined);
+          // Compensation is atomic with marking the pending order failed; never
+          // extend the original credit TTL or overwrite a newer reward expiry.
+          const rollbackSession = await mongoose.startSession();
+          try {
+            await rollbackSession.withTransaction(async () => {
+              const changed = await Order.updateOne({ _id: order._id, paymentState: "pending", stripeCheckoutSessionId: null }, { $set: { paymentState: "failed", creditAppliedCents: 0, totalCents: totalCents + creditAppliedCents }, $inc: { version: 1 } }, { session: rollbackSession }).exec();
+              if (changed.matchedCount !== 1) throw new Error("CREDIT_ROLLBACK_CONFLICT");
+              if (creditAppliedCents > 0) {
+                const restored = await CustomerAccount.updateOne({ _id: user._id }, { $inc: { pikiCreditsCents: creditAppliedCents }, $max: { pikiCreditsExpiresAt: new Date(creditExpiresAt) } }, { session: rollbackSession }).exec();
+                if (restored.matchedCount !== 1) throw new Error("CREDIT_ROLLBACK_CONFLICT");
+              }
+            });
+          } finally { await rollbackSession.endSession(); }
           console.error(`[customerCompat] stripe checkout`, error instanceof Error ? error.message : error);
           return fail(res, "El pago online no está disponible temporalmente.", "STRIPE_UNAVAILABLE");
         }
+        checkoutUrl = session.url;
+        // Do not refund if attaching an already-created Stripe session fails:
+        // that session may still be payable. This is not a quote conflict.
+        const attached = await Order.updateOne({ _id: order._id, paymentState: "pending" }, { $set: { stripeCheckoutSessionId: session.id }, $inc: { version: 1 } }).exec();
+        if (attached.matchedCount !== 1) return fail(res, "No se pudo confirmar la sesión de pago.", "STRIPE_UNAVAILABLE");
       }
       if (paymentMethod === "cash") await publishOrderIntakeEvents(order, { settlement: "cash_due", message: "Pedido a contrarreembolso: el Rider cobrará en efectivo al entregar." });
-      return reply(res, { orderId: code, checkoutUrl, totalCents: totalCents - creditAppliedCents, paymentMethod, paymentState: decision.paymentState, cashDueAtDelivery: paymentMethod === "cash", creditAppliedCents, priceBreakdown: calculatePriceBreakdown({ subtotalCents, deliveryFeeCents: deliveryCents, serviceFeeCents: serviceCents, discountCents: creditAppliedCents }), coverage, route });
+      return reply(res, { orderId: code, checkoutUrl, totalCents, paymentMethod, paymentState: decision.paymentState, cashDueAtDelivery: paymentMethod === "cash", creditAppliedCents, priceBreakdown: calculatePriceBreakdown({ subtotalCents, deliveryFeeCents: deliveryCents, serviceFeeCents: serviceCents, discountCents: creditAppliedCents }), coverage, route });
     }
     return fail(res, `Procedimiento no soportado: ${procedure}`, "NOT_FOUND");
   } catch (error) { console.error(`[customerCompat] ${procedure}`, error); return fail(res, "Error interno de la plataforma", "INTERNAL_SERVER_ERROR"); }

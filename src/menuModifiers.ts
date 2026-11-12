@@ -78,11 +78,11 @@ function cloneGroups(groups: CustomerModifierGroup[]) {
  */
 export function modifierGroupsForItem(item: unknown, useReferenceFallback = false): CustomerModifierGroup[] {
   const itemRecord = asRecord(item);
-  const rawGroups = Array.isArray(itemRecord?.modifiers) ? itemRecord.modifiers : [];
+  const rawGroups = Array.isArray(itemRecord?.modifiers) && itemRecord.modifiers.length ? itemRecord.modifiers : Array.isArray(itemRecord?.modifierGroups) ? itemRecord.modifierGroups : [];
   const groups = rawGroups.flatMap((rawGroup, groupIndex) => {
     const group = asRecord(rawGroup);
     if (!group) return [];
-    const rawOptions = Array.isArray(group.options) ? group.options : [];
+    const rawOptions = Array.isArray(group.optionItems) && group.optionItems.length ? group.optionItems : Array.isArray(group.options) ? group.options : [];
     const legacyPrice = asPrice(group.price) ?? 0;
     const options = rawOptions.flatMap((rawOption, optionIndex) => {
       if (typeof rawOption === "string") {
@@ -90,15 +90,15 @@ export function modifierGroupsForItem(item: unknown, useReferenceFallback = fals
         return name ? [{ id: safeId(name, `option-${optionIndex + 1}`), name, price: legacyPrice }] : [];
       }
       const option = asRecord(rawOption);
-      if (!option) return [];
+      if (!option || option.available === false) return [];
       const name = asText(option.name, 120);
       const price = asPrice(option.price);
       if (!name || price === null) return [];
       return [{ id: safeId(asText(option.id, 80), `option-${optionIndex + 1}`), name, price }];
     });
-    if (!options.length) return [];
-    const maximum = Math.min(asInteger(group.maxSelections) ?? options.length, options.length);
-    const minimum = Math.min(asInteger(group.minSelections) ?? (group.required === true ? 1 : 0), maximum);
+    const minimum = Math.max(asInteger(group.minSelections) ?? 0, group.required === true ? 1 : 0);
+    const maximum = asInteger(group.maxSelections) ?? Math.max(1, options.length, minimum);
+    if (!options.length && minimum === 0) return [];
     return [{
       id: safeId(asText(group.id, 80), `group-${groupIndex + 1}`),
       name: asText(group.name, 120) || `Opciones ${groupIndex + 1}`,
@@ -117,8 +117,10 @@ export function quoteMenuItem(item: unknown, rawSelections: unknown, useReferenc
   const itemName = asText(itemRecord?.name) || "Producto";
   const basePrice = asPrice(itemRecord?.price);
   if (basePrice === null) throw new Error("Producto con precio no válido");
+  if (itemRecord?.available === false || itemRecord?.orderable === false) throw new Error("Producto no disponible");
 
   const groups = modifierGroupsForItem(item, useReferenceFallback);
+  if (groups.some((group) => group.options.length < group.minSelections || group.maxSelections < group.minSelections)) throw new Error("Producto sin suficientes opciones obligatorias disponibles");
   const selections = Array.isArray(rawSelections) ? rawSelections : [];
   const receivedGroups = new Set<string>();
   const selectedOptions: SelectedMenuOption[] = [];

@@ -4,8 +4,7 @@ import { CUSTOMER_CATALOG_RESTAURANT_FILTER, CUSTOMER_ORDERABLE_RESTAURANT_FILTE
 import { customerMenuForRestaurant } from './customerCatalogPolicy.js';
 
 test('los partners próximos son visibles pero no son operables ni indexables como catálogo activo', () => {
-  assert.equal(COMING_SOON_SLUGS.length, 2);
-  assert.equal(COMING_SOON_SLUGS.length, 2);
+  assert.deepEqual(COMING_SOON_SLUGS, ['eleven-burgers-xativa', 'nakama-sushi-xativa', 'kazoku-xativa', 'kazoku-algemesi']);
   const upcomingFilter = CUSTOMER_CATALOG_RESTAURANT_FILTER.$or[1] as { slug: { $in: readonly string[] } };
   assert.deepEqual(upcomingFilter.slug.$in, [...COMING_SOON_SLUGS]);
   assert.equal(CUSTOMER_ORDERABLE_RESTAURANT_FILTER.availabilityStatus, 'available');
@@ -53,7 +52,9 @@ test('la comisión se aplica una sola vez cuando el precio guardado ya la incluy
   assert.equal(basePriced[0].modifierGroups[0].options[0].price, 2.4);
 
   const commissionIncluded = customerMenuForRestaurant({ slug: 'pizzeria', menu, priceIncludesCommission: true });
-  assert.deepEqual(commissionIncluded, menu);
+  assert.equal(commissionIncluded[0].price, 10);
+  assert.equal(commissionIncluded[0].modifiers[0].price, 1);
+  assert.equal(commissionIncluded[0].modifierGroups[0].options[0].price, 2);
   assert.equal(menu[0].price, 10, 'el cálculo no debe mutar el menú almacenado');
 });
 

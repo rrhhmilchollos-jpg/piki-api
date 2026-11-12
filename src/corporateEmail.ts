@@ -42,6 +42,14 @@ export function escapeCorporateHtml(value: string) {
 export function corporateRecipientAccepted(accepted: ReadonlyArray<string | { address: string; name?: string }>, recipient: string): boolean {
   return accepted.some(value => (typeof value === "string" ? value : value.address).toLowerCase() === recipient.toLowerCase());
 }
+type CorporateMailComposerConstructor = new (options: SendMailOptions) => { compile(): { build(): Promise<Buffer> } };
+export async function composeCorporateMime(options: SendMailOptions): Promise<Buffer> {
+  const imported: unknown = MailComposer;
+  const candidate = typeof imported === "function" ? imported : imported && typeof imported === "object" && "default" in imported ? imported.default : null;
+  if (typeof candidate !== "function") throw new Error("MAIL_COMPOSER_UNAVAILABLE");
+  const Constructor = candidate as CorporateMailComposerConstructor;
+  return new Constructor(options).compile().build();
+}
 async function saveCorporateSentCopy(mailOptions: SendMailOptions) {
   if (process.env.SMTP_IMAP_SAVE_SENT !== "true") return false;
   const imap = new ImapFlow({
@@ -53,7 +61,7 @@ async function saveCorporateSentCopy(mailOptions: SendMailOptions) {
     tls: { minVersion: "TLSv1.2", rejectUnauthorized: true },
   });
   try {
-    const raw = await new MailComposer(mailOptions).compile().build();
+    const raw = await composeCorporateMime(mailOptions);
     await imap.connect();
     const folders = await imap.list();
     const sentFolder = folders.find(folder => folder.specialUse?.toLowerCase() === "\\sent")?.path || process.env.SMTP_SENT_FOLDER || "INBOX.Sent";

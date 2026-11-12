@@ -70,6 +70,8 @@ import { postMarketplaceOrderLedger, preparePartnerPayoutBatch } from "./marketp
 import { extractAndParseMenu, readAssetBytes } from "./menuImport.js";
 import { canonicalRestaurantMenu, normalizePartnerMenuItems, partnerMenuItemsSchema } from "./menuContract.js";
 import { registerControlledMenuImportRoutes } from "./menuSafeImport.js";
+import { currentMenuRevision, menuAvailabilitySchema, menuRevisionFilter, menuWriteSchema } from "./menuRevision.js";
+import { searchLocalities } from "./localities.js";
 import { publishCatalogUpdate, serveCatalogEvents, startCatalogRelay } from "./catalogRealtime.js";
 import { purgeTestDataIfEnabled } from "./purgeTestData.js";
 import { validateDocumentRequestSubmission } from "./onboardingDocumentPolicy.js";
@@ -87,7 +89,9 @@ import { decryptGoogleSecret, exchangeGoogleCode, fromGoogleLocationHours, googl
 import { deliveredConfirmationResponse, deliveryCredentialNotLockedFilter, deliveryFailureAtomicUpdate, deliveryFailureLock, parseDeliveryCredential, stripeDeliveryPaymentAction } from "./deliveryConfirmation.js";
 import { fleetPublicView } from "./fleetView.js";
 import { prepareTrackingBatch } from "./riderLocationPolicy.js";
-import { activeRecruitmentProvinces, resolveRecruitmentSelection } from "./recruitmentAreas.js";
+import { resolveRecruitmentSelection } from "./recruitmentAreas.js";
+import { publicRecruitmentProvinces, resolvePublicRecruitmentSelection } from "./publicRecruitment.js";
+import { renderDeploymentCommit } from "./deploymentRevision.js";
 import { startGoogleBusinessSyncWorker, stopGoogleBusinessSyncWorker, googleBusinessSyncSettings, googleBusinessHoursChanged } from "./googleBusinessSyncWorker.js";
 import { resolveRiderGeofence } from "./riderGeofence.js";
 import { Badge, CustomerBadge, CustomerDeliverySaving, PikiPassSubscription, ReferralReward, UserStreak, WHEEL_CREDIT_TTL_MS, calculatePriceBreakdown, consumeCustomerCredits, ensureCustomerEngagementIndexes, recommendationProfileForCustomer, recordCompletedCustomerOrder, resolveWheelSpin, restoreCustomerCredits, syncCustomerDeliverySavings } from "./customerEngagement.js";
@@ -145,7 +149,8 @@ function photonAddress(properties: Record<string, string | undefined>) {
 }
 async function searchPhoton(query: string) {
   const url = new URL("https://photon.komoot.io/api/");
-  url.searchParams.set("q", `${query}, Comunitat Valenciana, España`); url.searchParams.set("limit", "8");
+  url.searchParams.set("q", `${query}, España`); url.searchParams.set("limit", "8");
+  url.searchParams.set("countrycode", "ES");
   const response = await boundedFetch(url, { headers: geocoderHeaders });
   if (!response.ok) throw new Error(`Photon HTTP ${response.status}`);
   const payload = await response.json() as { features?: PhotonFeature[] };
@@ -666,7 +671,7 @@ app.post("/api/v1/release/ack", async (req, res) => {
   return res.json({ ok: true, from, to, surface });
 });
 
-app.get("/health", (_req, res) => res.json({ service: "piki-api", status: "ok" }));
+app.get("/health", (_req, res) => res.json({ service: "piki-api", status: "ok", commit: renderDeploymentCommit() }));
 app.get("/ready", (_req, res) => {
   if (!databaseReady || mongoose.connection.readyState !== 1) return res.status(503).json({ service: "piki-api", status: "not_ready" });
   return res.json({ service: "piki-api", status: "ready" });
@@ -1485,7 +1490,7 @@ app.get("/api/v1/catalog/restaurants", async (req, res) => {
   const restaurants = await Restaurant.find(filter)
     // Explicit inclusion avoids MongoDB path-collision errors caused by
     // partnerProfile.documents having select:false nested fields.
-    .select("slug name cuisine category locality partnerGroupKey listingType fulfillmentMode goldFounder tagline etaMinutes deliveryFeeCents cashPaymentsEnabled rating reviews promoted image accent phone address location menu isActive onboardingStatus availabilityStatus upcomingAt upcomingMessage partnerProfile.openingHours partnerProfile.postalCode partnerProfile.city partnerProfile.province")
+    .select("slug name cuisine category locality partnerGroupKey listingType fulfillmentMode goldFounder tagline etaMinutes deliveryFeeCents cashPaymentsEnabled rating reviews promoted image accent phone address location menu menuRevision priceIncludesCommission isActive onboardingStatus availabilityStatus upcomingAt upcomingMessage partnerProfile.commissionRateBps partnerProfile.openingHours partnerProfile.postalCode partnerProfile.city partnerProfile.province")
     .sort({ promoted: -1, rating: -1, reviews: -1 }).lean().exec();
   const catalogPriority: Record<string, number> = {
     "alibaba-kebab-xativa": 0,
@@ -1510,6 +1515,13 @@ app.get("/api/v1/catalog/restaurants", async (req, res) => {
   res.json(body);
 });
 
+app.get("/api/v1/catalog/localities", (req, res) => {
+  const result = searchLocalities(req.query);
+  if (!result.ok) return res.status(400).json({ error: "INVALID_LOCALITIES_QUERY", details: result.details });
+  res.setHeader("Cache-Control", "public, max-age=3600");
+  return res.json(result.body);
+});
+
 app.get("/api/v1/locations/search", async (req, res) => {
   const query = typeof req.query.q === "string" ? req.query.q.trim() : "";
   if (query.length < 3) return res.status(400).json({ error: "QUERY_TOO_SHORT" });
@@ -1519,7 +1531,8 @@ app.get("/api/v1/locations/search", async (req, res) => {
   const shared = await sharedCacheGet<{ results: unknown[] }>(`piki:geocode:${cacheKey}`);
   if (shared) { geocodeCache.set(cacheKey, { expiresAt: Date.now() + GEOCODE_CACHE_MS, body: shared }); res.setHeader("Cache-Control", "public, max-age=300, s-maxage=300, stale-while-revalidate=600, stale-if-error=900"); return res.json(shared); }
   const url = new URL("https://nominatim.openstreetmap.org/search");
-  url.searchParams.set("q", `${query}, Comunitat Valenciana, España`);
+  url.searchParams.set("q", `${query}, España`);
+  url.searchParams.set("countrycodes", "es");
   url.searchParams.set("format", "jsonv2");
   url.searchParams.set("addressdetails", "1");
   url.searchParams.set("limit", "8");
@@ -1590,7 +1603,7 @@ app.get("/api/v1/coverage", async (req, res) => {
       const rows = await Restaurant.find(CUSTOMER_ORDERABLE_RESTAURANT_FILTER)
         // Inclusive projection avoids a MongoDB path collision with the
         // select:false document payload nested under partnerProfile.
-        .select("slug name cuisine category locality tagline etaMinutes deliveryFeeCents cashPaymentsEnabled rating reviews promoted image accent phone address location menu availabilityStatus upcomingAt upcomingMessage")
+        .select("slug name cuisine category locality listingType fulfillmentMode tagline etaMinutes deliveryFeeCents cashPaymentsEnabled rating reviews promoted image accent phone address location menu menuRevision priceIncludesCommission partnerProfile.commissionRateBps isActive onboardingStatus availabilityStatus upcomingAt upcomingMessage")
         .sort({ promoted: -1, rating: -1, reviews: -1 }).lean().exec();
       restaurants = rows.map((restaurant: any) => presentCustomerCatalogRestaurant({ ...restaurant, menu: canonicalRestaurantMenu(restaurant) }));
     } catch (error) {
@@ -1622,9 +1635,9 @@ async function notifyOnboarding(input: { channel: "admin" | "fleet"; type: strin
 }
 
 app.get("/api/v1/public/recruitment/areas", (_req, res) => {
-  // Never derive this response from planned MunicipalExpansion or Fleet zones.
-  // It is intentionally limited to the executable active coverage policy.
-  return res.json({ provinces: activeRecruitmentProvinces() });
+  // Contact intake is national; it never enables accounts, fleets or coverage.
+  // Existing operational areas retain their real identity, all others are interest only.
+  return res.json({ provinces: publicRecruitmentProvinces() });
 });
 
 app.post("/api/v1/public/partner-leads", async (req, res) => {
@@ -1632,10 +1645,10 @@ app.post("/api/v1/public/partner-leads", async (req, res) => {
   if (!parsed.success) return res.status(400).json({ error: "INVALID_PARTNER_LEAD", details: parsed.error.flatten() });
   if (parsed.data.website) return res.status(400).json({ error: "INVALID_PARTNER_LEAD" });
   const { website: _website, ...data } = parsed.data;
-  const selection = resolveRecruitmentSelection(data);
-  if (!selection) return res.status(400).json({ error: "INVALID_RECRUITMENT_AREA", message: "Selecciona una localidad, provincia y zona de cobertura activas y coherentes." });
+  const selection = resolvePublicRecruitmentSelection(data);
+  if (!selection) return res.status(400).json({ error: "INVALID_RECRUITMENT_AREA", message: "Selecciona una localidad oficial y su provincia. Una zona de reparto solo puede ser una zona real publicada." });
   try {
-    const lead = await PartnerLead.create({ ...data, city: selection.localityName, localityCode: selection.localityCode, provinceCode: selection.provinceCode, requestedZoneSlug: selection.requestedZoneSlug, email: normalizeLeadEmail(data.email), privacyNoticeAcceptedAt: new Date(), status: "new", history: [{ status: "new", notes: "Solicitud recibida desde Únete a PIKI." }] });
+    const lead = await PartnerLead.create({ ...data, city: selection.localityName, localityCode: selection.localityCode, provinceCode: selection.provinceCode, requestedZoneSlug: selection.requestedZoneSlug, email: normalizeLeadEmail(data.email), privacyNoticeAcceptedAt: new Date(), status: "new", history: [{ status: "new", notes: selection.intakeMode === "national_interest" ? "Solicitud de interés nacional recibida desde Únete a PIKI, sin zona de reparto asignada. Pendiente de revisión." : "Solicitud recibida desde Únete a PIKI." }] });
     await notifyOnboarding({ channel: "admin", type: "onboarding.partner_lead.created", entityId: String(lead._id), tenantId: (lead as any).tenantId });
     return res.status(201).json({ message: "Solicitud recibida. El equipo comercial revisará tus datos.", lead: { id: String(lead._id), status: lead.status } });
   } catch (error) {
@@ -2060,7 +2073,7 @@ app.post("/api/v1/partners/menu/imports/:id/publish", requireRole("partner"), as
     let restaurant: any = null;
     let published: any = null;
     await session.withTransaction(async () => {
-      restaurant = await Restaurant.findOneAndUpdate({ _id: objectId(restaurantId), onboardingStatus: "approved" }, { $set: { menu: normalizePartnerMenuItems(draft.items) } }, { new: true, session }).select("name menu").lean().exec() as any;
+      restaurant = await Restaurant.findOneAndUpdate({ _id: objectId(restaurantId), ...tenantScope(req), onboardingStatus: "approved" }, { $set: { menu: normalizePartnerMenuItems(draft.items) }, $inc: { menuRevision: 1 } }, { new: true, session }).select("name menu menuRevision").lean().exec() as any;
       if (!restaurant) throw new Error("RESTAURANT_NOT_APPROVED");
       published = await MenuImportDraft.findOneAndUpdate({ _id: id, restaurantId: objectId(restaurantId), status: "draft" }, { $set: { status: "published", publishedAt: new Date(), reviewedBy: objectId(String(req.auth?.employeeId || "")) } }, { new: true, session }).lean().exec();
       if (!published) throw new Error("MENU_IMPORT_NOT_FOUND_OR_CLOSED");
@@ -2267,10 +2280,11 @@ app.get("/api/v1/partners/menu", requireRole("partner"), async (req, res) => {
   if (!allowed) return res.status(403).json({ error: "PARTNER_PERMISSION_DENIED", permission: "menu:read" });
   const restaurantId = await employeeRestaurant(req, access);
   if (!restaurantId) return res.status(403).json({ error: access?.restaurantIds.length ? "PARTNER_RESTAURANT_ACCESS_DENIED" : "PARTNER_RESTAURANT_NOT_ASSIGNED" });
-  const restaurant = await Restaurant.findOne({ _id: objectId(restaurantId), ...tenantScope(req) }).select("name slug internalDemo menu").lean().exec() as any;
+  const restaurant = await Restaurant.findOne({ _id: objectId(restaurantId), ...tenantScope(req) }).select("name slug internalDemo menu menuRevision").lean().exec() as any;
   if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
   const menu = canonicalRestaurantMenu(restaurant);
-  return res.json({ restaurant: { ...restaurant, restaurantId: String(restaurant._id), menu }, restaurantId: String(restaurant._id), menu });
+  const menuRevision = currentMenuRevision(restaurant);
+  return res.json({ restaurant: { ...restaurant, restaurantId: String(restaurant._id), menu, menuRevision }, restaurantId: String(restaurant._id), menu, menuRevision });
 });
 app.put("/api/v1/partners/menu", requireRole("partner"), async (req, res) => {
   setPartnerMenuResponseHeaders(res);
@@ -2278,22 +2292,27 @@ app.put("/api/v1/partners/menu", requireRole("partner"), async (req, res) => {
   if (!allowed) return res.status(403).json({ error: "PARTNER_PERMISSION_DENIED", permission: "menu:write" });
   const restaurantId = await employeeRestaurant(req, access);
   if (!restaurantId) return res.status(403).json({ error: access?.restaurantIds.length ? "PARTNER_RESTAURANT_ACCESS_DENIED" : "PARTNER_RESTAURANT_NOT_ASSIGNED" });
-  const parsed = z.object({ items: partnerMenuItemsSchema }).safeParse(req.body);
+  const parsed = menuWriteSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_MENU", details: parsed.error.flatten() });
   const items = normalizePartnerMenuItems(parsed.data.items);
-  const restaurant = await Restaurant.findOneAndUpdate({ _id: objectId(restaurantId), ...tenantScope(req) }, { $set: { menu: items } }, { new: true }).select("name menu slug").lean().exec() as any;
-  if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
+  const scope = { _id: objectId(restaurantId), ...tenantScope(req) };
+  const restaurant = await Restaurant.findOneAndUpdate({ ...scope, ...menuRevisionFilter(parsed.data.expectedMenuRevision) }, { $set: { menu: items }, $inc: { menuRevision: 1 } }, { new: true, runValidators: true }).select("name menu slug menuRevision").lean().exec() as any;
+  if (!restaurant) {
+    const current = await Restaurant.findOne(scope).select("menuRevision").lean().exec() as any;
+    if (current && parsed.data.expectedMenuRevision !== undefined) return res.status(409).json({ error: "MENU_REVISION_CONFLICT", menuRevision: currentMenuRevision(current) });
+    return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
+  }
   invalidateCatalogCache();
   void publishCatalogUpdate(restaurant._id, "partner.menu.updated");
-  return res.json({ restaurant: { ...restaurant, restaurantId: String(restaurant._id) }, restaurantId: String(restaurant._id), menu: restaurant.menu || [] });
+  return res.json({ restaurant: { ...restaurant, restaurantId: String(restaurant._id) }, restaurantId: String(restaurant._id), menu: restaurant.menu || [], menuRevision: currentMenuRevision(restaurant) });
 });
 
 app.get("/api/v1/admin/restaurants/:id/menu", requireOwner(), async (req, res) => {
   const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
   if (!id) return res.status(400).json({ error: "INVALID_RESTAURANT_ID" });
-  const restaurant = await Restaurant.findOne({ _id: id, ...tenantScope(req), onboardingStatus: "approved" }).select("_id slug name menu").lean().exec() as any;
+  const restaurant = await Restaurant.findOne({ _id: id, ...tenantScope(req), onboardingStatus: "approved" }).select("_id slug name menu menuRevision").lean().exec() as any;
   if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND_OR_NOT_APPROVED" });
-  return res.json({ restaurant, menu: restaurant.menu || [] });
+  return res.json({ restaurant: { ...restaurant, menuRevision: currentMenuRevision(restaurant) }, menu: restaurant.menu || [], menuRevision: currentMenuRevision(restaurant) });
 });
 
 registerControlledMenuImportRoutes(app, {
@@ -2316,17 +2335,52 @@ registerControlledMenuImportRoutes(app, {
 app.put("/api/v1/admin/restaurants/:id/menu", requireOwner(), async (req, res) => {
   const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
   if (!id) return res.status(400).json({ error: "INVALID_RESTAURANT_ID" });
-  const parsed = z.object({ items: partnerMenuItemsSchema }).safeParse(req.body);
+  const parsed = menuWriteSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_MENU", details: parsed.error.flatten() });
+  const scope = { _id: id, ...tenantScope(req), onboardingStatus: "approved" };
   const restaurant = await Restaurant.findOneAndUpdate(
-    { _id: id, ...tenantScope(req), onboardingStatus: "approved" },
-    { $set: { menu: parsed.data.items } },
-    { new: true },
-  ).select("_id slug name menu").lean().exec() as any;
-  if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND_OR_NOT_APPROVED" });
+    { ...scope, ...menuRevisionFilter(parsed.data.expectedMenuRevision) },
+    { $set: { menu: normalizePartnerMenuItems(parsed.data.items) }, $inc: { menuRevision: 1 } },
+    { new: true, runValidators: true },
+  ).select("_id slug name menu menuRevision").lean().exec() as any;
+  if (!restaurant) {
+    const current = await Restaurant.findOne(scope).select("menuRevision").lean().exec() as any;
+    if (current && parsed.data.expectedMenuRevision !== undefined) return res.status(409).json({ error: "MENU_REVISION_CONFLICT", menuRevision: currentMenuRevision(current) });
+    return res.status(404).json({ error: "RESTAURANT_NOT_FOUND_OR_NOT_APPROVED" });
+  }
   invalidateCatalogCache();
   void publishCatalogUpdate(restaurant._id, "owner.menu.updated");
-  return res.json({ updated: true, restaurant, menu: restaurant.menu || [] });
+  return res.json({ updated: true, restaurant, menu: restaurant.menu || [], menuRevision: currentMenuRevision(restaurant) });
+});
+
+app.patch("/api/v1/restaurants/:id/menu/items/:itemId/availability", requireRole("partner", "admin"), (req, res, next) => req.auth?.role === "admin" ? requireOwner()(req, res, next) : next(), async (req, res) => {
+  setPartnerMenuResponseHeaders(res);
+  const id = objectId(String(req.params.id));
+  const itemId = String(req.params.itemId || "");
+  const parsed = menuAvailabilitySchema.safeParse(req.body);
+  if (!id || !itemId || itemId.length > 80 || !parsed.success) return res.status(400).json({ error: "INVALID_MENU_AVAILABILITY" });
+  if (req.auth?.role === "partner") {
+    const { access, allowed } = await partnerRequestAccess(req, "menu:write");
+    if (!allowed) return res.status(403).json({ error: "PARTNER_PERMISSION_DENIED", permission: "menu:write" });
+    if (await employeeRestaurant(req, access) !== String(id)) return res.status(403).json({ error: "PARTNER_RESTAURANT_ACCESS_DENIED" });
+  }
+  const scope = { _id: id, ...tenantScope(req), ...(req.auth?.role === "admin" ? { onboardingStatus: "approved" } : {}) };
+  // The product ID and its state are matched in the same array element. The
+  // positional update never replaces another product or the complete menu.
+  const restaurant = await Restaurant.findOneAndUpdate(
+    { ...scope, menu: { $elemMatch: { id: itemId, available: parsed.data.available ? false : { $ne: false } } } },
+    { $set: { "menu.$.available": parsed.data.available }, $inc: { menuRevision: 1 } },
+    { new: true, runValidators: true },
+  ).select("_id menu menuRevision").lean().exec() as any;
+  const current = restaurant || await Restaurant.findOne(scope).select("_id menu menuRevision").lean().exec() as any;
+  if (!current) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
+  const item = canonicalRestaurantMenu(current).find((entry: any) => entry.id === itemId);
+  if (!item) return res.status(404).json({ error: "MENU_ITEM_NOT_FOUND" });
+  if (restaurant) {
+    invalidateCatalogCache();
+    void publishCatalogUpdate(current._id, "restaurant.menu.availability.updated");
+  }
+  return res.json({ updated: true, changed: Boolean(restaurant), restaurantId: String(current._id), itemId, available: item.available !== false, menuRevision: currentMenuRevision(current) });
 });
 
 app.get("/api/v1/partners/kitchen/orders", requireRole("partner"), async (req, res) => {
@@ -2835,10 +2889,10 @@ app.post("/api/v1/public/rider-leads", async (req, res) => {
   if (!parsed.success) return res.status(400).json({ error: "INVALID_RIDER_LEAD", details: parsed.error.flatten() });
   if (parsed.data.website) return res.status(400).json({ error: "INVALID_RIDER_LEAD" });
   const { website: _website, ...data } = parsed.data;
-  const selection = resolveRecruitmentSelection(data);
-  if (!selection) return res.status(400).json({ error: "INVALID_RECRUITMENT_AREA", message: "Selecciona una localidad, provincia y zona de cobertura activas y coherentes." });
+  const selection = resolvePublicRecruitmentSelection(data);
+  if (!selection) return res.status(400).json({ error: "INVALID_RECRUITMENT_AREA", message: "Selecciona una localidad oficial y su provincia. Una zona de reparto solo puede ser una zona real publicada." });
   try {
-    const lead = await RiderLead.create({ ...data, city: selection.localityName, localityCode: selection.localityCode, provinceCode: selection.provinceCode, requestedZoneSlug: selection.requestedZoneSlug, email: normalizeLeadEmail(data.email), privacyNoticeAcceptedAt: new Date(), status: "new", history: [{ status: "new", notes: "Solicitud recibida desde Únete a PIKI." }] });
+    const lead = await RiderLead.create({ ...data, city: selection.localityName, localityCode: selection.localityCode, provinceCode: selection.provinceCode, requestedZoneSlug: selection.requestedZoneSlug, email: normalizeLeadEmail(data.email), privacyNoticeAcceptedAt: new Date(), status: "new", history: [{ status: "new", notes: selection.intakeMode === "national_interest" ? "Solicitud de interés nacional recibida desde Únete a PIKI, sin zona de reparto asignada. Pendiente de revisión." : "Solicitud recibida desde Únete a PIKI." }] });
     await notifyOnboarding({ channel: "admin", type: "onboarding.rider_lead.created", entityId: String(lead._id), tenantId: (lead as any).tenantId });
     return res.status(201).json({ message: "Solicitud recibida. El equipo Fleet revisará tus datos y te contactará.", lead: { id: String(lead._id), status: lead.status } });
   } catch (error) {
@@ -4456,12 +4510,12 @@ app.post("/api/v1/orders", rateLimit(20, 60_000, "orders-create"), async (req, r
   if (!["cash", "stripe"].includes(parsed.data.paymentMethod)) return res.status(409).json({ error: "PAYMENT_METHOD_UNAVAILABLE", message: "Método de pago no disponible." });
   const restaurantObjectId = objectId(parsed.data.restaurantId);
   if (!restaurantObjectId) return res.status(400).json({ error: "INVALID_RESTAURANT_ID" });
-  const restaurant = await Restaurant.findOne({ _id: restaurantObjectId, isActive: true, onboardingStatus: "approved" }).lean().exec() as any;
+  const restaurant = await Restaurant.findOne({ _id: restaurantObjectId, ...CUSTOMER_ORDERABLE_RESTAURANT_FILTER }).lean().exec() as any;
   if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_AVAILABLE" });
   if (!restaurantIsWithinOpeningHours(restaurant.partnerProfile?.openingHours)) return res.status(409).json({ error: "PARTNER_CLOSED", message: "Este establecimiento está cerrado ahora. Elige otro horario para realizar el pedido." });
   if (parsed.data.paymentMethod === "cash" && !isCashPaymentEnabledForRestaurant(restaurant)) return res.status(409).json(cashPaymentDisabledError(restaurant));
   // El catálogo público y el checkout deben compartir exactamente la misma política de precio.
-  // Alibaba aplica el 18% por producto; Kings Tacos y el resto no se alteran.
+  // Respeta el perfil explícito y la base de precio persistida del restaurante.
   const pricedMenu = pricedRestaurantMenu(restaurant);
   const pricedRestaurant = { ...restaurant, menu: pricedMenu };
   const useReferenceFallback = usesReferenceAddOns(pricedRestaurant);
@@ -5293,9 +5347,9 @@ app.post("/api/v1/admin/maintenance/menus/commission-flag", requireRole("admin")
   // El precio de carta es el precio base del comercio: la comisión de PIKI se
   // aplica al presentar la carta, de forma identica en catalogo y en checkout.
   const value = req.body?.priceIncludesCommission === true;
-  const result = await Restaurant.updateMany({}, { $set: { priceIncludesCommission: value } }).exec();
+  const result = await Restaurant.updateMany({ priceIncludesCommission: { $ne: value } }, { $set: { priceIncludesCommission: value }, $inc: { menuRevision: 1 } }).exec();
   invalidateCatalogCache();
-  void publishCatalogUpdate(null, "owner.menu.commission_flag.updated");
+  void publishCatalogUpdate(null, "owner.menu.price_basis.updated");
   return res.json({ priceIncludesCommission: value, matched: result.matchedCount ?? null, modified: result.modifiedCount ?? null });
 });
 app.get("/api/v1/admin/orders", requireRole("admin"), async (req, res) => {
@@ -5374,7 +5428,7 @@ app.post("/api/v1/admin/maintenance/menus/apply-commission", requireRole("admin"
       })),
     }));
     if (!dryRun) {
-      await Restaurant.updateOne({ _id: restaurant._id }, { $set: { menu: next, priceIncludesCommission: true } }).exec();
+      await Restaurant.updateOne({ _id: restaurant._id }, { $set: { menu: next, priceIncludesCommission: true }, $inc: { menuRevision: 1 } }).exec();
       invalidateCatalogCache();
     }
     report.push({ slug: restaurant.slug, skipped: false, items: next.length, first: { before: menu[0]?.price, after: next[0]?.price } });
@@ -5385,17 +5439,22 @@ app.post("/api/v1/admin/maintenance/menus/apply-commission", requireRole("admin"
 app.put("/api/v1/admin/maintenance/restaurants/:id/menu", requireRole("admin"), async (req, res) => {
   const id = objectId(String(req.params.id));
   if (!id) return res.status(400).json({ error: "INVALID_RESTAURANT_ID" });
-  const parsed = z.object({ items: partnerMenuItemsSchema }).safeParse(req.body);
+  const parsed = menuWriteSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_MENU", details: parsed.error.flatten() });
+  const scope = { _id: id, ...tenantScope(req), onboardingStatus: "approved" };
   const restaurant = await Restaurant.findOneAndUpdate(
-    { _id: id, onboardingStatus: "approved" },
-    { $set: { menu: parsed.data.items } },
-    { new: true },
-  ).select("_id slug name menu").lean().exec() as any;
-  if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND_OR_NOT_APPROVED" });
+    { ...scope, ...menuRevisionFilter(parsed.data.expectedMenuRevision) },
+    { $set: { menu: normalizePartnerMenuItems(parsed.data.items) }, $inc: { menuRevision: 1 } },
+    { new: true, runValidators: true },
+  ).select("_id slug name menu menuRevision").lean().exec() as any;
+  if (!restaurant) {
+    const current = await Restaurant.findOne(scope).select("menuRevision").lean().exec() as any;
+    if (current && parsed.data.expectedMenuRevision !== undefined) return res.status(409).json({ error: "MENU_REVISION_CONFLICT", menuRevision: currentMenuRevision(current) });
+    return res.status(404).json({ error: "RESTAURANT_NOT_FOUND_OR_NOT_APPROVED" });
+  }
   invalidateCatalogCache();
   void publishCatalogUpdate(restaurant._id, "owner.maintenance.menu.updated");
-  return res.json({ updated: true, menu: restaurant.menu || [] });
+  return res.json({ updated: true, menu: restaurant.menu || [], menuRevision: currentMenuRevision(restaurant) });
 });
 app.post("/api/v1/admin/maintenance/daily-summary", requireRole("admin"), async (_req, res) => {
   const result = await sendDailyBusinessSummary();

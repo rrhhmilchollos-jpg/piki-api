@@ -208,7 +208,7 @@ test("single catalog.list batches are arrays for GET and POST while a bare call 
   }
 });
 
-test("catalog.list preserves public location and persisted menu fields without repricing or mutating paused items", async () => {
+test("catalog.list preserves public location, explicitly final prices and paused source items", async () => {
   const persistedMenu = [
     {
       id: "persisted-menu-item",
@@ -237,6 +237,7 @@ test("catalog.list preserves public location and persisted menu fields without r
     locality: "Xàtiva",
     partnerProfile: { city: "Otra ciudad", postalCode: "46800" },
     menu: persistedMenu,
+    priceIncludesCommission: true,
   });
   const localityFallback = publicRestaurant({
     _id: IDs.profileLocality,
@@ -267,7 +268,7 @@ test("catalog.list preserves public location and persisted menu fields without r
 
     assert.deepEqual(presented.menu.map((item: any) => item.id), ["persisted-menu-item"], "paused products are not listed");
     const item = presented.menu[0];
-    assert.equal(item.price, persistedMenu[0].price, "the customer catalog keeps the persisted price rather than applying a commission transform");
+    assert.equal(item.price, persistedMenu[0].price, "an explicitly final persisted price must not be marked up again");
     assert.equal(item.category, "Menús");
     assert.equal(item.image, "https://cdn.example.test/menu-de-la-casa.webp");
     assert.equal(item.requestOnly, true);

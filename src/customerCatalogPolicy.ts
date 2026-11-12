@@ -1,16 +1,21 @@
 import { isCashPaymentEnabledForRestaurant } from "./paymentPolicy.js";
 import { customerAvailability, CUSTOMER_OPERATING_24_7 } from "./customerAvailability.js";
+import { modifierGroupsForItem } from "./menuModifiers.js";
 
-export const COMING_SOON_SLUGS = ["eleven-burgers-xativa", "nakama-sushi-xativa"] as const;
+export const COMING_SOON_SLUGS = ["eleven-burgers-xativa", "nakama-sushi-xativa", "kazoku-xativa", "kazoku-algemesi"] as const;
 export const CUSTOMER_HIDDEN_TEST_SLUGS = ["kfc-xativa-test", "partner-test"] as const;
 export const CUSTOMER_ORDERABLE_RESTAURANT_FILTER = {
   slug: { $nin: [...CUSTOMER_HIDDEN_TEST_SLUGS] }, internalDemo: { $ne: true }, isActive: true, onboardingStatus: "approved", availabilityStatus: "available", "menu.0": { $exists: true },
+  fulfillmentMode: { $ne: "assisted_purchase" },
+  // Legacy rows predating listingType retain partner delivery only. An explicit
+  // directory (or assisted purchase row without a type) is never orderable.
+  $or: [{ listingType: "official_partner" }, { listingType: { $exists: false } }],
 };
 export const CUSTOMER_DIRECTORY_RESTAURANT_FILTER = {
   slug: { $nin: [...CUSTOMER_HIDDEN_TEST_SLUGS] }, internalDemo: { $ne: true }, listingType: "local_directory", isActive: true, onboardingStatus: "approved",
 };
 export const CUSTOMER_CATALOG_RESTAURANT_FILTER = {
-  $or: [CUSTOMER_ORDERABLE_RESTAURANT_FILTER, { slug: { $in: [...COMING_SOON_SLUGS] }, availabilityStatus: "coming_soon", onboardingStatus: { $ne: "rejected" } }, CUSTOMER_DIRECTORY_RESTAURANT_FILTER],
+  $or: [CUSTOMER_ORDERABLE_RESTAURANT_FILTER, { slug: { $in: [...COMING_SOON_SLUGS] }, internalDemo: { $ne: true }, availabilityStatus: "coming_soon", onboardingStatus: { $ne: "rejected" } }, CUSTOMER_DIRECTORY_RESTAURANT_FILTER],
 };
 export function restaurantIsWithinOpeningHours(openingHours: unknown, now = new Date()): boolean {
   // This helper is shared by the customer catalogue and checkout guard.
@@ -19,7 +24,7 @@ export function restaurantIsWithinOpeningHours(openingHours: unknown, now = new 
   return CUSTOMER_OPERATING_24_7;
 }
 export function customerCatalogRestaurantName(restaurant: { name: string; slug?: string }) { return restaurant.name; }
-export function presentCustomerCatalogRestaurant<T extends { name: string; slug?: string; listingType?: string; goldFounder?: boolean; menu?: any[]; priceIncludesCommission?: boolean; availabilityStatus?: string; upcomingMessage?: string; isActive?: boolean; onboardingStatus?: string; cashPaymentsEnabled?: boolean; partnerProfile?: { openingHours?: unknown } }>(restaurant: T) {
+export function presentCustomerCatalogRestaurant<T extends { name: string; slug?: string; listingType?: string; goldFounder?: boolean; menu?: any[]; priceIncludesCommission?: boolean; availabilityStatus?: string; upcomingMessage?: string; isActive?: boolean; onboardingStatus?: string; cashPaymentsEnabled?: boolean; partnerProfile?: { openingHours?: unknown; commissionRateBps?: number } }>(restaurant: T) {
   const comingSoon = restaurant.availabilityStatus === "coming_soon";
   const withinHours = restaurantIsWithinOpeningHours(restaurant.partnerProfile?.openingHours);
   const listingType = restaurant.listingType === "local_directory" ? "local_directory" : "official_partner";
@@ -76,16 +81,18 @@ function alibabaModifierGroups(item: Record<string, any>) {
   return groups;
 }
 export function customerCommissionRate(restaurant: { slug?: string; partnerProfile?: { commissionRateBps?: number } }): number {
+  const explicit = restaurant.partnerProfile?.commissionRateBps;
+  if (typeof explicit === "number" && Number.isInteger(explicit) && explicit >= 0 && explicit <= 10_000) return explicit / 10_000;
   return PARTNER_COMMISSION_RATES[restaurant.slug || ""] ?? DEFAULT_CUSTOMER_COMMISSION_RATE;
 }
 function applyPartnerMenuPricing<T extends Record<string, any>>(item: T, rate: number, restaurantSlug = ""): T {
-  const apply = (value: unknown) => Number((Math.ceil(Math.max(0, Number(value || 0) * 100) * (1 + rate)) / 100).toFixed(2));
+  const apply = (value: unknown) => rate === 0 ? value : Number((Math.ceil(Math.max(0, Number(value || 0) * 100) * (1 + rate) - 1e-9) / 100).toFixed(2));
   const priced = { ...item, price: apply(item.price) };
   const sourceModifiers = Array.isArray(item.modifiers) && item.modifiers.length
     ? item.modifiers
     : Array.isArray(item.modifierGroups) && item.modifierGroups.length
       ? item.modifierGroups
-      : restaurantSlug === ALIBABA_KEBAB_SLUG || String(item.id || "").startsWith("alibaba-")
+      : rate > 0 && (restaurantSlug === ALIBABA_KEBAB_SLUG || String(item.id || "").startsWith("alibaba-"))
         ? alibabaModifierGroups(item)
         : null;
   if (!sourceModifiers) return priced;
@@ -98,27 +105,31 @@ function applyPartnerMenuPricing<T extends Record<string, any>>(item: T, rate: n
       ? modifier.optionItems
       : Array.isArray(modifier.options) ? modifier.options : Array.isArray(modifier.items) ? modifier.items : [])
       .filter((option: any) => option?.available !== false)
-      .map((option: any, optionIndex: number) => ({
+      .map((option: any, optionIndex: number) => typeof option === "string" ? option : ({
         ...option,
         id: String(option.id || `${String(modifier.id || groupIndex)}-option-${optionIndex + 1}`),
         name: String(option.name || option.title || option.label || `Opción ${optionIndex + 1}`),
         price: apply(option.price),
       }))
-      .filter((option: any) => option.name),
+      .filter((option: any) => typeof option === "string" ? Boolean(option) : option.name),
+    // Customer needs only selectable options. Do not expose stale unpriced
+    // optionItems alongside the priced options used by checkout.
+    optionItems: undefined,
   }));
   // Alibaba's imported menu used `modifiers`; Customer and checkout use the
   // canonical `modifierGroups` contract. Publish both during migration so the
   // + button opens the real option selector and the server can quote it.
-  return { ...priced, modifiers, modifierGroups: modifiers };
+  const modifierGroups = modifierGroupsForItem({ ...priced, modifiers });
+  const orderable = modifierGroups.every((group) => group.options.length >= group.minSelections && group.maxSelections >= group.minSelections);
+  return { ...priced, modifiers, modifierGroups, orderable, available: item.available !== false && orderable };
 }
 export function menuItemIsAvailable(item: { available?: boolean } | null | undefined): boolean {
   return Boolean(item) && item?.available !== false;
 }
-export function customerMenuForRestaurant<T extends { slug?: string; menu?: any[]; priceIncludesCommission?: boolean }>(restaurant: T): any[] {
+export function customerMenuForRestaurant<T extends { slug?: string; menu?: any[]; priceIncludesCommission?: boolean; partnerProfile?: { commissionRateBps?: number } }>(restaurant: T): any[] {
   const menu = Array.isArray(restaurant.menu) ? restaurant.menu.filter(menuItemIsAvailable) : [];
   // Si la carta ya guarda el precio final con comision incluida, no se vuelve a
   // aplicar el margen: una sola cifra para la ficha, la cesta y el ticket.
-  if (restaurant.priceIncludesCommission === true) return menu;
-  const rate = customerCommissionRate(restaurant as T & { partnerProfile?: { commissionRateBps?: number } });
-  return rate > 0 ? menu.map((item) => applyPartnerMenuPricing(item, rate, restaurant.slug || "")) : menu;
+  const rate = restaurant.priceIncludesCommission === true ? 0 : customerCommissionRate(restaurant);
+  return menu.map((item) => applyPartnerMenuPricing(item, rate, restaurant.slug || ""));
 }

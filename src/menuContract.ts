@@ -67,15 +67,15 @@ export function normalizePartnerMenuItems(items: PartnerMenuItem[]): PartnerMenu
   return items.map((item) => ({
     ...item,
     modifiers: item.modifiers.map((group) => {
-      const optionItems = canonicalOptions(group);
+      const optionItems = canonicalOptions(group).map((option) => ({ ...option }));
       const availableOptions = optionItems.filter((option) => option.available);
       return {
         ...group,
         optionItems,
         options: availableOptions,
         price: availableOptions.length ? Math.min(...availableOptions.map((option) => option.price)) : 0,
-        minSelections: Math.min(group.minSelections, availableOptions.length),
-        maxSelections: Math.min(Math.max(group.minSelections, group.maxSelections), Math.max(1, availableOptions.length)),
+        minSelections: group.required ? Math.max(1, group.minSelections) : group.minSelections,
+        maxSelections: group.maxSelections,
       };
     }),
   }));

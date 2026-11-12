@@ -12,6 +12,7 @@ export type CustomerAvailabilityInput = {
   availabilityStatus?: string;
   comingSoon?: boolean;
   listingType?: string;
+  fulfillmentMode?: string;
   hasMenu?: boolean;
   openingHours?: unknown;
 };
@@ -27,7 +28,7 @@ export function customerAvailability(input: CustomerAvailabilityInput, now = new
   else if (input.onboardingStatus !== "approved") reason = "not_approved";
   else if (input.availabilityStatus && input.availabilityStatus !== "available") reason = "unavailable";
   else if (!withinHours) reason = "closed";
-  else if (input.listingType === "local_directory" || input.hasMenu === false) reason = "not_orderable";
+  else if (input.fulfillmentMode === "assisted_purchase" || input.listingType === "local_directory" || input.hasMenu === false) reason = "not_orderable";
   else reason = "open";
 
   const canOrder = reason === "open";

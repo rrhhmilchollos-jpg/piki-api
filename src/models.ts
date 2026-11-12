@@ -20,7 +20,8 @@ const tenantMembershipSchema = new Schema({
 }, { timestamps: true, collection: "tenant_memberships" });
 tenantMembershipSchema.index({ tenantId: 1, employeeId: 1 }, { unique: true });
 const geoPoint = new Schema({ type: { type: String, enum: ["Point"], default: "Point" }, coordinates: { type: [Number], default: [0, 0] } }, { _id: false });
-const menuModifier = new Schema({ id: { type: String, required: true }, name: { type: String, required: true }, description: { type: String, default: "" }, price: { type: Number, required: true, min: 0, default: 0 }, required: { type: Boolean, default: false }, minSelections: { type: Number, min: 0, default: 0 }, maxSelections: { type: Number, min: 1, default: 1 }, options: { type: [Schema.Types.Mixed], default: [] } }, { _id: false });
+const menuModifierOption = new Schema({ id: { type: String, required: true }, name: { type: String, required: true }, price: { type: Number, required: true, min: 0 }, available: { type: Boolean, default: true }, description: { type: String, default: "" } }, { _id: false });
+const menuModifier = new Schema({ id: { type: String, required: true }, name: { type: String, required: true }, description: { type: String, default: "" }, price: { type: Number, required: true, min: 0, default: 0 }, required: { type: Boolean, default: false }, minSelections: { type: Number, min: 0, default: 0 }, maxSelections: { type: Number, min: 1, default: 1 }, options: { type: [Schema.Types.Mixed], default: [] }, optionItems: { type: [menuModifierOption], default: [] } }, { _id: false });
 const menuItem = new Schema({ id: { type: String, required: true }, name: { type: String, required: true }, description: { type: String, default: "" }, price: { type: Number, required: true, min: 0 }, category: { type: String, default: "General" }, image: { type: String, default: "" }, allergens: { type: [String], default: null }, modifiers: { type: [menuModifier], default: [] }, available: { type: Boolean, default: true }, vegetarian: { type: Boolean, default: false }, popular: { type: Boolean, default: false } }, { _id: false });
 const partnerAssetSchema = new Schema({
   tenantId: { type: Schema.Types.ObjectId, ref: "Tenant", default: null, index: true },
@@ -341,6 +342,7 @@ restaurantSchema.index({ isActive: 1, category: 1, rating: -1 });
 restaurantSchema.index({ isActive: 1, onboardingStatus: 1, promoted: -1, rating: -1, reviews: -1 });
 restaurantSchema.index({ isActive: 1, cuisine: 1, promoted: -1, rating: -1, reviews: -1 });
 restaurantSchema.add({ priceIncludesCommission: { type: Boolean, default: false } });
+restaurantSchema.add({ menuRevision: { type: Number, default: 0, min: 0 } });
 restaurantSchema.index({ tenantId: 1, onboardingStatus: 1, createdAt: -1 });
 
 const riderSchema = new Schema({

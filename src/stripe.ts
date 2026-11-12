@@ -129,8 +129,10 @@ export async function createCheckoutSession(input: {
     if (item.quantity === 1) { lineItems.push({ quantity: 1, price_data: { currency: "eur", product_data: { name: item.name }, unit_amount: item.unitPriceCents - deduction } }); continue; }
     const fullUnits = Math.floor((total - deduction) / item.unitPriceCents);
     if (fullUnits > 0) lineItems.push({ quantity: fullUnits, price_data: { currency: "eur", product_data: { name: item.name }, unit_amount: item.unitPriceCents } });
-    const remainderUnits = item.quantity - fullUnits;
-    if (remainderUnits > 0) lineItems.push({ quantity: remainderUnits, price_data: { currency: "eur", product_data: { name: item.name }, unit_amount: Math.max(0, Math.floor((total - deduction - fullUnits * item.unitPriceCents) / remainderUnits)) } });
+    // A partial paid unit carries the exact remainder. Dividing it over every
+    // discounted unit and flooring silently loses cents vs the canonical quote.
+    const remainderCents = total - deduction - fullUnits * item.unitPriceCents;
+    if (remainderCents > 0) lineItems.push({ quantity: 1, price_data: { currency: "eur", product_data: { name: item.name }, unit_amount: remainderCents } });
   }
   if (discountedDelivery > 0) lineItems.push({ quantity: 1, price_data: { currency: "eur", product_data: { name: "Entrega PIKI" }, unit_amount: discountedDelivery } });
   if (discountedService > 0) lineItems.push({ quantity: 1, price_data: { currency: "eur", product_data: { name: "Tasa de servicio PIKI" }, unit_amount: discountedService } });
