@@ -197,11 +197,11 @@ test("versioned non-kitchen Partner preserves orders readiness and its current m
   f.db.restaurants[0].onboardingStatus = "approved"; f.db.memberships[0].scopes = ["*"]; assert.equal((await partnerRequestAccess(request(), "orders:read")).allowed, false);
 });
 
-test("real protected Owner may use assigned Partner session, but admin/environmental/root-null context grants no Partner data", async (t) => {
+test("real persisted Owner may use Partner or admin session; environmental/root-null context grants no Partner data", async (t) => {
   const f = fixture(t); Object.assign(f.db.employees[0], { email: OWNER_EMAIL, jobRole: "admin", apiRole: "admin", primaryRole: "admin", roles: ["admin"], partnerRoles: [], kitchenAccessSetupVersion: null, ownerProtected: true, accessLevel: "superadmin" });
   Object.assign(f.db.memberships[0], { role: "owner", scopes: ["*"], restaurantIds: [] });
   assert.equal((await partnerRequestAccess(request(), "orders:read")).allowed, true);
-  f.db.sessions[0].role = "admin"; f.db.sessions[0].surface = "admin"; assert.equal((await partnerRequestAccess(request(), "orders:read")).allowed, false);
+  f.db.sessions[0].role = "admin"; f.db.sessions[0].surface = "admin"; assert.equal((await partnerRequestAccess(request(), "orders:read")).allowed, true);
   f.db.sessions[0].tenantId = null; f.db.employees[0].tenantId = null; assert.equal((await partnerRequestAccess(request(), "orders:read")).allowed, false);
   const res = response(); await servePartnerRealtimeEvents(request(), res, { ...f.deps, authorize: (req) => partnerRequestAccess(req, "orders:read", { resolveAuth: async () => ({ role: "admin", isRootOwner: true }), employeeById: async () => { throw new Error("No employee lookup authorized"); }, binding: {} as any }) }); assert.equal(res.statusCode, 401); assert.equal(res.flushed, false);
 });
@@ -280,4 +280,39 @@ test("unrelated real Rider SSE still uses its existing audience/replay without P
   f.db.events = [event(4000, { channel: "rider", audienceKey: `rider:${riderId}`, tenantId: null })];
   const req = request({ "x-piki-surface": "rider" }); const res = response(); await serveRealtimeEvents(req, res);
   assert.equal(res.statusCode, 200); assert.equal(res.flushed, true); assert.equal(f.reads[0].channel, "rider"); assert.deepEqual(f.reads[0].audienceKey.$in, [`rider:${riderId}`]); assert.deepEqual(deliveredIds(res), [String(event(4000)._id)]); req.emit("close");
+});
+
+function ownerFixture(t: TestContext) {
+  const f = fixture(t);
+  Object.assign(f.db.employees[0], { email: OWNER_EMAIL, jobRole: "admin", apiRole: "admin", primaryRole: "admin", roles: ["admin"], partnerRoles: [], kitchenAccessSetupVersion: null, ownerProtected: true, accessLevel: "superadmin", restaurantIds: [], restaurantId: null });
+  Object.assign(f.db.memberships[0], { role: "owner", scopes: ["*"], restaurantIds: [] });
+  Object.assign(f.db.sessions[0], { role: "admin", surface: "admin" });
+  return f;
+}
+
+test("Owner admin Partner SSE subscribes only selected tenant-local audience, never portfolio-wide", async (t) => {
+  const f = ownerFixture(t); f.db.restaurants.push({ ...clone(f.db.restaurants[0]), _id: ids.otherRestaurant });
+  const req = request({ "x-piki-restaurant-id": ids.otherRestaurant }); const res = response();
+  await servePartnerRealtimeEvents(req, res, f.deps);
+  assert.equal(res.statusCode, 200); assert.equal(f.reads[0].audienceKey, `restaurant:${ids.otherRestaurant}`); assert.equal(String(f.reads[0].tenantId), ids.tenant);
+  f.events.emit("event", event(8001)); f.events.emit("event", event(8002, { audienceKey: `restaurant:${ids.otherRestaurant}`, payload: { orderId: ids.order, restaurantId: ids.otherRestaurant } }));
+  await settle(); assert.deepEqual(deliveredIds(res), [String(event(8002)._id)]); req.emit("close");
+});
+
+test("Owner pending local denies SSE before replay/listener even with stale active flag", async (t) => {
+  const f = ownerFixture(t); f.db.restaurants[0].onboardingStatus = "pending_review";
+  const res = response(); await servePartnerRealtimeEvents(request(), res, f.deps);
+  assert.equal(res.statusCode, 403); assert.equal(res.flushed, false); assert.equal(f.reads.length, 0); assert.equal(f.events.listenerCount("event"), 0);
+});
+
+for (const [name, revoke] of [
+  ["persisted owner protection", (db: any) => { db.employees[0].ownerProtected = false; }],
+  ["Owner membership", (db: any) => { db.memberships[0].status = "revoked"; }],
+  ["frozen tenant", (db: any) => { db.employees[0].tenantId = ids.otherTenant; }],
+  ["pending readiness", (db: any) => { db.restaurants[0].onboardingStatus = "pending_review"; }],
+] as const) test(`Owner stream closes on ${name} before new private ACK; idle heartbeat also closes`, async (t) => {
+  const f = ownerFixture(t); const req = request(); const res = response(); await servePartnerRealtimeEvents(req, res, f.deps);
+  assert.equal(res.statusCode, 200); f.events.emit("event", event(9001)); await settle();
+  revoke(f.db); f.events.emit("event", event(9002)); f.tick(); await settle();
+  assert.equal(res.writableEnded, true); assert.deepEqual(deliveredIds(res), [String(event(9001)._id)]); assert.equal(f.events.listenerCount("event"), 0);
 });
