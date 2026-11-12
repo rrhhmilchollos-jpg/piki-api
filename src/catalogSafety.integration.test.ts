@@ -118,6 +118,29 @@ test("contratos de catálogo y carta con handlers reales, consultas en memoria y
     assert.deepEqual(stored, before);
   });
 
+  await t.test("legacy restaurant conserva catálogo y quote con todas las guardas antes de efectos", async () => {
+    stored = fixture({ listingType: "restaurant" });
+    assert.equal(matches(stored, CUSTOMER_ORDERABLE_RESTAURANT_FILTER), true);
+    const rest = await call("get", "/api/v1/catalog/restaurants", { query: {} });
+    const list = await trpc("catalog.list", {});
+    const detail = await trpc("catalog.byId", { id: restaurantId });
+    assert.equal(rest.body.restaurants.length, 1);
+    assert.equal(list.body.result.data.json.length, 1);
+    assert.equal(detail.body.result.data.json.canOrder, true);
+    const input = { restaurantId, items: [{ id: "dish", quantity: 1 }] };
+    assert.equal((await trpc("order.quote", input)).statusCode, 200);
+    const body = { restaurantId, deliveryAddress: "Calle sintética 12", deliveryLocation: { latitude: 38.990276, longitude: -0.521111 }, items: [{ itemId: "dish", quantity: 1 }], paymentMethod: "cash" };
+    assert.equal((await call("post", "/api/v1/orders", { body })).body.error, "RESTAURANT_LOCATION_UNAVAILABLE", "legacy llega a la guarda geográfica sin crear pedidos");
+    for (const override of [{ internalDemo: true }, { isActive: false }, { onboardingStatus: "pending_review" }, { onboardingStatus: "rejected" }, { availabilityStatus: "paused" }, { menu: [] }, { fulfillmentMode: "assisted_purchase" }, { slug: "partner-test" }]) {
+      stored = fixture({ listingType: "restaurant", ...override });
+      assert.equal(matches(stored, CUSTOMER_ORDERABLE_RESTAURANT_FILTER), false, JSON.stringify(override));
+      assert.equal((await trpc("order.quote", input)).statusCode, 404);
+    }
+    stored = fixture({ listingType: "local_directory" });
+    assert.equal(matches(stored, CUSTOMER_ORDERABLE_RESTAURANT_FILTER), false);
+    assert.equal(writes.length, 0);
+  });
+
   await t.test("perfil válido prevalece incluso sobre slug legacy; inválido conserva defaults", () => {
     assert.equal(customerCommissionRate({ slug: "alibaba-kebab-xativa", partnerProfile: { commissionRateBps: 1800 } }), 0.18);
     assert.equal(customerCommissionRate({ slug: "alibaba-kebab-xativa" }), 0.20);

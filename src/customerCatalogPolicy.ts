@@ -7,9 +7,10 @@ export const CUSTOMER_HIDDEN_TEST_SLUGS = ["kfc-xativa-test", "partner-test"] as
 export const CUSTOMER_ORDERABLE_RESTAURANT_FILTER = {
   slug: { $nin: [...CUSTOMER_HIDDEN_TEST_SLUGS] }, internalDemo: { $ne: true }, isActive: true, onboardingStatus: "approved", availabilityStatus: "available", "menu.0": { $exists: true },
   fulfillmentMode: { $ne: "assisted_purchase" },
-  // Legacy rows predating listingType retain partner delivery only. An explicit
-  // directory (or assisted purchase row without a type) is never orderable.
-  $or: [{ listingType: "official_partner" }, { listingType: { $exists: false } }],
+  // Persisted legacy partners use "restaurant" or predate listingType. They
+  // still must satisfy every approval, availability, menu and delivery guard.
+  // An explicit directory or assisted purchase row is never orderable.
+  $or: [{ listingType: { $in: ["official_partner", "restaurant"] } }, { listingType: { $exists: false } }],
 };
 export const CUSTOMER_DIRECTORY_RESTAURANT_FILTER = {
   slug: { $nin: [...CUSTOMER_HIDDEN_TEST_SLUGS] }, internalDemo: { $ne: true }, listingType: "local_directory", isActive: true, onboardingStatus: "approved",
