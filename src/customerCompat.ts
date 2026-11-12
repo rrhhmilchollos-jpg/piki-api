@@ -17,6 +17,7 @@ import { customerSupportCreateSchema, customerSupportTicketNumber, customerSuppo
 import { checkoutOrigin } from "./checkoutOrigin.js";
 import { Badge, CustomerBadge, PikiPassSubscription, RecommendationProfile, UserStreak, calculatePriceBreakdown } from "./customerEngagement.js";
 import { CustomerQuoteConflict, assertCustomerQuoteExpectation, customerOrderQuote, customerQuotedItems, customerQuoteExpectationSchema, debitQuotedCustomerCredits } from "./customerOrderQuote.js";
+import { SourceOrderFeeError } from "./sourceOrderFee.js";
 
 const COOKIE = "piki_customer_session";
 let dispatchCustomerOrder: ((orderId: string) => Promise<unknown>) | null = null;
@@ -419,7 +420,7 @@ async function handleCustomerTrpcSingle(req: Request, res: Response) {
       if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) {
         return reply(res, { subtotalCents, deliveryFeeCents: null, serviceFeeCents: null, creditAppliedCents: 0, totalCents: null, needsAddress: true, expectation: null });
       }
-      const coverage = evaluateXativaCoverage([longitude, latitude]);
+      const coverage = evaluateXativaCoverage([longitude, latitude], restaurant);
       if (!coverage.covered || coverage.deliveryFeeCents === null || coverage.serviceFeeCents === null) {
         return fail(res, "Todavía no repartimos en esa dirección.", "DELIVERY_OUTSIDE_COVERAGE");
       }
@@ -460,7 +461,7 @@ async function handleCustomerTrpcSingle(req: Request, res: Response) {
       const latitude = Number(input?.deliveryLocation?.latitude); const longitude = Number(input?.deliveryLocation?.longitude);
       if (!Number.isFinite(latitude) || latitude < -90 || latitude > 90 || !Number.isFinite(longitude) || longitude < -180 || longitude > 180) return fail(res, "Selecciona una dirección válida de la lista antes de confirmar el pedido.", "DELIVERY_LOCATION_REQUIRED");
       const deliveryPoint: [number, number] = [longitude, latitude];
-      const coverage = evaluateXativaCoverage(deliveryPoint);
+      const coverage = evaluateXativaCoverage(deliveryPoint, restaurant);
       if (!coverage.covered || coverage.deliveryFeeCents === null || coverage.serviceFeeCents === null) return fail(res, "Todavía no repartimos en esa dirección.", "DELIVERY_OUTSIDE_COVERAGE");
       const subtotalCents = normalized.reduce((sum, item) => sum + item.unitPriceCents * item.quantity, 0);
       const deliveryCents = coverage.deliveryFeeCents; const serviceCents = coverage.serviceFeeCents;
@@ -489,7 +490,11 @@ async function handleCustomerTrpcSingle(req: Request, res: Response) {
           try { freshItems = customerQuotedItems(freshRestaurant, requested); }
           catch { throw new CustomerQuoteConflict(); }
           const wallet = quoteMethod === "stripe" ? await CustomerAccount.findById(user._id).select("pikiCreditsCents pikiCreditsExpiresAt").session(orderSession).lean().exec() : null;
-          const freshQuote = customerOrderQuote({ restaurant: freshRestaurant, customerId: String(user._id), wallet, items: freshItems, deliveryPoint, deliveryFeeCents: deliveryCents, serviceFeeCents: serviceCents, paymentMethod: quoteMethod });
+          let freshCoverage: ReturnType<typeof evaluateXativaCoverage>;
+          try { freshCoverage = evaluateXativaCoverage(deliveryPoint, freshRestaurant); }
+          catch (error) { if (error instanceof SourceOrderFeeError) throw new CustomerQuoteConflict(); throw error; }
+          if (!freshCoverage.covered || freshCoverage.deliveryFeeCents === null || freshCoverage.serviceFeeCents === null) throw new CustomerQuoteConflict();
+          const freshQuote = customerOrderQuote({ restaurant: freshRestaurant, customerId: String(user._id), wallet, items: freshItems, deliveryPoint, deliveryFeeCents: freshCoverage.deliveryFeeCents, serviceFeeCents: freshCoverage.serviceFeeCents, paymentMethod: quoteMethod });
           assertCustomerQuoteExpectation(expected, freshQuote.expectation);
           // __v is the existing Mongoose document version. A real write locks
           // this snapshot through commit, including legacy menu writers that do
@@ -557,7 +562,10 @@ async function handleCustomerTrpcSingle(req: Request, res: Response) {
       return reply(res, { orderId: code, checkoutUrl, totalCents, paymentMethod, paymentState: decision.paymentState, cashDueAtDelivery: paymentMethod === "cash", creditAppliedCents, priceBreakdown: calculatePriceBreakdown({ subtotalCents, deliveryFeeCents: deliveryCents, serviceFeeCents: serviceCents, discountCents: creditAppliedCents }), coverage, route });
     }
     return fail(res, `Procedimiento no soportado: ${procedure}`, "NOT_FOUND");
-  } catch (error) { console.error(`[customerCompat] ${procedure}`, error); return fail(res, "Error interno de la plataforma", "INTERNAL_SERVER_ERROR"); }
+  } catch (error) {
+    if (error instanceof SourceOrderFeeError) return fail(res, "La tarifa de reparto del establecimiento no es válida. Contacta con PIKI.", "INVALID_DELIVERY_FEE");
+    console.error(`[customerCompat] ${procedure}`, error); return fail(res, "Error interno de la plataforma", "INTERNAL_SERVER_ERROR");
+  }
 }
 
 export async function handleCustomerTrpc(req: Request, res: Response) {

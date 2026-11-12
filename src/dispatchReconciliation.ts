@@ -12,6 +12,7 @@
  */
 import mongoose from "mongoose";
 import { Order, Rider, RiderAssignmentReservation } from "./models.js";
+import { unlockReleasedRiderOrder } from "./dispatchReservation.js";
 
 /** Una reserva que lleva horas sin corresponder a un pedido vivo es basura. */
 export const STALE_RESERVATION_HOURS = 6;
@@ -172,9 +173,8 @@ export async function reconcileDispatchState(
 async function releaseRiderIfIdle(riderId: string, orderId: string, dryRun: boolean) {
   if (!mongoose.isValidObjectId(riderId)) return;
   const remaining = await RiderAssignmentReservation.countDocuments({ riderId, status: "reserved" }).exec();
-  const update: Record<string, unknown> = remaining ? { status: "busy" } : { status: "available", activeOrderId: null };
   if (dryRun) return;
-  await Rider.updateOne({ _id: riderId }, { $set: update }).exec();
+  await unlockReleasedRiderOrder(orderId, riderId);
   // Si la reserva apuntaba a este pedido y el pedido seguía creyendo que tenía
   // rider, se libera también el pedido para que vuelva a la cola.
   if (!remaining) {

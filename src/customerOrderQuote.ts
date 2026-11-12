@@ -55,7 +55,7 @@ export function customerOrderQuote(input: {
 }) {
   const subtotalCents = input.items.reduce((sum, item) => sum + item.unitPriceCents * item.quantity, 0);
   const grossCents = subtotalCents + input.deliveryFeeCents + input.serviceFeeCents;
-  if (![subtotalCents, grossCents].every((value) => Number.isSafeInteger(value) && value >= 0)) throw new Error("INVALID_TOTAL");
+  if (![subtotalCents, input.deliveryFeeCents, input.serviceFeeCents, grossCents].every((value) => Number.isSafeInteger(value) && value >= 0)) throw new Error("INVALID_TOTAL");
   const creditAppliedCents = input.paymentMethod === "stripe" ? applicableCustomerCredit(input.wallet, grossCents) : 0;
   const amounts = { subtotalCents, deliveryFeeCents: input.deliveryFeeCents, serviceFeeCents: input.serviceFeeCents, creditAppliedCents, totalCents: grossCents - creditAppliedCents };
   const row = input.restaurant;
@@ -66,7 +66,7 @@ export function customerOrderQuote(input: {
     listingType: row.listingType, fulfillmentMode: row.fulfillmentMode, fulfillmentModel: row.fulfillmentModel,
     isActive: row.isActive, onboardingStatus: row.onboardingStatus, availabilityStatus: row.availabilityStatus,
     internalDemo: row.internalDemo, paymentMethods: row.paymentMethods, bizumOnly: row.bizumOnly,
-    cashPaymentsEnabled: row.cashPaymentsEnabled,
+    cashPaymentsEnabled: row.cashPaymentsEnabled, sourceDeliveryFeeCents: row.deliveryFeeCents,
     wallet: input.paymentMethod === "stripe" ? { balance: input.wallet?.pikiCreditsCents ?? null, expiresAt: input.wallet?.pikiCreditsExpiresAt ?? null } : null,
     items: input.items, deliveryPoint: input.deliveryPoint, paymentMethod: input.paymentMethod, amounts,
   };

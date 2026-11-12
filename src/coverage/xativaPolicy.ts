@@ -1,6 +1,7 @@
 import { xativaMunicipalityGeometry } from "./xativaBoundary.js";
 import { OPERATIONAL_AREAS } from "./operationalAreas.js";
 import { distanceKm, insideGeometry, nearestCoveredArea, sameUrbanLocality, validCoordinate, type AreaGeometry, type Coordinate } from "./territoryGeometry.js";
+import { sourceOrderFee, type SourceOrderFeeRestaurant } from "../sourceOrderFee.js";
 
 export const XATIVA_PHASE_2_LOCALITIES = ["La Llosa de Ranes", "Novetlè", "El Genovés", "Alboi", "Bixquert", "La Granja de la Costera", "Llanera de Ranes", "Cerdà", "Torrella"] as const;
 export const XATIVA_COVERAGE_POLICY = {
@@ -44,12 +45,13 @@ function extentKm(geometry: AreaGeometry, center: Coordinate) {
 }
 const extents = new Map(OPERATIONAL_AREAS.map((area) => [area.slug, extentKm(area.geometry, area.center)]));
 /** Membership is executable, not inferred from a province name or a marketing list. */
-export function evaluateXativaCoverage(point: Coordinate): CoverageDecision {
+export function evaluateXativaCoverage(point: Coordinate, restaurant?: SourceOrderFeeRestaurant): CoverageDecision {
   const valid = validCoordinate(point);
   const area = valid ? nearestCoveredArea(point, OPERATIONAL_AREAS) : null;
   const covered = Boolean(area);
   const withinMunicipality = covered || (valid && insideGeometry(point, xativaMunicipalityGeometry as unknown as AreaGeometry));
   const straightLineDistanceKm = valid ? distanceKm(area?.center || XATIVA_COVERAGE_POLICY.center, point) : 0;
+  const deliveryBaseFeeCents = restaurant === undefined ? XATIVA_COVERAGE_POLICY.deliveryBaseFeeCents : sourceOrderFee(restaurant, XATIVA_COVERAGE_POLICY.deliveryBaseFeeCents);
   return {
     policySlug: area?.slug || XATIVA_COVERAGE_POLICY.slug,
     policyVersion: XATIVA_COVERAGE_POLICY.version,
@@ -59,9 +61,9 @@ export function evaluateXativaCoverage(point: Coordinate): CoverageDecision {
     straightLineDistanceKm: Math.round(straightLineDistanceKm * 1000) / 1000,
     maxStraightLineDistanceKm: area ? (area.operationalRadiusKm || extents.get(area.slug) || 3) : 3,
     withinMunicipality,
-    deliveryBaseFeeCents: XATIVA_COVERAGE_POLICY.deliveryBaseFeeCents,
+    deliveryBaseFeeCents,
     outsideMunicipalitySurchargeCents: 0,
-    deliveryFeeCents: covered ? XATIVA_COVERAGE_POLICY.deliveryBaseFeeCents : null,
+    deliveryFeeCents: covered ? deliveryBaseFeeCents : null,
     serviceFeeCents: covered ? XATIVA_COVERAGE_POLICY.serviceFeeCents : null,
     localityName: area?.name || null,
     municipalityCode: area?.municipalityCode || null,
