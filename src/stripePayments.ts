@@ -13,6 +13,8 @@
  */
 import Stripe from "stripe";
 import { Order } from "./models.js";
+import { claimCodStripeEvent, finishCodStripeEvent } from "./stripeCodReceipt.js";
+import { ORDER_REFERENCE_FIELDS, referenceCandidates } from "./orderReferences.js";
 
 /** Vigencia estándar de una autorización de tarjeta en pagos online. */
 export const COD_AUTHORIZATION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
@@ -186,14 +188,21 @@ export async function captureCodOrder(
  * Devuelve un cobro que nunca debió existir sobre una garantía.
  * Idempotente: si Stripe dice que ya está devuelto, se da por bueno.
  */
-export async function refundGuaranteeCapture(paymentIntentId: string | null): Promise<boolean> {
+export async function refundGuaranteeCapture(paymentIntentId: string | null, capturedCents?: number): Promise<boolean> {
   if (!paymentIntentId) return false;
   try {
     const stripe = stripeClient();
-    const refunds = await stripe.refunds.list({ payment_intent: paymentIntentId, limit: 1 });
-    if (refunds.data.some((refund) => ["succeeded", "pending"].includes(String(refund.status)))) return true;
-    await stripe.refunds.create({ payment_intent: paymentIntentId, reason: "requested_by_customer" });
-    return true;
+    const refunds = await stripe.refunds.list({ payment_intent: paymentIntentId, limit: 100 });
+    const accepted = refunds.data.filter((refund) => ["succeeded", "pending"].includes(String(refund.status)));
+    if (capturedCents === undefined
+      ? accepted.length > 0
+      : accepted.reduce((sum, refund) => sum + refund.amount, 0) >= capturedCents) return true;
+    // Stable across event ids, failed saves, timeout/reclaim and repair callers.
+    const refund = await stripe.refunds.create(
+      { payment_intent: paymentIntentId, reason: "requested_by_customer" },
+      { idempotencyKey: `piki-cod-guarantee-refund-${paymentIntentId}` },
+    );
+    return ["succeeded", "pending"].includes(String(refund.status));
   } catch (error) {
     console.error(
       JSON.stringify({
@@ -356,111 +365,141 @@ export interface StripeEventSummary {
   orderId: string | null;
   paymentIntentId: string | null;
   handled: boolean;
+  duplicate?: boolean;
+}
+
+async function linkedCodOrder(paymentIntentId: string): Promise<any | null> {
+  const orders = await Order.find({ stripePaymentIntentId: paymentIntentId }).limit(2).lean().exec() as any[];
+  if (orders.length > 1) throw new Error("COD_STRIPE_AMBIGUOUS_PI_LINK");
+  return orders[0] ?? null;
+}
+
+function matchesCodOrderIdentity(order: any, identity: string): boolean {
+  if (identity === String(order._id)) return true;
+  // Actual legacy producer sends bare 8-character reference, not Mongo _id.
+  // Compare existing identity only; no fuzzy lookup or PI association from payload.
+  if (!/^(?:PIKI-?)?[A-Z0-9]{8}$/i.test(identity)) return false;
+  const candidates = referenceCandidates(identity);
+  return ORDER_REFERENCE_FIELDS.some((field) => typeof order[field] === "string"
+    && candidates.includes(order[field].trim().toUpperCase()));
 }
 
 /**
- * Aplica un evento de Stripe al pedido correspondiente.
- * Se apoya en metadata.orderId, que grabamos al crear la retención.
+ * Procesa un evento ya verificado por el destino receptor (sin verificar otra firma).
+ * El activo exige contrato COD explícito; el wrapper legacy conserva compatibilidad.
  */
 export async function handleStripeEvent(event: {
+  id: string;
   type: string;
   data: { object: Record<string, unknown> };
-}): Promise<StripeEventSummary> {
-  const object = event.data.object as {
-    id?: string;
-    metadata?: Record<string, string>;
-    status?: string;
-    amount_received?: number;
-  };
-  const paymentIntentId = typeof object.id === "string" ? object.id : null;
-  const orderId = object.metadata?.orderId ?? null;
-  const summary: StripeEventSummary = {
-    type: event.type,
-    orderId,
-    paymentIntentId,
-    handled: false,
-  };
-  if (!orderId && !paymentIntentId) return summary;
-
-  const query = orderId
-    ? { _id: orderId }
-    : { stripePaymentIntentId: paymentIntentId as string };
-  const order = await Order.findOne(query);
-  if (!order) return summary;
-
-  switch (event.type) {
-    case "payment_intent.amount_capturable_updated":
-      order.set({
-        paymentState: "authorized",
-        paymentAuthorizedAt: new Date(),
-        paymentAuthorizationExpiresAt: authorizationExpiry(),
-        stripePaymentIntentId: paymentIntentId,
-      });
-      summary.handled = true;
-      break;
-    case "payment_intent.succeeded": {
-      const isGuarantee = object.metadata?.flow === "cod_guarantee";
-      const capturedOnPurpose = Boolean(object.metadata?.capturedBy);
-      if (isGuarantee && !capturedOnPurpose) {
-        // Una garantía NUNCA debe cobrarse. Si el banco confirma un cobro, se
-        // devuelve en el acto y el pedido sigue pendiente de cobro en efectivo:
-        // el cliente no puede ver un cargo por un pedido que paga en mano.
-        const refunded = await refundGuaranteeCapture(paymentIntentId);
-        console.error(
-          JSON.stringify({
-            event: "cod_guarantee_charged",
-            paymentIntentId,
-            orderId,
-            amount: object.amount_received ?? null,
-            refunded,
-          }),
-        );
-        order.set({
-          paymentState: "pending",
-          paymentCapturedAt: null,
-          paymentCapturedCents: 0,
-          stripePaymentIntentId: paymentIntentId,
+}, options: { requireExplicitContract?: boolean } = {}): Promise<StripeEventSummary> {
+  if (!event || typeof event.id !== "string" || !/^evt_\S+$/.test(event.id)
+    || typeof event.type !== "string" || !event.data?.object || typeof event.data.object !== "object") {
+    throw new Error("COD_STRIPE_INVALID_EVENT");
+  }
+  const object = event.data.object;
+  const metadata = (object.metadata ?? {}) as Record<string, string>;
+  const paymentIntentId = typeof object.id === "string" && /^pi_\S+$/.test(object.id) ? object.id : null;
+  const orderId = typeof metadata.orderId === "string" && metadata.orderId ? metadata.orderId : null;
+  const summary: StripeEventSummary = { type: event.type, orderId, paymentIntentId, handled: false };
+  const supported = ["payment_intent.amount_capturable_updated", "payment_intent.succeeded", "payment_intent.canceled", "payment_intent.payment_failed"].includes(event.type);
+  if (!supported && !options.requireExplicitContract) return summary;
+  if (!paymentIntentId || object.object !== "payment_intent") throw new Error("COD_STRIPE_INVALID_INTENT");
+  // Do not create a no-op COD receipt that suppresses Checkout's shared event id.
+  const conflictingContract = Boolean(metadata.order_code || metadata.orderCode || metadata.order_id || metadata.purpose
+    || (metadata.flow && metadata.flow !== "cod_guarantee"));
+  if (conflictingContract && !options.requireExplicitContract) return summary;
+  if (!metadata.flow && !options.requireExplicitContract) {
+    // Legacy metadata-less events must already be linked to a COD/card order.
+    const linked = await linkedCodOrder(paymentIntentId);
+    if (!linked || !["cash", "card"].includes(linked.paymentMethod)) return summary;
+  }
+  const lease = await claimCodStripeEvent(event);
+  if (lease === "processed") return { ...summary, duplicate: true };
+  try {
+    // Fail mixed/missing contracts reclaimably, before any order/refund effect.
+    // Never reset a previously acknowledged receipt, even a historical no-op.
+    if (options.requireExplicitContract && (!supported || metadata.flow !== "cod_guarantee" || !orderId || conflictingContract)) {
+      throw new Error("COD_STRIPE_CONTRACT_CONFLICT");
+    }
+    // Resolve by linked PI, not an unchecked metadata id; never bind/overwrite PI.
+    const order = await linkedCodOrder(paymentIntentId);
+    if (!order) throw new Error("COD_STRIPE_ORDER_NOT_FOUND");
+    if ((orderId && !matchesCodOrderIdentity(order, orderId)) || !["cash", "card"].includes(order.paymentMethod)) {
+      throw new Error("COD_STRIPE_ORDER_MISMATCH");
+    }
+    const paidInCash = Boolean(order.cashCollectedAt);
+    const settled = paidInCash || ["paid", "refunded"].includes(order.paymentState);
+    const update: Record<string, unknown> = {};
+    const created = Number(object.created);
+    const intentCreatedAt = Number.isInteger(created) && created > 0 ? new Date(created * 1000) : null;
+    switch (event.type) {
+      case "payment_intent.amount_capturable_updated": {
+        if (settled || !["pending", "authorized"].includes(order.paymentState)) break;
+        if (order.paymentMethod !== "cash" || object.status !== "requires_capture" || object.capture_method !== "manual"
+          || object.currency !== "eur" || !Number.isInteger(object.amount_capturable) || object.amount_capturable !== order.totalCents
+          || Number(object.amount_capturable) <= 0 || !intentCreatedAt) throw new Error("COD_STRIPE_INVALID_AUTHORIZATION");
+        if (order.paymentState !== "authorized") Object.assign(update, {
+          paymentState: "authorized",
+          paymentAuthorizedAt: order.paymentAuthorizedAt ?? intentCreatedAt,
+          paymentAuthorizationExpiresAt: order.paymentAuthorizationExpiresAt ?? authorizationExpiry(intentCreatedAt),
         });
-        summary.handled = true;
         break;
       }
-      order.set({
-        paymentState: "paid",
-        paymentCapturedAt: new Date(),
-        paymentCapturedCents: object.amount_received ?? order.totalCents,
-      });
-      summary.handled = true;
-      break;
+      case "payment_intent.succeeded": {
+        const capturedCents = object.amount_received;
+        if (!Number.isInteger(order.totalCents) || order.totalCents <= 0
+          || object.status !== "succeeded" || object.currency !== "eur" || !Number.isInteger(capturedCents)
+          || Number(capturedCents) <= 0 || Number(capturedCents) > order.totalCents) throw new Error("COD_STRIPE_INVALID_CAPTURE");
+        const guarantee = metadata.flow === "cod_guarantee" && order.paymentMethod === "cash" && object.capture_method === "manual";
+        if (metadata.capturedBy && metadata.capturedBy !== "rider") throw new Error("COD_STRIPE_CAPTURE_AMBIGUOUS");
+        if (guarantee && !metadata.capturedBy) {
+          if (!await refundGuaranteeCapture(paymentIntentId, Number(capturedCents))) throw new Error("COD_STRIPE_REFUND_FAILED");
+          // A refund request is not evidence that cash was not collected.
+          if (!settled && (order.paymentState !== "pending" || order.paymentCapturedCents || order.paymentCapturedAt)) {
+            Object.assign(update, { paymentState: "pending", paymentCapturedAt: null, paymentCapturedCents: 0 });
+          }
+        } else {
+          if (order.paymentMethod === "cash" && !guarantee) throw new Error("COD_STRIPE_CAPTURE_AMBIGUOUS");
+          if (order.paymentMethod === "card" && object.capture_method !== "automatic") throw new Error("COD_STRIPE_CAPTURE_AMBIGUOUS");
+          if (!settled && ["pending", "authorized", "failed"].includes(order.paymentState)) Object.assign(update, {
+            paymentState: "paid", paymentCapturedAt: order.paymentCapturedAt ?? new Date(), paymentCapturedCents: capturedCents,
+          });
+        }
+        break;
+      }
+      case "payment_intent.canceled":
+        if (object.status !== "canceled") throw new Error("COD_STRIPE_INVALID_CANCELATION");
+        if (!settled && ["pending", "authorized", "failed"].includes(order.paymentState)) update.paymentState = "expired";
+        if (!order.paymentReleasedAt) update.paymentReleasedAt = new Date();
+        break;
+      case "payment_intent.payment_failed":
+        if (object.status !== "requires_payment_method") throw new Error("COD_STRIPE_INVALID_FAILURE");
+        if (!settled && ["pending", "authorized"].includes(order.paymentState)) update.paymentState = "failed";
+        break;
     }
-    case "payment_intent.canceled": {
-      // Cuando la retención se cancela porque el cliente pagó en efectivo, el
-      // webhook llega después de que el rider pulse "Cobrado en efectivo".
-      // Si aquí se escribiera "expired" se borraría el cobro real: el pedido
-      // volvería a la cola como impagado y la caja quedaría descuadrada.
-      const paidInCash = Boolean((order as any).cashCollectedAt);
-      order.set({
-        paymentState: paidInCash ? "paid" : "expired",
-        paymentReleasedAt: (order as any).paymentReleasedAt ?? new Date(),
-      });
-      summary.handled = true;
-      break;
+    if (Object.keys(update).length) {
+      // CAS protects against a cash collection / paid transition after our read.
+      const result = await Order.updateOne({
+        _id: order._id, stripePaymentIntentId: paymentIntentId,
+        paymentMethod: order.paymentMethod, paymentState: order.paymentState,
+        cashCollectedAt: order.cashCollectedAt ?? null,
+      }, { $set: update }).exec();
+      if (result.matchedCount !== 1) throw new Error("COD_STRIPE_ORDER_CHANGED");
     }
-    case "payment_intent.payment_failed":
-      order.set({ paymentState: "failed" });
-      summary.handled = true;
-      break;
-    default:
-      return summary;
+    await finishCodStripeEvent(event.id, lease);
+    return { ...summary, orderId: String(order._id), handled: true, duplicate: false };
+  } catch (error) {
+    try { await finishCodStripeEvent(event.id, lease, error); } catch { /* Keep the lease retryable; never acknowledge a failed effect. */ }
+    throw error;
   }
-  await order.save();
-  return summary;
 }
 
 /** Verifica la firma del webhook. Sin esto, cualquiera podría marcarnos pedidos como pagados. */
 export function verifyStripeWebhook(
   rawBody: Buffer | string,
   signature: string | undefined,
-): { type: string; data: { object: Record<string, unknown> } } {
+): { id: string; type: string; data: { object: Record<string, unknown> } } {
   const secret = process.env.STRIPE_WEBHOOK_SECRET;
   if (!secret) throw new Error("STRIPE_WEBHOOK_SECRET no configurada");
   if (!signature) throw new Error("falta la cabecera stripe-signature");
@@ -468,5 +507,5 @@ export function verifyStripeWebhook(
     rawBody,
     signature,
     secret,
-  ) as unknown as { type: string; data: { object: Record<string, unknown> } };
+  ) as unknown as { id: string; type: string; data: { object: Record<string, unknown> } };
 }

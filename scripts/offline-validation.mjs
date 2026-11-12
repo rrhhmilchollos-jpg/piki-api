@@ -22,6 +22,11 @@ if (mode === "check") {
     import net from 'node:net'; import http from 'node:http'; import https from 'node:https'; import tls from 'node:tls';
     const base = ${JSON.stringify(pathToFileURL(dependencies).href)};
     registerHooks({ resolve(specifier, context, nextResolve) {
+      const target = specifier.split('/').at(-1);
+      if (['mongooseBoot.js', 'mongooseBoot.ts'].includes(target)
+        || (['server.js', 'server.ts'].includes(target)
+          && !(process.env.NODE_ENV === 'test' && process.env.PIKI_NO_LISTEN === 'true')))
+        throw new Error('APPLICATION_BOOT_IMPORT_FORBIDDEN');
       try { return nextResolve(specifier, context); } catch (error) {
         if (error.code !== 'ERR_MODULE_NOT_FOUND' || specifier.startsWith('.') || specifier.startsWith('/') || specifier.includes(':')) throw error;
         return nextResolve(specifier, { ...context, parentURL: base });

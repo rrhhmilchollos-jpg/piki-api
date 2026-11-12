@@ -24,13 +24,17 @@ const fullAccessRoles = new Set(["owner", "partner_admin", "admin", "administrat
 const managerRoles = new Set(["area_manager", "zone_manager", "manager", "gerente", "store_manager"]);
 
 export function partnerRolesForEmployee(employee: PartnerEmployee | null | undefined): string[] {
-  const roleSource = Array.isArray(employee?.partnerRoles) && employee.partnerRoles.length ? employee.partnerRoles : employee?.roles;
+  const explicit = Array.isArray(employee?.partnerRoles) && employee.partnerRoles.length > 0;
+  const roleSource = explicit ? employee!.partnerRoles : employee?.roles;
   const configured = Array.isArray(roleSource)
     ? roleSource.filter((role): role is string => typeof role === "string" && Boolean(role.trim())).map((role) => role.trim())
     : [];
   const fallback = typeof employee?.jobRole === "string" ? employee.jobRole : employee?.apiRole;
   // Older multirol records can authenticate as Partner without a materialized
   // partnerRoles value. The assigned restaurant remains the security boundary.
+  // Explicit operational roles are authoritative, including invalid/empty
+  // values (fail closed); never upgrade a kitchen account from its job title.
+  if (explicit) return [...new Set(configured)];
   if (fallback === "partner" && !configured.some((role) => fullAccessRoles.has(role.toLowerCase()) || managerRoles.has(role.toLowerCase()))) {
     return [...new Set([...configured, "partner_admin"] )];
   }
