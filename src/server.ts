@@ -1,5 +1,5 @@
 import { pendingPartnerDraft } from "./partnerDrafts.js";
-import { nativeReleasePolicy } from "./nativeReleasePolicy.js";
+import { nativeReleasePolicy, riderClientReleasePolicy } from "./nativeReleasePolicy.js";
 import { registerEmployeeDeletionRoutes } from "./employeeDeletion.js";
 import { dispatchVehicleInputForOrder } from "./dispatchVehiclePolicy.js";
 import { confirmReservedDispatch, releaseRiderOrderSlot, reserveRiderOrderSlot } from "./dispatchReservation.js";
@@ -756,12 +756,12 @@ app.get("/api/v1/app-version", async (req, res) => {
   // Return that legacy sentinel only for its unversioned request so it can boot,
   // register the recovery worker, and receive the current network shell. All
   // versioned clients continue to receive the real, semver-based policy.
-  const responsePolicy = isNativePikiContainer(req, surface)
+  const responsePolicy = surface === "rider"
+    ? riderClientReleasePolicy(policy, isNativePikiContainer(req, surface), clientVersion, clientBuildId)
+    : isNativePikiContainer(req, surface)
     // Capacitor ships a versioned Android bundle through Google Play. A web PWA
     // release must never trap that native shell behind an in-browser worker gate.
     ? nativeReleasePolicy(policy, clientVersion, clientBuildId)
-    : surface === "rider"
-    ? { ...policy, minimumVersion: "0.0.0", forceUpdate: false }
     : clientVersion
     ? policy
     : surface === "customer"
@@ -788,7 +788,10 @@ app.use("/api/v1", async (req, res, next) => {
   const clientVersion = req.header("x-piki-client-version") || undefined;
   const clientBuildId = req.header("x-piki-client-build") || undefined;
   if (surface && clientVersion) {
-    const policy = await syncVersionPolicy(surface);
+    const syncedPolicy = await syncVersionPolicy(surface);
+    const policy = surface === "rider"
+      ? riderClientReleasePolicy(syncedPolicy, isNativePikiContainer(req, surface), clientVersion, clientBuildId)
+      : syncedPolicy;
     if (requiresUpdate(policy, clientVersion, clientBuildId, surface)) {
       res.setHeader("Cache-Control", "no-store, max-age=0");
       return res.status(426).json({ error: "CLIENT_UPDATE_REQUIRED", surface, ...policy });
