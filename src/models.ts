@@ -11,6 +11,7 @@ const tenantSchema = new Schema({
   settings: { type: Schema.Types.Mixed, default: { limits: { maxRiders: 100000, maxDailySlots: 100000, maxSlotsPerRiderPerDay: 3 } } },
 }, { timestamps: true, collection: "tenants" });
 tenantSchema.index({ status: 1, createdAt: -1 });
+tenantSchema.add({ kitchenAccessRevision: { type: Number, default: 0, min: 0 } });
 const tenantMembershipSchema = new Schema({
   tenantId: { type: Schema.Types.ObjectId, ref: "Tenant", required: true, index: true },
   employeeId: { type: Schema.Types.ObjectId, ref: "EmployeeAccount", required: true, index: true },
@@ -19,6 +20,10 @@ const tenantMembershipSchema = new Schema({
   scopes: { type: [String], default: [] },
 }, { timestamps: true, collection: "tenant_memberships" });
 tenantMembershipSchema.index({ tenantId: 1, employeeId: 1 }, { unique: true });
+tenantMembershipSchema.add({
+  restaurantIds: { type: [Schema.Types.ObjectId], ref: "Restaurant", default: [] },
+  kitchenAccessRevision: { type: Number, default: 0, min: 0 },
+});
 const geoPoint = new Schema({ type: { type: String, enum: ["Point"], default: "Point" }, coordinates: { type: [Number], default: [0, 0] } }, { _id: false });
 const menuModifierOption = new Schema({ id: { type: String, required: true }, name: { type: String, required: true }, price: { type: Number, required: true, min: 0 }, available: { type: Boolean, default: true }, description: { type: String, default: "" } }, { _id: false });
 const menuModifier = new Schema({ id: { type: String, required: true }, name: { type: String, required: true }, description: { type: String, default: "" }, price: { type: Number, required: true, min: 0, default: 0 }, required: { type: Boolean, default: false }, minSelections: { type: Number, min: 0, default: 0 }, maxSelections: { type: Number, min: 1, default: 1 }, options: { type: [Schema.Types.Mixed], default: [] }, optionItems: { type: [menuModifierOption], default: [] } }, { _id: false });
@@ -332,6 +337,7 @@ const customerAccountSchema = new Schema({
 employeeAccountSchema.pre("validate", function(this: any) {
   if (!this.employeeCode) this.employeeCode = `PIKI-E-${String(this._id).replace(/[^a-z0-9]/gi, "").slice(-8).toUpperCase()}`;
 });
+employeeAccountSchema.add({ kitchenAccessSetupVersion: { type: Number, enum: [1], default: null, immutable: true } });
 
 const restaurantSchema = new Schema({
   tenantId: { type: Schema.Types.ObjectId, ref: "Tenant", default: null, index: true },
@@ -343,6 +349,7 @@ restaurantSchema.index({ isActive: 1, onboardingStatus: 1, promoted: -1, rating:
 restaurantSchema.index({ isActive: 1, cuisine: 1, promoted: -1, rating: -1, reviews: -1 });
 restaurantSchema.add({ priceIncludesCommission: { type: Boolean, default: false } });
 restaurantSchema.add({ menuRevision: { type: Number, default: 0, min: 0 } });
+restaurantSchema.add({ kitchenAccessRevision: { type: Number, default: 0, min: 0 } });
 restaurantSchema.index({ tenantId: 1, onboardingStatus: 1, createdAt: -1 });
 
 const riderSchema = new Schema({

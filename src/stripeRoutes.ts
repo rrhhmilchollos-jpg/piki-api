@@ -76,15 +76,27 @@ export function mountStripeWebhook(app: Express): void {
     "/webhooks/stripe",
     express.raw({ type: "application/json" }),
     async (request: Request, response: Response) => {
+      if (!stripeConfigured() || !process.env.STRIPE_WEBHOOK_SECRET) {
+        response.status(503).json({ error: "STRIPE_WEBHOOK_NOT_CONFIGURED" });
+        return;
+      }
+      let event: ReturnType<typeof verifyStripeWebhook>;
       try {
-        const event = verifyStripeWebhook(
+        event = verifyStripeWebhook(
           request.body as Buffer,
           request.header("stripe-signature") ?? undefined,
         );
+      } catch {
+        response.status(400).json({ error: "INVALID_STRIPE_WEBHOOK" });
+        return;
+      }
+      try {
         const summary = await handleStripeEvent(event);
         response.json({ received: true, ...summary });
-      } catch (error) {
-        response.status(400).json({ error: (error as Error).message });
+      } catch {
+        // Persistence/processing failure is not an invalid signature. Keep it
+        // non-2xx and distinguish it from terminal payload errors for retries.
+        response.status(500).json({ error: "STRIPE_WEBHOOK_PROCESSING_FAILED" });
       }
     },
   );

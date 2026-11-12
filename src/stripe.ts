@@ -3,6 +3,7 @@ import mongoose from "mongoose";
 import { Order, StripeEvent } from "./models.js";
 import { publishOrderIntakeEvents, publishRealtimeEvent } from "./realtime.js";
 import { dispatchCustomerOrderById } from "./customerCompat.js";
+import { handleStripeEvent } from "./stripePayments.js";
 import { dispatchInitialIdempotencyKey, enqueueDispatchOutbox } from "./dispatchOutbox.js";
 import {
   allowedPriorPaymentStates,
@@ -56,7 +57,9 @@ export async function createPartnerStripeOnboardingLink(input: {
 }
 
 export function isStripeSignatureError(error: unknown): boolean {
-  return error instanceof Error && error.name === "StripeSignatureVerificationError";
+  // The installed SDK sets `type`, not `name` (which remains "Error").
+  return error instanceof Stripe.errors.StripeSignatureVerificationError
+    || (error instanceof Error && error.name === "StripeSignatureVerificationError");
 }
 
 export class StripeWebhookProcessingError extends Error {
@@ -221,6 +224,11 @@ async function reserveStripeEvent(event: StripeEventLike, orderCode: string | nu
 async function applyPaymentTransition(input: { orderCode: string; paymentState: StripePaymentState; eventType: string; object: StripeWebhookObject }): Promise<PaymentApplyResult> {
   const paymentIntentId = stripePaymentIntentId(input.object);
   const isCheckoutEvent = input.eventType.startsWith("checkout.session");
+  const isCancellation = input.eventType === "payment_intent.canceled";
+  if (isCancellation && (!paymentIntentId || !/^pi_\S+$/.test(paymentIntentId)
+    || input.object.object !== "payment_intent" || (input.object as { status?: string }).status !== "canceled")) {
+    throw new StripeWebhookProcessingError("STRIPE_INVALID_CANCELATION");
+  }
   const update = {
     $set: {
       paymentState: input.paymentState,
@@ -240,12 +248,16 @@ async function applyPaymentTransition(input: { orderCode: string; paymentState: 
         {
           publicCode: input.orderCode,
           paymentMethod: "stripe",
-          paymentState: { $in: allowedPriorPaymentStates(input.paymentState) },
+          paymentState: { $in: isCancellation ? ["pending", "authorized"] : allowedPriorPaymentStates(input.paymentState) },
+          ...(isCancellation ? { stripePaymentIntentId: paymentIntentId, cashCollectedAt: null } : {}),
         },
         update,
         { new: true, session },
       ).lean().exec() as any;
       const order = transitioned || await Order.findOne({ publicCode: input.orderCode }).session(session).lean().exec() as any;
+      if (isCancellation && order && order.stripePaymentIntentId !== paymentIntentId) {
+        throw new StripeWebhookProcessingError("STRIPE_CANCELATION_PI_MISMATCH");
+      }
       if (shouldPublishOperationalIntake(order, { paymentState: input.paymentState, activatesOperationalIntake: ["authorized", "paid"].includes(input.paymentState) })) {
         await enqueueDispatchOutbox({
           orderId: order._id,
@@ -295,7 +307,11 @@ export async function processStripeEvent(event: StripeEventLike, dependencies: S
   if (reservation === "in_progress") throw new StripeWebhookProcessingError("STRIPE_EVENT_IN_PROGRESS");
 
   try {
-    const transition = stripePaymentTransition(event.type);
+    // Cancellation belongs to Checkout's order_code contract only. It does not
+    // dispatch COD or infer cash settlement from metadata.
+    const transition = event.type === "payment_intent.canceled"
+      ? { paymentState: "expired" as const, activatesOperationalIntake: false }
+      : stripePaymentTransition(event.type);
     let activated = false;
     const metadata = object.metadata || {};
     if (metadata.purpose === "rider_tip" && orderCode && ["checkout.session.completed", "payment_intent.succeeded"].includes(event.type)) {
@@ -316,6 +332,9 @@ export async function processStripeEvent(event: StripeEventLike, dependencies: S
       activated = true;
     } else if (orderCode && transition) {
       const { order } = await dependencies.applyPaymentTransition({ orderCode, paymentState: transition.paymentState, eventType: event.type, object });
+      // Do not permanently acknowledge a payment before its order is present.
+      // The failed reservation stays reclaimable by the same Stripe event id.
+      if (!order) throw new StripeWebhookProcessingError("STRIPE_ORDER_NOT_FOUND");
       if (shouldPublishOperationalIntake(order, transition)) {
         await dependencies.publishIntake(order);
         activated = true;
@@ -341,6 +360,12 @@ export async function processStripeEvent(event: StripeEventLike, dependencies: S
 export async function processStripeWebhook(rawBody: Buffer, signature: string) {
   if (!stripe || !process.env.STRIPE_WEBHOOK_SECRET) throw new Error("Stripe webhook no configurado");
   const event = stripe.webhooks.constructEvent(rawBody, signature, process.env.STRIPE_WEBHOOK_SECRET);
+  // Dispatch only after the ACTIVE destination's signature, before Checkout
+  // can consume the shared event id as a processed no-op. No legacy whsec check.
+  if ((event.data.object as { metadata?: Record<string, string> }).metadata?.flow === "cod_guarantee") {
+    const cod = await handleStripeEvent(event as unknown as Parameters<typeof handleStripeEvent>[0], { requireExplicitContract: true });
+    return { ...cod, eventType: event.type, orderCode: null, activated: false };
+  }
   return processStripeEvent(event as unknown as StripeEventLike);
 }
 

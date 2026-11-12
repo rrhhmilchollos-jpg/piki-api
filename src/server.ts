@@ -55,6 +55,7 @@ import { BUSINESS_SUMMARY_RECIPIENT, sendDailyBusinessSummary } from "./dailyBus
 import { corporateEmailConfiguration, corporateEmailDepartmentForRole, escapeCorporateHtml, sendCorporateEmail, sendLeadContactEmail, verifyCorporateEmailConnection } from "./corporateEmail.js";
 import { activeOperationalOrderStatuses, dispatchableOrderStatuses, dispatchablePaymentFilter, isDispatchableOrderStatus, isDispatchablePayment } from "./dispatchEligibility.js";
 import { canReceivePartnerLocations, partnerCan, partnerPermissions, partnerRolesForEmployee, permissionsForPartnerRoles, type PartnerPermission } from "./partnerAccess.js";
+import { KitchenAccessError, kitchenBindingForEmployee, kitchenRestaurantCanOperate, registerPartnerKitchenAccessRoutes, validateKitchenActivation, type KitchenAccessDependencies } from "./partnerKitchenAccess.js";
 import { awardRiderRecruitmentMilestones, claimRiderReferralCode, completeRiderShiftIncentiveTracking, incentiveProgramStatus, loadRiderIncentiveSnapshot, trackRiderLocationForIncentive, trackRiderShiftStart } from "./riderIncentives.js";
 import { buildApprovedRiderOperationalProfile } from "./riderApproval.js";
 import { COMING_SOON_SLUGS, CUSTOMER_CATALOG_RESTAURANT_FILTER, CUSTOMER_ORDERABLE_RESTAURANT_FILTER, GOLDEN_FOUNDER_SLUGS, customerCommissionRate, customerMenuForRestaurant, presentCustomerCatalogRestaurant, restaurantIsWithinOpeningHours } from "./customerCatalogPolicy.js";
@@ -117,7 +118,7 @@ function configuredRiderPayoutCents() {
   const configured = Number(process.env.PIKI_RIDER_PAYOUT_CENTS ?? 350);
   return Number.isFinite(configured) ? Math.max(0, Math.round(configured)) : 350;
 }
-const defaultOrigins = ["http://localhost:3000", "http://localhost:5173", "https://localhost", "https://pikidelivery.com", "https://www.pikidelivery.com", "https://app.pikidelivery.com", "https://partners.pikidelivery.com", "https://admin.pikidelivery.com", "https://support.pikidelivery.com", "https://piki-admin-live.vercel.app", "https://piki-support.vercel.app", "https://rider.pikidelivery.com", "https://riders.pikidelivery.com", "https://fleet.pikidelivery.com", "https://piki-customer.onrender.com", "https://piki-riders.onrender.com", "https://piki-admin.onrender.com", "https://edpexgfa.manus.space"];
+const defaultOrigins = ["http://localhost:3000", "http://localhost:5173", "https://localhost", "https://pikidelivery.com", "https://www.pikidelivery.com", "https://app.pikidelivery.com", "https://partners.pikidelivery.com", "https://admin.pikidelivery.com", "https://support.pikidelivery.com", "https://piki-admin-live.vercel.app", "https://piki-support.vercel.app", "https://rider.pikidelivery.com", "https://fleet.pikidelivery.com", "https://piki-customer.onrender.com", "https://piki-riders.onrender.com", "https://piki-admin.onrender.com", "https://edpexgfa.manus.space"];
 const configuredOrigins = (process.env.CORS_ORIGINS || "").split(",").map((origin) => origin.trim()).filter(Boolean);
 const allowedOrigins = new Set([...defaultOrigins, ...configuredOrigins]);
 const managedPikiVercelOrigin = /^https:\/\/piki-(?:customer|partner|admin|fleet|rider|support)(?:-[a-z0-9-]+)?-rrhhmilchollos-jpgs-projects\.vercel\.app$/i;
@@ -1214,7 +1215,7 @@ app.post("/api/v1/auth/employee/logout", requireRole("admin", "partner", "rider"
   return res.status(204).end();
 });
 app.get("/api/v1/auth/employee/me", requireRole("admin", "partner", "rider", "fleet", "commercial", "gerente_comercial_zona", "finance", "support"), async (req, res) => {
-  const employee = req.auth?.employeeId ? await EmployeeAccount.findOne({ _id: req.auth.employeeId, ...tenantScope(req) }).select("name email employeeCode tenantId ownerProtected accessLevel authorizationStatus jobRole apiRole roles partnerRoles primaryRole zoneSlugs restaurantId restaurantIds").lean().exec() as any : null;
+  const employee = req.auth?.employeeId ? await EmployeeAccount.findOne({ _id: req.auth.employeeId, ...tenantScope(req) }).select("name email employeeCode tenantId ownerProtected accessLevel authorizationStatus jobRole apiRole roles partnerRoles primaryRole zoneSlugs restaurantId restaurantIds kitchenAccessSetupVersion").lean().exec() as any : null;
   const roles = partnerRolesForEmployee(employee);
   const permissions = [...permissionsForPartnerRoles(roles)];
   const locations = employee ? await partnerLocationsFor(employee, roles, permissions) : [];
@@ -1264,6 +1265,19 @@ app.post("/api/v1/admin/employees", requireOwner(), async (req, res) => {
     return res.status(201).json({ employee: { id: employee.id, employeeCode: employee.employeeCode, name: employee.name, email: employee.email, jobRole: employee.jobRole, apiRole: employee.apiRole, roles: employee.roles?.length ? employee.roles : [employee.apiRole], primaryRole: employee.primaryRole || employee.apiRole, portfolioId: employee.portfolioId, fleetId: employee.fleetId, zoneSlugs: employee.zoneSlugs, active: employee.active }, activationEmail, warning: activationEmail.sent ? undefined : "La cuenta se creó, pero no se pudo confirmar el envío del enlace. Usa “Enviar activación” cuando el correo corporativo esté disponible." });
   } catch (error) { if ((error as any)?.code === 11000) return res.status(409).json({ error: "EMPLOYEE_EMAIL_ALREADY_EXISTS" }); throw error; }
 });
+const kitchenAccessDependencies: KitchenAccessDependencies = {
+  requireOwner, ownerEmail, objectId,
+  newId: () => new mongoose.Types.ObjectId(), employeeCodeFor,
+  passwordHash: () => hashPassword(generateTemporaryPassword()),
+  employees: EmployeeAccount.collection, memberships: TenantMembership.collection,
+  tenants: Tenant.collection, restaurants: Restaurant.collection,
+  createEmployee: async (row, session) => (await EmployeeAccount.create([row], { session }))[0].toObject(),
+  createMembership: async (row, session) => TenantMembership.create([row], { session }),
+  createAuthorization: async (row, session) => AccessAuthorization.create([row], session ? { session } : {}),
+  startSession: () => mongoose.startSession(),
+  sendActivation: async (employee) => (await sendEmployeePasswordLink(employee, "partner", "activation")).delivery,
+};
+registerPartnerKitchenAccessRoutes(app, kitchenAccessDependencies);
 const onboardingRequestSchema = z.object({
   requestType: z.enum(["partner", "fleet", "rider"]),
   payload: z.record(z.string(), z.unknown()).refine((value) => Object.keys(value).length > 0, "payload_required"),
@@ -1363,10 +1377,17 @@ app.post("/api/v1/admin/employees/:id/reset-password", requireOwner(), async (re
 app.post("/api/v1/admin/employees/:id/send-activation", requireOwner(), async (req, res) => {
   const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
   if (!id) return res.status(400).json({ error: "INVALID_EMPLOYEE_ID" });
-  const target = await EmployeeAccount.findById(id).select("_id name email jobRole apiRole roles primaryRole ownerProtected authorizationStatus active accessLevel tenantId").lean().exec() as any;
+  let target = await EmployeeAccount.findById(id).select("_id name email jobRole apiRole roles primaryRole ownerProtected authorizationStatus active accessLevel tenantId kitchenAccessSetupVersion").lean().exec() as any;
   if (!target) return res.status(404).json({ error: "EMPLOYEE_NOT_FOUND" });
   if (target.ownerProtected || target.email === ownerEmail) return res.status(403).json({ error: "OWNER_ACCOUNT_PROTECTED" });
   if (!target.active || target.authorizationStatus !== "approved") return res.status(409).json({ error: "EMPLOYEE_NOT_APPROVED", message: "Aprueba la cuenta antes de enviar sus credenciales." });
+  if (target.kitchenAccessSetupVersion === 1) {
+    try { target = await validateKitchenActivation(req, target, kitchenAccessDependencies); }
+    catch (error) {
+      if (error instanceof KitchenAccessError) return res.status(error.status).json({ error: error.code });
+      throw error;
+    }
+  }
   const surface = preferredCredentialSurface(target);
   if (!surface) return res.status(409).json({ error: "EMPLOYEE_SURFACE_NOT_CONFIGURED", message: "La cuenta no tiene un panel operativo configurado para recibir el enlace." });
   const { delivery } = await sendEmployeePasswordLink(target, surface, "activation");
@@ -1904,13 +1925,15 @@ function assignedRestaurantIds(employee: any): string[] {
 async function partnerLocationsFor(employee: any, roles = partnerRolesForEmployee(employee), permissions = [...permissionsForPartnerRoles(roles)]) {
   const ids = assignedRestaurantIds(employee);
   if (!employee?.tenantId) return [];
+  // The Owner kitchen contract never discovers a location from email.
+  if (employee.kitchenAccessSetupVersion === 1 && (ids.length !== 1 || String(employee.restaurantId) !== ids[0] || employee.restaurantIds?.length !== 1)) return [];
   const tenantFilter = { tenantId: employee.tenantId };
   let restaurants = ids.length
     ? await Restaurant.find({ _id: { $in: ids }, ...tenantFilter }).select("_id name cuisine category locality address email phone deliveryFeeCents promoted availabilityStatus isActive onboardingStatus partnerProfile.commissionRateBps").lean().exec() as any[]
     : [];
   // Compatibilidad con cuentas de prueba/legacy creadas antes de guardar restaurantIds.
   // Solo se acepta una coincidencia exacta de correo entre la cuenta y el comercio.
-  if (!restaurants.length && employee?.email) {
+  if (!restaurants.length && employee?.email && employee.kitchenAccessSetupVersion !== 1) {
     const email = String(employee.email).trim().toLowerCase();
     if (email) restaurants = await Restaurant.find({ email, ...tenantFilter }).select("_id name cuisine category locality address email phone deliveryFeeCents promoted availabilityStatus isActive onboardingStatus partnerProfile.commissionRateBps").limit(10).lean().exec() as any[];
   }
@@ -1939,10 +1962,16 @@ async function partnerLocationsFor(employee: any, roles = partnerRolesForEmploye
 
 async function partnerAccessForRequest(req: express.Request) {
   if (!req.auth?.employeeId) return null;
-  const employee = await EmployeeAccount.findById(req.auth.employeeId).select("restaurantId restaurantIds tenantId jobRole apiRole roles partnerRoles").lean().exec() as any;
+  const employee = await EmployeeAccount.findById(req.auth.employeeId).select("_id email restaurantId restaurantIds tenantId jobRole apiRole roles primaryRole partnerRoles accessLevel ownerProtected active authorizationStatus fleetId zoneSlugs kitchenAccessSetupVersion").lean().exec() as any;
   if (!employee) return null;
+  let kitchenRestaurant: any = null;
+  if (employee.kitchenAccessSetupVersion === 1) {
+    if (String(employee.tenantId) !== req.auth?.tenantId) return null;
+    try { kitchenRestaurant = (await kitchenBindingForEmployee(employee, kitchenAccessDependencies)).restaurant; }
+    catch (error) { if (error instanceof KitchenAccessError) return null; throw error; }
+  }
   const roles = partnerRolesForEmployee(employee);
-  return { employee, restaurantIds: assignedRestaurantIds(employee), roles, permissions: [...permissionsForPartnerRoles(roles)] };
+  return { employee, restaurantIds: assignedRestaurantIds(employee), roles, permissions: [...permissionsForPartnerRoles(roles)], kitchenRestaurant };
 }
 
 async function employeeRestaurant(req: express.Request, access?: Awaited<ReturnType<typeof partnerAccessForRequest>>) {
@@ -1966,7 +1995,8 @@ function setPartnerMenuResponseHeaders(res: express.Response) {
 
 async function partnerRequestAccess(req: express.Request, permission: PartnerPermission) {
   const access = await partnerAccessForRequest(req);
-  return { access, allowed: Boolean(access && partnerCan(access.roles, permission)) };
+  const operationReady = access?.employee.kitchenAccessSetupVersion !== 1 || !permission.startsWith("orders:") || kitchenRestaurantCanOperate(access.kitchenRestaurant);
+  return { access, allowed: Boolean(access && operationReady && partnerCan(access.roles, permission)) };
 }
 function detectedMenuMime(bytes: Buffer): string | null {
   if (bytes.length >= 12 && bytes.subarray(0, 3).equals(Buffer.from([0xff, 0xd8, 0xff]))) return "image/jpeg";
