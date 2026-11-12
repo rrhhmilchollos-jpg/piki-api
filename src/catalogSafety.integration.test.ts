@@ -224,17 +224,31 @@ test("contratos de catálogo y carta con handlers reales, consultas en memoria y
     }
   });
 
-  await t.test("Kazoku sólo se anuncia cuando existe la fila coming_soon; no se fabrica registro", async () => {
-    for (const slug of COMING_SOON_SLUGS) {
-      stored = fixture({ slug, onboardingStatus: "pending_review", isActive: false, availabilityStatus: "coming_soon", menu: [] });
-      const rpc = await trpc("catalog.byId", { id: restaurantId });
-      assert.equal(rpc.body.result.data.json.canOrder, false);
-      assert.deepEqual(rpc.body.result.data.json.menu, []);
+  await t.test("REST y tRPC no publican directorios aprobados con carta, demos, borradores ni próximos", async () => {
+    const before = writes.length;
+    for (const override of [
+      { listingType: "local_directory" }, { listingType: "local_directory", availabilityStatus: "coming_soon" },
+      { listingType: null }, { listingType: "unknown" }, { internalDemo: true }, { slug: "partner-test" },
+      { isActive: false }, { onboardingStatus: "draft" }, { onboardingStatus: "pending_review" },
+      { onboardingStatus: "suspended" }, { onboardingStatus: "rejected" }, { menu: [] },
+      { fulfillmentMode: "assisted_purchase" },
+      ...COMING_SOON_SLUGS.map(slug => ({ slug, availabilityStatus: "coming_soon" })),
+    ]) {
+      stored = fixture(override);
+      const unchanged = structuredClone(stored);
+      assert.deepEqual((await call("get", "/api/v1/catalog/restaurants", { query: {} })).body.restaurants, [], JSON.stringify(override));
+      assert.deepEqual((await trpc("catalog.list", {})).body.result.data.json, [], JSON.stringify(override));
+      for (const id of [restaurantId, stored.slug]) assert.equal((await trpc("catalog.byId", { id })).body.result.data.json, null, JSON.stringify(override));
+      assert.deepEqual(stored, unchanged);
     }
-    stored = fixture({ slug: "arbitrary-pending", onboardingStatus: "pending_review", isActive: false, availabilityStatus: "coming_soon" });
-    assert.equal((await trpc("catalog.byId", { id: restaurantId })).body.result.data.json, null);
-    stored = fixture({ slug: "kazoku-xativa", internalDemo: true, availabilityStatus: "coming_soon" });
-    assert.equal((await trpc("catalog.byId", { id: restaurantId })).body.result.data.json, null);
+    for (const listingType of ["official_partner", "restaurant", undefined]) {
+      stored = fixture({ listingType });
+      if (listingType === undefined) delete stored.listingType;
+      assert.equal((await call("get", "/api/v1/catalog/restaurants", { query: {} })).body.restaurants.length, 1);
+      assert.equal((await trpc("catalog.list", {})).body.result.data.json.length, 1);
+      for (const id of [restaurantId, stored.slug]) assert.equal((await trpc("catalog.byId", { id })).body.result.data.json.canOrder, true);
+    }
+    assert.equal(writes.length, before);
   });
 
   await t.test("PATCH por ID es atómico, preserva resto, replay no incrementa y PUT stale da 409", async () => {

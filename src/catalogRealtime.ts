@@ -2,7 +2,7 @@ import { EventEmitter } from "node:events";
 import type { Request, Response } from "express";
 import mongoose from "mongoose";
 import { Restaurant } from "./models.js";
-import { COMING_SOON_SLUGS, CUSTOMER_HIDDEN_TEST_SLUGS } from "./customerCatalogPolicy.js";
+import { isPublishedCustomerPartner } from "./customerCatalogPolicy.js";
 
 export type CatalogUpdate = {
   type: "catalog.updated";
@@ -13,10 +13,7 @@ export type CatalogUpdate = {
 // change-stream updateDescription or authenticated operational events.
 export function publicCatalogUpdate(restaurant: any, reason = "restaurant.updated"): CatalogUpdate {
   const slug = typeof restaurant?.slug === "string" ? restaurant.slug : "";
-  const publicRestaurant = restaurant?.internalDemo !== true
-    && !(CUSTOMER_HIDDEN_TEST_SLUGS as readonly string[]).includes(slug)
-    && ((restaurant?.isActive === true && restaurant?.onboardingStatus === "approved" && restaurant?.availabilityStatus === "available" && restaurant?.menu?.length > 0)
-      || ((COMING_SOON_SLUGS as readonly string[]).includes(slug) && restaurant?.availabilityStatus === "coming_soon" && restaurant?.onboardingStatus !== "rejected"));
+  const publicRestaurant = isPublishedCustomerPartner(restaurant);
   return {
     type: "catalog.updated",
     payload: publicRestaurant && restaurant?._id
