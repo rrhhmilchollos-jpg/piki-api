@@ -1,4 +1,5 @@
 import { pendingPartnerDraft } from "./partnerDrafts.js";
+import { isPartnerEmployee, partnerBindingForEmployee, partnerBindingErrorResponse, persistPartnerBinding, validatePartnerCredentialTarget } from "./employeePartnerBinding.js";
 import { nativeReleasePolicy, riderClientReleasePolicy } from "./nativeReleasePolicy.js";
 import { registerEmployeeDeletionRoutes } from "./employeeDeletion.js";
 import { dispatchVehicleInputForOrder } from "./dispatchVehiclePolicy.js";
@@ -1123,6 +1124,7 @@ async function createEmployeePasswordReset(employee: any, surface: EmployeeCrede
 }
 
 async function sendEmployeePasswordLink(employee: any, surface: EmployeeCredentialSurface, purpose: "recovery" | "activation") {
+  if (isPartnerEmployee(employee)) await partnerBindingForEmployee(employee, kitchenAccessDependencies);
   const reset = await createEmployeePasswordReset(employee, surface, purpose === "activation" ? 24 * 60 * 60_000 : 30 * 60_000);
   const appLabel = employeeCredentialLabels[surface];
   const safeName = escapeCorporateHtml(String(employee.name || "equipo PIKI"));
@@ -1146,9 +1148,11 @@ app.post("/api/v1/auth/employee/password-reset/request", rateLimit(3, 15 * 60_00
   const surface = employeeCredentialSurface(req.header("x-piki-surface"));
   if (!parsed.success || !surface) return res.status(202).json({ message: passwordResetMessage });
   const email = parsed.data.email.trim().toLowerCase();
-  const employee = await EmployeeAccount.findOne({ email, active: true, authorizationStatus: "approved" }).select("_id email name jobRole apiRole roles primaryRole ownerProtected authorizationStatus").lean().exec() as any;
+  const employee = await EmployeeAccount.findOne({ email, active: true, authorizationStatus: "approved" }).lean().exec() as any;
   if (employee && employeeCanUseCredentialSurface(employee, surface)) {
-    const { delivery } = await sendEmployeePasswordLink(employee, surface, "recovery");
+    let delivery;
+    try { ({ delivery } = await sendEmployeePasswordLink(employee, surface, "recovery")); }
+    catch (error) { if (partnerBindingErrorResponse(error)) return res.status(202).json({ message: passwordResetMessage }); throw error; }
     if (!delivery.sent) {
       console.warn("Employee password reset email was not delivered", { error: delivery.error, surface });
       return res.status(503).json({ message: "El correo de Recursos Humanos no está disponible ahora. Inténtalo de nuevo en unos minutos o contacta con Administración." });
@@ -1165,8 +1169,10 @@ app.post("/api/v1/auth/employee/password-reset/confirm", rateLimit(8, 15 * 60_00
   // save lets two concurrent confirmations reuse the same reset link.
   const reset = await EmployeePasswordReset.findOneAndUpdate({ tokenHash, usedAt: null, expiresAt: { $gt: new Date() } }, { $set: { usedAt: new Date() } }, { new: true }).exec() as any;
   if (!reset) return res.status(400).json({ error: "PASSWORD_RESET_INVALID", message: "El enlace no es válido o ya ha caducado. Solicita otro enlace." });
-  const employee = await EmployeeAccount.findOne({ _id: reset.employeeId, active: true, authorizationStatus: "approved" }).select("+passwordHash email jobRole apiRole roles primaryRole ownerProtected authorizationStatus").exec() as any;
+  const employee = await EmployeeAccount.findOne({ _id: reset.employeeId, active: true, authorizationStatus: "approved" }).select("+passwordHash").exec() as any;
   if (!employee || !employeeCanUseCredentialSurface(employee, surface)) return res.status(400).json({ error: "PASSWORD_RESET_INVALID", message: "El enlace no es válido o ya ha caducado. Solicita otro enlace." });
+  try { if (isPartnerEmployee(employee)) await partnerBindingForEmployee(employee, kitchenAccessDependencies); }
+  catch (error) { if (partnerBindingErrorResponse(error)) return res.status(400).json({ error: "PASSWORD_RESET_INVALID" }); throw error; }
   employee.passwordHash = hashPassword(parsed.data.newPassword); employee.mustChangePassword = false; employee.passwordChangedAt = new Date(); employee.sessionHash = null; await employee.save();
   await EmployeeSession.deleteMany({ employeeId: employee._id }).exec();
   return res.json({ changed: true });
@@ -1236,10 +1242,16 @@ app.post("/api/v1/auth/employee/change-password", requireRole("admin", "partner"
   return res.json({ changed: true });
 });
 const employeeCreateSchema = z.object({ name: z.string().min(2).max(160), email: z.string().email(), jobRole: z.enum(["admin", "partner", "rider", "fleet", "zone_manager", "commercial", "gerente_comercial_zona", "finance", "support"]), roles: z.array(z.enum(["admin", "partner", "rider", "fleet", "commercial", "gerente_comercial_zona", "finance", "support"])).min(1).max(8).optional(), primaryRole: z.enum(["admin", "partner", "rider", "fleet", "commercial", "gerente_comercial_zona", "finance", "support"]).optional(), apiRole: z.enum(["admin", "partner", "rider", "fleet", "commercial", "gerente_comercial_zona", "finance", "support"]).optional(), restaurantId: z.string().regex(/^[a-f\d]{24}$/).nullable().optional(), fleetId: z.string().regex(/^[a-f\d]{24}$/).nullable().optional(), zoneSlugs: z.array(z.string().regex(/^[a-z0-9-]+$/)).max(100).default([]) });
+const employeePartnerCreateSchema = employeeCreateSchema.extend({ restaurantIds: z.array(z.string().regex(/^[a-f\d]{24}$/i)).min(1).max(100).optional(), partnerRoles: z.array(z.enum(partnerOperationalRoles)).min(1).max(10).optional(), sendActivation: z.boolean().default(true) });
 app.post("/api/v1/admin/employees", requireOwner(), async (req, res) => {
-  const parsed = employeeCreateSchema.safeParse(req.body); if (!parsed.success) return res.status(400).json({ error: "INVALID_EMPLOYEE", details: parsed.error.flatten() });
+  const parsed = employeePartnerCreateSchema.safeParse(req.body); if (!parsed.success) return res.status(400).json({ error: "INVALID_EMPLOYEE", details: parsed.error.flatten() });
   const apiRole = parsed.data.apiRole || (parsed.data.jobRole === "gerente_comercial_zona" ? "gerente_comercial_zona" : parsed.data.jobRole === "commercial" ? "commercial" : parsed.data.jobRole === "zone_manager" ? "fleet" : parsed.data.jobRole);
   const roles = parsed.data.roles?.length ? parsed.data.roles : [apiRole];
+  const isPartner = isPartnerEmployee({ ...parsed.data, apiRole, roles });
+  if (isPartner && !parsed.data.partnerRoles?.length) return res.status(400).json({ error: "PARTNER_ROLES_REQUIRED", message: "Selecciona los permisos Partner explícitos antes de crear la cuenta." });
+  const partnerIds = parsed.data.restaurantIds || (parsed.data.restaurantId ? [parsed.data.restaurantId] : []);
+  if (isPartner && (!partnerIds.length || (parsed.data.restaurantId && !partnerIds.includes(parsed.data.restaurantId)))) return res.status(409).json({ error: "PARTNER_RESTAURANT_NOT_ASSIGNED" });
+  if (!isPartner && (parsed.data.restaurantId || parsed.data.restaurantIds || parsed.data.partnerRoles)) return res.status(400).json({ error: "PARTNER_ROLE_REQUIRED" });
   const isFleetAccount = apiRole === "fleet" || roles.includes("fleet") || parsed.data.jobRole === "zone_manager";
   if (parsed.data.fleetId && !isFleetAccount) return res.status(400).json({ error: "FLEET_ID_REQUIRES_FLEET_ROLE", message: "Asigna una flota solo a una cuenta con permisos Fleet." });
   let assignedFleetTenantId: unknown = null;
@@ -1250,20 +1262,29 @@ app.post("/api/v1/admin/employees", requireOwner(), async (req, res) => {
     assignedFleetTenantId = fleet.tenantId;
   }
   const primaryRole = parsed.data.primaryRole || roles[0];
+  if (!roles.includes(primaryRole)) return res.status(400).json({ error: "PRIMARY_ROLE_NOT_ASSIGNED" });
+  if (isPartner && assignedFleetTenantId && String(assignedFleetTenantId) !== req.auth?.tenantId) return res.status(409).json({ error: "EMPLOYEE_TENANT_CONFLICT" });
   const temporaryPassword = generateTemporaryPassword();
   try {
     const employeeId = new mongoose.Types.ObjectId();
-    const employee = await EmployeeAccount.create({ _id: employeeId, employeeCode: employeeCodeFor(employeeId), ...parsed.data, roles, primaryRole, tenantId: assignedFleetTenantId, accessLevel: "subadmin", authorizationStatus: "approved", authorizedAt: new Date(), authorizedBy: req.auth?.employeeId ? objectId(req.auth.employeeId) : null, restaurantId: parsed.data.restaurantId ? objectId(parsed.data.restaurantId) : null, fleetId: parsed.data.fleetId ? objectId(parsed.data.fleetId) : null, apiRole, passwordHash: hashPassword(temporaryPassword), mustChangePassword: true, active: true });
-    await AccessAuthorization.create({ employeeId: employee._id, action: "created", previousStatus: null, nextStatus: "approved", previousRole: null, nextRole: apiRole, accessLevel: "subadmin", actorEmployeeId: objectId(req.auth!.employeeId!), reason: "Cuenta creada y autorizada por RRHH superadmin." });
+    const { sendActivation, ...accountData } = parsed.data;
+    const row = { _id: employeeId, employeeCode: employeeCodeFor(employeeId), ...accountData, email: parsed.data.email.trim().toLowerCase(), roles, primaryRole, tenantId: assignedFleetTenantId, accessLevel: "subadmin", authorizationStatus: "approved", authorizedAt: new Date(), authorizedBy: req.auth?.employeeId ? objectId(req.auth.employeeId) : null, restaurantId: parsed.data.restaurantId ? objectId(parsed.data.restaurantId) : null, fleetId: parsed.data.fleetId ? objectId(parsed.data.fleetId) : null, apiRole, passwordHash: hashPassword(temporaryPassword), mustChangePassword: true, active: true };
+    const employee = isPartner
+      ? await persistPartnerBinding(req, kitchenAccessDependencies, { newEmployee: row, restaurantIds: partnerIds, partnerRoles: parsed.data.partnerRoles, reason: "Cuenta creada y vinculada por RRHH superadmin; no aprueba el restaurante." })
+      : await EmployeeAccount.create(row);
+    if (!isPartner) await AccessAuthorization.create({ employeeId: employee._id, action: "created", previousStatus: null, nextStatus: "approved", previousRole: null, nextRole: apiRole, accessLevel: "subadmin", actorEmployeeId: objectId(req.auth!.employeeId!), reason: "Cuenta creada y autorizada por RRHH superadmin." });
     const surface = preferredCredentialSurface(employee);
     let activationEmail: { sent: boolean; error?: string; surface?: EmployeeCredentialSurface } = { sent: false };
-    if (surface) {
-      const { delivery } = await sendEmployeePasswordLink(employee, surface, "activation");
-      activationEmail = { sent: delivery.sent, error: delivery.error, surface };
-      if (delivery.sent) await AccessAuthorization.create({ employeeId: employee._id, action: "credentials_sent", previousStatus: "approved", nextStatus: "approved", previousRole: apiRole, nextRole: apiRole, accessLevel: "subadmin", actorEmployeeId: objectId(req.auth!.employeeId!), reason: `Enlace de activación enviado para ${employeeCredentialLabels[surface]}.` });
+    if (surface && sendActivation) {
+      try {
+        const target = isPartner ? await validatePartnerCredentialTarget(req, employee, kitchenAccessDependencies) : employee;
+        const { delivery } = await sendEmployeePasswordLink(target, surface, "activation");
+        activationEmail = { sent: delivery.sent, error: delivery.error, surface };
+        if (delivery.sent) await AccessAuthorization.create({ employeeId: employee._id, action: "credentials_sent", previousStatus: "approved", nextStatus: "approved", previousRole: apiRole, nextRole: apiRole, accessLevel: "subadmin", actorEmployeeId: objectId(req.auth!.employeeId!), reason: `Enlace de activación enviado para ${employeeCredentialLabels[surface]}.` });
+      } catch (error) { activationEmail = { ...activationEmail, surface, error: partnerBindingErrorResponse(error)?.error || "CREDENTIAL_EMAIL_OR_AUDIT_FAILED" }; }
     }
-    return res.status(201).json({ employee: { id: employee.id, employeeCode: employee.employeeCode, name: employee.name, email: employee.email, jobRole: employee.jobRole, apiRole: employee.apiRole, roles: employee.roles?.length ? employee.roles : [employee.apiRole], primaryRole: employee.primaryRole || employee.apiRole, portfolioId: employee.portfolioId, fleetId: employee.fleetId, zoneSlugs: employee.zoneSlugs, active: employee.active }, activationEmail, warning: activationEmail.sent ? undefined : "La cuenta se creó, pero no se pudo confirmar el envío del enlace. Usa “Enviar activación” cuando el correo corporativo esté disponible." });
-  } catch (error) { if ((error as any)?.code === 11000) return res.status(409).json({ error: "EMPLOYEE_EMAIL_ALREADY_EXISTS" }); throw error; }
+    return res.status(201).json({ bindingPersisted: isPartner, employee: { id: String(employee._id), employeeCode: employee.employeeCode, name: employee.name, email: employee.email, tenantId: employee.tenantId, restaurantId: employee.restaurantId, restaurantIds: employee.restaurantIds, partnerRoles: employee.partnerRoles, jobRole: employee.jobRole, apiRole: employee.apiRole, roles: employee.roles?.length ? employee.roles : [employee.apiRole], primaryRole: employee.primaryRole || employee.apiRole, portfolioId: employee.portfolioId, fleetId: employee.fleetId, zoneSlugs: employee.zoneSlugs, active: employee.active }, activationEmail, warning: activationEmail.sent ? undefined : "La cuenta se creó, pero no se pudo confirmar el envío del enlace. Usa “Enviar activación” cuando el correo corporativo esté disponible." });
+  } catch (error) { if ((error as any)?.code === 11000) return res.status(409).json({ error: "EMPLOYEE_EMAIL_ALREADY_EXISTS" }); const bindingError = partnerBindingErrorResponse(error); if (bindingError) return res.status(bindingError.status).json({ error: bindingError.error }); throw error; }
 });
 const kitchenAccessDependencies: KitchenAccessDependencies = {
   requireOwner, ownerEmail, objectId,
@@ -1352,7 +1373,16 @@ app.post("/api/v1/admin/tenants/:id/memberships", requireOwner(), async (req, re
 });
 registerEmployeeDeletionRoutes(app);
 registerTerritoryRoutes(app);
-app.get("/api/v1/admin/employees", requireRole("admin"), async (_req, res) => res.json({ employees: await EmployeeAccount.find({ email: { $ne: ownerEmail }, hiddenFromAdmin: { $ne: true } }).select("name email employeeCode jobRole apiRole roles primaryRole accessLevel authorizationStatus authorizedAt authorizedBy authorizationReason portfolioId fleetId zoneSlugs active mustChangePassword lastLoginAt createdAt").sort({ createdAt: -1 }).lean().exec() }));
+app.get("/api/v1/admin/employees", requireRole("admin"), async (_req, res) => {
+  const employees = await EmployeeAccount.find({ email: { $ne: ownerEmail }, hiddenFromAdmin: { $ne: true } }).select("name email employeeCode jobRole apiRole roles primaryRole partnerRoles restaurantId restaurantIds tenantId kitchenAccessSetupVersion partnerBindingVersion accessLevel authorizationStatus authorizedAt authorizedBy authorizationReason portfolioId fleetId zoneSlugs active mustChangePassword lastLoginAt createdAt").sort({ createdAt: -1 }).lean().exec() as any[];
+  return res.json({ employees: employees.map((employee) => ({ ...employee, resolvedPartnerRoles: isPartnerEmployee(employee) ? partnerRolesForEmployee(employee) : [] })) });
+});
+app.get("/api/v1/admin/partner-access/targets", requireOwner(), async (req, res) => {
+  const tenantId = objectId(String(req.auth?.tenantId || ""));
+  if (!tenantId) return res.status(409).json({ error: "TENANT_CONTEXT_REQUIRED" });
+  const restaurants = await Restaurant.find({ tenantId, onboardingStatus: { $in: ["pending_review", "approved"] }, listingType: { $in: ["official_partner", "restaurant"] }, internalDemo: { $ne: true } }).select("_id name address tenantId onboardingStatus isActive").sort({ name: 1 }).lean().exec();
+  return res.json({ tenantId: String(tenantId), restaurants });
+});
 app.get("/api/v1/admin/authorization-audit", requireOwner(), async (req, res) => {
   const email = typeof req.query.email === "string" ? req.query.email.toLowerCase() : undefined;
   const employee = email ? await EmployeeAccount.findOne({ email }).select("_id name email jobRole apiRole accessLevel authorizationStatus authorizedAt authorizedBy authorizationReason active").lean().exec() as any : null;
@@ -1367,9 +1397,11 @@ app.post("/api/v1/admin/employees/:id/reset-password", requireOwner(), async (re
   if (!id) return res.status(400).json({ error: "INVALID_EMPLOYEE_ID" });
   const parsed = z.object({ newPassword: z.string().min(12).max(200).regex(/[A-Z]/).regex(/[a-z]/).regex(/[0-9]/) }).safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_RESET_PASSWORD", message: "La contraseña debe tener 12 caracteres, mayúscula, minúscula y número." });
-  const target = await EmployeeAccount.findById(id).select("email ownerProtected").lean().exec() as any;
+  const target = await EmployeeAccount.findById(id).lean().exec() as any;
   if (!target) return res.status(404).json({ error: "EMPLOYEE_NOT_FOUND" });
   if (target.ownerProtected || target.email === ownerEmail) return res.status(403).json({ error: "OWNER_ACCOUNT_PROTECTED" });
+  try { if (isPartnerEmployee(target)) await validatePartnerCredentialTarget(req, target, kitchenAccessDependencies); }
+  catch (error) { const bindingError = partnerBindingErrorResponse(error); if (bindingError) return res.status(bindingError.status).json({ error: bindingError.error }); throw error; }
   const employee = await EmployeeAccount.findByIdAndUpdate(id, { $set: { passwordHash: hashPassword(parsed.data.newPassword), mustChangePassword: true, passwordChangedAt: new Date(), sessionHash: null, active: true } }, { new: true }).select("name email jobRole apiRole active mustChangePassword").lean().exec();
   await revokeEmployeeSessions(id);
   return res.json({ employee, reset: true });
@@ -1377,22 +1409,26 @@ app.post("/api/v1/admin/employees/:id/reset-password", requireOwner(), async (re
 app.post("/api/v1/admin/employees/:id/send-activation", requireOwner(), async (req, res) => {
   const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
   if (!id) return res.status(400).json({ error: "INVALID_EMPLOYEE_ID" });
-  let target = await EmployeeAccount.findById(id).select("_id name email jobRole apiRole roles primaryRole ownerProtected authorizationStatus active accessLevel tenantId kitchenAccessSetupVersion").lean().exec() as any;
+  let target = await EmployeeAccount.findById(id).lean().exec() as any;
   if (!target) return res.status(404).json({ error: "EMPLOYEE_NOT_FOUND" });
   if (target.ownerProtected || target.email === ownerEmail) return res.status(403).json({ error: "OWNER_ACCOUNT_PROTECTED" });
   if (!target.active || target.authorizationStatus !== "approved") return res.status(409).json({ error: "EMPLOYEE_NOT_APPROVED", message: "Aprueba la cuenta antes de enviar sus credenciales." });
-  if (target.kitchenAccessSetupVersion === 1) {
-    try { target = await validateKitchenActivation(req, target, kitchenAccessDependencies); }
+  if (isPartnerEmployee(target)) {
+    try { target = target.kitchenAccessSetupVersion === 1 ? await validateKitchenActivation(req, target, kitchenAccessDependencies) : await validatePartnerCredentialTarget(req, target, kitchenAccessDependencies); }
     catch (error) {
-      if (error instanceof KitchenAccessError) return res.status(error.status).json({ error: error.code });
+      const bindingError = partnerBindingErrorResponse(error);
+      if (bindingError) return res.status(bindingError.status).json({ error: bindingError.error });
       throw error;
     }
   }
   const surface = preferredCredentialSurface(target);
   if (!surface) return res.status(409).json({ error: "EMPLOYEE_SURFACE_NOT_CONFIGURED", message: "La cuenta no tiene un panel operativo configurado para recibir el enlace." });
-  const { delivery } = await sendEmployeePasswordLink(target, surface, "activation");
+  let delivery;
+  try { ({ delivery } = await sendEmployeePasswordLink(target, surface, "activation")); }
+  catch (error) { const bindingError = partnerBindingErrorResponse(error); if (bindingError) return res.status(bindingError.status).json({ error: bindingError.error }); throw error; }
   if (!delivery.sent) return res.status(503).json({ error: "CREDENTIAL_EMAIL_NOT_SENT", message: "No se pudo enviar el correo corporativo. Comprueba la configuración de correo y vuelve a intentarlo." });
-  await AccessAuthorization.create({
+  let warning: string | undefined;
+  try { await AccessAuthorization.create({
     tenantId: target.tenantId || null,
     employeeId: target._id,
     action: "credentials_sent",
@@ -1403,8 +1439,8 @@ app.post("/api/v1/admin/employees/:id/send-activation", requireOwner(), async (r
     accessLevel: target.accessLevel || "subadmin",
     actorEmployeeId: objectId(req.auth!.employeeId!),
     reason: `Enlace de activación enviado para ${employeeCredentialLabels[surface]}.`,
-  });
-  return res.json({ sent: true, surface, recipient: target.email, message: `Se ha enviado un enlace de activación a ${target.email}.` });
+  }); } catch { warning = "CREDENTIAL_AUDIT_FAILED_AFTER_SEND"; }
+  return res.json({ sent: true, surface, recipient: target.email, warning, message: `Se ha enviado un enlace de activación a ${target.email}.` });
 });
 app.patch("/api/v1/admin/employees/:id/authorization", requireOwner(), async (req, res) => {
   const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id); if (!id) return res.status(400).json({ error: "INVALID_EMPLOYEE_ID" });
@@ -1421,7 +1457,7 @@ app.patch("/api/v1/admin/employees/:id/authorization", requireOwner(), async (re
     reason: z.string().max(500).default(""),
   }).safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_AUTHORIZATION", details: parsed.error.flatten() });
-  const target = await EmployeeAccount.findById(id).select("email tenantId ownerProtected jobRole apiRole roles primaryRole partnerRoles restaurantId restaurantIds accessLevel authorizationStatus fleetId").lean().exec() as any;
+  const target = await EmployeeAccount.findById(id).lean().exec() as any;
   if (!target) return res.status(404).json({ error: "EMPLOYEE_NOT_FOUND" });
   if (target.ownerProtected || target.email === ownerEmail) return res.status(403).json({ error: "OWNER_ACCOUNT_PROTECTED" });
   const effectiveRoles = parsed.data.roles || (target.roles?.length ? target.roles : [parsed.data.apiRole || target.apiRole]);
@@ -1444,13 +1480,6 @@ app.patch("/api/v1/admin/employees/:id/authorization", requireOwner(), async (re
   if (parsed.data.roles) update.roles = parsed.data.roles;
   if (parsed.data.primaryRole) update.primaryRole = parsed.data.primaryRole;
   if (parsed.data.partnerRoles) update.partnerRoles = parsed.data.partnerRoles;
-  if (parsed.data.restaurantIds) {
-    const restaurantIds = [...new Set(parsed.data.restaurantIds)];
-    const approvedCount = await Restaurant.countDocuments({ _id: { $in: restaurantIds.map((restaurantId) => objectId(restaurantId)) }, onboardingStatus: "approved" });
-    if (approvedCount !== restaurantIds.length) return res.status(409).json({ error: "PARTNER_RESTAURANT_ASSIGNMENT_INVALID", message: "Solo se pueden asignar locales existentes y aprobados." });
-    update.restaurantId = objectId(restaurantIds[0]);
-    update.restaurantIds = restaurantIds.map((restaurantId) => objectId(restaurantId));
-  }
   if (parsed.data.fleetId !== undefined) {
     update.fleetId = parsed.data.fleetId ? objectId(parsed.data.fleetId) : null;
     if (parsed.data.fleetId) update.tenantId = assignedFleetTenantId;
@@ -1458,6 +1487,18 @@ app.patch("/api/v1/admin/employees/:id/authorization", requireOwner(), async (re
   if (parsed.data.zoneSlugs) update.zoneSlugs = parsed.data.zoneSlugs;
   const accessChanged = Boolean(parsed.data.apiRole || parsed.data.jobRole || parsed.data.roles || parsed.data.primaryRole || parsed.data.partnerRoles || parsed.data.restaurantIds || parsed.data.fleetId !== undefined || parsed.data.status !== "approved");
   if (accessChanged) update.sessionHash = null;
+  const effectiveTarget = { ...target, ...update };
+  const bindingEdit = Boolean(parsed.data.partnerRoles || parsed.data.restaurantIds || parsed.data.apiRole || parsed.data.jobRole || parsed.data.roles || parsed.data.primaryRole || parsed.data.fleetId !== undefined);
+  if (target.kitchenAccessSetupVersion === 1 && bindingEdit) return res.status(409).json({ error: "KITCHEN_ACCOUNT_CONTRACT_PROTECTED" });
+  if (isPartnerEmployee(effectiveTarget) && target.kitchenAccessSetupVersion !== 1 && (bindingEdit || parsed.data.status === "approved")) {
+    try {
+      const employee = await persistPartnerBinding(req, kitchenAccessDependencies, { employeeId: id, restaurantIds: parsed.data.restaurantIds || assignedRestaurantIds(target), partnerRoles: parsed.data.partnerRoles, employeeUpdate: update, reason: parsed.data.reason || "Autorización y asociación Partner confirmadas por Owner." });
+      await revokeEmployeeSessions(id);
+      const publicEmployee = { _id: employee._id, name: employee.name, email: employee.email, tenantId: employee.tenantId, jobRole: employee.jobRole, apiRole: employee.apiRole, roles: employee.roles, primaryRole: employee.primaryRole, partnerRoles: employee.partnerRoles, restaurantId: employee.restaurantId, restaurantIds: employee.restaurantIds, accessLevel: employee.accessLevel, authorizationStatus: employee.authorizationStatus, authorizedAt: employee.authorizedAt, authorizedBy: employee.authorizedBy, authorizationReason: employee.authorizationReason, fleetId: employee.fleetId, zoneSlugs: employee.zoneSlugs, active: employee.active, mustChangePassword: employee.mustChangePassword };
+      return res.json({ employee: publicEmployee, bindingPersisted: true, authorization: { status: parsed.data.status, persisted: true } });
+    } catch (error) { const bindingError = partnerBindingErrorResponse(error); if (bindingError) return res.status(bindingError.status).json({ error: bindingError.error }); throw error; }
+  }
+  if (!isPartnerEmployee(effectiveTarget) && (parsed.data.partnerRoles || parsed.data.restaurantIds)) return res.status(400).json({ error: "PARTNER_ROLE_REQUIRED" });
   const employee = await EmployeeAccount.findByIdAndUpdate(id, { $set: update }, { new: true }).select("name email tenantId jobRole apiRole roles primaryRole partnerRoles restaurantId restaurantIds accessLevel authorizationStatus authorizedAt authorizedBy authorizationReason fleetId zoneSlugs active mustChangePassword").lean().exec() as any;
   await AccessAuthorization.create({ employeeId: id, action: parsed.data.apiRole || parsed.data.jobRole || parsed.data.roles || parsed.data.partnerRoles || parsed.data.restaurantIds || parsed.data.fleetId !== undefined ? "role_changed" : parsed.data.status, previousStatus: target.authorizationStatus || null, nextStatus: parsed.data.status, previousRole: JSON.stringify({ apiRole: target.apiRole, roles: target.roles || [], partnerRoles: target.partnerRoles || [], restaurantIds: assignedRestaurantIds(target), fleetId: target.fleetId || null, tenantId: target.tenantId || null }), nextRole: JSON.stringify({ apiRole: employee.apiRole, roles: employee.roles || [], partnerRoles: employee.partnerRoles || [], restaurantIds: assignedRestaurantIds(employee), fleetId: employee.fleetId || null, tenantId: employee.tenantId || null }), accessLevel: employee.accessLevel || "subadmin", actorEmployeeId: objectId(req.auth!.employeeId!), reason: parsed.data.reason });
   if (accessChanged) await revokeEmployeeSessions(id);
@@ -1931,12 +1972,6 @@ async function partnerLocationsFor(employee: any, roles = partnerRolesForEmploye
   let restaurants = ids.length
     ? await Restaurant.find({ _id: { $in: ids }, ...tenantFilter }).select("_id name cuisine category locality address email phone deliveryFeeCents promoted availabilityStatus isActive onboardingStatus partnerProfile.commissionRateBps").lean().exec() as any[]
     : [];
-  // Compatibilidad con cuentas de prueba/legacy creadas antes de guardar restaurantIds.
-  // Solo se acepta una coincidencia exacta de correo entre la cuenta y el comercio.
-  if (!restaurants.length && employee?.email && employee.kitchenAccessSetupVersion !== 1) {
-    const email = String(employee.email).trim().toLowerCase();
-    if (email) restaurants = await Restaurant.find({ email, ...tenantFilter }).select("_id name cuisine category locality address email phone deliveryFeeCents promoted availabilityStatus isActive onboardingStatus partnerProfile.commissionRateBps").limit(10).lean().exec() as any[];
-  }
   if (!restaurants.length) return [];
   const byId = new Map(restaurants.map((restaurant) => [String(restaurant._id), restaurant]));
   const ordered = ids.length ? ids.map((id) => byId.get(id)).filter(Boolean) : restaurants;
@@ -1962,7 +1997,7 @@ async function partnerLocationsFor(employee: any, roles = partnerRolesForEmploye
 
 async function partnerAccessForRequest(req: express.Request) {
   if (!req.auth?.employeeId) return null;
-  const employee = await EmployeeAccount.findById(req.auth.employeeId).select("_id email restaurantId restaurantIds tenantId jobRole apiRole roles primaryRole partnerRoles accessLevel ownerProtected active authorizationStatus fleetId zoneSlugs kitchenAccessSetupVersion").lean().exec() as any;
+  const employee = await EmployeeAccount.findById(req.auth.employeeId).select("_id email restaurantId restaurantIds tenantId jobRole apiRole roles primaryRole partnerRoles accessLevel ownerProtected active authorizationStatus fleetId zoneSlugs kitchenAccessSetupVersion partnerBindingVersion").lean().exec() as any;
   if (!employee) return null;
   let kitchenRestaurant: any = null;
   if (employee.kitchenAccessSetupVersion === 1) {
@@ -1970,8 +2005,14 @@ async function partnerAccessForRequest(req: express.Request) {
     try { kitchenRestaurant = (await kitchenBindingForEmployee(employee, kitchenAccessDependencies)).restaurant; }
     catch (error) { if (error instanceof KitchenAccessError) return null; throw error; }
   }
+  let bindingRestaurants: any[] | null = null;
+  if (employee.partnerBindingVersion === 1) {
+    if (String(employee.tenantId) !== req.auth?.tenantId) return null;
+    try { bindingRestaurants = (await partnerBindingForEmployee(employee, kitchenAccessDependencies)).restaurants; }
+    catch (error) { if (partnerBindingErrorResponse(error)) return null; throw error; }
+  }
   const roles = partnerRolesForEmployee(employee);
-  return { employee, restaurantIds: assignedRestaurantIds(employee), roles, permissions: [...permissionsForPartnerRoles(roles)], kitchenRestaurant };
+  return { employee, restaurantIds: assignedRestaurantIds(employee), roles, permissions: [...permissionsForPartnerRoles(roles)], kitchenRestaurant, bindingRestaurants };
 }
 
 async function employeeRestaurant(req: express.Request, access?: Awaited<ReturnType<typeof partnerAccessForRequest>>) {
@@ -1995,7 +2036,11 @@ function setPartnerMenuResponseHeaders(res: express.Response) {
 
 async function partnerRequestAccess(req: express.Request, permission: PartnerPermission) {
   const access = await partnerAccessForRequest(req);
-  const operationReady = access?.employee.kitchenAccessSetupVersion !== 1 || !permission.startsWith("orders:") || kitchenRestaurantCanOperate(access.kitchenRestaurant);
+  let operationReady = access?.employee.kitchenAccessSetupVersion !== 1 || !permission.startsWith("orders:") || kitchenRestaurantCanOperate(access.kitchenRestaurant);
+  if (access?.bindingRestaurants && permission.startsWith("orders:")) {
+    const selectedId = String(req.header("x-piki-restaurant-id") || access.restaurantIds[0]);
+    operationReady = kitchenRestaurantCanOperate(access.bindingRestaurants.find((row) => String(row._id) === selectedId));
+  }
   return { access, allowed: Boolean(access && operationReady && partnerCan(access.roles, permission)) };
 }
 function detectedMenuMime(bytes: Buffer): string | null {
@@ -2647,17 +2692,12 @@ app.patch("/api/v1/admin/employees/:id/partner-locations", requireOwner(), async
   if (!employeeId) return res.status(400).json({ error: "INVALID_EMPLOYEE_ID" });
   const parsed = z.object({ restaurantIds: z.array(z.string().regex(/^[a-f\d]{24}$/i)).min(1).max(100), partnerRoles: z.array(z.enum(partnerOperationalRoles)).min(1).max(10).optional() }).safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_PARTNER_ASSIGNMENT", details: parsed.error.flatten() });
-  const employee = await EmployeeAccount.findById(employeeId).select("email ownerProtected apiRole roles partnerRoles authorizationStatus accessLevel restaurantId restaurantIds").lean().exec() as any;
-  if (!canReceivePartnerLocations(employee, ownerEmail)) return res.status(404).json({ error: "PARTNER_ACCOUNT_NOT_FOUND" });
-  const uniqueIds = [...new Set(parsed.data.restaurantIds)];
-  const restaurants = await Restaurant.find({ _id: { $in: uniqueIds.map((id) => objectId(id)) }, onboardingStatus: "approved" }).select("_id name address isActive onboardingStatus").lean().exec() as any[];
-  if (restaurants.length !== uniqueIds.length) return res.status(409).json({ error: "PARTNER_RESTAURANT_ASSIGNMENT_INVALID", message: "Solo se pueden asignar locales existentes y aprobados." });
-  const partnerRoles = parsed.data.partnerRoles || partnerRolesForEmployee(employee);
-  const updated = await EmployeeAccount.findByIdAndUpdate(employeeId, { $set: { restaurantId: objectId(uniqueIds[0]), restaurantIds: uniqueIds.map((id) => objectId(id)), partnerRoles } }, { new: true }).select("_id name email restaurantId restaurantIds partnerRoles roles apiRole accessLevel authorizationStatus").lean().exec() as any;
-  await AccessAuthorization.create({ employeeId, action: "role_changed", previousStatus: employee.authorizationStatus || "approved", nextStatus: updated.authorizationStatus || "approved", previousRole: JSON.stringify({ restaurantIds: assignedRestaurantIds(employee), partnerRoles: employee.partnerRoles || [] }), nextRole: JSON.stringify({ restaurantIds: uniqueIds, partnerRoles }), accessLevel: updated.accessLevel || "subadmin", actorEmployeeId: objectId(req.auth!.employeeId!), reason: "Asignación actualizada para operación PIKI Partner Orders" });
-  await revokeEmployeeSessions(employeeId);
-  const permissions = [...permissionsForPartnerRoles(partnerRoles)];
-  return res.json({ employee: { id: String(updated._id), email: updated.email, roles: partnerRoles, locations: await partnerLocationsFor(updated, partnerRoles, permissions) } });
+  try {
+    const updated = await persistPartnerBinding(req, kitchenAccessDependencies, { employeeId, restaurantIds: parsed.data.restaurantIds, partnerRoles: parsed.data.partnerRoles, reason: "Asignación Partner validada y persistida por Owner; no aprueba el restaurante." });
+    await revokeEmployeeSessions(employeeId);
+    const partnerRoles = partnerRolesForEmployee(updated);
+    return res.json({ bindingPersisted: true, employee: { id: String(updated._id), email: updated.email, tenantId: String(updated.tenantId), restaurantId: String(updated.restaurantId), restaurantIds: updated.restaurantIds.map(String), partnerRoles: updated.partnerRoles || [], roles: partnerRoles, locations: await partnerLocationsFor(updated, partnerRoles, [...permissionsForPartnerRoles(partnerRoles)]) } });
+  } catch (error) { const bindingError = partnerBindingErrorResponse(error); if (bindingError) return res.status(bindingError.status).json({ error: bindingError.error }); throw error; }
 });
 
 app.get("/api/v1/admin/restaurants", requireRole("admin"), async (req, res) => {
@@ -3746,15 +3786,19 @@ app.patch("/api/v1/admin/riders/:id/lifecycle", requireRole("admin"), async (req
   return res.json({ rider });
 });
 
-// Envío del enlace de activación sin sesión de empleado (token de entorno).
-app.patch("/api/v1/admin/maintenance/employees/:id/email", requireRole("admin"), async (req, res) => {
+// Credential maintenance requires the same persisted Owner identity as common administration.
+app.patch("/api/v1/admin/maintenance/employees/:id/email", requireOwner(), async (req, res) => {
   const id = objectId(String(req.params.id));
   const parsed = z.object({ email: z.string().trim().email().max(254) }).safeParse(req.body);
   if (!id) return res.status(400).json({ error: "INVALID_EMPLOYEE_ID" });
   if (!parsed.success) return res.status(400).json({ error: "INVALID_EMPLOYEE_EMAIL" });
   const email = parsed.data.email.toLowerCase();
-  const employee = await EmployeeAccount.findById(id).select("_id email name apiRole jobRole roles primaryRole tenantId active authorizationStatus").lean().exec() as any;
+  const employee = await EmployeeAccount.findById(id).lean().exec() as any;
   if (!employee) return res.status(404).json({ error: "EMPLOYEE_NOT_FOUND" });
+  if (employee.ownerProtected || employee.email === ownerEmail) return res.status(403).json({ error: "OWNER_ACCOUNT_PROTECTED" });
+  if (employee.kitchenAccessSetupVersion === 1) return res.status(409).json({ error: "KITCHEN_ACCOUNT_CONTRACT_PROTECTED" });
+  try { if (isPartnerEmployee(employee)) await validatePartnerCredentialTarget(req, employee, kitchenAccessDependencies); }
+  catch (error) { const bindingError = partnerBindingErrorResponse(error); if (bindingError) return res.status(bindingError.status).json({ error: bindingError.error }); throw error; }
   if (String(employee.email).toLowerCase() === email) return res.json({ updated: false, employee: { id: String(employee._id), email } });
   const duplicate = await EmployeeAccount.findOne({ email, _id: { $ne: id } }).select("_id").lean().exec() as any;
   if (duplicate) return res.status(409).json({ error: "EMPLOYEE_EMAIL_ALREADY_IN_USE" });
@@ -3766,14 +3810,19 @@ app.patch("/api/v1/admin/maintenance/employees/:id/email", requireRole("admin"),
   await recordGovernanceEvent({ actor: { employeeId: req.auth?.employeeId, role: req.auth?.role, tenantId: req.auth?.tenantId }, action: "employee_email_changed", targetType: "employee", targetId: id, before: { email: previousEmail }, after: { email, riderDocumentsUpdated: riderUpdate.modifiedCount }, reason: "Correo de acceso corregido por solicitud administrativa; enlaces de recuperación anteriores invalidados." });
   return res.json({ updated: true, employee: { id: String(id), email }, riderDocumentsUpdated: riderUpdate.modifiedCount });
 });
-app.post("/api/v1/admin/maintenance/employees/:id/send-activation", requireRole("admin"), async (req, res) => {
+app.post("/api/v1/admin/maintenance/employees/:id/send-activation", requireOwner(), async (req, res) => {
   const id = objectId(String(req.params.id));
   if (!id) return res.status(400).json({ error: "INVALID_EMPLOYEE_ID" });
-  const employee = await EmployeeAccount.findById(id).lean().exec() as any;
+  let employee = await EmployeeAccount.findById(id).lean().exec() as any;
   if (!employee) return res.status(404).json({ error: "EMPLOYEE_NOT_FOUND" });
+  if (employee.ownerProtected || employee.email === ownerEmail) return res.status(403).json({ error: "OWNER_ACCOUNT_PROTECTED" });
+  if (!employee.active || employee.authorizationStatus !== "approved") return res.status(409).json({ error: "EMPLOYEE_NOT_APPROVED" });
+  try { if (isPartnerEmployee(employee)) employee = await validatePartnerCredentialTarget(req, employee, kitchenAccessDependencies); }
+  catch (error) { const bindingError = partnerBindingErrorResponse(error); if (bindingError) return res.status(bindingError.status).json({ error: bindingError.error }); throw error; }
   const surface = preferredCredentialSurface(employee);
   if (!surface) return res.status(409).json({ error: "NO_CREDENTIAL_SURFACE" });
   const delivery = await sendEmployeePasswordLink(employee, surface, "activation");
+  if (!delivery.delivery.sent) return res.status(503).json({ error: "CREDENTIAL_EMAIL_NOT_SENT", sent: false });
   return res.json({ email: employee.email, surface, sent: delivery.delivery.sent, error: delivery.delivery.error ?? null });
 });
 // Vista previa del plan semanal según el contrato (sin escribir nada).

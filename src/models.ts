@@ -338,6 +338,7 @@ employeeAccountSchema.pre("validate", function(this: any) {
   if (!this.employeeCode) this.employeeCode = `PIKI-E-${String(this._id).replace(/[^a-z0-9]/gi, "").slice(-8).toUpperCase()}`;
 });
 employeeAccountSchema.add({ kitchenAccessSetupVersion: { type: Number, enum: [1], default: null, immutable: true } });
+employeeAccountSchema.add({ partnerBindingVersion: { type: Number, enum: [1], default: null }, kitchenAccessRevision: { type: Number, default: 0, min: 0 } });
 
 const restaurantSchema = new Schema({
   tenantId: { type: Schema.Types.ObjectId, ref: "Tenant", default: null, index: true },
