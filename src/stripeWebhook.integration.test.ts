@@ -133,6 +133,8 @@ test("Stripe: handlers reales sin DB, puertos, Stripe API, SMTP ni workers", asy
     });
     s.mock.method(models.EmployeeAccount as any, "find", () => query([]));
     s.mock.method(models.Restaurant as any, "findById", () => query(null));
+    // Partner publication now verifies the persisted restaurant/order tenant.
+    s.mock.method(models.Restaurant as any, "findOne", (filter: any) => query(String(filter._id) === restaurantId && String(filter.tenantId) === tenantId ? { _id: restaurantId, tenantId } : null));
     return { events, dispatch, realtime, get order() { return stored; }, get saves() { return saveCount; }, get transitions() { return transitionCount; }, set present(value: boolean) { present = value; }, set failSave(value: boolean) { failOrderSave = value; }, set failDispatch(value: boolean) { failDispatch = value; }, set failRealtime(value: boolean) { failRealtime = value; }, set failMarker(value: boolean) { failMarker = value; }, set beforeCodWrite(value: () => void) { beforeCodWrite = value; } };
   }
   await t.test("las tres rutas conservan bytes raw y se montan antes de JSON", async () => {

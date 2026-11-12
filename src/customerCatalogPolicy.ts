@@ -93,8 +93,11 @@ export function customerCommissionRate(restaurant: { slug?: string; partnerProfi
   if (typeof explicit === "number" && Number.isInteger(explicit) && explicit >= 0 && explicit <= 10_000) return explicit / 10_000;
   return PARTNER_COMMISSION_RATES[restaurant.slug || ""] ?? DEFAULT_CUSTOMER_COMMISSION_RATE;
 }
+export function customerMenuPrice(value: unknown, rate: number) {
+  return rate === 0 ? value : Number((Math.ceil(Math.max(0, Number(value || 0) * 100) * (1 + rate) - 1e-9) / 100).toFixed(2));
+}
 function applyPartnerMenuPricing<T extends Record<string, any>>(item: T, rate: number, restaurantSlug = ""): T {
-  const apply = (value: unknown) => rate === 0 ? value : Number((Math.ceil(Math.max(0, Number(value || 0) * 100) * (1 + rate) - 1e-9) / 100).toFixed(2));
+  const apply = (value: unknown) => customerMenuPrice(value, rate);
   const priced = { ...item, price: apply(item.price) };
   const sourceModifiers = Array.isArray(item.modifiers) && item.modifiers.length
     ? item.modifiers

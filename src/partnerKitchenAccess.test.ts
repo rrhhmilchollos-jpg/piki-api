@@ -9,6 +9,7 @@ import { corporateRecipientAccepted } from "./corporateEmail.js";
 import { kitchenAccessSchema, KitchenAccessError, kitchenBindingForEmployee, kitchenRestaurantCanOperate, registerPartnerKitchenAccessRoutes, validateKitchenActivation, type KitchenAccessDependencies } from "./partnerKitchenAccess.js";
 import { partnerCan, partnerRolesForEmployee, permissionsForPartnerRoles } from "./partnerAccess.js";
 import { isPartnerEmployee, partnerBindingForEmployee, partnerBindingErrorResponse, validatePartnerCredentialTarget } from "./employeePartnerBinding.js";
+import { partnerAccessForRequest as sharedPartnerAccessForRequest, partnerRequestAccess as sharedPartnerRequestAccess } from "./partnerOperationalAccess.js";
 // Synthetic IDs are mocks, never production targets.
 const ids = { owner: "64b000000000000000000001", tenant: "64b000000000000000000002", restaurant: "64b000000000000000000003", employee: "64b000000000000000000004", membership: "64b000000000000000000005", otherTenant: "64b000000000000000000006", xativa: "64b000000000000000000007" };
 const email = "jose888628@hotmail.com";
@@ -278,10 +279,12 @@ const query = (row: any) => ({ select() { return this; }, lean() { return this; 
 
 test("real runtime scope denies inactive orders before any Order read or write, and rejects X header", async () => {
   const h = harness(); await h.call(); const employee = h.db.employees[1];
-  const context: any = { EmployeeAccount: { findById: () => query(employee) }, kitchenAccessDependencies: h.deps, KitchenAccessError, kitchenBindingForEmployee, partnerRolesForEmployee, permissionsForPartnerRoles, assignedRestaurantIds: (e: any) => e.restaurantIds, kitchenRestaurantCanOperate, partnerCan };
+  employee.mustChangePassword = false;
+  const deps = { resolveAuth: async (r: any) => r.auth, employeeById: async () => employee, binding: h.deps };
+  const context: any = { sharedPartnerAccessForRequest: (r: any) => sharedPartnerAccessForRequest(r, deps), sharedPartnerRequestAccess: (r: any, p: any) => sharedPartnerRequestAccess(r, p, deps) };
   context.partnerAccessForRequest = helper("partnerAccessForRequest", context);
   context.partnerRequestAccess = helper("partnerRequestAccess", context);
-  const req: any = { auth: { employeeId: ids.employee, tenantId: ids.tenant }, header: (key: string) => key === "x-piki-restaurant-id" ? ids.xativa : "" };
+  const req: any = { auth: { role: "partner", employeeId: ids.employee, tenantId: ids.tenant }, header: (key: string) => key === "x-piki-restaurant-id" ? ids.xativa : "" };
   const selected = helper("employeeRestaurant", context);
   assert.equal(await selected(req), null);
   assert.equal(await context.partnerAccessForRequest({ auth: { ...req.auth, tenantId: ids.otherTenant } }), null);

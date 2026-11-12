@@ -6,6 +6,7 @@ import { currentCustomer } from "./customerCompat.js";
 import { resolveRole } from "./auth.js";
 import { publishInboxNotification } from "./notifications.js";
 import { createRealtimeRelay } from "./realtimeRelay.js";
+import { partnerRequestAccess } from "./partnerOperationalAccess.js";
 
 export type RealtimeChannel = "partner" | "fleet" | "admin" | "rider" | "customer";
 export type RealtimeEventPayload = Record<string, unknown>;
@@ -57,9 +58,34 @@ function writeEvent(response: Response, event: PersistedRealtimeEvent) {
   response.write(`data: ${JSON.stringify({ id: String(event._id), type: event.type, payload: event.payload, occurredAt: event.createdAt.toISOString() })}\n\n`);
 }
 
+/** Partner scope comes from persisted order/restaurant data, never a caller's
+ * tenant/audience claim. Untenant-ed legacy orders remain outside the private
+ * REST lane; they are not upgraded by assigning the restaurant's tenant.
+ */
+async function partnerPublicationTenant(input: { audienceKey: string; payload: RealtimeEventPayload; tenantId?: string | mongoose.Types.ObjectId | null }) {
+  const restaurantId = input.audienceKey.startsWith("restaurant:") ? input.audienceKey.slice("restaurant:".length) : "";
+  const orderId = String(input.payload.orderId || "");
+  if (!mongoose.isValidObjectId(restaurantId) || !mongoose.isValidObjectId(orderId)) return null;
+  if (input.payload.restaurantId !== undefined && String(input.payload.restaurantId) !== restaurantId) return null;
+  // Explicit null/invalid is not equivalent to the real tenant, even if the
+  // order has one. Omitted scope can only be recovered from the persisted order.
+  if (input.tenantId !== undefined && !validTenantId(input.tenantId)) return null;
+  const order = await Order.findOne({ _id: orderId, restaurantId }).select("_id restaurantId tenantId").lean().exec() as any;
+  const tenantId = validTenantId(order?.tenantId);
+  if (!tenantId || (input.tenantId !== undefined && String(validTenantId(input.tenantId)) !== String(tenantId))) return null;
+  const restaurant = await Restaurant.findOne({ _id: restaurantId, tenantId }).select("_id tenantId").lean().exec() as any;
+  return restaurant && String(restaurant.tenantId) === String(tenantId) ? tenantId : null;
+}
+
 export async function publishRealtimeEvent(input: { channel: RealtimeChannel; audienceKey: string; type: string; payload: RealtimeEventPayload; tenantId?: string | mongoose.Types.ObjectId | null; dedupeKey?: string }) {
+  let tenantId = validTenantId(input.tenantId);
+  if (input.channel === "partner") {
+    try { tenantId = await partnerPublicationTenant(input); }
+    catch { return null; } // Outbox unavailable: fail closed, keep REST fallback.
+    if (!tenantId) return null;
+  }
   const eventData = {
-    tenantId: validTenantId(input.tenantId),
+    tenantId,
     channel: input.channel,
     audienceKey: input.audienceKey,
     type: input.type,
@@ -85,6 +111,11 @@ export async function publishRealtimeEvent(input: { channel: RealtimeChannel; au
   }
   if (!document) throw new Error("REALTIME_EVENT_NOT_PERSISTED");
   const event = document.toObject() as PersistedRealtimeEvent;
+  // A global dedupe key may return an existing record. Never emit/fan out a
+  // different Partner audience/tenant (or an old null-scoped durable record).
+  if (input.channel === "partner" && (event.channel !== "partner" || String(event.tenantId) !== String(tenantId)
+    || event.audienceKey !== input.audienceKey || String(event.payload.orderId) !== String(input.payload.orderId)
+    || (event.payload.restaurantId !== undefined && String(event.payload.restaurantId) !== input.audienceKey.slice("restaurant:".length)))) return null;
   emitOnce(event);
   try {
     await publishInboxNotification({
@@ -273,13 +304,6 @@ async function resolveAudience(request: Request): Promise<ResolvedAudience | nul
     const employee = await EmployeeAccount.findById(auth.employeeId).select("tenantId").lean().exec() as any;
     return employee ? { channel: "fleet", audienceKeys: [tenantAudienceKey(employee.tenantId, "fleet")] } : null;
   }
-  if (surface === "partner" && auth.role === "partner") {
-    const employee = await EmployeeAccount.findById(auth.employeeId).select("restaurantId restaurantIds").lean().exec() as any;
-    const assignedRestaurantIds = [...new Set([...(Array.isArray(employee?.restaurantIds) ? employee.restaurantIds : []), employee?.restaurantId].filter(Boolean).map(String))];
-    const requestedRestaurantId = String(request.header("x-piki-restaurant-id") || "").trim();
-    const restaurantIds = requestedRestaurantId ? assignedRestaurantIds.filter((id) => id === requestedRestaurantId) : assignedRestaurantIds;
-    return restaurantIds.length ? { channel: "partner", audienceKeys: restaurantIds.map((id) => `restaurant:${id}`) } : null;
-  }
   if (surface === "rider" && auth.role === "rider") {
     const employee = await EmployeeAccount.findById(auth.employeeId).select("email").lean().exec() as any;
     const rider = employee?.email ? await Rider.findOne({ email: employee.email }).select("_id").lean().exec() as any : null;
@@ -288,7 +312,121 @@ async function resolveAudience(request: Request): Promise<ResolvedAudience | nul
   return null;
 }
 
+export type PartnerRealtimeDependencies = {
+  authorize: (request: Request) => ReturnType<typeof partnerRequestAccess>;
+  events: EventEmitter;
+  replay: (query: Record<string, unknown>, after: boolean) => Promise<PersistedRealtimeEvent[]>;
+  heartbeat: (callback: () => void) => () => void;
+};
+const partnerRealtimeDependencies: PartnerRealtimeDependencies = {
+  authorize: (request) => partnerRequestAccess(request, "orders:read"),
+  events: stream,
+  replay: async (query, after) => (after
+    ? await RealtimeEvent.find(query).sort({ _id: 1 }).limit(REPLAY_LIMIT).lean().exec()
+    : (await RealtimeEvent.find(query).sort({ _id: -1 }).limit(REPLAY_LIMIT).lean().exec()).reverse()
+  ) as unknown as PersistedRealtimeEvent[],
+  heartbeat: (callback) => { const timer = setInterval(callback, HEARTBEAT_MS); return () => clearInterval(timer); },
+};
+
+/** Partner alone uses REST's selected location, a pinned real tenant and fresh
+ * authorization before every replay/live delivery and idle heartbeat. Serial
+ * delivery avoids async revalidation races; live arrivals wait behind replay.
+ * Any authorization/read failure closes the stream; clients retain REST polling.
+ */
+export async function servePartnerRealtimeEvents(request: Request, response: Response, deps = partnerRealtimeDependencies) {
+  let initial: Awaited<ReturnType<typeof partnerRequestAccess>>;
+  try { initial = await deps.authorize(request); }
+  catch { return response.status(503).json({ error: "REALTIME_UNAVAILABLE" }); }
+  if (!initial.allowed || !initial.access || !initial.restaurantId || !validTenantId(initial.access.tenantId)) {
+    const denial = initial.denial || { status: 403, error: "PARTNER_PERMISSION_DENIED" };
+    if (denial.status === 401) response.setHeader("WWW-Authenticate", "Bearer realm=\"PIKI API\"");
+    return response.status(denial.status).json({ error: denial.error, permission: "orders:read" });
+  }
+  const tenantId = initial.access.tenantId;
+  const employeeId = String(initial.access.employee._id);
+  const restaurantId = initial.restaurantId;
+  const audienceKey = `restaurant:${restaurantId}`;
+  const suppliedId = String(request.header("last-event-id") || request.query.since || "");
+  const after = mongoose.isValidObjectId(suppliedId) ? new mongoose.Types.ObjectId(suppliedId) : null;
+  const query: Record<string, unknown> = { channel: "partner", audienceKey, tenantId: validTenantId(tenantId) };
+  if (after) query._id = { $gt: after };
+  let closed = false;
+  let replaying = true;
+  let queued = 0;
+  let pending: PersistedRealtimeEvent[] = [];
+  let cancelHeartbeat = () => {};
+  let queue = Promise.resolve();
+  const delivered = new Set<string>();
+  const matches = (event: PersistedRealtimeEvent) => event.channel === "partner" && event.audienceKey === audienceKey
+    && validTenantId(event.tenantId) !== null && String(event.tenantId) === tenantId
+    && event.payload && (event.payload.restaurantId === undefined || String(event.payload.restaurantId) === restaurantId)
+    && (!after || String(event._id) > String(after));
+  const close = () => {
+    closed = true;
+    pending = [];
+    cancelHeartbeat();
+    deps.events.off("event", listener);
+    request.off("close", close);
+    response.off("close", close);
+  };
+  const terminate = () => { close(); if (!response.writableEnded && !response.destroyed) response.end(); };
+  const stillAuthorized = async () => {
+    const current = await deps.authorize(request);
+    return !closed && current.allowed && current.restaurantId === restaurantId && current.access?.tenantId === tenantId
+      && String(current.access.employee._id) === employeeId;
+  };
+  const enqueue = (operation: () => Promise<void>) => {
+    if (closed) return;
+    if (++queued > 1_000) { terminate(); return; }
+    queue = queue.then(async () => { if (!closed) await operation(); }).catch(terminate).finally(() => { queued--; });
+  };
+  const deliver = async (event: PersistedRealtimeEvent) => {
+    if (!matches(event) || delivered.has(String(event._id)) || closed) return;
+    if (!await stillAuthorized()) { terminate(); return; }
+    delivered.add(String(event._id));
+    writeEvent(response, event);
+  };
+  const listener = (event: PersistedRealtimeEvent) => {
+    if (closed || !matches(event)) return;
+    if (replaying) {
+      if (pending.length >= 1_000) { terminate(); return; }
+      pending.push(event);
+    } else enqueue(() => deliver(event));
+  };
+  request.on("close", close);
+  response.on("close", close);
+  if (response.destroyed || response.writableEnded || request.destroyed) { close(); return; }
+  try {
+    response.status(200);
+    response.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+    response.setHeader("Cache-Control", "no-store, no-cache, no-transform");
+    response.setHeader("Vary", "x-piki-restaurant-id, Authorization");
+    response.setHeader("Connection", "keep-alive");
+    response.setHeader("X-Accel-Buffering", "no");
+    response.flushHeaders();
+    if (closed) { close(); return; }
+    response.write(`event: ready\ndata: ${JSON.stringify({ channel: "partner" })}\n\n`);
+    if (closed) { close(); return; }
+    deps.events.on("event", listener);
+    cancelHeartbeat = deps.heartbeat(() => {
+      enqueue(async () => { if (!await stillAuthorized()) terminate(); else if (!closed) response.write(`: heartbeat ${Date.now()}\n\n`); });
+    });
+    if (closed) { close(); return; }
+    const backlog = await deps.replay(query, Boolean(after));
+    if (closed) return;
+    // Both sources can contain the same durable id. Merge before draining so a
+    // live event received during replay cannot jump ahead of historical events.
+    const buffered = [...backlog, ...pending].sort((a, b) => String(a._id).localeCompare(String(b._id)));
+    pending = [];
+    for (const event of buffered) enqueue(() => deliver(event));
+    replaying = false;
+    await queue;
+  } catch { terminate(); }
+}
+
 export async function serveRealtimeEvents(request: Request, response: Response) {
+  const surface = String(request.header("x-piki-surface") || request.query.surface || "").toLowerCase();
+  if (surface === "partner") return servePartnerRealtimeEvents(request, response);
   const audience = await resolveAudience(request);
   if (!audience) {
     response.setHeader("WWW-Authenticate", "Bearer realm=\"PIKI API\"");

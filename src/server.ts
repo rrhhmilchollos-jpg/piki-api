@@ -56,7 +56,8 @@ import { BUSINESS_SUMMARY_RECIPIENT, sendDailyBusinessSummary } from "./dailyBus
 import { corporateEmailConfiguration, corporateEmailDepartmentForRole, escapeCorporateHtml, sendCorporateEmail, sendLeadContactEmail, verifyCorporateEmailConnection } from "./corporateEmail.js";
 import { activeOperationalOrderStatuses, dispatchableOrderStatuses, dispatchablePaymentFilter, isDispatchableOrderStatus, isDispatchablePayment } from "./dispatchEligibility.js";
 import { canReceivePartnerLocations, partnerCan, partnerPermissions, partnerRolesForEmployee, permissionsForPartnerRoles, type PartnerPermission } from "./partnerAccess.js";
-import { KitchenAccessError, kitchenBindingForEmployee, kitchenRestaurantCanOperate, registerPartnerKitchenAccessRoutes, validateKitchenActivation, type KitchenAccessDependencies } from "./partnerKitchenAccess.js";
+import { KitchenAccessError, kitchenBindingForEmployee, registerPartnerKitchenAccessRoutes, validateKitchenActivation, type KitchenAccessDependencies } from "./partnerKitchenAccess.js";
+import { assignedRestaurantIds, partnerAccessForRequest as sharedPartnerAccessForRequest, partnerRequestAccess as sharedPartnerRequestAccess } from "./partnerOperationalAccess.js";
 import { awardRiderRecruitmentMilestones, claimRiderReferralCode, completeRiderShiftIncentiveTracking, incentiveProgramStatus, loadRiderIncentiveSnapshot, trackRiderLocationForIncentive, trackRiderShiftStart } from "./riderIncentives.js";
 import { buildApprovedRiderOperationalProfile } from "./riderApproval.js";
 import { COMING_SOON_SLUGS, CUSTOMER_CATALOG_RESTAURANT_FILTER, CUSTOMER_ORDERABLE_RESTAURANT_FILTER, GOLDEN_FOUNDER_SLUGS, customerCommissionRate, customerMenuForRestaurant, presentCustomerCatalogRestaurant, restaurantIsWithinOpeningHours } from "./customerCatalogPolicy.js";
@@ -75,6 +76,7 @@ import { postMarketplaceOrderLedger, preparePartnerPayoutBatch } from "./marketp
 import { extractAndParseMenu, readAssetBytes } from "./menuImport.js";
 import { canonicalRestaurantMenu, normalizePartnerMenuItems, partnerMenuItemsSchema } from "./menuContract.js";
 import { registerControlledMenuImportRoutes } from "./menuSafeImport.js";
+import { registerPublicPartnerInformationRoute } from "./publicPartnerInformation.js";
 import { currentMenuRevision, menuAvailabilitySchema, menuRevisionFilter, menuWriteSchema } from "./menuRevision.js";
 import { searchLocalities } from "./localities.js";
 import { publishCatalogUpdate, serveCatalogEvents, startCatalogRelay } from "./catalogRealtime.js";
@@ -1571,6 +1573,11 @@ app.post("/api/v1/signatures/signaturit/events", rateLimit(100, 60_000, "signatu
   return res.status(200).json({ received: true });
 });
 
+registerPublicPartnerInformationRoute(app, {
+  objectId,
+  findRows: (filter, projection) => Restaurant.find(filter).select(projection).sort({ name: 1 }).lean().exec(),
+});
+
 app.get("/api/v1/catalog/restaurants", async (req, res) => {
   const query = typeof req.query.q === "string" ? req.query.q.trim().slice(0, 120).replace(/[.*+?^${}()|[\]\\]/g, "\\$&") : "";
   const category = typeof req.query.category === "string" ? req.query.category.trim() : "";
@@ -1955,14 +1962,6 @@ app.post("/api/v1/admin/partners/manual", requireOwner(), async (req, res) => {
   });
 });
 
-function assignedRestaurantIds(employee: any): string[] {
-  const ids = [
-    ...(Array.isArray(employee?.restaurantIds) ? employee.restaurantIds : []),
-    employee?.restaurantId,
-  ].map((value) => String(value || "")).filter((value) => Boolean(objectId(value)));
-  return [...new Set(ids)];
-}
-
 async function partnerLocationsFor(employee: any, roles = partnerRolesForEmployee(employee), permissions = [...permissionsForPartnerRoles(roles)]) {
   const ids = assignedRestaurantIds(employee);
   if (!employee?.tenantId) return [];
@@ -1996,23 +1995,7 @@ async function partnerLocationsFor(employee: any, roles = partnerRolesForEmploye
 }
 
 async function partnerAccessForRequest(req: express.Request) {
-  if (!req.auth?.employeeId) return null;
-  const employee = await EmployeeAccount.findById(req.auth.employeeId).select("_id email restaurantId restaurantIds tenantId jobRole apiRole roles primaryRole partnerRoles accessLevel ownerProtected active authorizationStatus fleetId zoneSlugs kitchenAccessSetupVersion partnerBindingVersion").lean().exec() as any;
-  if (!employee) return null;
-  let kitchenRestaurant: any = null;
-  if (employee.kitchenAccessSetupVersion === 1) {
-    if (String(employee.tenantId) !== req.auth?.tenantId) return null;
-    try { kitchenRestaurant = (await kitchenBindingForEmployee(employee, kitchenAccessDependencies)).restaurant; }
-    catch (error) { if (error instanceof KitchenAccessError) return null; throw error; }
-  }
-  let bindingRestaurants: any[] | null = null;
-  if (employee.partnerBindingVersion === 1) {
-    if (String(employee.tenantId) !== req.auth?.tenantId) return null;
-    try { bindingRestaurants = (await partnerBindingForEmployee(employee, kitchenAccessDependencies)).restaurants; }
-    catch (error) { if (partnerBindingErrorResponse(error)) return null; throw error; }
-  }
-  const roles = partnerRolesForEmployee(employee);
-  return { employee, restaurantIds: assignedRestaurantIds(employee), roles, permissions: [...permissionsForPartnerRoles(roles)], kitchenRestaurant, bindingRestaurants };
+  return sharedPartnerAccessForRequest(req);
 }
 
 async function employeeRestaurant(req: express.Request, access?: Awaited<ReturnType<typeof partnerAccessForRequest>>) {
@@ -2035,13 +2018,7 @@ function setPartnerMenuResponseHeaders(res: express.Response) {
 }
 
 async function partnerRequestAccess(req: express.Request, permission: PartnerPermission) {
-  const access = await partnerAccessForRequest(req);
-  let operationReady = access?.employee.kitchenAccessSetupVersion !== 1 || !permission.startsWith("orders:") || kitchenRestaurantCanOperate(access.kitchenRestaurant);
-  if (access?.bindingRestaurants && permission.startsWith("orders:")) {
-    const selectedId = String(req.header("x-piki-restaurant-id") || access.restaurantIds[0]);
-    operationReady = kitchenRestaurantCanOperate(access.bindingRestaurants.find((row) => String(row._id) === selectedId));
-  }
-  return { access, allowed: Boolean(access && operationReady && partnerCan(access.roles, permission)) };
+  return sharedPartnerRequestAccess(req, permission);
 }
 function detectedMenuMime(bytes: Buffer): string | null {
   if (bytes.length >= 12 && bytes.subarray(0, 3).equals(Buffer.from([0xff, 0xd8, 0xff]))) return "image/jpeg";

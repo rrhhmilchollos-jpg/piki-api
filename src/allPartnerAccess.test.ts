@@ -8,6 +8,7 @@ import { EmployeeAccount } from "./models.js";
 import { isPartnerEmployee, partnerBindingForEmployee, partnerBindingErrorResponse, persistPartnerBinding, validatePartnerCredentialTarget } from "./employeePartnerBinding.js";
 import { partnerRolesForEmployee, permissionsForPartnerRoles, partnerCan } from "./partnerAccess.js";
 import { kitchenRestaurantCanOperate, type KitchenAccessDependencies } from "./partnerKitchenAccess.js";
+import { partnerRequestAccess as sharedPartnerRequestAccess } from "./partnerOperationalAccess.js";
 const source = ts.createSourceFile("server.ts", readFileSync(new URL("./server.ts", import.meta.url), "utf8"), ts.ScriptTarget.Latest, true);
 const ids = { employee: "64c000000000000000000001", owner: "64c000000000000000000002", tenant: "64c000000000000000000003", restaurant: "64c000000000000000000004", second: "64c000000000000000000005", otherTenant: "64c000000000000000000006", membership: "64c000000000000000000007" };
 const ownerEmail = "rrhh.milchollos@gmail.com";
@@ -176,13 +177,15 @@ test("common create mails once only after atomic binding commit; SMTP/audit fail
 });
 test("new pending Partner cannot read or mutate orders but manager may maintain permitted setup", async () => {
   const h = harness(); const employee = await h.create({ partnerRoles: ["manager"] });
-  const access = { employee, restaurantIds: [ids.restaurant], roles: ["manager"], kitchenRestaurant: null, bindingRestaurants: h.db.restaurants };
-  const resolver = helper("partnerRequestAccess", { partnerAccessForRequest: async () => access, kitchenRestaurantCanOperate, partnerCan });
-  assert.equal((await resolver(req, "orders:read")).allowed, false); assert.equal((await resolver(req, "orders:prepare")).allowed, false); assert.equal((await resolver(req, "menu:write")).allowed, true);
+  employee.mustChangePassword = false;
+  const operationReq: any = { ...req, auth: { role: "partner", employeeId: employee._id, tenantId: ids.tenant } };
+  const deps = { resolveAuth: async (r: any) => r.auth, employeeById: async () => employee, binding: h.deps };
+  const resolver = helper("partnerRequestAccess", { sharedPartnerRequestAccess: (r: any, p: any) => sharedPartnerRequestAccess(r, p, deps) });
+  assert.equal((await resolver(operationReq, "orders:read")).allowed, false); assert.equal((await resolver(operationReq, "orders:prepare")).allowed, false); assert.equal((await resolver(operationReq, "menu:write")).allowed, true);
   const live = h.db.restaurants[0]; Object.assign(live, { onboardingStatus: "approved", isActive: true, availabilityStatus: "available", marketplaceCompliance: { pikiStatus: "verified" }, menu: [{ available: true, allergens: ["fish"] }] });
-  assert.equal((await resolver(req, "orders:read")).allowed, true);
-  live.menu[0].allergens = null; assert.equal((await resolver(req, "orders:read")).allowed, false);
-  assert.equal((await resolver({ ...req, header: () => ids.second }, "orders:read")).allowed, false);
+  assert.equal((await resolver(operationReq, "orders:read")).allowed, true);
+  live.menu[0].allergens = null; assert.equal((await resolver(operationReq, "orders:read")).allowed, false);
+  assert.equal((await resolver({ ...operationReq, header: () => ids.second }, "orders:read")).allowed, false);
 });
 test("new binding marker is persisted by schema; no legacy or kitchen marker is overwritten", async () => {
   const employee = new EmployeeAccount({ name: "OFFLINE", email: "offline@example.test", jobRole: "partner", apiRole: "partner", passwordHash: "OFFLINE_HASH", partnerBindingVersion: 1 }); await employee.validate(); assert.equal(employee.partnerBindingVersion, 1); assert.equal(employee.kitchenAccessSetupVersion, null);
