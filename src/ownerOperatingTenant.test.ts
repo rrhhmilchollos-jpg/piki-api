@@ -35,8 +35,8 @@ function compile(code: string, context: Record<string, any>) {
 const authSource = ts.createSourceFile("auth.ts", readFileSync(new URL("./auth.ts", import.meta.url), "utf8"), ts.ScriptTarget.Latest, true);
 function harness(options: { failure?: string; retry?: boolean; auth?: any } = {}) {
   let db: any = {
-    employees: [{ _id: ids.owner, email: OWNER_EMAIL, tenantId: null, name: "Synthetic owner", apiRole: "admin", jobRole: "admin", roles: ["admin"], primaryRole: "admin", ownerProtected: true, hiddenFromAdmin: true, accessLevel: "superadmin", active: true, authorizationStatus: "approved", mustChangePassword: false, updatedAt: sourceTime, createdAt: sourceTime, sessionHash: null, passwordHash: "OFFLINE_PASSWORD_HASH", zoneSlugs: ["offline-zone"], restaurantId: ids.restaurant, restaurantIds: [ids.restaurant], fleetId: ids.fleet },
-      { _id: ids.other, tenantId: ids.tenant, email: "independent@example.test", roles: ["partner"], passwordHash: "OTHER_OFFLINE_HASH" }],
+    employees: [{ _id: ids.owner, email: OWNER_EMAIL, tenantId: null, name: "Synthetic owner", apiRole: "admin", jobRole: "admin", roles: ["admin"], primaryRole: "admin", ownerProtected: true, hiddenFromAdmin: true, accessLevel: "superadmin", active: true, authorizationStatus: "approved", mustChangePassword: false, updatedAt: sourceTime, createdAt: sourceTime, sessionHash: null, passwordHash: "x", zoneSlugs: ["offline-zone"], restaurantId: ids.restaurant, restaurantIds: [ids.restaurant], fleetId: ids.fleet },
+      { _id: ids.other, tenantId: ids.tenant, email: "independent@example.test", roles: ["partner"], passwordHash: "y" }],
     tenants: [{ _id: ids.tenant, status: "active", name: "Synthetic tenant" }],
     memberships: [{ _id: ids.other, tenantId: ids.other, employeeId: ids.owner, role: "admin", status: "active", scopes: ["read"] }, { tenantId: ids.tenant, employeeId: ids.other, role: "partner", status: "active" }],
     restaurants: [{ _id: ids.restaurant, tenantId: ids.tenant, isActive: false, onboardingStatus: "pending_review", menu: [{ available: false, allergens: null }] }],
