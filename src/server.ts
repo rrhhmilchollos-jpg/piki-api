@@ -11,7 +11,8 @@ import { stripeClient } from "./stripePayments.js";
 import { mountGeofenceRoutes } from "./geofenceRoutes.js";
 import { planWeek, weekStartOf } from "./glovoShiftPlanner.js";
 import { calculatePayroll, payrollGap } from "./payroll.js";
-import { missingPartnerDocumentTypes, missingRiderDocumentTypes, type RiderVehicle } from "./manualOnboardingPolicy.js";
+import { missingRiderDocumentTypes, type RiderVehicle } from "./manualOnboardingPolicy.js";
+import { partnerSchema, manualPartnerSchema, allPartnerOnboardingDocumentsReceived, partnerLegalProfileReadyForReview } from "./partnerOnboarding.js";
 import "dotenv/config";
 import "express-async-errors";
 import { createHash, createHmac, randomBytes, randomInt, randomUUID, timingSafeEqual } from "node:crypto";
@@ -1271,7 +1272,19 @@ app.post("/api/v1/employee/onboarding-requests", requireRole("gerente_comercial_
   if (!employee?.jobRole || !["gerente_comercial_zona", "commercial", "zone_manager"].includes(employee.jobRole)) return res.status(403).json({ error: "ROLE_SCOPE_REQUIRED" });
   const zoneSlugs = Array.isArray(employee.zoneSlugs) ? employee.zoneSlugs : [];
   if (!zoneSlugs.includes("valencia")) return res.status(403).json({ error: "ZONE_SCOPE_REQUIRED", requiredZone: "valencia" });
-  const request = await OnboardingRequest.create({ ...tenantScope(req), requestedBy: employee._id, requestType: parsed.data.requestType, payload: parsed.data.payload, zoneSlugs, status: "pending" });
+  let payload = parsed.data.payload;
+  if (parsed.data.requestType === "partner") {
+    const partner = partnerSchema.safeParse(payload);
+    if (!partner.success) return res.status(400).json({ error: "INVALID_PARTNER", details: partner.error.flatten() });
+    try {
+      payload = { ...partner.data, documents: await normalizeAndScanOnboardingDocuments(partner.data.documents) };
+    } catch (error) {
+      if (error instanceof MalwareDetectedError) return res.status(422).json({ error: "MALWARE_DETECTED" });
+      if (error instanceof MalwareScannerUnavailableError) return res.status(503).json({ error: "MALWARE_SCANNER_UNAVAILABLE" });
+      return res.status(400).json({ error: error instanceof Error ? error.message : "DOCUMENT_VALIDATION_FAILED" });
+    }
+  }
+  const request = await OnboardingRequest.create({ ...tenantScope(req), requestedBy: employee._id, requestType: parsed.data.requestType, payload, zoneSlugs, status: "pending" });
   return res.status(201).json({ request: { id: request.id, requestType: request.requestType, status: request.status, zoneSlugs: request.zoneSlugs, createdAt: request.createdAt }, message: "Solicitud enviada al superadmin para aprobación." });
 });
 app.get("/api/v1/employee/onboarding-requests", requireRole("gerente_comercial_zona", "commercial"), async (req, res) => {
@@ -1701,8 +1714,6 @@ app.patch("/api/v1/admin/partner-leads/:id", requireRole("admin", "commercial", 
   return res.json({ lead });
 });
 
-const partnerDocumentSchema = z.object({ type: z.enum(["tax_id", "bank_certificate", "insurance", "activity_license", "food_sanitary_authorization", "identity", "other"]), fileName: z.string().min(1).max(180), mimeType: z.enum(DOCUMENT_UPLOAD_MIME_TYPES), sizeBytes: z.number().int().positive().max(2_500_000), sha256: z.string().regex(/^[a-f0-9]{64}$/), contentBase64: z.string().min(20).max(3_500_000) });
-const partnerSchema = z.object({ name: z.string().min(2).max(160), email: z.string().email(), password: z.string().min(12).max(200).regex(/[A-Z]/).regex(/[a-z]/).regex(/[0-9]/), phone: z.string().min(6).max(40), address: z.string().min(5).max(280), legalName: z.string().min(2).max(180), taxId: z.string().regex(/^[A-Za-z0-9-]{5,20}$/), legalForm: z.enum(["autonomo", "sl", "sa", "cooperativa", "otra"]), representativeName: z.string().min(2).max(160), representativeRole: z.string().min(2).max(100), representativeDocument: z.string().min(5).max(30), fiscalAddress: z.string().min(5).max(280), operatingAddress: z.string().min(5).max(280), postalCode: z.string().regex(/^\d{5}$/), city: z.string().min(2).max(100), province: z.string().min(2).max(100), iban: z.string().regex(/^[A-Z]{2}\d{2}[A-Z0-9]{10,30}$/), bankAccountHolder: z.string().min(2).max(180), cuisine: z.string().min(2).max(100), vatRate: z.union([z.literal(4), z.literal(10), z.literal(21)]), commissionAccepted: z.literal(true), termsAcceptedAt: z.coerce.date(), contractAccepted: z.literal(true), privacyAccepted: z.literal(true), dataProcessingAccepted: z.literal(true), pdaUnits: z.number().int().min(1).max(50), pdaUnitCostCents: z.literal(30000), pdaCostAccepted: z.literal(true), pdaCostAcceptedAt: z.coerce.date(), privacyAcceptedAt: z.coerce.date(), dataProcessingAcceptedAt: z.coerce.date(), openingHours: openingHoursSchema, documents: z.array(partnerDocumentSchema).length(5) });
 app.get("/api/v1/public/partners/:id/stripe/onboarding-link", async (req, res) => {
   const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
   if (!id || !process.env.STRIPE_SECRET_KEY) return res.status(404).json({ error: "STRIPE_ONBOARDING_NOT_AVAILABLE" });
@@ -1720,8 +1731,6 @@ app.get("/api/v1/public/partners/:id/stripe/onboarding-link", async (req, res) =
 app.post("/api/v1/partners/onboarding", async (req, res) => {
   const parsed = partnerSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_PARTNER", details: parsed.error.flatten() });
-  const requiredDocumentTypes = new Set(["tax_id", "bank_certificate", "activity_license", "insurance", "food_sanitary_authorization"]);
-  if (![...requiredDocumentTypes].every((type) => parsed.data.documents.some((document) => document.type === type))) return res.status(400).json({ error: "REQUIRED_PARTNER_DOCUMENTS_MISSING", required: [...requiredDocumentTypes] });
   let documents: Array<typeof parsed.data.documents[number]>;
   try {
     documents = await normalizeAndScanOnboardingDocuments(parsed.data.documents) as Array<typeof parsed.data.documents[number]>;
@@ -1747,13 +1756,13 @@ app.post("/api/v1/partners/onboarding", async (req, res) => {
       const partnerApp = String(process.env.PARTNER_APP_URL || "https://partners.pikidelivery.com").replace(/\/$/, "");
       const connected = await createPartnerStripeOnboardingLink({ restaurantId: String(partner._id), email: normalizedEmail, legalName, legalForm, refreshUrl: `${partnerApp}/?onboarding=stripe-refresh&restaurant_id=${encodeURIComponent(String(partner._id))}`, returnUrl: `${partnerApp}/?onboarding=stripe-complete&restaurant_id=${encodeURIComponent(String(partner._id))}` });
       stripeOnboarding = { accountId: connected.account.id, url: connected.link.url };
-      await Restaurant.updateOne({ _id: partner._id }, { $set: { onboardingStage: "stripe", "onboardingChecklist.profile": true, "onboardingChecklist.documents": true, "onboardingChecklist.stripe": false, "marketplaceCompliance.stripeAccountId": connected.account.id, "marketplaceCompliance.stripeStatus": "onboarding", "marketplaceCompliance.pikiStatus": "in_review" } }).exec();
+      await Restaurant.updateOne({ _id: partner._id }, { $set: { onboardingStage: "stripe", "onboardingChecklist.profile": true, "onboardingChecklist.documents": allPartnerOnboardingDocumentsReceived(documents), "onboardingChecklist.stripe": false, "marketplaceCompliance.stripeAccountId": connected.account.id, "marketplaceCompliance.stripeStatus": "onboarding", "marketplaceCompliance.pikiStatus": "in_review" } }).exec();
     } catch (error) {
       console.warn("Partner Stripe onboarding link creation failed", error instanceof Error ? error.message : error);
-      await Restaurant.updateOne({ _id: partner._id }, { $set: { onboardingStage: "review", "onboardingChecklist.profile": true, "onboardingChecklist.documents": true, "onboardingChecklist.stripe": false, "marketplaceCompliance.pikiStatus": "in_review" } }).exec();
+      await Restaurant.updateOne({ _id: partner._id }, { $set: { onboardingStage: "review", "onboardingChecklist.profile": true, "onboardingChecklist.documents": allPartnerOnboardingDocumentsReceived(documents), "onboardingChecklist.stripe": false, "marketplaceCompliance.pikiStatus": "in_review" } }).exec();
     }
   } else {
-    await Restaurant.updateOne({ _id: partner._id }, { $set: { onboardingStage: "review", "onboardingChecklist.profile": true, "onboardingChecklist.documents": true, "marketplaceCompliance.pikiStatus": "in_review" } }).exec();
+    await Restaurant.updateOne({ _id: partner._id }, { $set: { onboardingStage: "review", "onboardingChecklist.profile": true, "onboardingChecklist.documents": allPartnerOnboardingDocumentsReceived(documents), "marketplaceCompliance.pikiStatus": "in_review" } }).exec();
   }
   try {
     await EmployeeAccount.create({ ...publicTenant, name: contact.name, email: normalizedEmail, jobRole: "partner", apiRole: "partner", roles: ["partner"], partnerRoles: ["partner_admin"], accessLevel: "subadmin", authorizationStatus: "pending", restaurantId: partner._id, restaurantIds: [partner._id], passwordHash: hashPassword(parsed.data.password), mustChangePassword: false, active: false });
@@ -1764,15 +1773,12 @@ app.post("/api/v1/partners/onboarding", async (req, res) => {
   }
   await PartnerLocalityGroup.findOneAndUpdate({ ...publicTenant, localityKey: groupKey }, { $set: { localityName: locality, province, isActive: true }, $setOnInsert: publicTenant, $addToSet: { restaurantIds: partner._id } }, { upsert: true, new: true });
   await notifyOnboarding({ channel: "admin", type: "onboarding.partner_application.created", entityId: String(partner._id), tenantId: (partner as any).tenantId });
-  res.status(201).json({ message: "Solicitud recibida. Completa la verificación de Stripe para que PIKI pueda liquidar tus ventas.", partner: { id: partner.id, partnerCode: onboardingCode("P", partner._id), name: partner.name, email: partner.email, phone: partner.phone, locality, partnerGroupKey: groupKey, onboarding_status: partner.onboardingStatus, onboarding_stage: stripeOnboarding ? "stripe" : "review", checklist: { profile: true, documents: true, stripe: Boolean(stripeOnboarding), adminReview: false }, stripe_onboarding_url: stripeOnboarding?.url || null } });
+  res.status(201).json({ message: "Solicitud recibida. Completa la verificación de Stripe para que PIKI pueda liquidar tus ventas.", partner: { id: partner.id, partnerCode: onboardingCode("P", partner._id), name: partner.name, email: partner.email, phone: partner.phone, locality, partnerGroupKey: groupKey, onboarding_status: partner.onboardingStatus, onboarding_stage: stripeOnboarding ? "stripe" : "review", checklist: { profile: true, documents: allPartnerOnboardingDocumentsReceived(documents), stripe: Boolean(stripeOnboarding), adminReview: false }, stripe_onboarding_url: stripeOnboarding?.url || null } });
 });
 
-const manualPartnerSchema = partnerSchema.omit({ password: true });
 app.post("/api/v1/admin/partners/manual", requireOwner(), async (req, res) => {
   const parsed = manualPartnerSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_PARTNER", details: parsed.error.flatten() });
-  const missingDocuments = missingPartnerDocumentTypes(parsed.data.documents.map((document) => document.type));
-  if (missingDocuments.length) return res.status(400).json({ error: "REQUIRED_PARTNER_DOCUMENTS_MISSING", required: missingDocuments });
   let documents: Array<typeof parsed.data.documents[number]>;
   try {
     documents = await normalizeAndScanOnboardingDocuments(parsed.data.documents) as Array<typeof parsed.data.documents[number]>;
@@ -1811,7 +1817,7 @@ app.post("/api/v1/admin/partners/manual", requireOwner(), async (req, res) => {
         tagline: "Alta manual · pendiente de revisión",
         onboardingStatus: "pending_review",
         onboardingStage: "review",
-        onboardingChecklist: { profile: true, documents: true, stripe: false, adminReview: false },
+        onboardingChecklist: { profile: true, documents: allPartnerOnboardingDocumentsReceived(documents), stripe: false, adminReview: false },
         isActive: false,
         email,
         phone: contact.phone,
@@ -2716,20 +2722,20 @@ app.patch("/api/v1/admin/restaurants/:id/status", requireRole("admin"), async (r
   const parsed = z.object({ status: z.enum(["pending_review", "approved", "rejected", "suspended"]) }).safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_RESTAURANT_STATUS", details: parsed.error.flatten() });
   const scope = tenantScope(req);
-  const existing = await Restaurant.findOne({ _id: id, ...scope }).select("partnerProfile onboardingStatus").lean().exec() as any;
+  const existing = await Restaurant.findOne({ _id: id, ...scope }).lean().exec() as any;
   if (!existing) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
+  if (parsed.data.status === "approved" && existing.onboardingStatus !== "approved" && !partnerLegalProfileReadyForReview(existing.partnerProfile)) return res.status(409).json({ error: "PARTNER_LEGAL_PROFILE_REQUIRED", message: "Completa los datos legales, bancarios y las aceptaciones documentadas antes de aprobar el comercio; los archivos adjuntos son opcionales." });
   if (["approved", "rejected"].includes(parsed.data.status)) {
     const documents = existing.partnerProfile?.documents || [];
-    if (!documents.length || documents.some((document: any) => document.status === "received")) return res.status(409).json({ error: "PARTNER_DOCUMENT_REVIEW_REQUIRED", message: "Debes revisar todos los documentos del partner antes de aprobar o rechazar la solicitud." });
+    if (documents.some((document: any) => document.status === "received")) return res.status(409).json({ error: "PARTNER_DOCUMENT_REVIEW_REQUIRED", message: "Debes revisar todos los documentos del partner antes de aprobar o rechazar la solicitud." });
     if (parsed.data.status === "approved" && documents.some((document: any) => document.status !== "approved")) return res.status(409).json({ error: "PARTNER_DOCUMENTS_NOT_APPROVED", message: "No se puede aprobar: existe documentación del partner rechazada." });
   }
+  const partnerAccount = await EmployeeAccount.findOne({ restaurantId: existing._id, apiRole: "partner", ...scope }).select("_id authorizationStatus").exec() as any;
+  if (parsed.data.status === "approved" && !partnerAccount) return res.status(409).json({ error: "PARTNER_ACCOUNT_MISSING", message: "La solicitud no tiene una cuenta Partner asociada." });
+  // A retry is not a new approval, account authorization or historical consent.
+  if (parsed.data.status === "approved" && existing.onboardingStatus === "approved") return res.json({ restaurant: existing, partnerAccount: { id: String(partnerAccount._id), access: partnerAccount.authorizationStatus === "approved" ? "enabled" : "disabled" } });
   const restaurant = await Restaurant.findOneAndUpdate({ _id: id, ...scope }, { $set: { onboardingStatus: parsed.data.status, isActive: parsed.data.status === "approved", onboardingReviewedBy: objectId(req.auth!.employeeId!), onboardingReviewedAt: new Date() } }, { new: true }).lean().exec() as any;
   if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
-  const partnerAccount = await EmployeeAccount.findOne({ restaurantId: restaurant._id, apiRole: "partner", ...scope }).select("_id authorizationStatus").exec() as any;
-  if (parsed.data.status === "approved" && !partnerAccount) {
-    await Restaurant.updateOne({ _id: id, ...scope }, { $set: { onboardingStatus: "pending_review", isActive: false } }).exec();
-    return res.status(409).json({ error: "PARTNER_ACCOUNT_MISSING", message: "La solicitud no tiene una cuenta Partner asociada." });
-  }
   if (partnerAccount) {
     const approved = parsed.data.status === "approved";
     const nextStatus = approved ? "approved" : parsed.data.status === "rejected" ? "revoked" : "suspended";
@@ -2883,11 +2889,14 @@ app.patch("/api/v1/admin/restaurants/:id/compliance/status", requireRole("admin"
   if (!parsed.success) return res.status(400).json({ error: "INVALID_COMPLIANCE_STATUS", details: parsed.error.flatten() });
   const existing = await Restaurant.findOne({ _id: id, ...tenantScope(req) }).select("partnerProfile marketplaceCompliance name").lean().exec() as any;
   if (!existing) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
+  if (parsed.data.status === "verified" && existing.marketplaceCompliance?.pikiStatus !== "verified" && !partnerLegalProfileReadyForReview(existing.partnerProfile)) return res.status(409).json({ error: "PARTNER_LEGAL_PROFILE_REQUIRED", message: "Completa los datos legales, bancarios y las aceptaciones documentadas antes de verificar el expediente; los archivos adjuntos son opcionales." });
   const documents = existing.partnerProfile?.documents || [];
-  const requiredDocuments = documents.length > 0;
-  const allDocumentsApproved = requiredDocuments && documents.every((document: any) => document.status === "approved");
-  if (parsed.data.status === "verified" && !allDocumentsApproved) return res.status(409).json({ error: "KYB_DOCUMENT_REVIEW_REQUIRED", message: "Aprueba todos los documentos obligatorios antes de verificar el expediente KYB." });
+  // Missing optional uploads are not an internal approval prerequisite.
+  const allDocumentsApproved = documents.every((document: any) => document.status === "approved");
+  if (parsed.data.status === "verified" && !allDocumentsApproved) return res.status(409).json({ error: "KYB_DOCUMENT_REVIEW_REQUIRED", message: "Revisa y aprueba los documentos aportados antes de verificar el expediente KYB." });
   if (parsed.data.status === "rejected" && !parsed.data.rejectionReason) return res.status(400).json({ error: "KYB_REJECTION_REASON_REQUIRED", message: "Indica el motivo del rechazo para dejar trazabilidad." });
+  // Preserve historical review metadata on an exact verified-status retry.
+  if (parsed.data.status === "verified" && existing.marketplaceCompliance?.pikiStatus === "verified") return res.json({ restaurantId: String(id), compliance: existing.marketplaceCompliance });
   const now = new Date();
   const update = { $set: { "marketplaceCompliance.pikiStatus": parsed.data.status, "marketplaceCompliance.rejectionReason": parsed.data.status === "rejected" ? parsed.data.rejectionReason : null, "marketplaceCompliance.reviewedAt": now, "marketplaceCompliance.reviewedBy": objectId(req.auth!.employeeId!) } };
   const restaurant = await Restaurant.findOneAndUpdate({ _id: id, ...tenantScope(req) }, update, { new: true }).lean().exec() as any;

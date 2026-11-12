@@ -18,7 +18,7 @@ test("electric scooters need a responsible declaration and DGT homologation", ()
   assert.deepEqual(missingRiderDocumentTypes("electric_scooter", ["identity", "bank_certificate", "profile_photo"]), ["scooter_responsible_declaration", "dgt_mvp_homologation"]);
 });
 
-test("Partners need all five documents before their expediente can be stored", () => {
+test("Partner document inventory identifies missing optional uploads without gating storage", () => {
   assert.deepEqual(missingPartnerDocumentTypes(["tax_id", "bank_certificate", "activity_license", "insurance", "food_sanitary_authorization"]), []);
   assert.deepEqual(missingPartnerDocumentTypes(["tax_id", "insurance"]), ["bank_certificate", "activity_license", "food_sanitary_authorization"]);
 });
