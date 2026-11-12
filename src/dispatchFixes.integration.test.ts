@@ -6,6 +6,7 @@ import net from "node:net";
 import http from "node:http";
 import https from "node:https";
 import mongoose from "mongoose";
+import { CUSTOMER_ORDERABLE_RESTAURANT_FILTER } from "./customerCatalogPolicy.js";
 
 function query(value: any): any {
   const q: any = { select: () => q, lean: () => q, sort: () => q, limit: () => q, session: () => q, exec: async () => value, then: (resolve: any, reject: any) => Promise.resolve(value).then(resolve, reject) };
@@ -15,6 +16,25 @@ function response() {
   const state: any = { status: 200 };
   const res: any = { status: (code: number) => { state.status = code; return res; }, json: (body: any) => { state.body = body; return res; }, setHeader: () => res };
   return { state, res };
+}
+
+// Evaluate the actual Mongo predicates, including persisted legacy listingType.
+function matchesRestaurant(row: any, filter: any): boolean {
+  const equal = (a: any, b: any) => a?.toHexString || b?.toHexString ? String(a) === String(b) : a === b;
+  return Object.entries(filter).every(([key, expected]: [string, any]) => {
+    if (key === "$or") return expected.some((clause: any) => matchesRestaurant(row, clause));
+    const actual = key.split(".").reduce((value, part) => value?.[part], row);
+    if (expected && typeof expected === "object" && !expected.toHexString) {
+      return Object.entries(expected).every(([operator, value]: [string, any]) => {
+        if (operator === "$in") return value.some((candidate: any) => equal(actual, candidate));
+        if (operator === "$nin") return !value.some((candidate: any) => equal(actual, candidate));
+        if (operator === "$ne") return !equal(actual, value);
+        if (operator === "$exists") return (actual !== undefined) === value;
+        assert.fail(`Unsupported Restaurant fixture predicate: ${operator}`);
+      });
+    }
+    return equal(actual, expected);
+  });
 }
 
 // This file invokes handlers directly. No port, database or outbound transport is allowed.
@@ -50,6 +70,8 @@ test("dispatch fixes: real handlers with in-memory persistence and forbidden ext
   const { dispatchVehicleInputForOrder } = await import("./dispatchVehiclePolicy.js");
   const { evaluateDispatchVehicleEligibility } = await import("./dispatch.js");
   const { isDispatchablePayment } = await import("./dispatchEligibility.js");
+  const { EmployeeSession } = await import("./employeeSessions.js");
+  const { RiderShiftPlanModel } = await import("./shiftPlans.js");
   const { startRealtimeRelay, stopRealtimeRelay } = await import("./realtime.js");
   const server = await import("./server.js");
   (globalThis as any).Date = FixedDate;
@@ -65,10 +87,17 @@ test("dispatch fixes: real handlers with in-memory persistence and forbidden ext
   const id = () => new mongoose.Types.ObjectId();
   const tenantId = id(), restaurantId = id(), riderId = id(), customerId = id();
   const point: [number, number] = [-0.521111, 38.990276];
-  const restaurant: any = { _id: restaurantId, tenantId, name: "Ficticio", slug: "offline-ficticio", location: { type: "Point", coordinates: point }, partnerProfile: {}, priceIncludesCommission: true, menu: [{ id: "item-1", name: "Producto", price: 6, category: "Comida" }] };
-  const rider: any = { _id: riderId, tenantId, status: "available", vehicle: "electric_bike", location: restaurant.location, lastLocationAt: new Date() };
+  const restaurant: any = { _id: restaurantId, tenantId, name: "Ficticio", slug: "offline-ficticio", isActive: true, onboardingStatus: "approved", availabilityStatus: "available", listingType: "restaurant", location: { type: "Point", coordinates: point }, partnerProfile: {}, priceIncludesCommission: true, menu: [{ id: "item-1", name: "Producto", price: 6, category: "Comida" }] };
+  const rider: any = { _id: riderId, tenantId, email: "offline@example.invalid", lifecycleStatus: "active", status: "available", vehicle: "electric_bike", location: restaurant.location, lastLocationAt: new Date() };
   const paidOrder = (): any => ({ _id: id(), tenantId, restaurantId, publicCode: "OFFLINE-ORDER", totalCents: 899, status: "pending", paymentMethod: "stripe", paymentState: "paid", assignmentState: "unassigned", riderId: null, version: 0, dispatchAttempts: 0, pickupLocation: restaurant.location, deliveryLocation: restaurant.location, routeDistanceKm: 1, routingDegraded: false });
-  const slot: any = { _id: id(), riderId, tenantId, date: "2026-11-10", startTime: "20:00", endTime: "02:00", status: "active" };
+  const slot: any = { _id: id(), riderId, tenantId, date: "2026-11-10", startTime: "20:00", endTime: "02:00", status: "active", startedAt: new Date("2026-11-10T19:00:00Z") };
+  const sessionEmployee = { _id: customerId, tenantId, email: rider.email, active: true, authorizationStatus: "approved", mustChangePassword: false, apiRole: "rider", roles: ["rider"] };
+  t.mock.method(models.Tenant as any, "findOne", () => query({ _id: tenantId, status: "active" }));
+  t.mock.method(EmployeeAccount as any, "findOne", () => query(sessionEmployee));
+  t.mock.method(EmployeeSession as any, "find", () => query([{ _id: customerId, employeeId: customerId, tenantId, tokenHash: "offline-only", role: "rider", surface: "rider", issuedAt: new Date(fixed - 60_000), expiresAt: new Date(fixed + 3600_000) }]));
+  t.mock.method(EmployeeSession as any, "exists", () => query(true));
+  t.mock.method(RiderShiftPlanModel as any, "findOne", () => query({ riderId, tenantId, weeklyHours: 40, shifts: [{ weekday: 2, start: "20:00", end: "02:00" }] }));
+  t.mock.method(Order as any, "find", () => query([]));
   t.mock.method(Restaurant as any, "findOne", () => query(restaurant));
   t.mock.method(Restaurant as any, "findById", () => query(null));
   t.mock.method(CustomerAccount as any, "findOne", () => query({ _id: customerId, name: "Ficticio", email: "offline@example.invalid" }));
@@ -89,10 +118,42 @@ test("dispatch fixes: real handlers with in-memory persistence and forbidden ext
   t.mock.method(Rider as any, "findOneAndUpdate", () => query({ ...rider, status: "busy" }));
   t.mock.method(DispatchDecision as any, "create", async () => ({ _id: id() }));
 
+  function customerRestaurantFixture(s: any, initial = restaurant) {
+    let persisted = { ...initial };
+    let inTransaction = false, ended = false, locks = 0;
+    const session = { withTransaction: async (fn: any) => { inTransaction = true; try { return await fn(); } finally { inTransaction = false; } }, endSession: async () => { ended = true; } };
+    s.mock.method(mongoose, "startSession", async () => session as any);
+    s.mock.method(Restaurant as any, "findOne", (filter: any) => query(matchesRestaurant(persisted, filter) ? { ...persisted } : null));
+    s.mock.method(Restaurant as any, "updateOne", (filter: any, update: any, options: any) => {
+      if (update.$inc) {
+        assert.deepEqual(filter, { _id: restaurantId, ...CUSTOMER_ORDERABLE_RESTAURANT_FILTER });
+        assert.deepEqual(update, { $inc: { __v: 1 } });
+        assert.equal(options?.session, session);
+        assert.equal(options?.timestamps, false);
+        assert.equal(inTransaction, true);
+        assert.equal(persisted.menu[0].price, 6);
+        assert.equal(persisted.priceIncludesCommission, true);
+      } else {
+        assert.equal(inTransaction, false, "legacy geocode repair precedes checkout transaction");
+        assert.deepEqual(filter, { _id: restaurantId });
+        assert.deepEqual(update, { $set: { location: { type: "Point", coordinates: point } } });
+      }
+      const matchedCount = matchesRestaurant(persisted, filter) ? 1 : 0;
+      if (matchedCount) {
+        if ("$inc" in update) { locks++; persisted = { ...persisted, __v: (persisted.__v || 0) + 1 }; }
+        else persisted = { ...persisted, ...update.$set };
+      }
+      return query({ matchedCount, modifiedCount: matchedCount });
+    });
+    return { session, assertComplete() { assert.equal(locks, 1); assert.equal(ended, true); assert.equal(inTransaction, false); }, assertCreating() { assert.equal(inTransaction, true); assert.equal(locks, 1); } };
+  }
+
   for (const procedure of ["order.create", "order.checkout"]) {
     await t.test(`${procedure}: saves the resolved pickup snapshot, routing and cash gate`, async (s) => {
+      const fixture = customerRestaurantFixture(s);
       let stored: any;
-      s.mock.method(Order as any, "create", async (input: any[]) => { stored = new Order(input[0]).toObject(); return [new Order(stored)]; });
+      let creations = 0;
+      s.mock.method(Order as any, "create", async (input: any[], options: any) => { fixture.assertCreating(); assert.equal(options?.session, fixture.session); creations++; stored = new Order(input[0]).toObject(); return [new Order(stored)]; });
       s.mock.method(globalThis, "fetch", async (url: any) => {
         assert.match(String(url), /^https:\/\/router\.project-osrm\.org\/route\/v1\/driving\//);
         return new Response(JSON.stringify({ code: "Ok", routes: [{ distance: 1000, duration: 180 }] }), { status: 200 });
@@ -106,30 +167,61 @@ test("dispatch fixes: real handlers with in-memory persistence and forbidden ext
       assert.equal(stored.paymentState, "pending");
       assert.equal(isDispatchablePayment(stored.paymentState, "cash", stored.totalCents), false);
       assert.equal(evaluateDispatchVehicleEligibility("electric_bike", dispatchVehicleInputForOrder(stored)).eligible, true);
+      assert.equal(stored.subtotalCents, 600);
+      assert.equal(stored.creditAppliedCents, 0);
+      assert.equal(stored.totalCents, 899);
+      assert.equal(creations, 1);
+      assert.equal(state.body.result.data.json.checkoutUrl, null);
+      fixture.assertComplete();
     });
   }
 
   await t.test("Customer snapshots the geocoded point, even when the original row has no location", async (s) => {
     const missing = { ...restaurant, location: undefined, address: "Calle ficticia 123", locality: "Xativa" };
-    s.mock.method(Restaurant as any, "findOne", () => query(missing));
-    s.mock.method(Restaurant as any, "updateOne", () => query({ modifiedCount: 1 }));
+    const fixture = customerRestaurantFixture(s, missing);
     s.mock.method(globalThis, "fetch", async (url: any) => {
       assert.match(String(url), /^https:\/\/nominatim\.openstreetmap\.org\/search\?/);
       return new Response(JSON.stringify([{ lat: String(point[1]), lon: String(point[0]) }]), { status: 200 });
     });
     let stored: any;
-    s.mock.method(Order as any, "create", async (input: any[]) => { stored = new Order(input[0]).toObject(); return [new Order(stored)]; });
+    let creations = 0;
+    s.mock.method(Order as any, "create", async (input: any[], options: any) => { fixture.assertCreating(); assert.equal(options?.session, fixture.session); creations++; stored = new Order(input[0]).toObject(); return [new Order(stored)]; });
     const req: any = { path: "/api/trpc/order.create", originalUrl: "/api/trpc/order.create", params: { procedure: "order.create" }, query: {}, body: { json: { restaurantId: String(restaurantId), items: [{ id: "item-1", quantity: 1 }], paymentMethod: "stripe", address: "Calle ficticia 1", deliveryLocation: { latitude: point[1], longitude: point[0] } } }, header: () => "offline-session" };
     const { res, state } = response();
     await customer.handleCustomerTrpc(req, res);
-    assert.equal(state.status, 200);
+    assert.equal(state.status, 200, JSON.stringify(state.body));
     assert.deepEqual(stored.pickupLocation.coordinates, point);
     assert.equal(missing.location, undefined);
+    assert.equal(stored.subtotalCents, 600);
+    assert.equal(stored.creditAppliedCents, 0);
+    assert.equal(stored.totalCents, 899);
+    assert.equal(creations, 1);
+    fixture.assertComplete();
   });
 
   function dispatchFixture(s: any, initial = paidOrder()) {
     let stored = initial;
     let assignments = 0;
+    let busy = Boolean(initial.riderId);
+    let reserved: any = initial.riderId ? { _id: id(), tenantId, riderId, orderId: initial._id, slot: 1, status: "reserved" } : null;
+    s.mock.method(Rider as any, "findOne", () => query({ ...rider, status: busy ? "busy" : "available", activeOrderId: busy ? stored._id : null }));
+    s.mock.method(Rider as any, "exists", () => query(true));
+    s.mock.method(Rider as any, "findOneAndUpdate", (_filter: any, update: any) => {
+      if (update.$set.status === "busy") busy = true;
+      return query({ ...rider, status: busy ? "busy" : "available", activeOrderId: busy ? stored._id : null });
+    });
+    s.mock.method(RiderAssignmentReservation as any, "find", () => query(reserved?.status === "reserved" ? [reserved] : []));
+    s.mock.method(RiderAssignmentReservation as any, "findOneAndUpdate", () => {
+      reserved = { _id: id(), tenantId, riderId, orderId: stored._id, slot: 1, status: "reserved" };
+      return query(reserved);
+    });
+    s.mock.method(RiderAssignmentReservation as any, "exists", () => query(Boolean(reserved)));
+    s.mock.method(RiderAssignmentReservation as any, "updateOne", (_filter: any, update: any) => {
+      if (reserved) Object.assign(reserved, update.$set); return query({ modifiedCount: 1 });
+    });
+    s.mock.method(Order as any, "findOne", () => query(stored));
+    s.mock.method(Order as any, "find", () => query(stored.riderId ? [stored] : []));
+    s.mock.method(Order as any, "exists", () => query(true));
     s.mock.method(Order as any, "findById", () => query(stored));
     s.mock.method(Order as any, "findOneAndUpdate", (_filter: any, update: any) => {
       assignments++;

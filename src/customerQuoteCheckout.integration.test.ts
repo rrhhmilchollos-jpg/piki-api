@@ -23,6 +23,7 @@ function matches(row: any, filter: any, dbNow = Date.now()): boolean {
     if (value && typeof value === "object" && !(value instanceof Date)) {
       if ("$exists" in value) return (actual !== undefined) === value.$exists;
       if ("$ne" in value) return !same(actual, value.$ne);
+      if ("$in" in value) return value.$in.includes(actual);
       if ("$nin" in value) return !value.$nin.includes(actual);
     }
     return same(actual, value) || String(actual) === String(value);
