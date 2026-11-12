@@ -100,16 +100,21 @@ const projection = { _id: 1, tenantId: 1, slug: 1, name: 1, menu: 1, menuRevisio
 function timestamp(restaurant: any): string | null {
   return restaurant.updatedAt instanceof Date && Number.isFinite(restaurant.updatedAt.getTime()) ? restaurant.updatedAt.toISOString() : null;
 }
-function assertRawContext(restaurant: any) {
-  if (!restaurant) throw new MenuImportError(404, "RESTAURANT_NOT_FOUND_OR_NOT_APPROVED");
-  if (restaurant.onboardingStatus !== "approved" || !isObjectIdLike(restaurant.tenantId)) throw new MenuImportError(409, "RESTAURANT_TENANT_OR_APPROVAL_REQUIRED");
+function assertRawContext(restaurant: any, draftOnly = false) {
+  if (!restaurant) throw new MenuImportError(404, draftOnly ? "RESTAURANT_NOT_FOUND_OR_NOT_DRAFT_ELIGIBLE" : "RESTAURANT_NOT_FOUND_OR_NOT_APPROVED");
+  if (draftOnly) {
+    if (restaurant.onboardingStatus !== "pending_review" || restaurant.isActive !== false || restaurant.listingType !== "official_partner" || !isObjectIdLike(restaurant.tenantId)) throw new MenuImportError(409, "RESTAURANT_DRAFT_CONTEXT_REQUIRED");
+    // This route accepts base/source prices only. Missing, null, legacy or
+    // commission-inclusive flags are not evidence of a compatible price basis.
+    if (!Object.hasOwn(restaurant, "priceIncludesCommission") || restaurant.priceIncludesCommission !== false) throw new MenuImportError(409, "DRAFT_SOURCE_BASE_PRICE_CONTEXT_REQUIRED");
+  } else if (restaurant.onboardingStatus !== "approved" || !isObjectIdLike(restaurant.tenantId)) throw new MenuImportError(409, "RESTAURANT_TENANT_OR_APPROVAL_REQUIRED");
   if (!Array.isArray(restaurant.menu)) throw new MenuImportError(409, "RAW_MENU_ARRAY_REQUIRED");
 }
-function rootAccess(req: Request, deps: MenuImportDependencies) {
+function rootAccess(req: Request, deps: MenuImportDependencies, draftOnly = false) {
   if (!req.auth?.employeeId || !deps.isRootOwner(req)) throw new MenuImportError(403, "SUPERADMIN_ONLY");
   const id = deps.objectId(String(req.params.id));
   if (!id) throw new MenuImportError(400, "INVALID_RESTAURANT_ID");
-  return { _id: id, ...deps.tenantScope(req), onboardingStatus: "approved" };
+  return { _id: id, ...deps.tenantScope(req), ...(draftOnly ? { onboardingStatus: "pending_review", listingType: "official_partner", isActive: false } : { onboardingStatus: "approved" }) };
 }
 function checkExpected(restaurant: any, body: ControlledMenuImport) {
   if (body.expectedMenuHash && body.expectedMenuHash !== rawMenuHash(restaurant.menu)) throw new MenuImportError(409, "MENU_IMPORT_CONFLICT");
@@ -134,48 +139,57 @@ function errorResponse(res: Response, error: unknown) {
 }
 
 export function registerControlledMenuImportRoutes(app: Pick<Express, "get" | "post">, deps: MenuImportDependencies) {
-  app.get("/api/v1/admin/restaurants/:id/menu/raw", deps.requireOwner(), async (req: Request, res: Response) => {
-    res.setHeader("Cache-Control", "no-store");
-    res.setHeader("Vary", "Authorization, Cookie");
-    try {
-      const scope = rootAccess(req, deps);
-      const restaurant = await deps.restaurants.findOne(scope, { projection });
-      assertRawContext(restaurant);
-      return res.json({ source: "authorized_owner_raw_menu_export", capturedAt: new Date().toISOString(), restaurant: { _id: String(restaurant._id), tenantId: String(restaurant.tenantId), slug: restaurant.slug, name: restaurant.name, onboardingStatus: restaurant.onboardingStatus, updatedAt: timestamp(restaurant), priceIncludesCommission: restaurant.priceIncludesCommission ?? null, priceIncludesCommissionPresent: Object.hasOwn(restaurant, "priceIncludesCommission"), menu: restaurant.menu }, menuHash: rawMenuHash(restaurant.menu), hashAlgorithm: "sha256-sorted-json-v1", priceBasis: "stored_source_not_public" });
-    } catch (error) { return errorResponse(res, error); }
-  });
-  app.post("/api/v1/admin/restaurants/:id/menu/import", deps.requireOwner(), async (req: Request, res: Response) => {
-    res.setHeader("Cache-Control", "no-store");
-    let session: Session | undefined;
-    try {
-      const scope = rootAccess(req, deps);
-      const parsed = controlledMenuImportSchema.safeParse(req.body);
-      if (!parsed.success) return res.status(400).json({ error: "INVALID_MENU_IMPORT", details: parsed.error.flatten() });
-      const body = parsed.data;
-      const snapshot = await deps.restaurants.findOne(scope, { projection });
-      assertRawContext(snapshot);
-      checkExpected(snapshot, body);
-      const plan = planControlledMenuImport(snapshot.menu, body);
-      const response = { restaurantId: String(snapshot._id), tenantId: String(snapshot.tenantId), currentMenuHash: rawMenuHash(snapshot.menu), currentUpdatedAt: timestamp(snapshot), priceBasis: "source", priceIncludesCommission: snapshot.priceIncludesCommission ?? null, ...plan.preview };
-      if (body.dryRun) {
-        await validateIncomingAssets(snapshot, body.items, deps);
-        return res.json({ dryRun: true, applied: false, ...response });
-      }
-      session = await deps.startSession();
-      await session.withTransaction(async () => {
-        // Exact real tenant from the authorised snapshot; no client tenant input.
-        const actualScope = { ...scope, ...buildTenantScope(snapshot.tenantId) };
-        const current = await deps.restaurants.findOne(actualScope, { projection, session });
-        assertRawContext(current);
-        checkExpected(current, body);
-        if (rawMenuHash(current.menu) !== response.currentMenuHash || timestamp(current) !== timestamp(snapshot)) throw new MenuImportError(409, "MENU_IMPORT_CONFLICT");
-        await validateIncomingAssets(current, body.items, deps, session);
-        const result = await deps.restaurants.updateOne({ ...actualScope, menu: { $eq: snapshot.menu }, updatedAt: { $eq: snapshot.updatedAt } }, { $set: { menu: plan.menu, updatedAt: new Date(Math.max(Date.now(), snapshot.updatedAt.getTime() + 1)) }, $inc: { menuRevision: 1 } }, { session, upsert: false });
-        if (result.matchedCount !== 1) throw new MenuImportError(409, "MENU_IMPORT_CONFLICT");
-      });
-      deps.afterApply(snapshot._id);
-      return res.json({ dryRun: false, applied: true, ...response, menuRevision: (snapshot.menuRevision ?? 0) + 1 });
-    } catch (error) { return errorResponse(res, error); }
-    finally { if (session) await session.endSession(); }
-  });
+  const readOwner = deps.requireOwner();
+  const writeOwner = deps.requireOwner();
+  // Shared implementation, separate eligibility: never widen approved routes.
+  function register(draftOnly: boolean) {
+    const contextProjection = draftOnly ? { ...projection, listingType: 1, isActive: 1 } : projection;
+    app.get(`/api/v1/admin/restaurants/:id/menu/${draftOnly ? "raw-draft" : "raw"}`, readOwner, async (req: Request, res: Response) => {
+      res.setHeader("Cache-Control", "no-store");
+      res.setHeader("Vary", "Authorization, Cookie");
+      try {
+        const scope = rootAccess(req, deps, draftOnly);
+        const restaurant = await deps.restaurants.findOne(scope, { projection: contextProjection });
+        assertRawContext(restaurant, draftOnly);
+        return res.json({ source: draftOnly ? "authorized_owner_raw_draft_menu_export" : "authorized_owner_raw_menu_export", capturedAt: new Date().toISOString(), restaurant: { _id: String(restaurant._id), tenantId: String(restaurant.tenantId), slug: restaurant.slug, name: restaurant.name, onboardingStatus: restaurant.onboardingStatus, ...(draftOnly ? { listingType: restaurant.listingType, isActive: restaurant.isActive } : {}), updatedAt: timestamp(restaurant), priceIncludesCommission: restaurant.priceIncludesCommission ?? null, priceIncludesCommissionPresent: Object.hasOwn(restaurant, "priceIncludesCommission"), menu: restaurant.menu }, menuHash: rawMenuHash(restaurant.menu), hashAlgorithm: "sha256-sorted-json-v1", priceBasis: "stored_source_not_public" });
+      } catch (error) { return errorResponse(res, error); }
+    });
+    app.post(`/api/v1/admin/restaurants/:id/menu/${draftOnly ? "draft-import" : "import"}`, writeOwner, async (req: Request, res: Response) => {
+      res.setHeader("Cache-Control", "no-store");
+      let session: Session | undefined;
+      try {
+        const scope = rootAccess(req, deps, draftOnly);
+        const parsed = controlledMenuImportSchema.safeParse(req.body);
+        if (!parsed.success) return res.status(400).json({ error: "INVALID_MENU_IMPORT", details: parsed.error.flatten() });
+        const body = parsed.data;
+        if (draftOnly && (body.items.some((item) => item.available !== false) || body.legacyPolicy !== "retain_ids_mark_unavailable")) throw new MenuImportError(400, "DRAFT_IMPORT_UNAVAILABLE_ITEMS_AND_LEGACY_POLICY_REQUIRED");
+        const snapshot = await deps.restaurants.findOne(scope, { projection: contextProjection });
+        assertRawContext(snapshot, draftOnly);
+        checkExpected(snapshot, body);
+        const plan = planControlledMenuImport(snapshot.menu, body);
+        const response = { restaurantId: String(snapshot._id), tenantId: String(snapshot.tenantId), currentMenuHash: rawMenuHash(snapshot.menu), currentUpdatedAt: timestamp(snapshot), priceBasis: "source", priceIncludesCommission: snapshot.priceIncludesCommission ?? null, ...(draftOnly ? { draftOnly: true, onboardingStatus: snapshot.onboardingStatus, isActive: snapshot.isActive } : {}), ...plan.preview };
+        if (body.dryRun) {
+          await validateIncomingAssets(snapshot, body.items, deps);
+          return res.json({ dryRun: true, applied: false, ...response });
+        }
+        session = await deps.startSession();
+        await session.withTransaction(async () => {
+          // Exact real tenant from the authorised snapshot; no client tenant input.
+          const actualScope = { ...scope, ...buildTenantScope(snapshot.tenantId), ...(draftOnly ? { priceIncludesCommission: false } : {}) };
+          const current = await deps.restaurants.findOne(actualScope, { projection: contextProjection, session });
+          assertRawContext(current, draftOnly);
+          checkExpected(current, body);
+          if (rawMenuHash(current.menu) !== response.currentMenuHash || timestamp(current) !== timestamp(snapshot)) throw new MenuImportError(409, "MENU_IMPORT_CONFLICT");
+          await validateIncomingAssets(current, body.items, deps, session);
+          const result = await deps.restaurants.updateOne({ ...actualScope, menu: { $eq: snapshot.menu }, updatedAt: { $eq: snapshot.updatedAt } }, { $set: { menu: plan.menu, updatedAt: new Date(Math.max(Date.now(), snapshot.updatedAt.getTime() + 1)) }, $inc: { menuRevision: 1 } }, { session, upsert: false });
+          if (result.matchedCount !== 1) throw new MenuImportError(409, "MENU_IMPORT_CONFLICT");
+        });
+        deps.afterApply(snapshot._id);
+        return res.json({ dryRun: false, applied: true, ...response, menuRevision: (snapshot.menuRevision ?? 0) + 1 });
+      } catch (error) { return errorResponse(res, error); }
+      finally { if (session) await session.endSession(); }
+    });
+  }
+  register(false);
+  register(true);
 }

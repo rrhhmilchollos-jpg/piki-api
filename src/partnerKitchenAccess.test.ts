@@ -8,7 +8,7 @@ import { canIssueEmployeeSession, sessionRole, sessionTenantMatchesEmployee } fr
 import { corporateRecipientAccepted } from "./corporateEmail.js";
 import { kitchenAccessSchema, KitchenAccessError, kitchenBindingForEmployee, kitchenRestaurantCanOperate, registerPartnerKitchenAccessRoutes, validateKitchenActivation, type KitchenAccessDependencies } from "./partnerKitchenAccess.js";
 import { partnerCan, partnerRolesForEmployee, permissionsForPartnerRoles } from "./partnerAccess.js";
-
+import { isPartnerEmployee, partnerBindingForEmployee, partnerBindingErrorResponse, validatePartnerCredentialTarget } from "./employeePartnerBinding.js";
 // Synthetic IDs are mocks, never production targets.
 const ids = { owner: "64b000000000000000000001", tenant: "64b000000000000000000002", restaurant: "64b000000000000000000003", employee: "64b000000000000000000004", membership: "64b000000000000000000005", otherTenant: "64b000000000000000000006", xativa: "64b000000000000000000007" };
 const email = "jose888628@hotmail.com";
@@ -258,6 +258,7 @@ test("new kitchen operation gate requires approved/active/published menu and kno
 
 const serverSource = ts.createSourceFile("server.ts", readFileSync(new URL("./server.ts", import.meta.url), "utf8"), ts.ScriptTarget.Latest, true);
 function compile(code: string, context: Record<string, any>) {
+  context = { isPartnerEmployee, partnerBindingForEmployee, partnerBindingErrorResponse, validatePartnerCredentialTarget, ...context };
   const javascript = ts.transpileModule(code, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS } }).outputText;
   return new Function(...Object.keys(context), `${javascript}; return subject;`)(...Object.values(context));
 }
