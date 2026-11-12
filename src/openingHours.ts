@@ -30,7 +30,8 @@ const legacyOpeningDaySchema = z.object({
   closed: z.boolean(),
 }).transform(({ open, close, closed }) => ({
   morning: { open, close, closed: false },
-  evening: { open, close, closed: false },
+  // A continuous legacy period is one interval, not two invented shifts.
+  evening: { open, close, closed: true },
   closed,
 }));
 

@@ -37,6 +37,8 @@ if (mode === "check") {
     mongoose.connect = forbidden; mongoose.Connection.prototype.openUri = forbidden;
     mongoose.startSession = forbidden;
     mongoose.Query.prototype.exec = forbidden;
+    mongoose.Model.prototype.save = forbidden;
+    mongoose.Model.create = forbidden; mongoose.Model.insertMany = forbidden; mongoose.Model.bulkWrite = forbidden;
   `;
   const env = { PATH: process.env.PATH, HOME: process.env.HOME, NODE_ENV: "test", PIKI_NO_LISTEN: "true", DOTENV_CONFIG_PATH: "/dev/null" };
   const files = process.argv.slice(3);
