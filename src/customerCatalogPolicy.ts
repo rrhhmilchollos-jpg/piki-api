@@ -12,12 +12,19 @@ export const CUSTOMER_ORDERABLE_RESTAURANT_FILTER = {
   // An explicit directory or assisted purchase row is never orderable.
   $or: [{ listingType: { $in: ["official_partner", "restaurant"] } }, { listingType: { $exists: false } }],
 };
-export const CUSTOMER_DIRECTORY_RESTAURANT_FILTER = {
-  slug: { $nin: [...CUSTOMER_HIDDEN_TEST_SLUGS] }, internalDemo: { $ne: true }, listingType: "local_directory", isActive: true, onboardingStatus: "approved",
-};
-export const CUSTOMER_CATALOG_RESTAURANT_FILTER = {
-  $or: [CUSTOMER_ORDERABLE_RESTAURANT_FILTER, { slug: { $in: [...COMING_SOON_SLUGS] }, internalDemo: { $ne: true }, availabilityStatus: "coming_soon", onboardingStatus: { $ne: "rejected" } }, CUSTOMER_DIRECTORY_RESTAURANT_FILTER],
-};
+// Public partner lists/details share the existing operational gate. Directory
+// records and unpublished announcements remain stored, never public partners.
+export const CUSTOMER_CATALOG_RESTAURANT_FILTER = CUSTOMER_ORDERABLE_RESTAURANT_FILTER;
+export function isPublishedCustomerPartner(restaurant: any): boolean {
+  return Boolean(restaurant)
+    && restaurant.internalDemo !== true
+    && !(CUSTOMER_HIDDEN_TEST_SLUGS as readonly string[]).includes(restaurant.slug)
+    && restaurant.isActive === true && restaurant.onboardingStatus === "approved"
+    && restaurant.availabilityStatus === "available"
+    && Array.isArray(restaurant.menu) && restaurant.menu.length > 0
+    && restaurant.fulfillmentMode !== "assisted_purchase"
+    && (restaurant.listingType === undefined || restaurant.listingType === "official_partner" || restaurant.listingType === "restaurant");
+}
 export function restaurantIsWithinOpeningHours(openingHours: unknown, now = new Date()): boolean {
   // This helper is shared by the customer catalogue and checkout guard.
   // Keep the partner schedule for operations, but never reject a customer

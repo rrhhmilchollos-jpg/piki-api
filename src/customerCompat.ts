@@ -236,7 +236,7 @@ async function handleCustomerTrpcSingle(req: Request, res: Response) {
       const id = String(input?.id || "").trim();
       if (!id) return reply(res, null);
       const identity = /^[a-f\d]{24}$/i.test(id) ? { _id: id } : { slug: id };
-      const row = await Restaurant.findOne({ ...identity, ...CUSTOMER_CATALOG_RESTAURANT_FILTER }).lean().exec();
+      const row = await Restaurant.findOne({ $and: [identity, CUSTOMER_CATALOG_RESTAURANT_FILTER] }).lean().exec();
       return reply(res, row ? restaurantView(row) : null);
     }
     if (procedure === "auth.me") { const user = await currentCustomer(req) as any; if (user) user.referralCode = await ensureReferralCode(user); return reply(res, publicUser(user)); }

@@ -153,7 +153,8 @@ function containsCatalogFilter(value: unknown): boolean {
     if (!value || typeof value !== "object") return false;
     const record = value as Record<string, unknown>;
     try {
-      assert.deepEqual({ $or: record.$or }, CUSTOMER_CATALOG_RESTAURANT_FILTER);
+      const policyFields = Object.fromEntries(Object.keys(CUSTOMER_CATALOG_RESTAURANT_FILTER).map(key => [key, record[key]]));
+      assert.deepEqual(policyFields, CUSTOMER_CATALOG_RESTAURANT_FILTER);
       return true;
     } catch {
       return Object.values(record).some(containsCatalogFilter);

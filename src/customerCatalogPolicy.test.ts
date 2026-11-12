@@ -3,10 +3,9 @@ import assert from 'node:assert/strict';
 import { CUSTOMER_CATALOG_RESTAURANT_FILTER, CUSTOMER_ORDERABLE_RESTAURANT_FILTER, COMING_SOON_SLUGS, presentCustomerCatalogRestaurant, restaurantIsWithinOpeningHours } from './customerCatalogPolicy.js';
 import { customerMenuForRestaurant } from './customerCatalogPolicy.js';
 
-test('los partners próximos son visibles pero no son operables ni indexables como catálogo activo', () => {
+test('el catálogo público usa exactamente la guarda operativa, sin excepciones de próximos o directorios', () => {
   assert.deepEqual(COMING_SOON_SLUGS, ['eleven-burgers-xativa', 'nakama-sushi-xativa', 'kazoku-xativa', 'kazoku-algemesi']);
-  const upcomingFilter = CUSTOMER_CATALOG_RESTAURANT_FILTER.$or[1] as { slug: { $in: readonly string[] } };
-  assert.deepEqual(upcomingFilter.slug.$in, [...COMING_SOON_SLUGS]);
+  assert.equal(CUSTOMER_CATALOG_RESTAURANT_FILTER, CUSTOMER_ORDERABLE_RESTAURANT_FILTER);
   assert.equal(CUSTOMER_ORDERABLE_RESTAURANT_FILTER.availabilityStatus, 'available');
   assert.deepEqual(CUSTOMER_ORDERABLE_RESTAURANT_FILTER['menu.0'], { $exists: true });
   for (const slug of COMING_SOON_SLUGS) {
@@ -28,7 +27,7 @@ test('un restaurante aprobado, activo y disponible se presenta como operable', (
   assert.equal(view.upcomingMessage, '');
 });
 
-test('una ficha de directorio local se muestra pero nunca habilita checkout', () => {
+test('un directorio conserva su presentación interna no pedible, sin publicarse en catálogo', () => {
   const view = presentCustomerCatalogRestaurant({ name: 'Comercio local', slug: 'comercio-local', listingType: 'local_directory', availabilityStatus: 'available', isActive: true, onboardingStatus: 'approved', menu: [{ id: 'x', name: 'Producto informativo', price: 1 }] });
   assert.equal(view.listingType, 'local_directory');
   assert.equal(view.orderable, false);
