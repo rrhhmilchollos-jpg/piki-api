@@ -3,7 +3,8 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import mongoose from "mongoose";
 import { z } from "zod";
-import { Restaurant, ensureIndexes } from "../src/models.js";
+import { Restaurant } from "../src/models.js";
+import { preflightRestaurantCatalogIndexes } from "../src/catalogImportPreflight.js";
 import { normalizePartnerMenuItems } from "../src/menuContract.js";
 
 /**
@@ -62,9 +63,9 @@ if (!apply) {
 }
 const uri = String(process.env.MONGODB_URI || "").trim();
 if (!uri) throw new Error("MONGODB_URI es obligatorio para --apply");
-await mongoose.connect(uri, { dbName: process.env.MONGODB_DB || undefined, serverSelectionTimeoutMS: 10_000 });
-await ensureIndexes();
+await mongoose.connect(uri, { dbName: process.env.MONGODB_DB || undefined, serverSelectionTimeoutMS: 10_000, autoIndex: false, autoCreate: false });
 try {
+  await preflightRestaurantCatalogIndexes(Restaurant.collection);
   const results = [];
   for (const store of input.stores) {
     const menu = normalizePartnerMenuItems(store.menu as never[]);
@@ -99,6 +100,7 @@ try {
           "partnerProfile.operatingAddress": store.address,
         },
         $setOnInsert: { slug: store.slug },
+        $inc: { menuRevision: 1 },
       },
       { upsert: true, new: true, setDefaultsOnInsert: true },
     ).select("_id slug name locality availabilityStatus onboardingStatus isActive menu").lean().exec() as any;

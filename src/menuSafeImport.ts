@@ -96,7 +96,7 @@ export type MenuImportDependencies = {
   imageMimeTypes: readonly string[];
   afterApply: (restaurantId: unknown) => void;
 };
-const projection = { _id: 1, tenantId: 1, slug: 1, name: 1, menu: 1, updatedAt: 1, onboardingStatus: 1, priceIncludesCommission: 1 };
+const projection = { _id: 1, tenantId: 1, slug: 1, name: 1, menu: 1, menuRevision: 1, updatedAt: 1, onboardingStatus: 1, priceIncludesCommission: 1 };
 function timestamp(restaurant: any): string | null {
   return restaurant.updatedAt instanceof Date && Number.isFinite(restaurant.updatedAt.getTime()) ? restaurant.updatedAt.toISOString() : null;
 }
@@ -170,11 +170,11 @@ export function registerControlledMenuImportRoutes(app: Pick<Express, "get" | "p
         checkExpected(current, body);
         if (rawMenuHash(current.menu) !== response.currentMenuHash || timestamp(current) !== timestamp(snapshot)) throw new MenuImportError(409, "MENU_IMPORT_CONFLICT");
         await validateIncomingAssets(current, body.items, deps, session);
-        const result = await deps.restaurants.updateOne({ ...actualScope, menu: { $eq: snapshot.menu }, updatedAt: { $eq: snapshot.updatedAt } }, { $set: { menu: plan.menu, updatedAt: new Date(Math.max(Date.now(), snapshot.updatedAt.getTime() + 1)) } }, { session, upsert: false });
+        const result = await deps.restaurants.updateOne({ ...actualScope, menu: { $eq: snapshot.menu }, updatedAt: { $eq: snapshot.updatedAt } }, { $set: { menu: plan.menu, updatedAt: new Date(Math.max(Date.now(), snapshot.updatedAt.getTime() + 1)) }, $inc: { menuRevision: 1 } }, { session, upsert: false });
         if (result.matchedCount !== 1) throw new MenuImportError(409, "MENU_IMPORT_CONFLICT");
       });
       deps.afterApply(snapshot._id);
-      return res.json({ dryRun: false, applied: true, ...response });
+      return res.json({ dryRun: false, applied: true, ...response, menuRevision: (snapshot.menuRevision ?? 0) + 1 });
     } catch (error) { return errorResponse(res, error); }
     finally { if (session) await session.endSession(); }
   });

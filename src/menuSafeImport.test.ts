@@ -35,10 +35,11 @@ function fixture(options: { race?: boolean; badAsset?: boolean; tenant?: unknown
         calls.writes.push({ filter, update, opts });
         assert.equal(opts.session, session); assert.equal(opts.upsert, false);
         assert.equal(filter.tenantId, tenantId); assert.equal(filter.onboardingStatus, "approved");
-        assert.deepEqual(Object.keys(update), ["$set"]); assert.deepEqual(Object.keys(update.$set).sort(), ["menu", "updatedAt"]);
+        assert.deepEqual(Object.keys(update), ["$set", "$inc"]); assert.deepEqual(Object.keys(update.$set).sort(), ["menu", "updatedAt"]);
+        assert.deepEqual(update.$inc, { menuRevision: 1 });
         if (options.race) { stored.menu = [...stored.menu, { id: "concurrent", name: "Otro editor", price: 1 }]; return { matchedCount: 0, modifiedCount: 0 }; }
         assert.deepEqual(filter.menu.$eq, stored.menu); assert.deepEqual(filter.updatedAt.$eq, stored.updatedAt);
-        pending = update.$set; return { matchedCount: 1, modifiedCount: 1 };
+        pending = { ...update.$set, menuRevision: (stored.menuRevision ?? 0) + update.$inc.menuRevision }; return { matchedCount: 1, modifiedCount: 1 };
       },
     },
     assets: { async findOne(filter, opts) { calls.assetReads.push({ filter, opts }); assert.equal(filter.restaurantId, restaurantId); assert.equal(filter.tenantId, tenantId); assert.equal(filter.scanStatus, "clean"); assert.equal(filter.kind, "menu_image"); return options.badAsset ? null : { _id: assetId }; } },
@@ -122,9 +123,10 @@ test("dryRun por defecto devuelve matches/hash sin escrituras, sesiones ni notif
   assert.equal(JSON.stringify(f.stored), before); assert.equal(f.calls.writes.length, 0); assert.equal(f.calls.sessions, 0); assert.equal(f.calls.effects, 0);
 });
 
-test("aplicación hace CAS nativo exacto dentro de transacción y sólo modifica menu/updatedAt", async () => {
+test("aplicación hace CAS nativo exacto dentro de transacción y sólo modifica menu/updatedAt y revisión", async () => {
   const f = fixture(); const legacy = f.stored.menu[1]; const r = await f.invoke(f.applyBody({ legacyPolicy: "retain_ids_mark_unavailable", items: [{ ...sourceItems()[0], image: assetUrl }, sourceItems()[1]] }));
   assert.equal(r.status, 200); assert.equal(r.body.applied, true);
+  assert.equal(f.stored.menuRevision, 1); assert.equal(r.body.menuRevision, 1);
   assert.deepEqual(f.stored.menu[2], { ...legacy, available: false }); assert.equal(f.stored.priceIncludesCommission, false); assert.equal(f.stored.privateSecret, "not-exported");
   assert.equal(f.calls.writes.length, 1); assert.equal(f.calls.effects, 1); assert.equal(f.calls.ended, 1);
   assert.equal(f.calls.reads[1].filter.tenantId, tenantId); assert.equal(f.calls.assetReads.length, 1); assert.ok(f.calls.assetReads[0].opts.session);

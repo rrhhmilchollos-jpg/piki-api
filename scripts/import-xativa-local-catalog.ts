@@ -3,7 +3,8 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import mongoose from "mongoose";
 import { z } from "zod";
-import { Restaurant, ensureIndexes } from "../src/models.js";
+import { Restaurant } from "../src/models.js";
+import { preflightRestaurantCatalogIndexes } from "../src/catalogImportPreflight.js";
 import { normalizePartnerMenuItems, partnerMenuItemsSchema, type PartnerMenuItem } from "../src/menuContract.js";
 
 /**
@@ -109,10 +110,10 @@ async function main() {
 
   const uri = String(process.env.MONGODB_URI || "").trim();
   if (!uri) throw new Error("MONGODB_URI es obligatorio para --apply");
-  await mongoose.connect(uri, { dbName: process.env.MONGODB_DB || undefined, serverSelectionTimeoutMS: 10_000 });
-  await ensureIndexes();
+  await mongoose.connect(uri, { dbName: process.env.MONGODB_DB || undefined, serverSelectionTimeoutMS: 10_000, autoIndex: false, autoCreate: false });
   const results: Array<{ slug: string; id: string; products: number; status: string }> = [];
   try {
+    await preflightRestaurantCatalogIndexes(Restaurant.collection);
     for (const store of input.stores) {
       const menu: PartnerMenuItem[] = normalizePartnerMenuItems(store.menu);
       const status = "coming_soon" as const;
@@ -140,6 +141,7 @@ async function main() {
           "marketplaceCompliance.pikiStatus": "pending",
         },
         $setOnInsert: { slug: store.slug },
+        $inc: { menuRevision: 1 },
       };
       const saved = await Restaurant.findOneAndUpdate({ slug: store.slug }, update, { upsert: true, new: true, setDefaultsOnInsert: true }).select("_id slug menu availabilityStatus isActive").lean().exec() as any;
       results.push({ slug: store.slug, id: String(saved._id), products: menu.length, status: `${saved.availabilityStatus}/${saved.isActive ? "active" : "inactive"}` });

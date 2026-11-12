@@ -3,7 +3,7 @@ import { createRequire } from "node:module";
 import { spawnSync } from "node:child_process";
 import { pathToFileURL } from "node:url";
 import { resolve } from "node:path";
-const dependencies = "/home/ubuntu/piki-audit/piki-api/package.json";
+const dependencies = new URL("../package.json", import.meta.url).pathname;
 const require = createRequire(dependencies);
 const mode = process.argv[2];
 if (mode === "check") {
@@ -19,7 +19,7 @@ if (mode === "check") {
   const preload = `
     import { registerHooks, createRequire } from 'node:module';
     import { pathToFileURL } from 'node:url';
-    import net from 'node:net'; import http from 'node:http'; import https from 'node:https';
+    import net from 'node:net'; import http from 'node:http'; import https from 'node:https'; import tls from 'node:tls';
     const base = ${JSON.stringify(pathToFileURL(dependencies).href)};
     registerHooks({ resolve(specifier, context, nextResolve) {
       try { return nextResolve(specifier, context); } catch (error) {
@@ -30,10 +30,12 @@ if (mode === "check") {
     const forbidden = () => { throw new Error('EXTERNAL_IO_FORBIDDEN'); };
     net.Socket.prototype.connect = forbidden; net.Server.prototype.listen = forbidden;
     http.request = forbidden; http.get = forbidden; https.request = forbidden; https.get = forbidden;
+    tls.connect = forbidden;
     globalThis.fetch = forbidden;
     const mongoose = createRequire(base)('mongoose');
     mongoose.set('bufferCommands', false); mongoose.set('autoIndex', false); mongoose.set('autoCreate', false);
     mongoose.connect = forbidden; mongoose.Connection.prototype.openUri = forbidden;
+    mongoose.startSession = forbidden;
     mongoose.Query.prototype.exec = forbidden;
   `;
   const env = { PATH: process.env.PATH, HOME: process.env.HOME, NODE_ENV: "test", PIKI_NO_LISTEN: "true", DOTENV_CONFIG_PATH: "/dev/null" };

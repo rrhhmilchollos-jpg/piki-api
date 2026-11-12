@@ -1,0 +1,494 @@
+TAP version 13
+# (node:27354) [MONGOOSE] Warning: `errors` is a reserved schema pathname and may break some functionality. You are allowed to use it, but use at your own risk. To disable this warning pass `suppressReservedKeysWarning` as a schema option.
+# (Use `node --trace-warnings ...` to show where the warning was created)
+# Subtest: contratos de catálogo y carta con handlers reales, consultas en memoria y red bloqueada
+    # Subtest: REST + tRPC + quote: final=false, perfil=legacy20
+    ok 1 - REST + tRPC + quote: final=false, perfil=legacy20
+      ---
+      duration_ms: 9.463534
+      type: 'test'
+      ...
+    # Subtest: REST + tRPC + quote: final=false, perfil=1800
+    ok 2 - REST + tRPC + quote: final=false, perfil=1800
+      ---
+      duration_ms: 2.391546
+      type: 'test'
+      ...
+    # Subtest: REST + tRPC + quote: final=true, perfil=legacy20
+    ok 3 - REST + tRPC + quote: final=true, perfil=legacy20
+      ---
+      duration_ms: 1.920617
+      type: 'test'
+      ...
+    # Subtest: REST + tRPC + quote: final=true, perfil=1800
+    ok 4 - REST + tRPC + quote: final=true, perfil=1800
+      ---
+      duration_ms: 1.266208
+      type: 'test'
+      ...
+    # Subtest: perfil válido prevalece incluso sobre slug legacy; inválido conserva defaults
+    ok 5 - perfil válido prevalece incluso sobre slug legacy; inválido conserva defaults
+      ---
+      duration_ms: 0.276817
+      type: 'test'
+      ...
+    # Subtest: POST orders rechaza estados no operables y producto pausado antes de cualquier efecto
+    ok 6 - POST orders rechaza estados no operables y producto pausado antes de cualquier efecto
+      ---
+      duration_ms: 13.03878
+      type: 'test'
+      ...
+    # Subtest: assisted_purchase se veta globalmente en REST, tRPC y flags públicos
+    ok 7 - assisted_purchase se veta globalmente en REST, tRPC y flags públicos
+      ---
+      duration_ms: 3.772451
+      type: 'test'
+      ...
+    # Subtest: Partner/Admin fullsave: pausa parcial/total/reactivación preservan requisitos
+    ok 8 - Partner/Admin fullsave: pausa parcial/total/reactivación preservan requisitos
+      ---
+      duration_ms: 53.659206
+      type: 'test'
+      ...
+    # Subtest: Kazoku sólo se anuncia cuando existe la fila coming_soon; no se fabrica registro
+    ok 9 - Kazoku sólo se anuncia cuando existe la fila coming_soon; no se fabrica registro
+      ---
+      duration_ms: 1.275423
+      type: 'test'
+      ...
+    # Subtest: PATCH por ID es atómico, preserva resto, replay no incrementa y PUT stale da 409
+    ok 10 - PATCH por ID es atómico, preserva resto, replay no incrementa y PUT stale da 409
+      ---
+      duration_ms: 6.91707
+      type: 'test'
+      ...
+    # Subtest: revisión ausente es cero; PATCH/PUT validan input, permisos y tenant
+    ok 11 - revisión ausente es cero; PATCH/PUT validan input, permisos y tenant
+      ---
+      duration_ms: 2.644496
+      type: 'test'
+      ...
+    # Subtest: búsqueda geográfica nacional conserva España sin sesgo regional ni coordenadas de fallback
+    ok 12 - búsqueda geográfica nacional conserva España sin sesgo regional ni coordenadas de fallback
+      ---
+      duration_ms: 1.976787
+      type: 'test'
+      ...
+    # Subtest: GET localities nacional valida límite y no consulta DB ni expone cobertura
+    ok 13 - GET localities nacional valida límite y no consulta DB ni expone cobertura
+      ---
+      duration_ms: 5.966768
+      type: 'test'
+      ...
+    1..13
+ok 1 - contratos de catálogo y carta con handlers reales, consultas en memoria y red bloqueada
+  ---
+  duration_ms: 1166.800945
+  type: 'test'
+  ...
+# Subtest: catálogo municipal nacional: alias, tildes, provincia, código y vacío
+ok 2 - catálogo municipal nacional: alias, tildes, provincia, código y vacío
+  ---
+  duration_ms: 7.396607
+  type: 'test'
+  ...
+# Subtest: preflight de importadores sólo lee índices Restaurant y falla cerrado sin unicidad slug
+ok 3 - preflight de importadores sólo lee índices Restaurant y falla cerrado sin unicidad slug
+  ---
+  duration_ms: 0.969043
+  type: 'test'
+  ...
+# Subtest: single catalog.list batches are arrays for GET and POST while a bare call remains an object
+ok 4 - single catalog.list batches are arrays for GET and POST while a bare call remains an object
+  ---
+  duration_ms: 7.187596
+  type: 'test'
+  ...
+# Subtest: catalog.list preserves public location, explicitly final prices and paused source items
+ok 5 - catalog.list preserves public location, explicitly final prices and paused source items
+  ---
+  duration_ms: 1.870731
+  type: 'test'
+  ...
+# Subtest: catalog.byId resolves ObjectId and slug lookups only within the public catalog filter
+ok 6 - catalog.byId resolves ObjectId and slug lookups only within the public catalog filter
+  ---
+  duration_ms: 12.739105
+  type: 'test'
+  ...
+# Subtest: catalog.list keeps configured stores visible with incomplete postal metadata while preserving query and category filters
+ok 7 - catalog.list keeps configured stores visible with incomplete postal metadata while preserving query and category filters
+  ---
+  duration_ms: 2.435804
+  type: 'test'
+  ...
+# Subtest: catalog.list takes each restaurant menu exclusively from that persisted restaurant row
+ok 8 - catalog.list takes each restaurant menu exclusively from that persisted restaurant row
+  ---
+  duration_ms: 0.784571
+  type: 'test'
+  ...
+# Subtest: los partners próximos son visibles pero no son operables ni indexables como catálogo activo
+ok 9 - los partners próximos son visibles pero no son operables ni indexables como catálogo activo
+  ---
+  duration_ms: 3.263533
+  type: 'test'
+  ...
+# Subtest: los partners Gold operativos no forman parte de la lista de próximos
+ok 10 - los partners Gold operativos no forman parte de la lista de próximos
+  ---
+  duration_ms: 0.220769
+  type: 'test'
+  ...
+# Subtest: un restaurante aprobado, activo y disponible se presenta como operable
+ok 11 - un restaurante aprobado, activo y disponible se presenta como operable
+  ---
+  duration_ms: 0.233759
+  type: 'test'
+  ...
+# Subtest: una ficha de directorio local se muestra pero nunca habilita checkout
+ok 12 - una ficha de directorio local se muestra pero nunca habilita checkout
+  ---
+  duration_ms: 0.458664
+  type: 'test'
+  ...
+# Subtest: el catálogo customer permanece operativo 24/7 aunque exista un horario partido
+ok 13 - el catálogo customer permanece operativo 24/7 aunque exista un horario partido
+  ---
+  duration_ms: 0.248806
+  type: 'test'
+  ...
+# Subtest: la comisión se aplica una sola vez cuando el precio guardado ya la incluye
+ok 14 - la comisión se aplica una sola vez cuando el precio guardado ya la incluye
+  ---
+  duration_ms: 1.037463
+  type: 'test'
+  ...
+# Subtest: Alibaba conserva el configurador cuando el registro legacy trae complementos vacíos
+ok 15 - Alibaba conserva el configurador cuando el registro legacy trae complementos vacíos
+  ---
+  duration_ms: 0.908777
+  type: 'test'
+  ...
+# Subtest: resuelve auth.me y catalog.list juntos en batches GET y POST
+ok 16 - resuelve auth.me y catalog.list juntos en batches GET y POST
+  ---
+  duration_ms: 4.867899
+  type: 'test'
+  ...
+# Subtest: obtiene el pedido de una petición tRPC GET por lotes
+ok 17 - obtiene el pedido de una petición tRPC GET por lotes
+  ---
+  duration_ms: 1.926901
+  type: 'test'
+  ...
+# Subtest: conserva el formato tRPC no agrupado
+ok 18 - conserva el formato tRPC no agrupado
+  ---
+  duration_ms: 0.205936
+  type: 'test'
+  ...
+# Subtest: conserva un cuerpo directo de Customer
+ok 19 - conserva un cuerpo directo de Customer
+  ---
+  duration_ms: 0.19065
+  type: 'test'
+  ...
+# Subtest: extrae cada input tRPC por lotes en el orden de los procedimientos
+ok 20 - extrae cada input tRPC por lotes en el orden de los procedimientos
+  ---
+  duration_ms: 0.289765
+  type: 'test'
+  ...
+# Subtest: rellena inputs ausentes de un batch sin compartir objetos mutables
+ok 21 - rellena inputs ausentes de un batch sin compartir objetos mutables
+  ---
+  duration_ms: 0.451657
+  type: 'test'
+  ...
+# Subtest: expone el pedido listo como ready a los bundles Android anteriores
+ok 22 - expone el pedido listo como ready a los bundles Android anteriores
+  ---
+  duration_ms: 0.235793
+  type: 'test'
+  ...
+# Subtest: priceBreakdown calcula subtotal, tarifas, descuento, propina y total en céntimos
+ok 23 - priceBreakdown calcula subtotal, tarifas, descuento, propina y total en céntimos
+  ---
+  duration_ms: 2.444977
+  type: 'test'
+  ...
+# Subtest: priceBreakdown no permite descuentos superiores al importe
+ok 24 - priceBreakdown no permite descuentos superiores al importe
+  ---
+  duration_ms: 0.269236
+  type: 'test'
+  ...
+# Subtest: los badges cubren primer pedido, recurrencia, rachas, explorador y noctámbulo
+ok 25 - los badges cubren primer pedido, recurrencia, rachas, explorador y noctámbulo
+  ---
+  duration_ms: 0.20281
+  type: 'test'
+  ...
+# Subtest: un cliente nuevo nunca gana el pedido gratis
+ok 26 - un cliente nuevo nunca gana el pedido gratis
+  ---
+  duration_ms: 0.877303
+  type: 'test'
+  ...
+# Subtest: el pedido gratis solo aparece tras 25 giros y 5 pedidos, y nunca pasa de 5 €
+ok 27 - el pedido gratis solo aparece tras 25 giros y 5 pedidos, y nunca pasa de 5 €
+  ---
+  duration_ms: 0.514088
+  type: 'test'
+  ...
+# Subtest: la ruleta evita repetir el envío gratis y nunca supera el tope del 5 %
+ok 28 - la ruleta evita repetir el envío gratis y nunca supera el tope del 5 %
+  ---
+  duration_ms: 0.767177
+  type: 'test'
+  ...
+# Subtest: cuando el cliente ya ha recibido 10 € al mes solo quedan premios pequeños
+ok 29 - cuando el cliente ya ha recibido 10 € al mes solo quedan premios pequeños
+  ---
+  duration_ms: 0.26378
+  type: 'test'
+  ...
+# Subtest: la distribución real es aburrida a propósito: el crédito domina
+ok 30 - la distribución real es aburrida a propósito: el crédito domina
+  ---
+  duration_ms: 41.620594
+  type: 'test'
+  ...
+# Subtest: el premio se calcula sobre la comisión del pedido: 15 % del 18 %
+ok 31 - el premio se calcula sobre la comisión del pedido: 15 % del 18 %
+  ---
+  duration_ms: 1.002371
+  type: 'test'
+  ...
+# Subtest: el coste esperado por giro se queda en el 15 % de la comisión
+ok 32 - el coste esperado por giro se queda en el 15 % de la comisión
+  ---
+  duration_ms: 23.191489
+  type: 'test'
+  ...
+# Subtest: la recompensa de racha se paga una sola vez cada tres días consecutivos
+ok 33 - la recompensa de racha se paga una sola vez cada tres días consecutivos
+  ---
+  duration_ms: 0.547137
+  type: 'test'
+  ...
+# Subtest: la racha sólo aumenta con el día UTC inmediatamente siguiente
+ok 34 - la racha sólo aumenta con el día UTC inmediatamente siguiente
+  ---
+  duration_ms: 0.277876
+  type: 'test'
+  ...
+# Subtest: quote → checkout real: crédito confirmado, expectativa exacta y débito transaccional offline
+    # Subtest: quote y callback neto con crédito cero
+    ok 1 - quote y callback neto con crédito cero
+      ---
+      duration_ms: 16.110826
+      type: 'test'
+      ...
+    # Subtest: quote y callback neto con crédito positivo
+    ok 2 - quote y callback neto con crédito positivo
+      ---
+      duration_ms: 2.776259
+      type: 'test'
+      ...
+    # Subtest: quote y callback neto con crédito caducado
+    ok 3 - quote y callback neto con crédito caducado
+      ---
+      duration_ms: 2.909121
+      type: 'test'
+      ...
+    # Subtest: quote y callback neto con crédito sin vigencia
+    ok 4 - quote y callback neto con crédito sin vigencia
+      ---
+      duration_ms: 2.317341
+      type: 'test'
+      ...
+    # Subtest: cambio entre quote y checkout: saldo baja
+    ok 5 - cambio entre quote y checkout: saldo baja
+      ---
+      duration_ms: 3.963487
+      type: 'test'
+      ...
+    # Subtest: cambio entre quote y checkout: saldo sube
+    ok 6 - cambio entre quote y checkout: saldo sube
+      ---
+      duration_ms: 1.634773
+      type: 'test'
+      ...
+    # Subtest: cambio entre quote y checkout: caduca
+    ok 7 - cambio entre quote y checkout: caduca
+      ---
+      duration_ms: 6.709273
+      type: 'test'
+      ...
+    # Subtest: cambio entre quote y checkout: precio
+    ok 8 - cambio entre quote y checkout: precio
+      ---
+      duration_ms: 1.69334
+      type: 'test'
+      ...
+    # Subtest: cambio entre quote y checkout: elegibilidad
+    ok 9 - cambio entre quote y checkout: elegibilidad
+      ---
+      duration_ms: 1.490326
+      type: 'test'
+      ...
+    # Subtest: cambio entre quote y checkout: identidad
+    ok 10 - cambio entre quote y checkout: identidad
+      ---
+      duration_ms: 1.515228
+      type: 'test'
+      ...
+    # Subtest: cambio entre quote y checkout: saldo cambia pero descuento sigue limitado
+    ok 11 - cambio entre quote y checkout: saldo cambia pero descuento sigue limitado
+      ---
+      duration_ms: 1.406299
+      type: 'test'
+      ...
+    # Subtest: relectura transaccional detecta cambio tras precheck: saldo
+    ok 12 - relectura transaccional detecta cambio tras precheck: saldo
+      ---
+      duration_ms: 1.715346
+      type: 'test'
+      ...
+    # Subtest: relectura transaccional detecta cambio tras precheck: precio
+    ok 13 - relectura transaccional detecta cambio tras precheck: precio
+      ---
+      duration_ms: 1.452755
+      type: 'test'
+      ...
+    # Subtest: relectura transaccional detecta cambio tras precheck: elegibilidad
+    ok 14 - relectura transaccional detecta cambio tras precheck: elegibilidad
+      ---
+      duration_ms: 1.321181
+      type: 'test'
+      ...
+    # Subtest: retry por WriteConflict vuelve a validar expectativa original, nunca acepta saldo menor
+    ok 15 - retry por WriteConflict vuelve a validar expectativa original, nunca acepta saldo menor
+      ---
+      duration_ms: 2.175141
+      type: 'test'
+      ...
+    # Subtest: CAS fallido después de lectura con saldo 0: no Order ni Stripe
+    ok 16 - CAS fallido después de lectura con saldo 0: no Order ni Stripe
+      ---
+      duration_ms: 1.837435
+      type: 'test'
+      ...
+    # Subtest: CAS fallido después de lectura con saldo 300: no Order ni Stripe
+    ok 17 - CAS fallido después de lectura con saldo 300: no Order ni Stripe
+      ---
+      duration_ms: 1.679958
+      type: 'test'
+      ...
+    # Subtest: caducidad en el instante del CAS usa reloj DB y aborta sin pedido
+    ok 18 - caducidad en el instante del CAS usa reloj DB y aborta sin pedido
+      ---
+      duration_ms: 1.642183
+      type: 'test'
+      ...
+    # Subtest: crédito que alcanza productos de varias unidades no pierde un céntimo en Stripe
+    ok 19 - crédito que alcanza productos de varias unidades no pierde un céntimo en Stripe
+      ---
+      duration_ms: 2.206025
+      type: 'test'
+      ...
+    # Subtest: fallo Order.create revierte débito y lock por la misma transacción
+    ok 20 - fallo Order.create revierte débito y lock por la misma transacción
+      ---
+      duration_ms: 2.229081
+      type: 'test'
+      ...
+    # Subtest: Stripe falla: compensa saldo y marca failed atómicamente sin extender vigencia
+    ok 21 - Stripe falla: compensa saldo y marca failed atómicamente sin extender vigencia
+      ---
+      duration_ms: 2.598869
+      type: 'test'
+      ...
+    # Subtest: input legacy sin expectation conserva handler pero usa CAS transaccional
+    ok 22 - input legacy sin expectation conserva handler pero usa CAS transaccional
+      ---
+      duration_ms: 1.554152
+      type: 'test'
+      ...
+    # Subtest: expectation inválida o total menor se rechaza sin efectos
+    ok 23 - expectation inválida o total menor se rechaza sin efectos
+      ---
+      duration_ms: 1.890505
+      type: 'test'
+      ...
+    1..23
+ok 35 - quote → checkout real: crédito confirmado, expectativa exacta y débito transaccional offline
+  ---
+  duration_ms: 605.22459
+  type: 'test'
+  ...
+# Subtest: conserva optionItems, precios propios y disponibilidad del editor Partner
+ok 36 - conserva optionItems, precios propios y disponibilidad del editor Partner
+  ---
+  duration_ms: 7.815657
+  type: 'test'
+  ...
+# Subtest: migra un menú antiguo que solo tenía options de texto
+ok 37 - migra un menú antiguo que solo tenía options de texto
+  ---
+  duration_ms: 0.609954
+  type: 'test'
+  ...
+# Subtest: el menú guardado del partner de prueba llega al catálogo público con el mismo producto
+ok 38 - el menú guardado del partner de prueba llega al catálogo público con el mismo producto
+  ---
+  duration_ms: 0.864996
+  type: 'test'
+  ...
+# Subtest: el catálogo conserva el menú persistido aunque el partner tenga un slug con datos históricos
+ok 39 - el catálogo conserva el menú persistido aunque el partner tenga un slug con datos históricos
+  ---
+  duration_ms: 0.256773
+  type: 'test'
+  ...
+# Subtest: roundtrip Mongoose conserva optionItems pausadas, precios y descripción
+ok 40 - roundtrip Mongoose conserva optionItems pausadas, precios y descripción
+  ---
+  duration_ms: 133.509728
+  type: 'test'
+  ...
+# Subtest: required legacy y mínimos mayores no se rebajan al pausar todas/parcialmente
+ok 41 - required legacy y mínimos mayores no se rebajan al pausar todas/parcialmente
+  ---
+  duration_ms: 3.371362
+  type: 'test'
+  ...
+# Subtest: expone la configuración de referencia para los cuatro productos operativos
+ok 42 - expone la configuración de referencia para los cuatro productos operativos
+  ---
+  duration_ms: 1.840643
+  type: 'test'
+  ...
+# Subtest: recalcula el importe de complementos y bebidas en servidor
+ok 43 - recalcula el importe de complementos y bebidas en servidor
+  ---
+  duration_ms: 0.573524
+  type: 'test'
+  ...
+# Subtest: rechaza opciones inyectadas por el cliente
+ok 44 - rechaza opciones inyectadas por el cliente
+  ---
+  duration_ms: 0.609461
+  type: 'test'
+  ...
+1..44
+# tests 80
+# suites 0
+# pass 80
+# fail 0
+# cancelled 0
+# skipped 0
+# todo 0
+# duration_ms 3505.980498

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { customerMenuForRestaurant } from "./customerCatalogPolicy.js";
 import { canonicalRestaurantMenu, normalizePartnerMenuItems, partnerMenuItemsSchema } from "./menuContract.js";
+import { modifierGroupsForItem, quoteMenuItem } from "./menuModifiers.js";
 
 test("conserva optionItems, precios propios y disponibilidad del editor Partner", () => {
   const parsed = partnerMenuItemsSchema.parse([{
@@ -53,4 +54,41 @@ test("el catálogo conserva el menú persistido aunque el partner tenga un slug 
   const persistedMenu = [{ id: "partner-live-001", name: "Plato actualizado por Partner", price: 9.25, available: true }];
   assert.deepEqual(canonicalRestaurantMenu({ slug: "alibaba-kebab-xativa", menu: persistedMenu }), persistedMenu);
   assert.deepEqual(canonicalRestaurantMenu({ slug: "rooster-kebab-xativa" }), []);
+});
+
+test("roundtrip Mongoose conserva optionItems pausadas, precios y descripción", async () => {
+  const { Restaurant } = await import("./models.js");
+  const menu = normalizePartnerMenuItems(partnerMenuItemsSchema.parse([{
+    id: "roundtrip", name: "Producto sintético", price: 10,
+    modifiers: [{ id: "extra", name: "Extras", optionItems: [
+      { id: "on", name: "Disponible", price: 1.25, available: true, description: "Disponible" },
+      { id: "off", name: "Pausada", price: 2.75, available: false, description: "No eliminar" },
+    ] }],
+  }]));
+  const first = new Restaurant({ slug: "offline-roundtrip", name: "Fixture", cuisine: "Fixture", category: "Fixture", menu }).toObject();
+  const second = new Restaurant(first).toObject();
+  assert.deepEqual(second.menu[0].modifiers[0].optionItems, menu[0].modifiers[0].optionItems);
+  assert.equal(second.menu[0].modifiers[0].options.length, 1);
+  assert.equal(second.menuRevision, 0);
+});
+
+test("required legacy y mínimos mayores no se rebajan al pausar todas/parcialmente", () => {
+  for (const minimum of [undefined, 1, 2]) {
+    const original = partnerMenuItemsSchema.parse([{ id: "dish", name: "Obligatorio", price: 10, modifiers: [{ id: "required", name: "Requerido", required: true, ...(minimum === undefined ? {} : { minSelections: minimum }), maxSelections: 3, optionItems: [{ id: "a", name: "A", price: 0, available: false }] }] }]);
+    const before = structuredClone(original);
+    const menu = normalizePartnerMenuItems(original);
+    assert.deepEqual(original, before);
+    assert.equal(menu[0].modifiers[0].minSelections, minimum ?? 1);
+    assert.equal(menu[0].modifiers[0].maxSelections, 3);
+    const groups = modifierGroupsForItem(menu[0], true);
+    assert.equal(groups.length, 1, "el grupo requerido no desaparece ni se sustituye por fallback");
+    assert.equal(groups[0].minSelections, minimum ?? 1);
+    assert.deepEqual(groups[0].options, []);
+    assert.throws(() => quoteMenuItem(menu[0], [], true), /opciones obligatorias/);
+    const priced = customerMenuForRestaurant({ menu, priceIncludesCommission: true })[0];
+    assert.equal(priced.available, false); assert.equal(priced.orderable, false);
+    assert.equal(priced.modifierGroups[0].minSelections, minimum ?? 1);
+    assert.throws(() => quoteMenuItem(priced, []), /no disponible/);
+    assert.deepEqual(original, before);
+  }
 });
