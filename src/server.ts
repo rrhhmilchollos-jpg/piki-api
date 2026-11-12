@@ -9,6 +9,7 @@ import { VEHICLE_CATALOG_VERSION, VEHICLE_TYPES, incompatibleVehicles, uniqueVeh
 import { registerTerritoryRoutes } from "./coverage/territoryRoutes.js";
 import { operationalZoneInputSchema } from "./coverage/zoneInput.js";
 import { stripeClient } from "./stripePayments.js";
+import { registerRootFleetZoneRepairRoutes } from "./rootFleetZoneRepair.js";
 import { mountGeofenceRoutes } from "./geofenceRoutes.js";
 import { planWeek, weekStartOf } from "./glovoShiftPlanner.js";
 import { calculatePayroll, payrollGap } from "./payroll.js";
@@ -1223,7 +1224,7 @@ app.post("/api/v1/auth/employee/logout", requireRole("admin", "partner", "rider"
   return res.status(204).end();
 });
 app.get("/api/v1/auth/employee/me", requireRole("admin", "partner", "rider", "fleet", "commercial", "gerente_comercial_zona", "finance", "support"), async (req, res) => {
-  const employee = req.auth?.employeeId ? await EmployeeAccount.findOne({ _id: req.auth.employeeId, ...tenantScope(req) }).select("name email employeeCode tenantId ownerProtected accessLevel authorizationStatus jobRole apiRole roles partnerRoles primaryRole zoneSlugs restaurantId restaurantIds kitchenAccessSetupVersion").lean().exec() as any : null;
+  const employee = req.auth?.employeeId ? await EmployeeAccount.findOne({ _id: req.auth.employeeId, ...tenantScope(req) }).select("name email employeeCode tenantId ownerProtected accessLevel authorizationStatus jobRole apiRole roles partnerRoles primaryRole zoneSlugs restaurantId restaurantIds kitchenAccessSetupVersion fleetId").lean().exec() as any : null;
   const roles = partnerRolesForEmployee(employee);
   const permissions = [...permissionsForPartnerRoles(roles)];
   const locations = employee ? await partnerLocationsFor(employee, roles, permissions) : [];
@@ -7191,6 +7192,14 @@ app.post("/api/v1/zones", requireRole("admin"), async (req, res) => {
   const parsed = zoneSchema.safeParse(req.body); if (!parsed.success) return res.status(400).json({ error: "INVALID_ZONE", details: parsed.error.flatten() });
   const zone = await Zone.findOneAndUpdate({ ...tenantScope(req), slug: parsed.data.slug }, { $set: { ...parsed.data, ...tenantScope(req), polygon: parsed.data.polygon } }, { upsert: true, new: true }).lean().exec();
   return res.status(201).json({ zone });
+});
+
+registerRootFleetZoneRepairRoutes(app, {
+  requireOwner, ownerEmail, objectId,
+  tenants: Tenant.collection, employees: EmployeeAccount.collection,
+  fleets: Fleet.collection, zones: Zone.collection,
+  startSession: () => mongoose.startSession(),
+  createAudit: async (row, session) => GovernanceAuditEvent.create([row], { session }),
 });
 
 app.get("/api/v1/zones", requireRole("admin", "fleet"), async (req, res) => {
