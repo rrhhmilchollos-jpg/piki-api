@@ -32,6 +32,7 @@ async function roundtrip(input: unknown, allowed = true) {
     partnerIsOpenNow: helper("partnerIsOpenNow", {}),
     partnerRequestAccess: async () => ({ allowed, access: { restaurantIds: [row._id] } }), employeeRestaurant: async () => row._id,
     tenantScope: () => ({ tenantId: "64b000000000000000000002" }),
+    partnerTenantScope: () => ({ tenantId: "64b000000000000000000002" }),
     Restaurant: { findOne: () => query(row), findOneAndUpdate: (filter: any, update: any) => { writes++; assert.equal(filter.tenantId, "64b000000000000000000002"); assert.equal(filter.onboardingStatus, "approved"); row.partnerProfile.openingHours = update.$set["partnerProfile.openingHours"]; return query(row); } },
     invalidateCatalogCache: () => undefined, publishCatalogUpdate: () => undefined,
   };

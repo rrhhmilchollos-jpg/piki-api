@@ -1,4 +1,4 @@
-import type { Request } from "express";
+import type { Request, RequestHandler } from "express";
 import mongoose from "mongoose";
 import { resolveRole } from "./auth.js";
 import { isRootOwnerAccount, OWNER_EMAIL } from "./employeeSessions.js";
@@ -7,11 +7,14 @@ import { partnerCan, partnerRolesForEmployee, permissionsForPartnerRoles, type P
 import { kitchenBindingForEmployee, kitchenRestaurantCanOperate, type KitchenBindingDependencies } from "./partnerKitchenAccess.js";
 import { isPartnerEmployee, partnerBindingForEmployee, partnerBindingErrorResponse, partnerMembershipForEmployee } from "./employeePartnerBinding.js";
 import { isObjectIdLike } from "./tenantScope.js";
+import { CUSTOMER_HIDDEN_TEST_SLUGS } from "./customerCatalogPolicy.js";
+import { customerAvailability, type CustomerAvailabilityReason } from "./customerAvailability.js";
 
 export type PartnerOperationalDependencies = {
   resolveAuth: typeof resolveRole;
   employeeById: (id: string) => Promise<any>;
   binding: KitchenBindingDependencies;
+  ownerRestaurants?: (tenantId: string) => Promise<any[]>;
 };
 const dependencies: PartnerOperationalDependencies = {
   resolveAuth: resolveRole,
@@ -23,6 +26,12 @@ const dependencies: PartnerOperationalDependencies = {
     tenants: Tenant.collection,
     memberships: TenantMembership.collection,
   },
+  // Identity portfolio, not the public/orderable catalog. The explicit frozen
+  // tenant is mandatory even for a root-admin session; filtering below also
+  // defends against an incoherent result or an over-broad adapter.
+  ownerRestaurants: (tenantId) => Restaurant.find({ tenantId })
+    .select("_id tenantId slug listingType fulfillmentMode internalDemo onboardingStatus isActive availabilityStatus marketplaceCompliance.pikiStatus menu.available menu.allergens")
+    .sort({ _id: 1 }).lean().exec(),
 };
 export type PartnerOperationalAccess = {
   employee: any;
@@ -32,8 +41,9 @@ export type PartnerOperationalAccess = {
   kitchenRestaurant: any;
   bindingRestaurants: any[] | null;
   tenantId: string;
+  ownerPortfolio?: boolean;
 };
-export type PartnerAccessDenial = { status: number; error: string };
+export type PartnerAccessDenial = { status: number; error: string; reason?: CustomerAvailabilityReason };
 const denied = (error: string, status = 403) => ({ access: null, denial: { status, error } });
 const sameId = (a: unknown, b: unknown) => isObjectIdLike(a) && isObjectIdLike(b) && String(a) === String(b);
 
@@ -42,24 +52,54 @@ export function assignedRestaurantIds(employee: any): string[] {
     .filter(isObjectIdLike).map(String))];
 }
 
-/** No bootstrap import, no lookup by email, no cached req.auth/session snapshot.
- * resolveRole re-reads session expiry/revocation, passwordChangedAt, frozen tenant
- * and role. The second account read guards its current operative state too.
+export function partnerReadinessReason(restaurant: any): CustomerAvailabilityReason {
+  if (kitchenRestaurantCanOperate(restaurant)) return "open";
+  if (restaurant?.onboardingStatus !== "approved") return "not_approved";
+  const { reason } = customerAvailability({ ...restaurant, hasMenu: Array.isArray(restaurant?.menu) && restaurant.menu.length > 0 });
+  return reason === "open" ? "not_orderable" : reason;
+}
+
+/** No bootstrap import, email discovery, cached session snapshot or claim-only
+ * privilege. Resolve the credential and re-read its account and frozen tenant.
  */
 async function loadPartnerAccess(req: Request, deps: PartnerOperationalDependencies): Promise<{ access: PartnerOperationalAccess | null; denial: PartnerAccessDenial | null }> {
   const auth = await deps.resolveAuth(req);
   if (!auth?.employeeId) return denied("AUTHENTICATION_REQUIRED", 401);
-  if (auth.role !== "partner") return denied("FORBIDDEN");
+  if (!["partner", "admin"].includes(auth.role)) return denied("FORBIDDEN");
   if (!isObjectIdLike(auth.employeeId) || !isObjectIdLike(auth.tenantId)) return denied("TENANT_CONTEXT_REQUIRED");
   if (auth.mustChangePassword) return denied("PASSWORD_CHANGE_REQUIRED", 428);
-  // REST's subsequent query uses req.auth. Never authorize a different context.
   if (req.auth && (req.auth.employeeId !== auth.employeeId || req.auth.tenantId !== auth.tenantId || req.auth.role !== auth.role)) return denied("AUTHENTICATION_REQUIRED", 401);
   const employee = await deps.employeeById(auth.employeeId);
   if (!employee || employee.active !== true || employee.authorizationStatus !== "approved") return denied("PARTNER_ACCOUNT_INVALID");
   if (employee.mustChangePassword) return denied("PASSWORD_CHANGE_REQUIRED", 428);
   if (!sameId(employee._id, auth.employeeId) || !sameId(employee.tenantId, auth.tenantId)) return denied("PARTNER_TENANT_BINDING_REQUIRED");
-  if (!isPartnerEmployee(employee) && !isRootOwnerAccount(employee)) return denied("PARTNER_ACCOUNT_INVALID");
-  const restaurantIds = assignedRestaurantIds(employee);
+  const owner = isRootOwnerAccount(employee);
+  if (auth.role !== "partner" && !owner) return denied("FORBIDDEN");
+  if (!isPartnerEmployee(employee) && !owner) return denied("PARTNER_ACCOUNT_INVALID");
+  const assignedIds = assignedRestaurantIds(employee);
+  if (owner) {
+    // Persisted Owner + active Owner/Admin membership in exactly this tenant.
+    // Old assignments neither restrict this portfolio nor rescue a revoked one.
+    // Other-tenant memberships never substitute for or expand the frozen tenant.
+    if (employee.kitchenAccessSetupVersion === 1) return denied("PARTNER_BINDING_INVALID");
+    const [tenant, memberships] = await Promise.all([
+      deps.binding.tenants.findOne({ _id: employee.tenantId, status: "active" }),
+      deps.binding.memberships.find({ employeeId: employee._id, tenantId: employee.tenantId }).toArray(),
+    ]);
+    if (!tenant || !sameId(tenant._id, employee.tenantId) || tenant.status !== "active"
+      || memberships.length !== 1 || !["owner", "admin"].includes(memberships[0].role) || memberships[0].status !== "active"
+      || !sameId(memberships[0].employeeId, employee._id) || !sameId(memberships[0].tenantId, employee.tenantId)) return denied("OWNER_TENANT_MEMBERSHIP_REQUIRED");
+    if (!deps.ownerRestaurants) return denied("OWNER_PARTNER_PORTFOLIO_UNAVAILABLE");
+    const restaurants = (await deps.ownerRestaurants(String(employee.tenantId))).filter((row) => sameId(row.tenantId, employee.tenantId)
+      && isObjectIdLike(row._id) && ["pending_review", "approved"].includes(row.onboardingStatus)
+      && row.internalDemo !== true && !(CUSTOMER_HIDDEN_TEST_SLUGS as readonly string[]).includes(row.slug)
+      && row.fulfillmentMode !== "assisted_purchase" && (row.listingType === undefined || ["official_partner", "restaurant"].includes(row.listingType)));
+    const foundIds = [...new Set(restaurants.map((row) => String(row._id)))];
+    const restaurantIds = [...assignedIds.filter((id) => foundIds.includes(id)), ...foundIds.filter((id) => !assignedIds.includes(id))];
+    req.auth = auth;
+    return { access: { employee, restaurantIds, roles: ["owner"], permissions: ["*"], kitchenRestaurant: null, bindingRestaurants: restaurants, tenantId: String(employee.tenantId), ownerPortfolio: true }, denial: null };
+  }
+  const restaurantIds = assignedIds;
   if (!restaurantIds.length) return denied("PARTNER_RESTAURANT_NOT_ASSIGNED");
   let kitchenRestaurant: any = null;
   let bindingRestaurants: any[] | null = null;
@@ -69,18 +109,13 @@ async function loadPartnerAccess(req: Request, deps: PartnerOperationalDependenc
     } else if (employee.partnerBindingVersion === 1) {
       bindingRestaurants = (await partnerBindingForEmployee(employee, deps.binding)).restaurants;
     } else {
-      // Legacy accounts retain role permissions/readiness semantics and may
-      // predate memberships/listingType. A present membership is not optional:
-      // it must remain active and coherent. Owner admin/owner membership is not
-      // converted to Partner or granted additional scopes/locations.
+      // Keep legacy scoped managers and their optional membership contract.
       const [tenant, memberships, restaurants] = await Promise.all([
         deps.binding.tenants.findOne({ _id: employee.tenantId, status: "active" }),
         deps.binding.memberships.find({ employeeId: employee._id }).toArray(),
         Promise.all(restaurantIds.map((id) => deps.binding.restaurants.findOne({ _id: deps.binding.objectId(id), tenantId: employee.tenantId }))),
       ]);
       if (!tenant || restaurants.some((row) => !row || !sameId(row.tenantId, employee.tenantId))) return denied("PARTNER_TENANT_BINDING_REQUIRED");
-      // Same optional-legacy membership contract as partnerBindingForEmployee.
-      // Foreign-tenant memberships never substitute for the frozen tenant.
       if (memberships.some((row) => !sameId(row.tenantId, employee.tenantId))) return denied("PARTNER_MEMBERSHIP_BINDING_REQUIRED");
       partnerMembershipForEmployee(employee, memberships, restaurantIds);
     }
@@ -89,6 +124,7 @@ async function loadPartnerAccess(req: Request, deps: PartnerOperationalDependenc
     throw error;
   }
   const roles = partnerRolesForEmployee(employee);
+  req.auth = auth;
   return { access: { employee, restaurantIds, roles, permissions: [...permissionsForPartnerRoles(roles)], kitchenRestaurant, bindingRestaurants, tenantId: String(employee.tenantId) }, denial: null };
 }
 
@@ -96,19 +132,36 @@ export async function partnerAccessForRequest(req: Request, deps = dependencies)
   return (await loadPartnerAccess(req, deps)).access;
 }
 
-/** Shared operational contract. No header means REST's first assigned location,
- * not all assigned locations. Readiness remains exactly the existing versioned
- * kitchen/Partner policy; it does not turn setup identity into orders access.
- */
+/** Partner REST gate accepts a persisted Owner's admin session without opening
+ * ordinary admin/shared-token access. It never changes the session's role. */
+export function requirePartnerSurface(deps = dependencies): RequestHandler {
+  return async (req, res, next) => {
+    res.setHeader("Cache-Control", "no-store, no-cache, max-age=0, must-revalidate");
+    res.setHeader("Vary", "X-PIKI-Restaurant-Id, Authorization");
+    const result = await loadPartnerAccess(req, deps);
+    if (!result.access) {
+      const denial = result.denial!;
+      if (denial.status === 401) res.setHeader("WWW-Authenticate", "Bearer");
+      return res.status(denial.status).json({ error: denial.error });
+    }
+    return next();
+  };
+}
+
+/** Same selected-location contract for REST/SSE. A pending Owner location is
+ * consultative menu-read only, never an operational privilege or approval.
+ * Ordinary versioned and legacy readiness/permission contracts are unchanged. */
 export async function partnerRequestAccess(req: Request, permission: PartnerPermission, deps = dependencies) {
   const resolved = await loadPartnerAccess(req, deps);
   const access = resolved.access;
   if (!access) return { ...resolved, allowed: false, restaurantId: null };
   const requested = String(req.header("x-piki-restaurant-id") || "").trim();
   const restaurantId = requested || access.restaurantIds[0];
-  if (!access.restaurantIds.includes(restaurantId)) return { access, allowed: false, restaurantId: null, denial: { status: 403, error: "PARTNER_RESTAURANT_ACCESS_DENIED" } };
-  let operationReady = access.employee.kitchenAccessSetupVersion !== 1 || !permission.startsWith("orders:") || kitchenRestaurantCanOperate(access.kitchenRestaurant);
-  if (access.bindingRestaurants && permission.startsWith("orders:")) operationReady = kitchenRestaurantCanOperate(access.bindingRestaurants.find((row) => String(row._id) === restaurantId));
+  if (!restaurantId || !access.restaurantIds.includes(restaurantId)) return { access, allowed: false, restaurantId: null, denial: { status: 403, error: "PARTNER_RESTAURANT_ACCESS_DENIED" } };
+  const restaurant = access.kitchenRestaurant || access.bindingRestaurants?.find((row) => String(row._id) === restaurantId);
+  const needsReadiness = (access.ownerPortfolio && permission !== "menu:read")
+    || ((access.employee.kitchenAccessSetupVersion === 1 || access.bindingRestaurants) && permission.startsWith("orders:"));
+  const operationReady = !needsReadiness || kitchenRestaurantCanOperate(restaurant);
   const allowed = operationReady && partnerCan(access.roles, permission);
-  return { access, allowed, restaurantId, denial: allowed ? null : { status: 403, error: "PARTNER_PERMISSION_DENIED" } };
+  return { access, allowed, restaurantId, denial: allowed ? null : { status: 403, error: "PARTNER_PERMISSION_DENIED", ...(!operationReady ? { reason: partnerReadinessReason(restaurant) } : {}) } };
 }
