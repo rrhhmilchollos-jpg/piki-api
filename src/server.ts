@@ -1153,16 +1153,19 @@ app.post("/api/v1/auth/employee/password-reset/request", rateLimit(3, 15 * 60_00
   const parsed = employeePasswordResetRequestSchema.safeParse(req.body);
   const surface = employeeCredentialSurface(req.header("x-piki-surface"));
   if (!parsed.success || !surface) return res.status(202).json({ message: passwordResetMessage });
-  const email = parsed.data.email.trim().toLowerCase();
-  const employee = await EmployeeAccount.findOne({ email, active: true, authorizationStatus: "approved" }).lean().exec() as any;
-  if (employee && employeeCanUseCredentialSurface(employee, surface)) {
-    let delivery;
-    try { ({ delivery } = await sendEmployeePasswordLink(employee, surface, "recovery")); }
-    catch (error) { if (partnerBindingErrorResponse(error)) return res.status(202).json({ message: passwordResetMessage }); throw error; }
-    if (!delivery.sent) {
-      console.warn("Employee password reset email was not delivered", { error: delivery.error, surface });
-      return res.status(503).json({ message: "El correo de Recursos Humanos no está disponible ahora. Inténtalo de nuevo en unos minutos o contacta con Administración." });
+  try {
+    const email = parsed.data.email.trim().toLowerCase();
+    const employee = await EmployeeAccount.findOne({ email, active: true, authorizationStatus: "approved" }).lean().exec() as any;
+    if (employee && employeeCanUseCredentialSurface(employee, surface)) {
+      const { delivery } = await sendEmployeePasswordLink(employee, surface, "recovery");
+      if (!delivery.sent) console.warn("Employee password reset email was not delivered", { error: delivery.error, surface });
     }
+  } catch (error) {
+    const candidateCode = (error as { code?: unknown } | null)?.code;
+    const failureCode = typeof candidateCode === "string" && /^[A-Z0-9_-]{1,80}$/.test(candidateCode)
+      ? candidateCode
+      : error instanceof Error ? error.name : "UNKNOWN";
+    console.warn("Employee password reset request failed", { error: failureCode, surface });
   }
   return res.status(202).json({ message: passwordResetMessage });
 });

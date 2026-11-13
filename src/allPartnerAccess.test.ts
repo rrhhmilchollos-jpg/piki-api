@@ -159,6 +159,21 @@ test("public recovery hides invalid binding and neither creates reset nor change
   const context: any = { employeePasswordResetRequestSchema: z.object({ email: z.string().email() }), employeeCredentialSurface: () => "partner", passwordResetMessage: "neutral", EmployeeAccount: { findOne: () => query(account) }, employeeCanUseCredentialSurface: () => true, kitchenAccessDependencies: h.deps, sendEmployeePasswordLink: helper("sendEmployeePasswordLink", { kitchenAccessDependencies: h.deps, createEmployeePasswordReset: () => { resets++; throw new Error("Unexpected token"); } }) };
   const res = response(); await handler("/api/v1/auth/employee/password-reset/request", context)({ body: { email: account.email }, header: () => "partner" }, res); assert.equal(res.code, 202); assert.equal(resets, 0);
 });
+test("public recovery always returns a neutral response when email delivery fails", async () => {
+  const failures = [
+    async () => ({ delivery: { sent: false, error: "CORPORATE_EMAIL_UNAVAILABLE" } }),
+    async () => { throw Object.assign(new Error("SMTP delivery failed"), { code: "EAUTH" }); },
+  ];
+  for (const sendEmployeePasswordLink of failures) {
+    const h = harness(); const account = h.account(); h.db.employees.push(account);
+    const context: any = { employeePasswordResetRequestSchema: z.object({ email: z.string().email() }), employeeCredentialSurface: () => "partner", passwordResetMessage: "neutral", EmployeeAccount: { findOne: () => query(account) }, employeeCanUseCredentialSurface: () => true, kitchenAccessDependencies: h.deps, sendEmployeePasswordLink };
+    const originalWarn = console.warn; console.warn = () => undefined;
+    try {
+      const res = response(); await handler("/api/v1/auth/employee/password-reset/request", context)({ body: { email: account.email }, header: () => "partner" }, res);
+      assert.equal(res.code, 202); assert.deepEqual(res.body, { message: "neutral" });
+    } finally { console.warn = originalWarn; }
+  }
+});
 test("common create fails before employee write/mail when Partner target is missing; nonPartner stays intact", async () => {
   const h = harness(); let writes = 0; let emails = 0;
   const schema = z.object({ name: z.string(), email: z.string(), jobRole: z.string(), apiRole: z.string().optional(), roles: z.array(z.string()).optional(), primaryRole: z.string().optional(), restaurantId: z.string().nullable().optional(), restaurantIds: z.array(z.string()).optional(), partnerRoles: z.array(z.string()).optional(), fleetId: z.string().nullable().optional(), sendActivation: z.boolean().default(true), zoneSlugs: z.array(z.string()).default([]) });
