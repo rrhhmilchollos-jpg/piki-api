@@ -90,6 +90,7 @@ import { PIKI_PRL_COURSE_SLUG, RiderTrainingAssignment, RiderTrainingCourse, Rid
 import { deadLetterDispatchError, dispatchInitialIdempotencyKey, dispatchRecoveryIdempotencyKey, dispatchRequeueIdempotencyKey, enqueueDispatchOutbox, isRetryableDispatchState, processDispatchOutboxBatch, rearmDeadLetterDispatchEvent, type DispatchOutboxEvent } from "./dispatchOutbox.js";
 import { assignedScheduleFields, expandWeeklySchedule, isValidScheduleWindow, nextScheduleRevision, scheduleWindowsOverlap, riderSlotHasEnded, riderSlotIsCurrent } from "./riderSchedulePolicy.js";
 import { buildFleetEntityScope, buildFleetRiderPickerScope, buildTenantScope } from "./tenantScope.js";
+import { buildFleetOrdersScope, resolveFleetOrdersLocality, restaurantBelongsToFleetOrdersLocality } from "./fleetOrderScope.js";
 import { parseRiderListPagination } from "./riderListPagination.js";
 import { authenticationOptions, registrationOptions, verifyAuthentication, verifyRegistration } from "./passkeys.js";
 import { markPartnerBatchPaid, markRiderBatchPaid, publicPartnerCode, publicRiderCode, recordGovernanceEvent, syncPublicIds } from "./pikiGovernance.js";
@@ -7589,37 +7590,59 @@ app.get("/api/v1/admin/operations/live", requireRole("admin"), async (req, res) 
  * stale position as live.
  */
 app.get("/api/v1/fleet/orders", requireRole("admin", "fleet"), async (req, res) => {
-  // Alcance de flota: el gestor solo ve pedidos de su localidad. Sin localidad
-  // explícita no se devuelve nada para no exponer la operación de otras ciudades.
-  const locality = String(req.query.locality || "").trim();
-  if (!locality) return res.status(400).json({ error: "LOCALITY_REQUIRED", message: "Indica la localidad de la flota." });
-  const normalise = (value: unknown) => String(value ?? "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().trim();
-  const target = normalise(locality);
-  const orders = await Order.find({}).sort({ createdAt: -1 }).limit(300).lean().exec() as any[];
-  // El pedido no guarda siempre la ciudad: se resuelve por su comercio.
-  const restaurantIds = Array.from(new Set(orders.map((order) => String(order.restaurantId || "")).filter(Boolean)));
-  const restaurants = restaurantIds.length
-    ? await Restaurant.find({ _id: { $in: restaurantIds } }).select("city locality slug name").lean().exec() as any[]
-    : [];
-  const cityByRestaurant = new Map(restaurants.map((restaurant) => [String(restaurant._id), restaurant.city || restaurant.locality || ""]));
-  const rows = orders
-    .filter((order) => {
-      const candidates = [order.city, order.localityName, order.restaurantCity, order.restaurantLocality, order.deliveryLocality, order.restaurantName, cityByRestaurant.get(String(order.restaurantId || ""))];
-      return candidates.some((value) => value && (normalise(value).includes(target) || target.includes(normalise(value))));
-    })
-    .map((order) => ({
-      id: String(order._id),
-      publicCode: order.publicCode || "",
-      displayCode: order.displayCode || "",
-      status: order.status || "",
-      paymentMethod: order.paymentMethod || "",
-      paymentState: order.paymentState || "",
-      totalCents: Number(order.totalCents) || 0,
-      restaurantName: order.restaurantName || "",
-      customerName: order.customerName || "",
-      riderId: order.riderId ? String(order.riderId) : null,
-      createdAt: order.createdAt || null,
-    }));
+  const requestedLocality = String(req.query.locality || "").trim();
+  const tenant = tenantScope(req);
+  let locality = resolveFleetOrdersLocality(req.auth?.role, requestedLocality);
+  let fleetId: unknown;
+  let riderIds: unknown[] = [];
+
+  if (req.auth?.role === "fleet") {
+    const employee = await employeeScope(req);
+    const employeeFleetId = employee?.fleetId ? objectId(String(employee.fleetId)) : null;
+    if (!employee || !employeeFleetId || !req.auth?.tenantId) {
+      return res.status(403).json({ error: "FLEET_CONTEXT_REQUIRED", message: "La sesión no está vinculada a una flota activa." });
+    }
+    const fleet = await Fleet.findOne({
+      _id: employeeFleetId,
+      ...buildTenantScope(req.auth.tenantId),
+      isActive: { $ne: false },
+    }).select("localityName city").lean().exec() as any;
+    if (!fleet) return res.status(403).json({ error: "FLEET_CONTEXT_REQUIRED", message: "La flota vinculada no pertenece al tenant activo o está inactiva." });
+    fleetId = fleet._id;
+    locality = resolveFleetOrdersLocality("fleet", requestedLocality, fleet);
+    if (!locality) return res.status(409).json({ error: "FLEET_LOCALITY_NOT_CONFIGURED", message: "La flota no tiene una localidad configurada; no se devolverán pedidos." });
+    const riders = await Rider.find(await fleetRiderFilter(req)).select("_id").lean().exec() as any[];
+    riderIds = riders.map((rider) => rider._id);
+  }
+
+  if (!locality) return res.status(400).json({ error: "LOCALITY_REQUIRED", message: "Indica la localidad que quieres consultar." });
+  const tenantRestaurants = await Restaurant.find(tenant).select("_id city locality name").lean().exec() as any[];
+  const allowedRestaurants = tenantRestaurants.filter((restaurant) =>
+    restaurantBelongsToFleetOrdersLocality(restaurant, locality),
+  );
+  const restaurantIds = allowedRestaurants.map((restaurant) => restaurant._id);
+  const orders = await Order.find(buildFleetOrdersScope({
+    role: req.auth?.role,
+    tenantId: req.auth?.tenantId,
+    fleetId,
+    isPlatformSuperadmin: hasExplicitPlatformSuperadminScope(req),
+    restaurantIds,
+    riderIds,
+  })).sort({ createdAt: -1 }).limit(300).lean().exec() as any[];
+  const restaurantById = new Map(tenantRestaurants.map((restaurant) => [String(restaurant._id), restaurant]));
+  const rows = orders.map((order) => ({
+    id: String(order._id),
+    publicCode: order.publicCode || "",
+    displayCode: order.displayCode || "",
+    status: order.status || "",
+    paymentMethod: order.paymentMethod || "",
+    paymentState: order.paymentState || "",
+    totalCents: Number(order.totalCents) || 0,
+    restaurantName: order.restaurantName || restaurantById.get(String(order.restaurantId || ""))?.name || "",
+    customerName: order.customerName || "",
+    riderId: order.riderId ? String(order.riderId) : null,
+    createdAt: order.createdAt || null,
+  }));
   const bucket = (status: string) => {
     if (["delivered", "completed"].includes(status)) return "delivered";
     if (["cancelled", "rejected", "expired"].includes(status)) return "cancelled";
