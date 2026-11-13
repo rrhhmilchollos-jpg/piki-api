@@ -18,6 +18,7 @@ test("Admin release sync fetches and applies metadata from its canonical public 
       ok: true,
       json: async () => ({
         surface: "admin",
+        publishedAt: "2026-11-13T13:31:37.612Z",
         version: "1.0.7",
         minimumVersion: "1.0.7",
         buildId: "b653f6ebc4ab",
