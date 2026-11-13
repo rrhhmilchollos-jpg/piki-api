@@ -2,6 +2,7 @@ import mongoose, { InferSchemaType, Schema } from "mongoose";
 import { RiderIncentiveBudget, RiderIncentiveEntry, RiderReferralProfile, RiderShiftIncentiveMetric } from "./riderIncentivesModels.js";
 import { RiderTrainingAssignment, RiderTrainingCourse, RiderTrainingResponse } from "./riderTraining.js";
 import { VEHICLE_CATALOG_VERSION, VEHICLE_TYPES } from "./vehicleCatalog.js";
+import { syncIndexesWithIndexRaceRecovery } from "./indexMaintenance.js";
 
 const tenantSchema = new Schema({
   slug: { type: String, required: true, unique: true, lowercase: true, trim: true, index: true },
@@ -490,7 +491,7 @@ export async function ensureIndexes() {
       if (error?.codeName !== "IndexNotFound" && error?.code !== 27) throw error;
     }
   }
-  await Promise.all([PartnerLocalityGroup.syncIndexes(), Fleet.syncIndexes(), Zone.syncIndexes(), RiderSlot.syncIndexes(), RiderReferralProfile.syncIndexes(), RiderShiftIncentiveMetric.syncIndexes(), RiderIncentiveEntry.syncIndexes(), RiderIncentiveBudget.syncIndexes()]);
+  await Promise.all([syncIndexesWithIndexRaceRecovery(PartnerLocalityGroup), syncIndexesWithIndexRaceRecovery(Fleet), syncIndexesWithIndexRaceRecovery(Zone), syncIndexesWithIndexRaceRecovery(RiderSlot), syncIndexesWithIndexRaceRecovery(RiderReferralProfile), syncIndexesWithIndexRaceRecovery(RiderShiftIncentiveMetric), syncIndexesWithIndexRaceRecovery(RiderIncentiveEntry), syncIndexesWithIndexRaceRecovery(RiderIncentiveBudget)]);
   await Promise.all([Tenant.init(), TenantMembership.init(), Restaurant.init(), PartnerAsset.init(), PartnerLocalityGroup.init(), MenuImportDraft.init(), Fleet.init(), Order.init(), Zone.init(), MarketplaceLedgerEntry.init(), PartnerPayoutBatch.init(), StripeEvent.init(), CashLedgerEntry.init(), DispatchDecision.init(), DispatchOutbox.init(), RiderIncident.init(), RiderOrderMessage.init(), RiderApplication.init(), PartnerLead.init(), RiderLead.init(), DocumentRequest.init(), CustomerAccount.init(), RiderSlot.init(), SignatureRequest.init(), PasskeyCredential.init(), PasskeyChallenge.init(), PushSubscription.init(), Notification.init(), RealtimeEvent.init(), RiderAssignmentReservation.init(), FreeDeliveryLaunchState.init(), FreeDeliveryClaim.init(), TrackingSession.init(), LocationSample.init(), EmployeeAccount.init(), AccessAuthorization.init(), OnboardingRequest.init(), RiderReferralProfile.init(), RiderShiftIncentiveMetric.init(), RiderIncentiveEntry.init(), RiderIncentiveBudget.init(), RiderTrainingCourse.init(), RiderTrainingAssignment.init(), RiderTrainingResponse.init()]);
   const ridersWithoutCode = await Rider.find({ $or: [{ riderCode: { $exists: false } }, { riderCode: null }, { riderCode: "" }] }).select("_id").lean().exec();
   for (const rider of ridersWithoutCode) {
@@ -500,6 +501,5 @@ export async function ensureIndexes() {
     while (await Rider.exists({ riderCode })) riderCode = `${base}-${suffix++}`;
     await Rider.updateOne({ _id: rider._id, $or: [{ riderCode: { $exists: false } }, { riderCode: null }, { riderCode: "" }] }, { $set: { riderCode } }).exec();
   }
-  await Rider.syncIndexes();
-  await EmployeeAccount.syncIndexes();
+  await Promise.all([syncIndexesWithIndexRaceRecovery(Rider), syncIndexesWithIndexRaceRecovery(EmployeeAccount)]);
 }
