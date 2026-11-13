@@ -1,7 +1,40 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { operationsClock, shiftPlanForSweep, validateShiftPlan, weekStart, workedMinutesFromSlots, type WorkedSlot } from "./shiftPlans.js";
+import { buildScopedRiderOwnershipFilter, buildScopedShiftSweepOrderFilter, buildShiftSweepRiderFilter, normalizeShiftSweepRunErrors, operationsClock, shiftPlanForSweep, ShiftSweepRun, validateShiftPlan, weekStart, workedMinutesFromSlots, type WorkedSlot } from "./shiftPlans.js";
 import { isStaleInRoute, planSweep } from "./shiftSweep.js";
+
+test("el historial de barridos evita la ruta reservada y conserva errores históricos", () => {
+  assert.ok(ShiftSweepRun.schema.path("errorMessages"));
+  assert.equal(ShiftSweepRun.schema.path("errors"), undefined);
+  assert.ok(ShiftSweepRun.schema.path("tenantId"));
+  assert.ok(ShiftSweepRun.schema.path("fleetId"));
+  assert.deepEqual(normalizeShiftSweepRunErrors({ errorMessages: ["nuevo"] }), ["nuevo"]);
+  assert.deepEqual(normalizeShiftSweepRunErrors({ errors: ["histórico"] }), ["histórico"]);
+});
+
+test("el barrido global solo se representa con scope omitido y una flota vacía no coincide con nadie", () => {
+  const riderId = "507f1f77bcf86cd799439011";
+  assert.deepEqual(buildShiftSweepRiderFilter(), {});
+  assert.deepEqual(buildShiftSweepRiderFilter([]), { riderId: { $in: [] } });
+  assert.deepEqual(buildShiftSweepRiderFilter([riderId, riderId, "no-es-id"]), { riderId: { $in: [riderId] } });
+});
+
+test("el corte y liberación scoped comparan tenant/flota actuales y fallan cerrados", () => {
+  const riderId = "507f1f77bcf86cd799439011";
+  const tenantId = "507f1f77bcf86cd799439012";
+  const fleetId = "507f1f77bcf86cd799439013";
+  const riderFilter = buildScopedRiderOwnershipFilter({ riderId, tenantId, fleetId });
+  assert.equal(String(riderFilter?._id), riderId);
+  assert.equal(String(riderFilter?.tenantId), tenantId);
+  assert.equal(String(riderFilter?.fleetId), fleetId);
+  assert.equal(buildScopedRiderOwnershipFilter({ riderId, fleetId }), null);
+  assert.equal(buildScopedRiderOwnershipFilter({ riderId: "bad-id", tenantId, fleetId }), null);
+
+  const orderFilter = buildScopedShiftSweepOrderFilter({ orderId: riderId, riderId, tenantId, statuses: ["assigned"] });
+  assert.equal(String(orderFilter?.tenantId), tenantId);
+  assert.deepEqual(orderFilter?.status, { $in: ["assigned"] });
+  assert.equal(buildScopedShiftSweepOrderFilter({ orderId: riderId, riderId, tenantId: "bad-id", statuses: ["assigned"] }), null);
+});
 
 test("el contrato solo admite 10, 20, 30 o 40 horas", () => {
   const result = validateShiftPlan({ weeklyHours: 25, shifts: [{ weekday: 1, start: "10:00", end: "14:00" }] });

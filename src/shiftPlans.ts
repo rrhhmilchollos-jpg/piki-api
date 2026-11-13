@@ -104,11 +104,13 @@ const sweepRunSchema = new Schema(
   {
     source: { type: String, enum: ["manual", "worker"], default: "manual" },
     actorId: { type: Schema.Types.ObjectId, default: null },
+    tenantId: { type: Schema.Types.ObjectId, default: null, index: true },
+    fleetId: { type: Schema.Types.ObjectId, default: null, index: true },
     dryRun: { type: Boolean, default: true },
     checked: { type: Number, default: 0 },
     loggedOut: { type: Number, default: 0 },
     released: { type: Number, default: 0 },
-    errors: { type: [String], default: [] },
+    errorMessages: { type: [String], default: [] },
     actions: { type: [Schema.Types.Mixed], default: [] },
     startedAt: { type: Date, default: null },
     finishedAt: { type: Date, default: null },
@@ -117,11 +119,55 @@ const sweepRunSchema = new Schema(
   { timestamps: true, collection: "shift_sweep_runs" },
 );
 sweepRunSchema.index({ createdAt: -1 });
+sweepRunSchema.index({ tenantId: 1, fleetId: 1, createdAt: -1 });
 
 export const RiderShiftPlanModel =
   mongoose.models.RiderShiftPlan || mongoose.model("RiderShiftPlan", shiftPlanSchema);
 export const ShiftSweepRun =
   mongoose.models.ShiftSweepRun || mongoose.model("ShiftSweepRun", sweepRunSchema);
+
+/** An omitted list means a trusted global worker/owner run; an empty list denies every rider. */
+export function buildShiftSweepRiderFilter(riderIds?: readonly unknown[]): Record<string, any> {
+  if (riderIds === undefined) return {};
+  const ids = [...new Set(riderIds.map((id) => String(id)).filter((id) => mongoose.isValidObjectId(id)))];
+  return { riderId: { $in: ids } };
+}
+
+/** Builds a Rider ownership CAS; a fleet scope without a valid tenant is denied. */
+export function buildScopedRiderOwnershipFilter(input: { riderId: unknown; tenantId?: unknown; fleetId?: unknown }): Record<string, unknown> | null {
+  if (!mongoose.isValidObjectId(input.riderId)) return null;
+  const filter: Record<string, unknown> = { _id: new mongoose.Types.ObjectId(String(input.riderId)) };
+  if (input.tenantId !== undefined) {
+    if (!mongoose.isValidObjectId(input.tenantId)) return null;
+    filter.tenantId = new mongoose.Types.ObjectId(String(input.tenantId));
+  }
+  if (input.fleetId !== undefined) {
+    if (!mongoose.isValidObjectId(input.fleetId) || input.tenantId === undefined) return null;
+    filter.fleetId = new mongoose.Types.ObjectId(String(input.fleetId));
+  }
+  return filter;
+}
+
+/** Adds tenant to the order CAS so a scoped run cannot release a foreign-tenant order. */
+export function buildScopedShiftSweepOrderFilter(input: { orderId: unknown; riderId: unknown; statuses: readonly string[]; tenantId?: unknown }): Record<string, unknown> | null {
+  if (!mongoose.isValidObjectId(input.orderId) || !mongoose.isValidObjectId(input.riderId)) return null;
+  const filter: Record<string, unknown> = {
+    _id: new mongoose.Types.ObjectId(String(input.orderId)),
+    riderId: new mongoose.Types.ObjectId(String(input.riderId)),
+    status: { $in: [...input.statuses] },
+  };
+  if (input.tenantId !== undefined) {
+    if (!mongoose.isValidObjectId(input.tenantId)) return null;
+    filter.tenantId = new mongoose.Types.ObjectId(String(input.tenantId));
+  }
+  return filter;
+}
+
+export function normalizeShiftSweepRunErrors(run: { errorMessages?: unknown; errors?: unknown }): string[] {
+  const current = Array.isArray(run.errorMessages) ? run.errorMessages : [];
+  const legacy = Array.isArray(run.errors) ? run.errors : [];
+  return (current.length ? current : legacy).map((value) => String(value));
+}
 
 export type StoredShiftPlan = {
   riderId: string;
@@ -539,21 +585,25 @@ export type ShiftCutResult = {
 export async function cutRiderShift(input: {
   riderId: string;
   reason: string;
+  tenantId?: string;
+  fleetId?: string;
   now?: Date;
 }): Promise<ShiftCutResult | null> {
-  if (!mongoose.isValidObjectId(input.riderId)) return null;
+  const riderFilter = buildScopedRiderOwnershipFilter({ riderId: input.riderId, tenantId: input.tenantId, fleetId: input.fleetId });
+  if (!riderFilter) return null;
   const now = input.now ?? new Date();
-  const rider = (await Rider.findById(input.riderId).select("_id name email status tenantId activeOrderId").lean().exec()) as any;
+  // The ownership predicate is part of the write itself, not just a prior read:
+  // a reassignment between authorization and mutation must make the cut fail.
+  const rider = (await Rider.findOneAndUpdate(riderFilter, { $set: { status: "offline", activeOrderId: null } }, { new: false })
+    .select("_id name email status tenantId activeOrderId")
+    .lean()
+    .exec()) as any;
   if (!rider) return null;
 
+  const tenantFilter = input.tenantId ? { tenantId: new mongoose.Types.ObjectId(input.tenantId) } : {};
   const closed = await RiderSlot.updateMany(
-    { riderId: rider._id, status: "active" },
+    { riderId: rider._id, ...tenantFilter, status: "active" },
     { $set: { status: "completed", stoppedAt: now, stoppedReason: input.reason } },
-  ).exec();
-
-  await Rider.updateOne(
-    { _id: rider._id },
-    { $set: { status: "offline", activeOrderId: null } },
   ).exec();
 
   let sessionsRevoked = 0;
@@ -572,7 +622,7 @@ export async function cutRiderShift(input: {
   }
 
   await RiderShiftPlanModel.updateOne(
-    { riderId: rider._id },
+    { riderId: rider._id, ...tenantFilter },
     { $set: { lastCutAt: now, lastCutReason: input.reason } },
   ).exec();
 
@@ -604,18 +654,26 @@ export async function releaseOrderFromRider(input: {
   riderId: string;
   publicCode: string;
   reason: string;
+  tenantId?: string;
+  fleetId?: string;
   now?: Date;
   /** Pedido ya en ruta (picked_up/on_the_way) que lleva horas sin entregarse. */
   fromInProgress?: boolean;
 }): Promise<boolean> {
   const now = input.now ?? new Date();
-  if (!mongoose.isValidObjectId(input.orderId)) return false;
+  const riderScope = buildScopedRiderOwnershipFilter({ riderId: input.riderId, tenantId: input.tenantId, fleetId: input.fleetId });
+  if (!riderScope) return false;
+  // Re-check the live assignment immediately before a scoped order CAS. The
+  // order update below independently fences by tenantId.
+  if ((input.tenantId !== undefined || input.fleetId !== undefined) && !(await Rider.exists(riderScope).exec())) return false;
   const statuses = input.fromInProgress ? ["picked_up", "on_the_way"] : ["assigned", "accepted", "preparing", "ready_for_pickup"];
   const statusFields = input.fromInProgress
     ? { status: "ready_for_pickup", riderArrivedAt: null, riderArrivalDistanceMeters: null, pickupDeadlineAt: null }
     : {};
+  const orderFilter = buildScopedShiftSweepOrderFilter({ orderId: input.orderId, riderId: input.riderId, statuses, tenantId: input.tenantId });
+  if (!orderFilter) return false;
   const updated = (await Order.findOneAndUpdate(
-    { _id: input.orderId, riderId: input.riderId, status: { $in: statuses } },
+    orderFilter,
     {
       $set: {
         ...statusFields,
@@ -645,7 +703,9 @@ export async function releaseOrderFromRider(input: {
     .exec()) as any;
   if (!updated) return false;
 
-  await Rider.updateOne({ _id: input.riderId, activeOrderId: updated._id }, { $set: { activeOrderId: null } }).exec();
+  const riderUpdateFilter: Record<string, unknown> = { _id: new mongoose.Types.ObjectId(input.riderId), activeOrderId: updated._id };
+  if (input.tenantId !== undefined) riderUpdateFilter.tenantId = new mongoose.Types.ObjectId(input.tenantId);
+  await Rider.updateOne(riderUpdateFilter, { $set: { activeOrderId: null } }).exec();
   await enqueueDispatchOutbox({
     orderId: updated._id,
     tenantId: updated.tenantId || null,
@@ -704,17 +764,46 @@ export async function runShiftSweep(options: {
   apply: boolean;
   source?: "manual" | "worker";
   actorId?: string | null;
+  tenantId?: string;
+  fleetId?: string;
+  riderIds?: readonly string[];
   now?: Date;
 }): Promise<ShiftSweepReport> {
   const now = options.now ?? new Date();
   const startedAt = now.toISOString();
-  const reminders = options.apply
+  const hasScope = options.tenantId !== undefined || options.fleetId !== undefined || options.riderIds !== undefined;
+  const tenantObjectId = options.tenantId !== undefined && mongoose.isValidObjectId(options.tenantId)
+    ? new mongoose.Types.ObjectId(options.tenantId)
+    : undefined;
+  const fleetObjectId = options.fleetId !== undefined && mongoose.isValidObjectId(options.fleetId)
+    ? new mongoose.Types.ObjectId(options.fleetId)
+    : undefined;
+  const validScope = (options.tenantId === undefined || tenantObjectId !== undefined)
+    && (options.fleetId === undefined || (fleetObjectId !== undefined && tenantObjectId !== undefined));
+  let scopedRiderIds: string[] | undefined;
+  if (hasScope) {
+    scopedRiderIds = [];
+    if (validScope && options.riderIds !== undefined) {
+      const requestedIds = [...new Set(options.riderIds.filter((id) => mongoose.isValidObjectId(id)))];
+      const currentRiderFilter: Record<string, unknown> = { _id: { $in: requestedIds.map((id) => new mongoose.Types.ObjectId(id)) } };
+      if (tenantObjectId) currentRiderFilter.tenantId = tenantObjectId;
+      if (fleetObjectId) currentRiderFilter.fleetId = fleetObjectId;
+      const currentRiders = (await Rider.find(currentRiderFilter).select("_id").lean().exec()) as any[];
+      scopedRiderIds = currentRiders.map((rider) => String(rider._id));
+    }
+  }
+  const riderFilter = buildShiftSweepRiderFilter(scopedRiderIds);
+  const riderIdCondition: Record<string, unknown> = { $exists: true, $ne: null };
+  if (scopedRiderIds !== undefined) riderIdCondition.$in = riderFilter.riderId.$in;
+  const reminders = options.apply && !hasScope
     ? await notifyUpcomingRiderShiftStarts(now).catch((error) => {
       console.warn("No se pudo notificar el inicio de turnos Rider", error instanceof Error ? error.message : error);
       return 0;
     })
     : 0;
-  const plans = (await RiderShiftPlanModel.find({}).lean().exec()) as any[];
+  const planFilter: Record<string, unknown> = { ...riderFilter };
+  if (tenantObjectId) planFilter.tenantId = tenantObjectId;
+  const plans = (await RiderShiftPlanModel.find(planFilter).lean().exec()) as any[];
   const riders = plans
     .filter((plan) => mongoose.isValidObjectId(plan.riderId))
     .map((plan) => ({
@@ -730,10 +819,12 @@ export async function runShiftSweep(options: {
 
   const workedByRider = await computeWorkedMinutesThisWeek(riders.map((rider) => rider.riderId), now);
 
-  const activeOrders = (await Order.find({
-    riderId: { $exists: true, $ne: null },
+  const activeOrderFilter: Record<string, unknown> = {
+    riderId: riderIdCondition,
     status: { $in: ["assigned", "accepted", "preparing", "ready_for_pickup", "picked_up", "on_the_way"] },
-  })
+  };
+  if (tenantObjectId) activeOrderFilter.tenantId = tenantObjectId;
+  const activeOrders = (await Order.find(activeOrderFilter)
     .select("publicCode riderId status assignedAt createdAt riderArrivedAt")
     .lean()
     .exec()) as any[];
@@ -755,16 +846,22 @@ export async function runShiftSweep(options: {
   if (planRiderIds.length) {
     const planObjectIds = planRiderIds.map((riderId) => new mongoose.Types.ObjectId(riderId));
     const clock = operationsClock(now);
-    const [riderDocs, slotDocs] = await Promise.all([
-      Rider.find({ _id: { $in: planObjectIds } }).select("_id status activeOrderId").lean().exec() as Promise<any[]>,
-      RiderSlot.find({
-        riderId: { $in: planObjectIds },
+    const riderQuery: Record<string, unknown> = { _id: { $in: planObjectIds } };
+    if (tenantObjectId) riderQuery.tenantId = tenantObjectId;
+    if (fleetObjectId) riderQuery.fleetId = fleetObjectId;
+    const riderDocs = (await Rider.find(riderQuery).select("_id status activeOrderId").lean().exec()) as any[];
+    const currentPlanObjectIds = riderDocs.map((rider) => rider._id);
+    const slotQuery: Record<string, unknown> = {
+        riderId: { $in: currentPlanObjectIds },
         $or: [
           { status: "active" },
           { status: "planned", date: { $in: [clock.date, addDays(clock.date, -1)] } },
         ],
-      }).select("riderId tenantId date startTime endTime status").lean().exec() as Promise<any[]>,
-    ]);
+    };
+    if (tenantObjectId) slotQuery.tenantId = tenantObjectId;
+    const slotDocs = currentPlanObjectIds.length
+      ? (await RiderSlot.find(slotQuery).select("riderId tenantId date startTime endTime status").lean().exec()) as any[]
+      : [];
     sweepSlots = slotDocs.map((slot) => ({ ...slot, riderId: String(slot.riderId) }));
     for (const doc of riderDocs) {
       if (String(doc.status || "") !== "offline" || doc.activeOrderId) activeRiderIds.add(String(doc._id));
@@ -792,7 +889,10 @@ export async function runShiftSweep(options: {
   const ridersWithoutPlan = ridersWithOrders.filter((riderId) => !riders.some((rider) => rider.riderId === riderId));
   const allRiderIds = [...new Set([...riders.map((rider) => rider.riderId), ...ridersWithOrders])].filter((id) => mongoose.isValidObjectId(id));
   if (allRiderIds.length) {
-    const docs = (await Rider.find({ _id: { $in: allRiderIds.map((riderId) => new mongoose.Types.ObjectId(riderId)) } })
+    const riderNameFilter: Record<string, unknown> = { _id: { $in: allRiderIds.map((riderId) => new mongoose.Types.ObjectId(riderId)) } };
+    if (tenantObjectId) riderNameFilter.tenantId = tenantObjectId;
+    if (fleetObjectId) riderNameFilter.fleetId = fleetObjectId;
+    const docs = (await Rider.find(riderNameFilter)
       .select("_id name email")
       .lean()
       .exec()) as any[];
@@ -819,7 +919,13 @@ export async function runShiftSweep(options: {
       details.set(action.riderId, detail);
       if (options.apply) {
         try {
-          const cut = await cutRiderShift({ riderId: action.riderId, reason: action.reason, now });
+          const cut = await cutRiderShift({
+            riderId: action.riderId,
+            reason: action.reason,
+            tenantId: options.tenantId,
+            fleetId: options.fleetId,
+            now,
+          });
           detail.sessionRevoked = Boolean(cut && cut.sessionsRevoked > 0);
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
@@ -840,6 +946,8 @@ export async function runShiftSweep(options: {
         riderId: action.riderId,
         publicCode: action.publicCode,
         reason: action.reason,
+        tenantId: options.tenantId,
+        fleetId: options.fleetId,
         now,
       });
       if (released) applied += 1;
@@ -862,7 +970,16 @@ export async function runShiftSweep(options: {
     result.released += 1;
     if (!options.apply) continue;
     try {
-      const released = await releaseOrderFromRider({ orderId: String(order._id), riderId, publicCode: order.publicCode, reason: "pedido_abandonado_en_ruta", now, fromInProgress: true });
+      const released = await releaseOrderFromRider({
+        orderId: String(order._id),
+        riderId,
+        publicCode: order.publicCode,
+        reason: "pedido_abandonado_en_ruta",
+        tenantId: options.tenantId,
+        fleetId: options.fleetId,
+        now,
+        fromInProgress: true,
+      });
       if (released) applied += 1;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -890,11 +1007,13 @@ export async function runShiftSweep(options: {
   await ShiftSweepRun.create({
     source: report.source,
     actorId: options.actorId && mongoose.isValidObjectId(options.actorId) ? new mongoose.Types.ObjectId(options.actorId) : null,
+    tenantId: options.tenantId && mongoose.isValidObjectId(options.tenantId) ? new mongoose.Types.ObjectId(options.tenantId) : null,
+    fleetId: options.fleetId && mongoose.isValidObjectId(options.fleetId) ? new mongoose.Types.ObjectId(options.fleetId) : null,
     dryRun: report.dryRun,
     checked: report.checked,
     loggedOut: report.loggedOut,
     released: report.released,
-    errors: report.errors,
+    errorMessages: report.errors,
     actions: report.actions,
     startedAt: new Date(startedAt),
     finishedAt: new Date(finishedAt),
