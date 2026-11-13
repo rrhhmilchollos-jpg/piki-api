@@ -337,7 +337,7 @@ test("real server mounts only the intended collection/adaptor dependencies and o
   assert.deepEqual(write.opts, { upsert: true, new: true }); // Original creation behavior is not repurposed as a repair.
 });
 
-test("real GET employee/me projection includes ONLY fleetId addition and reports bound fleet instead of null", async () => {
+test("real GET employee/me preserves projection with fleetId/photoUrl additions and reports real identity", async () => {
   const originalProjection = "name email employeeCode tenantId ownerProtected accessLevel authorizationStatus jobRole apiRole roles partnerRoles primaryRole zoneSlugs restaurantId restaurantIds kitchenAccessSetupVersion";
   for (const linked of [true, false]) {
     const employee = { _id: ids.manager, email: "personal@example.test", name: "Offline manager", fleetId: linked ? ids.fleet : null };
@@ -352,7 +352,8 @@ test("real GET employee/me projection includes ONLY fleetId addition and reports
       Fleet: { findById(id: string) { fleetReads++; assert.equal(id, ids.fleet); return query({ _id: ids.fleet, name: "Offline fleet", city: "Offline city", managerEmployeeId: ids.manager }); } },
     });
     await actual.handler({ auth: { role: "fleet", employeeId: ids.manager } }, { json(value: any) { response = value; } });
-    assert.equal(projection, `${originalProjection} fleetId`);
+    assert.equal(projection, `${originalProjection} fleetId photoUrl`);
+    assert.equal(response.employee.fullName, employee.name); assert.equal(response.employee.photoUrl, null);
     assert.equal(response.employee.fleetId, linked ? ids.fleet : null); assert.equal(response.employee.isFleetManager, linked);
     assert.equal(fleetReads, linked ? 1 : 0); assert.equal(response.employee.fleetName, linked ? "Offline fleet" : null);
   }

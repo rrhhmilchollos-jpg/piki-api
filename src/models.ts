@@ -3,6 +3,7 @@ import { RiderIncentiveBudget, RiderIncentiveEntry, RiderReferralProfile, RiderS
 import { RiderTrainingAssignment, RiderTrainingCourse, RiderTrainingResponse } from "./riderTraining.js";
 import { VEHICLE_CATALOG_VERSION, VEHICLE_TYPES } from "./vehicleCatalog.js";
 import { syncIndexesWithIndexRaceRecovery } from "./indexMaintenance.js";
+import { isRasterProfilePhoto, PROFILE_PHOTO_MAX_CHARS, riderFirstNameSchema, riderLastNameSchema } from "./profileIdentityPolicy.js";
 
 const tenantSchema = new Schema({
   slug: { type: String, required: true, unique: true, lowercase: true, trim: true, index: true },
@@ -357,6 +358,15 @@ restaurantSchema.index({ tenantId: 1, onboardingStatus: 1, createdAt: -1 });
 const riderSchema = new Schema({
   tenantId: { type: Schema.Types.ObjectId, ref: "Tenant", default: null, index: true }, isTestRider: { type: Boolean, default: false, index: true }, riderCode: { type: String, unique: true, sparse: true, index: true, immutable: true }, name: { type: String, required: true }, email: { type: String, required: true, unique: true }, phone: { type: String, default: "", trim: true, maxlength: 40 }, city: { type: String, default: "", trim: true, maxlength: 120 }, availability: { type: String, default: "", trim: true, maxlength: 160 }, fleetId: { type: Schema.Types.ObjectId, ref: "Fleet", default: null }, zoneSlug: { type: String, default: null, index: true }, geofence: { type: Schema.Types.Mixed, default: null }, geofenceZoneSlug: { type: String, default: null }, geofenceStrikes: { type: Number, default: 0, min: 0 }, lastGeofenceViolationAt: { type: Date, default: null }, geofenceDistanceMeters: { type: Number, default: null }, geofenceSyncedAt: { type: Date, default: null }, geofenceOutside: { type: Boolean, default: false, index: true }, geofenceCheckedAt: { type: Date, default: null }, locationPrivacyExpiresAt: { type: Date, default: null, index: true }, operatingMode: { type: String, enum: ["founder_partner", "contracted"], default: "contracted", index: true }, hourlyPayEnabled: { type: Boolean, default: false, index: true }, contractWeeklyHours: { type: Number, default: null, min: 0, max: 60 }, revenueDestination: { type: String, enum: ["platform_central", "rider"], default: "platform_central", index: true }, status: { type: String, enum: ["offline", "available", "busy", "paused"], default: "offline", index: true }, lifecycleStatus: { type: String, enum: ["pending_documents", "active", "suspended", "terminated"], default: "active", index: true }, lifecycleReason: { type: String, default: "", trim: true, maxlength: 500 }, lifecycleChangedAt: { type: Date, default: null }, lifecycleChangedBy: { type: Schema.Types.ObjectId, ref: "EmployeeAccount", default: null }, vehicle: { type: String, enum: ["bike", "electric_bike", "electric_scooter", "motorcycle", "scooter", "car"], default: "electric_scooter" }, location: { type: geoPoint, default: undefined }, lastLocationAt: { type: Date, default: null }, activeOrderId: { type: Schema.Types.ObjectId, ref: "Order", default: null }, reliabilityScore: { type: Number, min: 0, max: 1, default: 0.75 }, ratingScore: { type: Number, min: 0, max: 1, default: 0.75 }, ratingCount: { type: Number, min: 0, default: 0 } }, { timestamps: true, collection: "riders" });
 riderSchema.index({ location: "2dsphere" }, { sparse: true });
+// Dedicated, nullable avatar fields are intentionally unrelated to KYC storage.
+for (const schema of [customerAccountSchema, employeeAccountSchema, riderSchema]) {
+  schema.add({ photoUrl: { type: String, default: null, maxlength: PROFILE_PHOTO_MAX_CHARS,
+    validate: { validator: (value: unknown) => value === null || value === undefined || isRasterProfilePhoto(value), message: "INVALID_PROFILE_PHOTO" } } });
+}
+riderSchema.add({
+  firstName: { type: String, trim: true, default: null, maxlength: 80, validate: (value: unknown) => riderFirstNameSchema.safeParse(value).success },
+  lastName: { type: String, trim: true, default: null, maxlength: 120, validate: (value: unknown) => riderLastNameSchema.safeParse(value).success },
+});
 const onboardingRequestSchema = new Schema({
   tenantId: { type: Schema.Types.ObjectId, ref: "Tenant", default: null, index: true },
   requestedBy: { type: Schema.Types.ObjectId, ref: "EmployeeAccount", required: true, index: true },

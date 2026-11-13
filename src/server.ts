@@ -1,6 +1,8 @@
 import { pendingPartnerDraft } from "./partnerDrafts.js";
 import { isPartnerEmployee, partnerBindingForEmployee, partnerBindingErrorResponse, persistPartnerBinding, validatePartnerCredentialTarget } from "./employeePartnerBinding.js";
 import { nativeReleasePolicy, riderClientReleasePolicy } from "./nativeReleasePolicy.js";
+import { customerDeliveryIsActive, employeeProfileUpdateSchema, riderAdminProfileUpdateSchema } from "./profileIdentityPolicy.js";
+import { customerAssignedRider } from "./customerRiderTracking.js";
 import { registerEmployeeDeletionRoutes } from "./employeeDeletion.js";
 import { dispatchVehicleInputForOrder } from "./dispatchVehiclePolicy.js";
 import { confirmReservedDispatch, releaseRiderOrderSlot, reserveRiderOrderSlot } from "./dispatchReservation.js";
@@ -1266,7 +1268,7 @@ app.post("/api/v1/auth/employee/logout", requireRole("admin", "partner", "rider"
   return res.status(204).end();
 });
 app.get("/api/v1/auth/employee/me", requireRole("admin", "partner", "rider", "fleet", "commercial", "gerente_comercial_zona", "finance", "support"), async (req, res) => {
-  const employee = req.auth?.employeeId ? await EmployeeAccount.findOne({ _id: req.auth.employeeId, ...tenantScope(req) }).select("name email employeeCode tenantId ownerProtected accessLevel authorizationStatus jobRole apiRole roles partnerRoles primaryRole zoneSlugs restaurantId restaurantIds kitchenAccessSetupVersion fleetId").lean().exec() as any : null;
+  const employee = req.auth?.employeeId ? await EmployeeAccount.findOne({ _id: req.auth.employeeId, ...tenantScope(req) }).select("name email employeeCode tenantId ownerProtected accessLevel authorizationStatus jobRole apiRole roles partnerRoles primaryRole zoneSlugs restaurantId restaurantIds kitchenAccessSetupVersion fleetId photoUrl").lean().exec() as any : null;
   const access = ["admin", "partner"].includes(req.auth?.role || "") ? await partnerAccessForRequest(req) : null;
   const roles = access?.roles || partnerRolesForEmployee(employee);
   const permissions = access?.permissions || [...permissionsForPartnerRoles(roles)];
@@ -1275,7 +1277,18 @@ app.get("/api/v1/auth/employee/me", requireRole("admin", "partner", "rider", "fl
   res.setHeader?.("Cache-Control", "no-store");
   const employeeFleet = employee?.fleetId ? await Fleet.findById(employee.fleetId).select("name managerName managerEmployeeId city").lean().exec() as any : null;
   const fleetManager = employeeFleet?.managerEmployeeId ? await EmployeeAccount.findById(employeeFleet.managerEmployeeId).select("name email").lean().exec() as any : null;
-  return res.json({ employee: { id: req.auth?.employeeId, employeeCode: employee?.employeeCode || (req.auth?.employeeId ? employeeCodeFor(req.auth.employeeId) : null), name: employee?.name || null, email: employee?.email || null, tenantId: access?.tenantId || (employee?.tenantId ? String(employee.tenantId) : null), restaurantIds: access?.restaurantIds || [], role: req.auth?.role, accessLevel: employee?.accessLevel || "subadmin", authorizationStatus: employee?.authorizationStatus || "approved", ownerProtected: Boolean(employee?.ownerProtected), jobRole: employee?.jobRole || null, apiRole: employee?.apiRole || req.auth?.role || null, roles, permissions, primaryRole: employee?.primaryRole || employee?.apiRole || req.auth?.role, zoneSlugs: employee?.zoneSlugs || [], locations, fleetId: employee?.fleetId ? String(employee.fleetId) : null, fleetName: employeeFleet?.name || null, fleetCity: employeeFleet?.city || null, fleetManagerName: fleetManager?.name || employeeFleet?.managerName || null, isFleetManager: Boolean(employee?.fleetId && employeeFleet?.managerEmployeeId && String(employeeFleet.managerEmployeeId) === String(employee?._id)), mustChangePassword: Boolean(req.auth?.mustChangePassword) } });
+  return res.json({ employee: { id: req.auth?.employeeId, employeeCode: employee?.employeeCode || (req.auth?.employeeId ? employeeCodeFor(req.auth.employeeId) : null), name: employee?.name || null, fullName: employee?.name || null, photoUrl: employee?.photoUrl ?? null, email: employee?.email || null, tenantId: access?.tenantId || (employee?.tenantId ? String(employee.tenantId) : null), restaurantIds: access?.restaurantIds || [], role: req.auth?.role, accessLevel: employee?.accessLevel || "subadmin", authorizationStatus: employee?.authorizationStatus || "approved", ownerProtected: Boolean(employee?.ownerProtected), jobRole: employee?.jobRole || null, apiRole: employee?.apiRole || req.auth?.role || null, roles, permissions, primaryRole: employee?.primaryRole || employee?.apiRole || req.auth?.role, zoneSlugs: employee?.zoneSlugs || [], locations, fleetId: employee?.fleetId ? String(employee.fleetId) : null, fleetName: employeeFleet?.name || null, fleetCity: employeeFleet?.city || null, fleetManagerName: fleetManager?.name || employeeFleet?.managerName || null, isFleetManager: Boolean(employee?.fleetId && employeeFleet?.managerEmployeeId && String(employeeFleet.managerEmployeeId) === String(employee?._id)), mustChangePassword: Boolean(req.auth?.mustChangePassword) } });
+});
+app.patch("/api/v1/auth/employee/profile", requireRole("admin", "partner", "rider", "fleet", "commercial", "gerente_comercial_zona", "finance", "support"), async (req, res) => {
+  if (!req.auth?.employeeId) return res.status(403).json({ error: "EMPLOYEE_SESSION_REQUIRED" });
+  const parsed = employeeProfileUpdateSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "INVALID_EMPLOYEE_PROFILE", details: parsed.error.flatten() });
+  const employee = await EmployeeAccount.findOneAndUpdate({ _id: req.auth.employeeId, ...tenantScope(req), active: true, authorizationStatus: "approved" },
+    { $set: { photoUrl: parsed.data.photoUrl } }, { new: true, runValidators: true })
+    .select("_id name jobRole photoUrl").lean().exec() as any;
+  if (!employee) return res.status(404).json({ error: "EMPLOYEE_NOT_FOUND" });
+  res.setHeader("Cache-Control", "private, no-store");
+  return res.json({ updated: true, employee: { id: String(employee._id), name: employee.name, fullName: employee.name, jobRole: employee.jobRole, role: req.auth.role, photoUrl: employee.photoUrl ?? null } });
 });
 app.post("/api/v1/auth/employee/change-password", requireRole("admin", "partner", "rider", "fleet", "commercial", "gerente_comercial_zona", "finance", "support"), async (req, res) => {
   const parsed = z.object({ currentPassword: z.string().min(8), newPassword: z.string().min(12).max(200).regex(/[A-Z]/).regex(/[a-z]/).regex(/[0-9]/) }).safeParse(req.body);
@@ -5210,16 +5223,18 @@ app.post("/api/v1/internal/customer-orders/:publicCode/tip-checkout", async (req
 });
 app.get("/api/v1/internal/customer-orders/:publicCode/tracking", async (req, res) => {
   if (!requireCustomerSyncSecret(req, res)) return;
-  const order = await Order.findOne({ publicCode: String(req.params.publicCode) }).lean().exec() as any;
+  // Sync callers must supply the actual Customer owner, not only a public code.
+  const customerId = typeof req.query.customerId === "string" ? req.query.customerId.trim() : "";
+  if (!customerId || customerId.length > 160) return res.status(400).json({ error: "CUSTOMER_ID_REQUIRED" });
+  const order = await Order.findOne({ publicCode: String(req.params.publicCode), customerId }).lean().exec() as any;
   if (!order) return res.status(404).json({ error: "ORDER_NOT_FOUND" });
-  const active = order.assignmentState === "assigned" && ["picked_up", "on_the_way"].includes(order.status);
-  // Once delivered/cancelled, do not return rider identity, vehicle or coordinates.
-  // The client cannot rediscover the private delivery relationship from this endpoint.
-  const rider = active && order.riderId ? await Rider.findById(order.riderId).select("name vehicle location lastLocationAt photoUrl").lean().exec() as any : null;
+  const { identity, rider } = await customerAssignedRider(order);
+  const active = customerDeliveryIsActive(order) && Boolean(rider);
+  res.setHeader("Cache-Control", "private, no-store");
   const coordinates = rider?.location?.coordinates;
   const updatedAt = rider?.lastLocationAt ? new Date(rider.lastLocationAt).getTime() : 0;
   const fresh = active && Array.isArray(coordinates) && coordinates.length >= 2 && updatedAt >= Date.now() - 120_000;
-  return res.json({ publicCode: order.publicCode, status: order.status, assignmentState: order.assignmentState, paymentMethod: order.paymentMethod, paymentState: order.paymentState, cashDueAtDelivery: order.paymentMethod === "cash" && order.paymentState !== "paid", tipCents: Number(order.tipCents || 0), tipGivenAt: order.tipGivenAt || null, riderId: rider?._id ? String(rider._id) : null, riderName: rider?.name || null, riderPhotoUrl: rider?.photoUrl || null, vehicle: rider?.vehicle || null, chatAvailable: active, locationAvailable: fresh, latitude: fresh ? Number(coordinates[1]) : null, longitude: fresh ? Number(coordinates[0]) : null, updatedAt: fresh ? updatedAt : null });
+  return res.json({ publicCode: order.publicCode, status: order.status, assignmentState: order.assignmentState, paymentMethod: order.paymentMethod, paymentState: order.paymentState, cashDueAtDelivery: order.paymentMethod === "cash" && order.paymentState !== "paid", tipCents: Number(order.tipCents || 0), tipGivenAt: order.tipGivenAt || null, ...identity, chatAvailable: active, locationAvailable: fresh, latitude: fresh ? Number(coordinates[1]) : null, longitude: fresh ? Number(coordinates[0]) : null, updatedAt: fresh ? updatedAt : null });
 });
 app.post("/api/v1/internal/customer-orders/:publicCode/messages", async (req, res) => {
   if (!requireCustomerSyncSecret(req, res)) return;
@@ -6350,7 +6365,7 @@ app.get("/api/v1/riders/:id/profile", requireRole("admin", "rider", "fleet"), as
   if (!riderId) return res.status(400).json({ error: "INVALID_RIDER_ID" });
   if (req.auth?.role === "rider" && !(await riderAccessForRequest(riderId, req))) return res.status(403).json({ error: "RIDER_ACCESS_DENIED" });
   if (req.auth?.role === "fleet" && !(await fleetCanAccessRider(req, riderId))) return res.status(403).json({ error: "FLEET_RIDER_ACCESS_DENIED" });
-  const rider = await Rider.findOne({ _id: riderId, ...tenantScope(req) }).select("_id riderCode name email phone city availability vehicle status lifecycleStatus fleetId zoneSlug lastLocationAt").lean().exec() as any;
+  const rider = await Rider.findOne({ _id: riderId, ...tenantScope(req) }).select("_id riderCode name firstName lastName email phone city availability vehicle status lifecycleStatus fleetId zoneSlug lastLocationAt").lean().exec() as any;
   if (!rider) return res.status(404).json({ error: "RIDER_NOT_FOUND" });
   return res.json({ profile: { ...rider, id: String(rider._id), riderCode: rider.riderCode || publicRiderCode(rider._id) } });
 });
@@ -6366,13 +6381,25 @@ app.patch("/api/v1/riders/:id/profile", requireRole("rider"), async (req, res) =
   await recordGovernanceEvent({ actor: { employeeId, role: "rider", tenantId: (req.auth as any)?.tenantId }, action: "rider_basic_profile_updated", targetType: "rider", targetId: riderId, before: null, after: { fields: Object.keys(parsed.data) }, reason: "Cambio básico permitido al rider; sin acceso a pagos, asignaciones críticas ni configuración de PIKI." });
   return res.json({ updated: true, profile: { ...updated, id: String(updated._id), riderCode: updated.riderCode || publicRiderCode(updated._id) } });
 });
+app.patch("/api/v1/admin/riders/:id/basic-profile", requireOwner(), async (req, res) => {
+  const riderId = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
+  if (!riderId) return res.status(400).json({ error: "INVALID_RIDER_ID" });
+  const parsed = riderAdminProfileUpdateSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "INVALID_RIDER_BASIC_PROFILE", details: parsed.error.flatten() });
+  const { fleetId, ...fields } = parsed.data;
+  const rider = await Rider.findOneAndUpdate({ _id: riderId, ...tenantScope(req) }, { $set: { ...fields, ...(fleetId !== undefined ? { fleetId: fleetId ? objectId(fleetId) : null } : {}) } }, { new: true, runValidators: true })
+    .select("_id riderCode name firstName lastName email phone city availability vehicle status lifecycleStatus fleetId zoneSlug").lean().exec() as any;
+  if (!rider) return res.status(404).json({ error: "RIDER_NOT_FOUND" });
+  await recordGovernanceEvent({ actor: { employeeId: req.auth?.employeeId, role: "admin", tenantId: req.auth?.tenantId }, action: "rider_admin_profile_updated", targetType: "rider", targetId: riderId, before: null, after: { fields: Object.keys(parsed.data) }, reason: "Superadmin actualizó el perfil operativo y los campos estructurados del nombre público del Rider; sin modificar permisos ni documentos." });
+  return res.json({ updated: true, profile: { ...rider, id: String(rider._id) } });
+});
 app.patch("/api/v1/admin/riders/:id/profile", requireOwner(), async (req, res) => {
   const riderId = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
   if (!riderId) return res.status(400).json({ error: "INVALID_RIDER_ID" });
-  const parsed = riderBasicProfileSchema.extend({ name: z.string().trim().min(2).max(160).optional(), vehicle: z.enum(["bike", "electric_bike", "electric_scooter", "motorcycle", "scooter", "car"]).optional(), fleetId: z.string().regex(/^[a-f\d]{24}$/).nullable().optional(), zoneSlug: z.string().trim().max(80).nullable().optional() }).safeParse(req.body);
+  const parsed = riderAdminProfileUpdateSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_RIDER_ADMIN_PROFILE", details: parsed.error.flatten() });
   const { fleetId, ...fields } = parsed.data;
-  const updated = await Rider.findOneAndUpdate({ _id: riderId, ...tenantScope(req) }, { $set: { ...fields, ...(fleetId !== undefined ? { fleetId: fleetId ? objectId(fleetId) : null } : {}) } }, { new: true }).select("_id riderCode name email phone city availability vehicle status lifecycleStatus fleetId zoneSlug").lean().exec() as any;
+  const updated = await Rider.findOneAndUpdate({ _id: riderId, ...tenantScope(req) }, { $set: { ...fields, ...(fleetId !== undefined ? { fleetId: fleetId ? objectId(fleetId) : null } : {}) } }, { new: true, runValidators: true }).select("_id riderCode name firstName lastName email phone city availability vehicle status lifecycleStatus fleetId zoneSlug").lean().exec() as any;
   if (!updated) return res.status(404).json({ error: "RIDER_NOT_FOUND" });
   const ownerId = objectId(String(req.auth!.employeeId!));
   if (ownerId) await AccessAuthorization.create({ employeeId: riderId, action: "settings_updated", previousStatus: "approved", nextStatus: "approved", previousRole: "rider", nextRole: "rider", accessLevel: "superadmin", actorEmployeeId: ownerId, reason: "Superadmin actualizó el perfil operativo del Rider." });
@@ -6482,7 +6509,8 @@ app.get("/api/v1/riders/session", requireRole("rider"), async (req, res) => {
   const update: Record<string, unknown> = { status: effectiveStatus };
   if (!hasActiveOrder && effectiveStatus === "offline") update.activeOrderId = null;
   if (effectiveStatus !== rider.status || update.activeOrderId === null) await Rider.updateOne({ _id: rider._id, ...tenant, status: rider.status, lifecycleStatus: rider.lifecycleStatus, activeOrderId: rider.activeOrderId ?? null, updatedAt: rider.updatedAt ?? null }, { $set: update }).exec();
-  return res.json({ rider: { id: rider._id, riderCode: rider.riderCode, name: rider.name, email: rider.email, status: effectiveStatus, fleetId: rider.fleetId }, now, slot: slot || null });
+  res.setHeader?.("Cache-Control", "private, no-store");
+  return res.json({ employee: { id: String(employee._id), name: employee.name, fullName: employee.name, jobRole: employee.jobRole, role: req.auth?.role, photoUrl: employee.photoUrl ?? null }, rider: { id: rider._id, riderCode: rider.riderCode, name: rider.name, email: rider.email, status: effectiveStatus, fleetId: rider.fleetId }, now, slot: slot || null });
 });
 
 app.get("/api/v1/riders/:id/shift", requireRole("admin", "rider", "fleet"), async (req, res) => {

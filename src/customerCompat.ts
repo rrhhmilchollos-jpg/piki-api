@@ -18,6 +18,8 @@ import { checkoutOrigin } from "./checkoutOrigin.js";
 import { Badge, CustomerBadge, PikiPassSubscription, RecommendationProfile, UserStreak, calculatePriceBreakdown } from "./customerEngagement.js";
 import { CustomerQuoteConflict, assertCustomerQuoteExpectation, customerOrderQuote, customerQuotedItems, customerQuoteExpectationSchema, debitQuotedCustomerCredits } from "./customerOrderQuote.js";
 import { SourceOrderFeeError } from "./sourceOrderFee.js";
+import { customerDeliveryIsActive, profilePhotoSchema, publicProfilePhoto } from "./profileIdentityPolicy.js";
+import { customerAssignedRider } from "./customerRiderTracking.js";
 
 const COOKIE = "piki_customer_session";
 let dispatchCustomerOrder: ((orderId: string) => Promise<unknown>) | null = null;
@@ -43,7 +45,7 @@ const ensureReferralCode = async (user: any) => {
   await CustomerAccount.updateOne({ _id: user._id, $or: [{ referralCode: { $exists: false } }, { referralCode: null }, { referralCode: "" }] }, { $set: { referralCode: code } }).exec();
   return code;
 };
-const publicUser = (user: any) => user ? ({ id: String(user._id), name: user.name, email: user.email, referralCode: user.referralCode || `PIKI-${String(user._id).slice(-8).toUpperCase()}`, role: "user", createdAt: user.createdAt, lastSignedIn: user.lastSignedIn }) : null;
+const publicUser = (user: any) => user ? ({ id: String(user._id), name: user.name, email: user.email, photoUrl: publicProfilePhoto(user.photoUrl), referralCode: user.referralCode || `PIKI-${String(user._id).slice(-8).toUpperCase()}`, role: "user", createdAt: user.createdAt, lastSignedIn: user.lastSignedIn }) : null;
 
 export function parseCustomerTrpcInput(value: unknown): any {
   if (!value || typeof value !== "object") return {};
@@ -256,6 +258,8 @@ async function handleCustomerTrpcSingle(req: Request, res: Response) {
       const user = await currentCustomer(req) as any;
       if (!user) return fail(res, "Inicia sesión para consultar tu perfil.", "AUTH_REQUIRED");
       if (procedure === "customer.profile.update") {
+        const photo = input?.photoUrl === undefined ? null : profilePhotoSchema.safeParse(input.photoUrl);
+        if (photo && !photo.success) return fail(res, "La foto de perfil debe ser JPEG, PNG o WebP válida y no superar 220000 caracteres.", "BAD_REQUEST");
         const name = input?.name === undefined ? String(user.name || "").trim() : String(input.name || "").trim();
         const phone = input?.phone === undefined ? String(user.phone || "").trim() : String(input.phone || "").trim();
         const locality = input?.locality === undefined ? String(user.locality || "").trim() : String(input.locality || "").trim();
@@ -263,12 +267,13 @@ async function handleCustomerTrpcSingle(req: Request, res: Response) {
         const address = addressInput === undefined ? String(user.deliveryAddress || "").trim() : String(addressInput || "").trim();
         if (name.length < 2 || name.length > 160 || phone.length > 40 || locality.length > 120 || address.length > 280) return fail(res, "Revisa los datos del perfil e inténtalo de nuevo.", "BAD_REQUEST");
         const update: Record<string, unknown> = { name, phone, locality };
+        if (photo?.success) update.photoUrl = photo.data;
         if (addressInput !== undefined) { update.deliveryAddress = address || null; update.deliveryAddressUpdatedAt = new Date(); }
-        const updated = await CustomerAccount.findOneAndUpdate({ _id: user._id }, { $set: update }, { new: true }).lean().exec() as any;
+        const updated = await CustomerAccount.findOneAndUpdate({ _id: user._id }, { $set: update }, { new: true, runValidators: true }).lean().exec() as any;
         if (!updated) return fail(res, "No se pudo actualizar el perfil.", "NOT_FOUND");
-        return reply(res, { saved: true, profile: { id: String(updated._id), name: updated.name, email: updated.email, phone: updated.phone || "", locality: updated.locality || "", address: updated.deliveryAddress || "", updatedAt: updated.updatedAt || null } });
+        return reply(res, { saved: true, profile: { id: String(updated._id), name: updated.name, email: updated.email, photoUrl: publicProfilePhoto(updated.photoUrl), phone: updated.phone || "", locality: updated.locality || "", address: updated.deliveryAddress || "", updatedAt: updated.updatedAt || null } });
       }
-      return reply(res, { id: String(user._id), name: user.name, email: user.email, phone: user.phone || "", locality: user.locality || "", address: user.deliveryAddress || "", updatedAt: user.updatedAt || null });
+      return reply(res, { id: String(user._id), name: user.name, email: user.email, photoUrl: publicProfilePhoto(user.photoUrl), phone: user.phone || "", locality: user.locality || "", address: user.deliveryAddress || "", updatedAt: user.updatedAt || null });
     }
     if (procedure === "customer.orders.list") {
       const user = await currentCustomer(req) as any;
@@ -359,22 +364,25 @@ async function handleCustomerTrpcSingle(req: Request, res: Response) {
       const user = await currentCustomer(req) as any;
       if (!user) return fail(res, "Inicia sesión con la cuenta que realizó el pedido.", "AUTH_REQUIRED");
       const publicCode = String(input?.id || "").trim();
-      const order = await Order.findOne({ publicCode, customerId: String(user._id) }).select("_id publicCode status restaurantId riderId assignmentState routeDurationMinutes deliveryAddress paymentState").lean().exec() as any;
+      const order = await Order.findOne({ publicCode, customerId: String(user._id) }).select("_id publicCode tenantId status restaurantId riderId assignmentState routeDurationMinutes deliveryAddress paymentState").lean().exec() as any;
       if (!order) return fail(res, "Pedido no encontrado", "NOT_FOUND");
       const restaurant = await Restaurant.findById(order.restaurantId).select("name").lean().exec() as any;
+      res.setHeader("Cache-Control", "private, no-store");
+      const { identity, rider } = await customerAssignedRider(order);
+      const publicOrder = { status: customerDisplayStatus(order.status), operationalStatus: order.status, assignmentState: order.assignmentState, ...identity };
       if (procedure === "order.get") {
-        return reply(res, { id: order.publicCode, restaurant: restaurant?.name || "Pedido PIKI", status: customerDisplayStatus(order.status), operationalStatus: order.status, eta: order.routeDurationMinutes ? `${order.routeDurationMinutes} min` : "actualizando…" });
+        return reply(res, { id: order.publicCode, restaurant: restaurant?.name || "Pedido PIKI", ...publicOrder, eta: order.routeDurationMinutes ? `${order.routeDurationMinutes} min` : "actualizando…" });
       }
-      // The rider location is private until Partner has prepared the order and Rider has confirmed pickup.
-      if (!order.riderId || order.assignmentState !== "assigned" || !["picked_up", "on_the_way"].includes(order.status)) {
-        return reply(res, { available: false, status: customerDisplayStatus(order.status), operationalStatus: order.status, reason: "not_in_delivery" });
+      // Assignment identity precedes pickup, but GPS and chat keep their delivery-only gate.
+      const active = customerDeliveryIsActive(order) && Boolean(rider);
+      if (!active) {
+        return reply(res, { available: false, ...publicOrder, chatAvailable: false, reason: "not_in_delivery" });
       }
-      const rider = await (await import("./models.js")).Rider.findById(order.riderId).select("name vehicle photoUrl location lastLocationAt").lean().exec() as any;
       const coordinates = rider?.location?.coordinates;
       const updatedAt = rider?.lastLocationAt ? new Date(rider.lastLocationAt).getTime() : 0;
       const fresh = Array.isArray(coordinates) && coordinates.length >= 2 && updatedAt >= Date.now() - 90_000;
-      if (!fresh) return reply(res, { available: false, status: customerDisplayStatus(order.status), operationalStatus: order.status, riderName: rider.name || "Tu rider", riderPhotoUrl: rider.photoUrl || null, vehicle: rider.vehicle || "bike", reason: "location_unavailable" });
-      return reply(res, { available: true, status: customerDisplayStatus(order.status), operationalStatus: order.status, riderName: rider.name || "Tu rider", riderPhotoUrl: rider.photoUrl || null, vehicle: rider.vehicle || "bike", phase: "going_to_customer", etaMinutes: order.routeDurationMinutes || null, latitude: Number(coordinates[1]), longitude: Number(coordinates[0]), accuracyMeters: null, updatedAt });
+      if (!fresh) return reply(res, { available: false, ...publicOrder, chatAvailable: true, reason: "location_unavailable" });
+      return reply(res, { available: true, ...publicOrder, chatAvailable: true, phase: "going_to_customer", etaMinutes: order.routeDurationMinutes || null, latitude: Number(coordinates[1]), longitude: Number(coordinates[0]), accuracyMeters: null, updatedAt });
     }
     if (procedure === "order.deliveryCredentials") {
       const user = await currentCustomer(req) as any;
