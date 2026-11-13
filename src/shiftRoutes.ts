@@ -11,12 +11,13 @@ import type { Express, Request, Response } from "express";
 import mongoose from "mongoose";
 import { z } from "zod";
 import { EmployeeAccount, Rider } from "./models.js";
-import { requireRole } from "./auth.js";
+import { requireOwner, requireRole } from "./auth.js";
 import { buildFleetEntityScope, buildTenantScope } from "./tenantScope.js";
 import {
   buildShiftSnapshot,
   cutRiderShift,
   deleteShiftPlan,
+  normalizeShiftSweepRunErrors,
   runShiftSweep,
   saveShiftPlan,
   ShiftSweepRun,
@@ -76,6 +77,20 @@ async function riderScope(request: Request, riderId: mongoose.Types.ObjectId) {
   return { _id: riderId, ...tenant };
 }
 
+/** Lista de Riders de la flota autenticada. Contexto ausente o inválido => acceso denegado. */
+async function fleetShiftScope(request: Request) {
+  const tenantId = request.auth?.tenantId;
+  const employee = await employeeScope(request);
+  if (!mongoose.isValidObjectId(tenantId) || !mongoose.isValidObjectId(employee?.fleetId)) return null;
+  const query = buildFleetEntityScope({ tenantId, role: "fleet", fleetId: employee?.fleetId });
+  const riders = (await Rider.find(query).select("_id").lean().exec()) as any[];
+  return {
+    tenantId: String(tenantId),
+    fleetId: String(employee.fleetId),
+    riderIds: riders.map((rider) => String(rider._id)).filter((id) => mongoose.isValidObjectId(id)),
+  };
+}
+
 export function mountShiftRoutes(app: Express): void {
   /** Contrato y estado de jornada del rider. */
   app.get("/api/v1/riders/:id/shift-plan", requireRole("admin", "fleet", "rider"), async (request: Request, response: Response) => {
@@ -124,11 +139,20 @@ export function mountShiftRoutes(app: Express): void {
   app.post("/api/v1/riders/:id/shift-plan/cut", requireRole("admin", "fleet"), async (request: Request, response: Response) => {
     const riderId = riderIdParam(request);
     if (!riderId) return response.status(400).json({ error: "INVALID_RIDER_ID" });
-    const rider = await Rider.findOne(await riderScope(request, riderId)).select("_id").lean().exec() as any;
+    const rider = await Rider.findOne(await riderScope(request, riderId)).select("_id tenantId fleetId").lean().exec() as any;
     if (!rider) return response.status(403).json({ error: "RIDER_ACCESS_DENIED" });
     const reason = String((request.body as any)?.reason || "manual").slice(0, 120);
-    const cut = await cutRiderShift({ riderId: String(rider._id), reason });
-    const swept = await runShiftSweep({ apply: true, source: "manual", actorId: request.auth?.employeeId ?? null });
+    const tenantId = rider.tenantId ? String(rider.tenantId) : (request.auth?.tenantId && mongoose.isValidObjectId(request.auth.tenantId) ? String(request.auth.tenantId) : undefined);
+    const fleetId = rider.fleetId ? String(rider.fleetId) : undefined;
+    const cut = await cutRiderShift({ riderId: String(rider._id), reason, tenantId, fleetId });
+    const swept = await runShiftSweep({
+      apply: true,
+      source: "manual",
+      actorId: request.auth?.employeeId ?? null,
+      tenantId,
+      fleetId,
+      riderIds: [String(rider._id)],
+    });
     return response.json({
       message: cut
         ? `Jornada cortada. Sesión revocada en ${cut.sessionsRevoked} cuenta(s) y ${cut.slotsClosed} turno(s) cerrados.`
@@ -139,16 +163,34 @@ export function mountShiftRoutes(app: Express): void {
   });
 
   /** Barrido de jornada. Simula salvo que se pida `?apply=1`. */
-  app.post("/api/v1/admin/shift-sweep", requireRole("admin", "fleet"), async (request: Request, response: Response) => {
+  app.post("/api/v1/admin/shift-sweep", requireOwner(), async (request: Request, response: Response) => {
     const apply = String(request.query.apply || "") === "1";
     if (!mongoose.connection.db) return response.status(503).json({ error: "DB_NOT_READY" });
     const report = await runShiftSweep({ apply, source: "manual", actorId: request.auth?.employeeId ?? null });
     return response.json(report);
   });
 
-  /** Últimos barridos ejecutados (manuales y automáticos). */
-  app.get("/api/v1/admin/shift-sweep/runs", requireRole("admin", "fleet"), async (request: Request, response: Response) => {
+  /** La ejecución manual de Fleet queda limitada a sus riders actuales. */
+  app.post("/api/v1/fleet/shift-sweep", requireRole("fleet"), async (request: Request, response: Response) => {
+    if (!mongoose.connection.db) return response.status(503).json({ error: "DB_NOT_READY" });
+    const scope = await fleetShiftScope(request);
+    if (!scope) return response.status(403).json({ error: "FLEET_SCOPE_REQUIRED" });
+    const apply = String(request.query.apply || "") === "1";
+    const report = await runShiftSweep({
+      apply,
+      source: "manual",
+      actorId: request.auth?.employeeId ?? null,
+      tenantId: scope.tenantId,
+      fleetId: scope.fleetId,
+      riderIds: scope.riderIds,
+    });
+    return response.json(report);
+  });
+
+  /** Historial global disponible únicamente para la cuenta superadmin. */
+  app.get("/api/v1/admin/shift-sweep/runs", requireOwner(), async (request: Request, response: Response) => {
     const limit = Math.max(1, Math.min(50, Number(request.query.limit || 10)));
+    if (!mongoose.connection.db) return response.status(503).json({ error: "DB_NOT_READY" });
     const runs = (await ShiftSweepRun.find({}).sort({ createdAt: -1 }).limit(limit).lean().exec()) as any[];
     return response.json({
       worker: shiftSweepWorkerStatus(),
@@ -159,7 +201,31 @@ export function mountShiftRoutes(app: Express): void {
         checked: run.checked,
         loggedOut: run.loggedOut,
         released: run.released,
-        errors: run.errors || [],
+        errors: normalizeShiftSweepRunErrors(run),
+        startedAt: run.startedAt,
+        finishedAt: run.finishedAt,
+        durationMs: run.durationMs,
+      })),
+    });
+  });
+
+  /** Historial agregado limitado al tenant y flota de la sesión actual. */
+  app.get("/api/v1/fleet/shift-sweep/runs", requireRole("fleet"), async (request: Request, response: Response) => {
+    const scope = await fleetShiftScope(request);
+    if (!scope) return response.status(403).json({ error: "FLEET_SCOPE_REQUIRED" });
+    if (!mongoose.connection.db) return response.status(503).json({ error: "DB_NOT_READY" });
+    const limit = Math.max(1, Math.min(50, Number(request.query.limit || 10)));
+    const runs = (await ShiftSweepRun.find({ tenantId: scope.tenantId, fleetId: scope.fleetId }).sort({ createdAt: -1 }).limit(limit).lean().exec()) as any[];
+    return response.json({
+      worker: shiftSweepWorkerStatus(),
+      runs: runs.map((run) => ({
+        id: String(run._id),
+        source: run.source,
+        dryRun: run.dryRun,
+        checked: run.checked,
+        loggedOut: run.loggedOut,
+        released: run.released,
+        errors: normalizeShiftSweepRunErrors(run),
         startedAt: run.startedAt,
         finishedAt: run.finishedAt,
         durationMs: run.durationMs,

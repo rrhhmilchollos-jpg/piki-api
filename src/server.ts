@@ -64,6 +64,7 @@ import { assignedRestaurantIds, partnerAccessForRequest as sharedPartnerAccessFo
 import { awardRiderRecruitmentMilestones, claimRiderReferralCode, completeRiderShiftIncentiveTracking, incentiveProgramStatus, loadRiderIncentiveSnapshot, trackRiderLocationForIncentive, trackRiderShiftStart } from "./riderIncentives.js";
 import { buildApprovedRiderOperationalProfile } from "./riderApproval.js";
 import { COMING_SOON_SLUGS, CUSTOMER_CATALOG_RESTAURANT_FILTER, CUSTOMER_ORDERABLE_RESTAURANT_FILTER, GOLDEN_FOUNDER_SLUGS, customerCommissionRate, customerMenuForRestaurant, presentCustomerCatalogRestaurant, restaurantIsWithinOpeningHours } from "./customerCatalogPolicy.js";
+import { buildPartnerLocationBackfillFilter, buildPartnerLocationUpdateFilter, partnerOperationalAddress, partnerOperationalLocality, uniquePartnerGeocodePoint, validOperationalCoordinates } from "./partnerLocationBackfill.js";
 import { PARTNER_DEMO_MENU_VERSION, partnerDemoMenu } from "./partnerDemoMenu.js";
 import { KINGS_TACOS_COVER_IMAGE } from "./kingsTacosMenu.js";
 import { ALIBABA_KEBAB_COVER_IMAGE } from "./alibabaKebabMenu.js";
@@ -168,40 +169,74 @@ async function searchPhoton(query: string) {
   const payload = await response.json() as { features?: PhotonFeature[] };
   return (payload.features || []).map((feature, index) => {
     const properties = feature.properties || {}; const coordinates = feature.geometry?.coordinates; const address = photonAddress(properties);
+    const longitudeValue: unknown = coordinates?.[0];
+    const latitudeValue: unknown = coordinates?.[1];
+    const longitude = typeof longitudeValue === "number" ? longitudeValue : Number.NaN;
+    const latitude = typeof latitudeValue === "number" ? latitudeValue : Number.NaN;
     const label = [address.road, [address.postcode, address.locality].filter(Boolean).join(" ")].filter(Boolean).join(", ") || [properties.name, address.locality].filter(Boolean).join(", ");
-    return { id: `photon:${properties.osm_type || "feature"}:${properties.osm_id || index}`, label, latitude: Number(coordinates?.[1]), longitude: Number(coordinates?.[0]), type: properties.type || "address", address: properties };
+    return { id: `photon:${properties.osm_type || "feature"}:${properties.osm_id || index}`, label, latitude, longitude, type: properties.type || "address", address: properties };
   }).filter((row) => Number.isFinite(row.latitude) && Number.isFinite(row.longitude));
 }
-function validOperationalCoordinates(value: unknown): value is [number, number] {
-  return Array.isArray(value) && value.length >= 2 && Number.isFinite(Number(value[0])) && Number.isFinite(Number(value[1])) && Number(value[0]) >= -180 && Number(value[0]) <= 180 && Number(value[1]) >= -90 && Number(value[1]) <= 90;
-}
-async function geocodePartnerAddress(address: string, locality: string) {
+async function geocodePartnerAddress(address: string, locality: string, postalCode = "") {
   const original = String(address || "").trim();
+  const postal = String(postalCode || "").trim();
   const unitFree = original.replace(/,\s*(?:\d+\s*)?(?:bajo|bajos|entresuelo|principal|planta\s*\w+|piso\s*\w+|puerta\s*\w+|pta\.?\s*\w+)\s*(?=,|$)/i, "");
-  const variants = [...new Set([original, unitFree, unitFree.replace(/^(carrer|calle|rua)\b/i, "Avinguda")].filter(Boolean))];
+  const variants = [...new Set([original, unitFree].filter(Boolean))];
+  const allResults: Awaited<ReturnType<typeof searchPhoton>> = [];
+  let searchFailed = false;
   for (const variant of variants) {
     try {
-      const results = await searchPhoton(`${variant}, ${locality}`);
-      const match = results.find((row) => Number.isFinite(row.longitude) && Number.isFinite(row.latitude));
-      if (match) return [match.longitude, match.latitude] as [number, number];
+      const postalQualifier = postal && !variant.includes(postal) ? postal : "";
+      const query = [variant, postalQualifier, locality].filter(Boolean).join(", ");
+      allResults.push(...await searchPhoton(query));
     } catch (error) {
+      searchFailed = true;
       console.warn("Partner address geocoding attempt failed", error instanceof Error ? error.message : String(error));
     }
   }
-  return null;
+  if (searchFailed) return null;
+  return uniquePartnerGeocodePoint({ address: original, locality, postalCode: postal }, allResults);
 }
 async function ensurePartnerOperationalLocation(restaurant: any, force = false) {
   if (!restaurant?._id || (!force && validOperationalCoordinates(restaurant.location?.coordinates))) return Boolean(restaurant?.location);
-  const point = await geocodePartnerAddress(String(restaurant.address || restaurant.partnerProfile?.operatingAddress || ""), String(restaurant.locality || restaurant.partnerProfile?.city || ""));
+  const address = partnerOperationalAddress(restaurant);
+  const locality = partnerOperationalLocality(restaurant);
+  if (!address || !locality) return false;
+  const point = await geocodePartnerAddress(address, locality, String(restaurant.partnerProfile?.postalCode || ""));
   if (!point) return false;
-  await Restaurant.updateOne({ _id: restaurant._id }, { $set: { location: { type: "Point", coordinates: point } } }).exec();
-  return true;
+  const result = await Restaurant.updateOne(buildPartnerLocationUpdateFilter(restaurant), { $set: { location: { type: "Point", coordinates: point } } }).exec();
+  return result.matchedCount === 1;
 }
 async function backfillPartnerOperationalLocations() {
-  const missing = await Restaurant.find({ $or: [{ location: { $exists: false } }, { "location.coordinates": { $exists: false } }] }).select("_id address locality partnerProfile.operatingAddress partnerProfile.city location").limit(200).lean().exec();
+  const candidates = Restaurant.find(buildPartnerLocationBackfillFilter()).select("_id slug address locality partnerProfile.operatingAddress partnerProfile.city partnerProfile.postalCode location").sort({ _id: 1 }).lean().cursor();
+  let examined = 0;
+  let scanned = 0;
   let repaired = 0;
-  for (const restaurant of missing) if (await ensurePartnerOperationalLocation(restaurant)) repaired += 1;
-  if (missing.length) console.log(JSON.stringify({ event: "partner_operational_location_backfill", scanned: missing.length, repaired, remaining: missing.length - repaired }));
+  let remaining = 0;
+  const unresolved: Array<{ restaurantId: string; slug: string; reason: string }> = [];
+  const recordUnresolved = (entry: { restaurantId: string; slug: string; reason: string }) => {
+    remaining += 1;
+    if (unresolved.length < 50) unresolved.push(entry);
+  };
+  try {
+    for await (const restaurant of candidates) {
+      examined += 1;
+      if (validOperationalCoordinates(restaurant.location?.coordinates)) continue;
+      scanned += 1;
+      const address = partnerOperationalAddress(restaurant);
+      const locality = partnerOperationalLocality(restaurant);
+      const reason = !address ? "address_missing" : !locality ? "locality_missing" : "geocoder_unresolved_or_source_changed";
+      if (!address || !locality) {
+        recordUnresolved({ restaurantId: String(restaurant._id), slug: String(restaurant.slug || ""), reason });
+        continue;
+      }
+      if (await ensurePartnerOperationalLocation(restaurant)) repaired += 1;
+      else recordUnresolved({ restaurantId: String(restaurant._id), slug: String(restaurant.slug || ""), reason });
+    }
+  } finally {
+    await candidates.close();
+  }
+  if (scanned) console.log(JSON.stringify({ event: "partner_operational_location_backfill", scope: "published_orderable_partners", examined, scanned, repaired, remaining, unresolved, unresolvedTruncated: remaining > unresolved.length }));
 }
 async function reversePhoton(latitude: number, longitude: number) {
   const url = new URL("https://photon.komoot.io/reverse"); url.searchParams.set("lat", String(latitude)); url.searchParams.set("lon", String(longitude));
@@ -2800,9 +2835,25 @@ app.patch("/api/v1/admin/restaurants/:id/settings", requireOwner(), async (req, 
   if (!parsed.success) return res.status(400).json({ error: "INVALID_PARTNER_SETTINGS", details: parsed.error.flatten() });
   const { commissionRateBps, ...settings } = parsed.data;
   const update = { ...settings, ...(commissionRateBps === undefined ? {} : { "partnerProfile.commissionRateBps": commissionRateBps }) };
-  const restaurant = await Restaurant.findOneAndUpdate({ _id: id, ...tenantScope(req) }, { $set: update }, { new: true }).select("_id slug name cuisine category phone email address locality deliveryFeeCents cashPaymentsEnabled isActive availabilityStatus promoted image location onboardingStatus partnerProfile.commissionRateBps").lean().exec() as any;
-  if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
-  if (settings.address !== undefined || settings.locality !== undefined) await ensurePartnerOperationalLocation(restaurant, true);
+  const current = await Restaurant.findOne({ _id: id, ...tenantScope(req) }).select("_id address locality location partnerProfile.operatingAddress partnerProfile.city partnerProfile.postalCode").lean().exec() as any;
+  if (!current) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
+  const addressChanged = settings.address !== undefined && settings.address.trim() !== String(current.address ?? "").trim();
+  const localityChanged = settings.locality !== undefined && settings.locality.trim() !== String(current.locality ?? "").trim();
+  const locationFieldsSubmitted = settings.address !== undefined || settings.locality !== undefined;
+  const shouldResolveLocation = addressChanged || localityChanged || (locationFieldsSubmitted && !validOperationalCoordinates(current.location?.coordinates));
+  let locationUpdate: { location?: { type: "Point"; coordinates: [number, number] } } = {};
+  if (shouldResolveLocation) {
+    const candidate = { ...current, address: settings.address ?? current.address, locality: settings.locality ?? current.locality };
+    const address = partnerOperationalAddress(candidate);
+    const locality = partnerOperationalLocality(candidate);
+    if (!address || !locality) return res.status(422).json({ error: "OPERATIONAL_LOCATION_UNRESOLVED", message: "No se guardó el cambio: completa la dirección y la localidad operativas del comercio." });
+    const point = await geocodePartnerAddress(address, locality, String(current.partnerProfile?.postalCode || ""));
+    if (!point) return res.status(422).json({ error: "OPERATIONAL_LOCATION_UNRESOLVED", message: "No se guardó el cambio: PIKI no pudo verificar una ubicación exacta. Comprueba la calle, el número, la localidad y el código postal del expediente." });
+    locationUpdate = { location: { type: "Point", coordinates: point } };
+  }
+  const sourceGuard = locationFieldsSubmitted ? buildPartnerLocationUpdateFilter(current) : {};
+  const restaurant = await Restaurant.findOneAndUpdate({ ...sourceGuard, _id: id, ...tenantScope(req) }, { $set: { ...update, ...locationUpdate } }, { new: true }).select("_id slug name cuisine category phone email address locality deliveryFeeCents cashPaymentsEnabled isActive availabilityStatus promoted image location onboardingStatus partnerProfile.commissionRateBps").lean().exec() as any;
+  if (!restaurant) return res.status(locationFieldsSubmitted ? 409 : 404).json({ error: locationFieldsSubmitted ? "PARTNER_CHANGED_RETRY" : "RESTAURANT_NOT_FOUND", message: locationFieldsSubmitted ? "El comercio cambió mientras se validaba la ubicación. Recarga sus datos e inténtalo de nuevo." : undefined });
   invalidateCatalogCache();
   void publishCatalogUpdate(restaurant._id, "owner.restaurant.settings.updated");
   await AccessAuthorization.create({ employeeId: objectId(String(req.auth!.employeeId!)), action: "settings_updated", previousStatus: "approved", nextStatus: "approved", previousRole: "partner", nextRole: "partner", accessLevel: "superadmin", actorEmployeeId: objectId(String(req.auth!.employeeId!)), reason: `Configuración protegida actualizada para ${restaurant.name}; comisión definida por PIKI superadmin.` });
@@ -8001,7 +8052,6 @@ async function start() {
     await purgeExpiredQaPartner();
     setInterval(() => { void purgeExpiredQaPartner().catch((error) => console.warn("QA partner purge failed", error instanceof Error ? error.message : String(error))); }, 60_000).unref();
     await ensureMrRoosterOperational();
-    await backfillPartnerOperationalLocations();
     await purgeTestDataIfEnabled();
     databaseReady = true;
     if (process.env.RUN_TENANT_MIGRATION === "true") {
@@ -8013,6 +8063,9 @@ async function start() {
   await EmployeeSession.init();
   await EmployeePasswordReset.init();
   const server = app.listen(port, "0.0.0.0", () => console.log(`PIKI API listening on port ${port}`));
+  if (uri) server.once("listening", () => {
+    void backfillPartnerOperationalLocations().catch((error) => console.warn(JSON.stringify({ event: "partner_operational_location_backfill_failed", message: error instanceof Error ? error.message : String(error) })));
+  });
   // Fallback operativo: si Render no tiene levantado el worker dedicado, el
   // API consume la outbox con leases atómicos. Si el worker existe, ambos
   // procesos compiten de forma segura por cada evento y nunca duplican ofertas.
