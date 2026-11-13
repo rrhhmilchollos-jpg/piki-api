@@ -59,13 +59,13 @@ function parseEnvironmentPolicy(): VersionPolicyMap {
 }
 
 let policies: VersionPolicyMap = parseEnvironmentPolicy();
-const releaseUrls: Record<PikiSurface, string> = {
+export const RELEASE_METADATA_URLS: Readonly<Record<PikiSurface, string>> = Object.freeze({
   customer: "https://pikidelivery.com/release.json",
   partner: "https://partners.pikidelivery.com/release.json",
   fleet: "https://fleet.pikidelivery.com/release.json",
-  admin: "https://piki-admin.onrender.com/release.json",
+  admin: "https://admin.pikidelivery.com/release.json",
   rider: "https://rider.pikidelivery.com/release.json",
-};
+});
 const lastSync = new Map<PikiSurface, number>();
 const SYNC_INTERVAL_MS = 30_000;
 
@@ -76,7 +76,7 @@ export async function syncVersionPolicy(surface: PikiSurface): Promise<VersionPo
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 5_000);
   try {
-    const response = await fetch(releaseUrls[surface], { cache: "no-store", signal: controller.signal });
+    const response = await fetch(RELEASE_METADATA_URLS[surface], { cache: "no-store", signal: controller.signal });
     if (!response.ok) throw new Error(`release metadata HTTP ${response.status}`);
     const body = await response.json() as Record<string, unknown>;
     const { surface: releaseSurface, ...releasePolicy } = body;
