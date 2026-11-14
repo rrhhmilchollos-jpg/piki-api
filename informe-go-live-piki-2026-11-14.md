@@ -7,7 +7,7 @@
 
 ## Resumen ejecutivo
 
-El ecosistema tiene una base técnica amplia y el backend está respondiendo en producción. La API pública devuelve HTTP 200 en `/health`, pero **los últimos cambios todavía no están desplegados**: la producción sigue sirviendo el commit `322e7a651f30e7c5b856c2f1cc0c0973a61d1f87`, que es el `HEAD` anterior del clon local. Los cambios de avatar administrativo y la unificación de comisiones están modificados localmente, pero todavía no se han publicado en la plataforma.
+El ecosistema tiene una base técnica amplia y el backend está respondiendo en producción. La API pública devuelve HTTP 200 en `/health` y, tras el push, Render ya sirve el commit `434119f3800b618d5ef5755f64f508fd2e6fe688`. Los cambios de avatar administrativo y la unificación de comisiones ya están publicados en el API.
 
 La API no está desplegada en Vercel. La respuesta pública de `api.pikidelivery.com` incluye `x-render-origin-server: Render`, y el `render.yaml` del repositorio declara dos servicios Render: `piki-api` y `piki-dispatch-worker`. Vercel sí sirve los frontends y dominios como `pikidelivery.com`, `admin.pikidelivery.com`, `partners.pikidelivery.com` y `rider.pikidelivery.com`.
 
@@ -21,7 +21,7 @@ El dispatch tiene una cobertura automatizada sólida: **166 pruebas de dispatch 
 |---|---|
 | `GET https://api.pikidelivery.com/health` | HTTP 200 |
 | Estado declarado | `ok` |
-| Commit servido | `322e7a651f30e7c5b856c2f1cc0c0973a61d1f87` |
+| Commit servido | `434119f3800b618d5ef5755f64f508fd2e6fe688` |
 | Proveedor observado | Render detrás de Cloudflare |
 | `GET /api/v1/health` | HTTP 404; el endpoint canónico es `/health` |
 
@@ -65,12 +65,11 @@ También existe un QR corregido en `artifacts/piki-qr-pikidelivery-com.png`.
 
 ### Conclusión
 
-**No está actualizado en producción.** La producción sirve el commit anterior y no contiene todavía:
+**El API ya está actualizado en producción.** Render recogió el push y `/health` confirma el commit nuevo. Quedan por verificar operativamente:
 
-- `PATCH /api/v1/admin/employees/:id/profile`.
-- La unificación del cálculo de comisiones con `marketplaceAccounting.ts`.
-- El valor por defecto de comisión del 18% en catálogo e importador.
-- La corrección de precio con comisión incluida.
+- Logs internos y estado del worker `piki-dispatch-worker`.
+- E2E QA real, pendiente del token `PIKI_E2E_ADMIN_TOKEN`.
+- Secretos live y configuración de payout, pendiente de acceso Render y decisiones de negocio.
 
 Antes de GO-LIVE hay que hacer commit, revisión y push al repositorio conectado al servicio Render, esperar al auto-deploy y volver a comprobar `/health` y el commit servido.
 
@@ -170,9 +169,9 @@ Debe realizarse preferentemente contra un entorno staging o con un token especí
 
 - [ ] Crear commit de los cambios locales.
 - [x] Revisar el diff final y ejecutar las pruebas locales de dispatch, marketplace y catálogo: 195/195 correctas.
-- [ ] Push al repositorio conectado a Render.
-- [ ] Esperar auto-deploy de `piki-api`.
-- [ ] Verificar que `/health` devuelve el nuevo commit.
+- [x] Push al repositorio conectado a Render.
+- [x] Esperar auto-deploy de `piki-api`.
+- [x] Verificar que `/health` devuelve el nuevo commit `434119f3800b618d5ef5755f64f508fd2e6fe688`.
 - [ ] Verificar el deploy del servicio `piki-dispatch-worker`.
 - [ ] Revisar logs del worker durante una ventana de tráfico controlado.
 - [ ] Ejecutar `scripts/e2e-order-flow.mjs --apply` en staging o QA.
