@@ -46,7 +46,7 @@ test("el menú guardado del partner de prueba llega al catálogo público con el
   assert.deepEqual(publicMenu.map(({ id, name, price }) => ({ id, name, price })), [{
     id: "sync-fixture-bowl-001",
     name: "Bowl de prueba de sincronización",
-    price: 10.2,
+    price: 10.03, // 8,50 EUR más la comisión predeterminada del 18 %, redondeada al céntimo.
   }]);
 });
 

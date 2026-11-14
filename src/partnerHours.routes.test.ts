@@ -33,7 +33,17 @@ async function roundtrip(input: unknown, allowed = true) {
     partnerRequestAccess: async () => ({ allowed, access: { restaurantIds: [row._id] } }), employeeRestaurant: async () => row._id,
     tenantScope: () => ({ tenantId: "64b000000000000000000002" }),
     partnerTenantScope: () => ({ tenantId: "64b000000000000000000002" }),
-    Restaurant: { findOne: () => query(row), findOneAndUpdate: (filter: any, update: any) => { writes++; assert.equal(filter.tenantId, "64b000000000000000000002"); assert.equal(filter.onboardingStatus, "approved"); row.partnerProfile.openingHours = update.$set["partnerProfile.openingHours"]; return query(row); } },
+    Restaurant: {
+      findOne: () => query(row),
+      findOneAndUpdate: (filter: any, update: any) => {
+        writes++;
+        assert.equal(filter._id, row._id);
+        assert.equal(filter.tenantId, "64b000000000000000000002");
+        assert.deepEqual(filter.onboardingStatus, { $in: ["approved", "pending_review"] });
+        row.partnerProfile.openingHours = update.$set["partnerProfile.openingHours"];
+        return query(row);
+      },
+    },
     invalidateCatalogCache: () => undefined, publishCatalogUpdate: () => undefined,
   };
   let status = 200; let body: any;
