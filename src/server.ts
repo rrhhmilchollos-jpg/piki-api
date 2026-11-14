@@ -2073,7 +2073,10 @@ async function partnerLocationsFor(employee: any, roles = partnerRolesForEmploye
   return ordered.map((restaurant: any) => {
     const bound = access?.kitchenRestaurant || access?.bindingRestaurants?.find((row) => String(row._id) === String(restaurant._id));
     const reason = bound ? partnerReadinessReason(bound) : restaurant.onboardingStatus !== "approved" ? "not_approved" : restaurant.isActive ? "open" : "paused";
-    const readOnly = Boolean(access?.ownerPortfolio && reason !== "open");
+    // The owner must be able to configure and reopen a paused/pending local.
+    // Readiness still gates order operations in partnerRequestAccess; it must
+    // not hide the management controls that can make a local ready.
+    const readOnly = false;
     return {
       id: String(restaurant._id),
       tenantId: String(employee.tenantId),

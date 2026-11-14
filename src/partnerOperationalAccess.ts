@@ -159,7 +159,10 @@ export async function partnerRequestAccess(req: Request, permission: PartnerPerm
   const restaurantId = requested || access.restaurantIds[0];
   if (!restaurantId || !access.restaurantIds.includes(restaurantId)) return { access, allowed: false, restaurantId: null, denial: { status: 403, error: "PARTNER_RESTAURANT_ACCESS_DENIED" } };
   const restaurant = access.kitchenRestaurant || access.bindingRestaurants?.find((row) => String(row._id) === restaurantId);
-  const needsReadiness = (access.ownerPortfolio && permission !== "menu:read")
+  // Store configuration and online/offline controls must work while a local
+  // is paused or still being prepared. Order permissions keep the publication
+  // gate; otherwise reopening a paused local would require it to be active.
+  const needsReadiness = (access.ownerPortfolio && permission.startsWith("orders:"))
     || ((access.employee.kitchenAccessSetupVersion === 1 || access.bindingRestaurants) && permission.startsWith("orders:"));
   const operationReady = !needsReadiness || kitchenRestaurantCanOperate(restaurant);
   const allowed = operationReady && partnerCan(access.roles, permission);

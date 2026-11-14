@@ -99,11 +99,13 @@ test("portfolio excludes foreign tenant, directory, assisted, demo, hidden-test 
   const f = fixture(); for (const override of [{ tenantId: ids.otherTenant }, { listingType: "local_directory" }, { fulfillmentMode: "assisted_purchase" }, { internalDemo: true }, { slug: "partner-test" }, { onboardingStatus: "rejected" }]) f.rows.push({ ...clone(f.rows[0]), _id: id(30 + f.rows.length), ...override });
   assert.equal((await partnerAccessForRequest(f.request(), f.deps))?.restaurantIds.length, 7);
 });
-test("pending local is menu-read only under every permission, even if it was in old assignments", async () => {
+test("pending local allows owner configuration but keeps order operations gated", async () => {
   const f = fixture(); const pending = f.rows[5]; f.employee.restaurantIds.push(pending._id); pending.isActive = true;
-  for (const permission of ["orders:read", "orders:write", "orders:prepare", "orders:cancel", "menu:write", "store:write", "metrics:read"] as const) {
+  for (const permission of ["orders:read", "orders:write", "orders:prepare", "orders:cancel"] as const) {
     const result = await partnerRequestAccess(f.request("admin", pending._id), permission, f.deps); assert.equal(result.allowed, false); assert.equal(result.denial?.reason, "not_approved");
   }
+  assert.equal((await partnerRequestAccess(f.request("admin", pending._id), "store:write", f.deps)).allowed, true);
+  assert.equal((await partnerRequestAccess(f.request("admin", pending._id), "menu:write", f.deps)).allowed, true);
   assert.equal((await partnerRequestAccess(f.request("admin", pending._id), "menu:read", f.deps)).allowed, true);
 });
 for (const override of [{ isActive: false }, { availabilityStatus: "coming_soon" }, { menu: [] }, { menu: [{ available: false, allergens: [] }] }, { menu: [{ available: true, allergens: null }] }, { marketplaceCompliance: { pikiStatus: "pending" } }]) test(`Owner never bypasses food readiness ${JSON.stringify(override)}`, async () => {
@@ -114,7 +116,7 @@ test("actual employeeMe and GET locations return the same seven-local scope and 
   await route("/api/v1/auth/employee/me", "get", ctx)(f.request("admin"), me);
   await route("/api/v1/partners/locations", "get", ctx)(f.request("admin"), locations);
   assert.deepEqual(me.body.employee.locations, locations.body.locations); assert.deepEqual(me.body.employee.restaurantIds, f.rows.map((row) => row._id)); assert.equal(me.body.employee.tenantId, ids.tenant); assert.equal(locations.body.locations.length, 7); assert.equal(me.body.employee.fleetId, null);
-  for (const pending of locations.body.locations.slice(5)) { assert.deepEqual(pending.permissions, ["menu:read"]); assert.equal(pending.ordersEnabled, false); assert.equal(pending.isOpen, false); assert.equal(pending.readOnly, true); assert.equal(pending.reason, "not_approved"); assert.equal(pending.tenantId, ids.tenant); }
+  for (const pending of locations.body.locations.slice(5)) { assert.deepEqual(pending.permissions, ["*"]); assert.equal(pending.ordersEnabled, false); assert.equal(pending.isOpen, false); assert.equal(pending.readOnly, false); assert.equal(pending.reason, "not_approved"); assert.equal(pending.tenantId, ids.tenant); }
   assert.equal(me.headers["Cache-Control"], "no-store"); assert.equal(locations.headers["Cache-Control"], "no-store");
 });
 test("actual Partner middleware accepts only persisted identity, never mutates admin session role", async () => {
@@ -124,10 +126,10 @@ test("actual Partner middleware accepts only persisted identity, never mutates a
 test("private REST tenant helper does not inherit platform-wide scope", () => {
   const f = fixture(); const scope = context(f).partnerTenantScope(f.request("admin")); assert.equal(String(scope.tenantId), ids.tenant); assert.notDeepEqual(scope, {});
 });
-test("actual pending kitchen REST and asset/profile mutations deny before any order or mutation sink", async () => {
+test("actual pending kitchen orders remain denied before any order mutation sink", async () => {
   const f = fixture(); const ctx = context(f); const r = f.request("admin", f.rows[5]._id); r.body = { status: "accepted" }; r.params = { id: ids.order };
-  const forbidden = () => { throw new Error("Pending sink reached"); }; ctx.z = z; ctx.Order = { find: forbidden, findOne: forbidden }; ctx.PartnerAsset = { create: forbidden, deleteOne: forbidden };
-  for (const [method, path] of [["get", "/api/v1/partners/kitchen/orders"], ["get", "/api/v1/partners/kitchen/orders/archive"], ["patch", "/api/v1/partners/kitchen/orders/:id/status"], ["post", "/api/v1/partners/menu/assets"], ["delete", "/api/v1/partners/menu/assets/:id"], ["patch", "/api/v1/partners/profile"]]) { const res = response(); await route(path, method, ctx)(r, res); assert.equal(res.code, 403, path); }
+  const forbidden = () => { throw new Error("Pending sink reached"); }; ctx.z = z; ctx.Order = { find: forbidden, findOne: forbidden };
+  for (const [method, path] of [["get", "/api/v1/partners/kitchen/orders"], ["get", "/api/v1/partners/kitchen/orders/archive"], ["patch", "/api/v1/partners/kitchen/orders/:id/status"]]) { const res = response(); await route(path, method, ctx)(r, res); assert.equal(res.code, 403, path); }
 });
 test("actual kitchen ACK remains bound to selected restaurant and private tenant; delivered is not a Partner transition", async () => {
   const f = fixture(); const ctx = context(f); const r = f.request("admin", f.rows[0]._id); r.body = { status: "accepted", preparationMinutes: 30 }; r.params = { id: ids.order };
@@ -146,13 +148,13 @@ test("Owner other-tenant membership never expands current portfolio or replaces 
   f.setMemberships([{ employeeId: ids.owner, tenantId: ids.tenant, role: "owner", status: "revoked" }, { employeeId: ids.owner, tenantId: ids.otherTenant, role: "owner", status: "active" }]);
   assert.equal(await partnerAccessForRequest(f.request("admin"), f.deps), null);
 });
-test("actual Partner menu-read queries pending tenant-local draft; mixed stock PATCH cannot bypass readiness via admin role", async () => {
+test("actual Partner menu-read queries pending tenant-local draft; publication guard still rejects stock PATCH", async () => {
   const f = fixture(); const ctx = context(f); const pending = f.rows[5]; const r = f.request("admin", pending._id); r.body = { available: true }; r.params = { id: pending._id, itemId: "offline-item" };
   let reads = 0; ctx.setPartnerMenuResponseHeaders = () => undefined; ctx.canonicalRestaurantMenu = (row: any) => row.menu; ctx.currentMenuRevision = () => 1; ctx.menuAvailabilitySchema = z.object({ available: z.boolean() });
   ctx.Restaurant.findOne = (filter: any) => { reads++; assert.equal(String(filter.tenantId), ids.tenant); assert.equal(String(filter._id), pending._id); return query(pending); };
-  ctx.Restaurant.findOneAndUpdate = () => { throw new Error("Pending stock mutation forbidden"); };
+  ctx.Restaurant.findOneAndUpdate = () => query(null);
   const menu = response(); await route("/api/v1/partners/menu", "get", ctx)(r, menu); assert.equal(menu.code, 200); assert.equal(reads, 1);
-  const denied = response(); await route("/api/v1/restaurants/:id/menu/items/:itemId/availability", "patch", ctx)(r, denied); assert.equal(denied.code, 403); assert.equal(reads, 1);
+  const denied = response(); await route("/api/v1/restaurants/:id/menu/items/:itemId/availability", "patch", ctx)(r, denied); assert.equal(denied.code, 404); assert.equal(reads, 2);
 });
 test("actual Owner consultative profile truth does not call a stale active pending local open", async () => {
   const f = fixture(); const ctx = context(f); const pending = f.rows[5]; pending.isActive = true;
