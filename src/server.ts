@@ -2865,6 +2865,34 @@ const partnerSettingsSchema = z.object({
   commissionRateBps: z.number().int().min(0).max(10000).optional(),
 }).strict();
 
+const partnerSensitiveDataSchema = z.object({
+  legalName: z.string().trim().min(2).max(180).optional(),
+  taxId: z.string().trim().toUpperCase().regex(/^[A-Z0-9][A-Z0-9-]{4,19}$/).optional(),
+  iban: z.string().trim().regex(/^[A-Za-z]{2}\d{2}[A-Za-z0-9]{10,30}$/).transform((value) => value.toUpperCase()).optional(),
+  bankAccountHolder: z.string().trim().min(2).max(180).optional(),
+}).strict().refine((value) => Object.keys(value).length > 0, "sensitive_data_required");
+
+function validIbanChecksum(value: string): boolean {
+  const rearranged = `${value.slice(4)}${value.slice(0, 4)}`;
+  let remainder = 0;
+  for (const character of rearranged) {
+    const digits = /[A-Z]/.test(character) ? String(character.charCodeAt(0) - 55) : character;
+    for (const digit of digits) remainder = (remainder * 10 + Number(digit)) % 97;
+  }
+  return remainder === 1;
+}
+
+function redactedPartnerSensitiveData(profile: Record<string, any>) {
+  const taxId = typeof profile.taxId === "string" ? profile.taxId : "";
+  const iban = typeof profile.iban === "string" ? profile.iban : "";
+  return {
+    legalNamePresent: Boolean(profile.legalName),
+    taxIdLast4: taxId ? taxId.slice(-4) : null,
+    ibanLast4: iban ? iban.slice(-4) : null,
+    bankAccountHolderPresent: Boolean(profile.bankAccountHolder),
+  };
+}
+
 app.get("/api/v1/admin/restaurants/:id/settings", requireOwner(), async (req, res) => {
   const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
   if (!id) return res.status(400).json({ error: "INVALID_RESTAURANT_ID" });
@@ -2903,6 +2931,27 @@ app.patch("/api/v1/admin/restaurants/:id/settings", requireOwner(), async (req, 
   void publishCatalogUpdate(restaurant._id, "owner.restaurant.settings.updated");
   await AccessAuthorization.create({ employeeId: objectId(String(req.auth!.employeeId!)), action: "settings_updated", previousStatus: "approved", nextStatus: "approved", previousRole: "partner", nextRole: "partner", accessLevel: "superadmin", actorEmployeeId: objectId(String(req.auth!.employeeId!)), reason: `Configuración protegida actualizada para ${restaurant.name}; comisión definida por PIKI superadmin.` });
   return res.json({ updated: true, restaurant: { ...restaurant, id: String(restaurant._id), partnerCode: restaurant.partnerCode || publicPartnerCode(restaurant._id), commissionRateBps: Number(restaurant.partnerProfile?.commissionRateBps ?? DEFAULT_PARTNER_COMMISSION_BPS), commissionPercent: Number(restaurant.partnerProfile?.commissionRateBps ?? DEFAULT_PARTNER_COMMISSION_BPS) / 100 } });
+});
+
+app.get("/api/v1/admin/restaurants/:id/sensitive-data", requireRole("admin"), async (req, res) => {
+  const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
+  if (!id) return res.status(400).json({ error: "INVALID_RESTAURANT_ID" });
+  const restaurant = await Restaurant.findOne({ _id: id, ...tenantScope(req) }).select("_id partnerProfile.legalName partnerProfile.taxId partnerProfile.iban partnerProfile.bankAccountHolder").lean().exec() as any;
+  if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
+  return res.json({ restaurantId: String(restaurant._id), sensitive: redactedPartnerSensitiveData(restaurant.partnerProfile || {}) });
+});
+
+app.patch("/api/v1/admin/restaurants/:id/sensitive-data", requireRole("admin"), async (req, res) => {
+  const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
+  if (!id) return res.status(400).json({ error: "INVALID_RESTAURANT_ID" });
+  const parsed = partnerSensitiveDataSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "INVALID_PARTNER_SENSITIVE_DATA", details: parsed.error.flatten() });
+  if (parsed.data.iban && !validIbanChecksum(parsed.data.iban)) return res.status(400).json({ error: "INVALID_IBAN", message: "El IBAN no supera la validación de checksum." });
+  const changes = Object.fromEntries(Object.entries(parsed.data).map(([key, value]) => [`partnerProfile.${key}`, value]));
+  const restaurant = await Restaurant.findOneAndUpdate({ _id: id, ...tenantScope(req) }, { $set: changes }, { new: true, runValidators: true }).select("_id name partnerProfile.legalName partnerProfile.taxId partnerProfile.iban partnerProfile.bankAccountHolder").lean().exec() as any;
+  if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
+  await AccessAuthorization.create({ employeeId: objectId(String(req.auth!.employeeId!)), action: "partner_sensitive_data_updated", previousStatus: "approved", nextStatus: "approved", previousRole: "partner", nextRole: "partner", accessLevel: "superadmin", actorEmployeeId: objectId(String(req.auth!.employeeId!)), reason: `Datos fiscales/bancarios actualizados para ${restaurant.name}; valores omitidos por seguridad.` });
+  return res.json({ updated: true, sensitive: redactedPartnerSensitiveData(restaurant.partnerProfile || {}) });
 });
 
 app.patch("/api/v1/admin/restaurants/:id/customer-name", requireOwner(), async (req, res) => {
