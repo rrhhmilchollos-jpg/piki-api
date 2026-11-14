@@ -47,7 +47,7 @@ Las superficies Riders y Administración reintentaban el stream `/api/v1/realtim
 | `429` | Respeta `Retry-After`, si existe | Protección de API |
 | Red / `5xx` | Backoff exponencial con jitter, máximo 60 s | Recuperación sin martillear Render |
 
-La API también devuelve `WWW-Authenticate: Bearer realm="PIKI API"` en el SSE no autenticado. Se han añadido a CORS los orígenes de fallback `https://piki-customer.onrender.com`, `https://piki-riders.onrender.com` y `https://piki-admin.onrender.com`; los dominios canónicos `*.pikidelivery.com` ya estaban permitidos.
+La API también devuelve `WWW-Authenticate: Bearer realm="PIKI API"` en el SSE no autenticado. Los clientes deben usar los dominios canónicos de PIKI; los subdominios antiguos de Render ya no se enumeran como orígenes CORS fijos.
 
 ## 3. Separación segura entre API y futuros microservicios
 

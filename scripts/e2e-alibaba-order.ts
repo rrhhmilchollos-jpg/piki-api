@@ -1,6 +1,7 @@
 import "dotenv/config";
-
-const baseUrl = String(process.env.PIKI_E2E_BASE_URL || "https://piki-api-staging-v2.onrender.com").replace(/\/$/, "");
+const configuredBaseUrl = String(process.env.PIKI_E2E_BASE_URL || "").trim();
+if (!configuredBaseUrl) throw new Error("PIKI_E2E_BASE_URL debe apuntar explícitamente a una API de staging/QA");
+const baseUrl = configuredBaseUrl.replace(/\/$/, "");
 const riderToken = String(process.env.PIKI_E2E_RIDER_TOKEN || "").trim();
 const riderId = String(process.env.PIKI_E2E_RIDER_ID || "").trim();
 const partnerToken = String(process.env.PIKI_E2E_PARTNER_TOKEN || "").trim();
@@ -8,6 +9,7 @@ const confirm = process.env.PIKI_E2E_CONFIRM === "YES";
 const timeoutMs = Number(process.env.PIKI_E2E_TIMEOUT_MS || 90_000);
 const expectedCommissionBps = Number(process.env.PIKI_E2E_EXPECTED_COMMISSION_BPS || 1800);
 
+if (!/^https:\/\//i.test(baseUrl)) throw new Error("PIKI_E2E_BASE_URL debe usar HTTPS");
 if (/production|api\.pikidelivery\.com/i.test(baseUrl)) throw new Error("E2E solo permite un endpoint de staging/QA");
 if (!riderToken || !riderId) throw new Error("PIKI_E2E_RIDER_TOKEN y PIKI_E2E_RIDER_ID son obligatorios");
 if (!confirm) throw new Error("Para crear y avanzar un pedido usa PIKI_E2E_CONFIRM=YES");

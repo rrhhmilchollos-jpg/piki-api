@@ -7,7 +7,7 @@
 - [x] Máquina de estados de pedidos, control de versión y transiciones con validación de rol.
 - [x] Endpoints de catálogo, cobertura geográfica, pedidos, localización de riders y resúmenes operativos.
 - [x] API compilada y publicada en GitHub: `piki-api`.
-- [x] Frontends Partners, Admin, Riders y Fleet compilados, conectados a `https://piki-api-e0yg.onrender.com` y publicados en GitHub.
+- [x] Frontends Partners, Admin, Riders y Fleet compilados, conectados al dominio canónico `https://api.pikidelivery.com` y publicados en GitHub.
 - [x] Proyectos Vercel creados y variables `VITE_API_URL` configuradas para Customer, Partners, Admin, Riders y Fleet.
 - [x] Dominios personalizados añadidos y verificados dentro de Vercel.
 - [x] Repositorios separados creados para API, Customer, Partner, Admin, Rider, Fleet, Web pública, Staging y Docs.
@@ -18,7 +18,7 @@
 - [ ] **MongoDB Atlas:** falta crear el proyecto `PIKI DELIVERY`, el clúster y obtener `MONGODB_URI` desde la cuenta Atlas del propietario. Sin esto `/ready`, catálogo real, cobertura y paneles operativos no pueden funcionar con datos persistentes.
 - [ ] **DNS:** `pikidelivery.com` continúa pendiente en Cloudflare; los subdominios no resuelven públicamente. El registrador debe usar `cameron.ns.cloudflare.com` y `khloe.ns.cloudflare.com`.
 - [ ] **Vercel:** los despliegues nuevos aparecen `BLOCKED` por la protección SSO del equipo. Hay despliegues anteriores `READY`; los dominios personalizados permanecen asociados y verificados. Hay que ajustar la protección del equipo o desplegar con acceso autorizado.
-- [ ] **API custom domain:** `api.pikidelivery.com` requiere que DNS esté activo y asociarlo al servicio Render `piki-api-e0yg`.
+- [x] **API custom domain:** `api.pikidelivery.com` está asociado al servicio Render `piki-api` del workspace destino; `/health` y `/ready` responden HTTP 200.
 
 ## Siguiente ejecución cuando Atlas y DNS estén listos
 
