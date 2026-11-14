@@ -639,7 +639,7 @@ test("Stripe: handlers reales sin DB, puertos, Stripe API, SMTP ni workers", asy
     assert.ok(values.includes("https://rider.pikidelivery.com"));
     assert.ok(!values.includes("https://riders.pikidelivery.com"));
     assert.ok(values.includes("https://partners.pikidelivery.com"));
-    assert.ok(values.includes("https://piki-riders.onrender.com"));
+    assert.ok(!values.some((origin: string) => origin.includes(".onrender.com")));
   });
   await t.test("activo COD: verifica sólo whsec ACTIVE y procesa referencia/PI una vez antes de claim moderno", async (s) => {
     const f = fixture(s, { paymentMethod: "cash", publicCode: "PIKI-MVZH7BM8" });
