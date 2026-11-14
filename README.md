@@ -88,6 +88,12 @@ Stripe requiere el cuerpo crudo para verificar la firma; por eso la ruta se regi
 
 Los clientes deben enviar `X-PIKI-Surface`, credenciales válidas y conservar `Last-Event-ID`; así pueden recuperar eventos tras una pérdida temporal de red sin solicitar un refresco manual.
 
+### Expediente personal y pagos de Riders
+
+El directorio de Personal Riders exige la variable de entorno `PIKI_RIDER_PII_ENCRYPTION_KEY`, que debe contener 32 bytes aleatorios codificados en Base64 estándar. Genérala localmente con `openssl rand -base64 32` y añádela como secreto del servicio API en Render antes de desplegar o guardar datos reales; no la incluyas en Git, tickets, capturas ni conversaciones. Conserva una copia de recuperación en un gestor de secretos seguro: perder o reemplazar la clave sin migrar los datos hará imposible descifrar expedientes existentes. La clave no se rota automáticamente.
+
+Los campos de domicilio, documento de identidad, banco, titular e IBAN se cifran con AES-256-GCM en una colección separada y no se devuelven en el directorio; la ficha completa requiere sesión superadmin y registra accesos/cambios en la auditoría sin copiar valores personales. El módulo solo almacena datos de pago: no ejecuta nóminas, anticipos ni transferencias.
+
 ## Seguridad de configuración
 
 El archivo `.env` no se versiona. Las credenciales se configuran en Render y los clientes solo consumen la API pública a través de HTTPS. Los orígenes autorizados se controlan con `CORS_ORIGINS`.
