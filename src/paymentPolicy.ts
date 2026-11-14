@@ -1,6 +1,19 @@
 export const MAX_CASH_ORDER_CENTS = 4_899;
-/** Production kill-switch: COD is closed unless explicitly enabled in Render. */
-export const CASH_PAYMENTS_ENABLED = process.env.PIKI_CASH_PAYMENTS_ENABLED === "true";
+/** Production kill-switch: COD is closed unless explicitly enabled in Render or Admin. */
+export let CASH_PAYMENTS_ENABLED = process.env.PIKI_CASH_PAYMENTS_ENABLED === "true";
+export function setCashPaymentsEnabled(enabled: boolean) {
+  CASH_PAYMENTS_ENABLED = Boolean(enabled);
+}
+export async function hydrateCashPaymentsEnabled() {
+  try {
+    const mongoose = (await import("mongoose")).default;
+    const collection = mongoose.connection.collection("global_configs");
+    const config = await collection.findOne({ configKey: "default" }, { projection: { "values.cashPaymentsEnabled": 1 } }) as any;
+    if (typeof config?.values?.cashPaymentsEnabled === "boolean") setCashPaymentsEnabled(config.values.cashPaymentsEnabled);
+  } catch (error) {
+    console.warn("No se pudo cargar el estado persistido del contrareembolso; se mantiene el valor de Render.", error instanceof Error ? error.message : error);
+  }
+}
 
 export type CashPaymentMethod = "cash" | "stripe" | string | undefined | null;
 export type CashPaymentPartner = { slug?: string | null; name?: string | null; cashPaymentsEnabled?: boolean | null };

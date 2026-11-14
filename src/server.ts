@@ -76,7 +76,7 @@ import { partnerBasicProfileSchema } from "./partnerProfilePolicy.js";
 import { quoteMenuItem, usesReferenceAddOns } from "./menuModifiers.js";
 import { pointDistanceMeters } from "./pickupPolicy.js";
 import { buildLegacyRiderSupportTicketFilter, buildRiderSupportTicketFilter } from "./supportTicketScope.js";
-import { CASH_PAYMENTS_ENABLED, cashOrderLimitError, cashPaymentDisabledError, isCashOrderWithinLimit, isCashPaymentEnabledForRestaurant } from "./paymentPolicy.js";
+import { CASH_PAYMENTS_ENABLED, cashOrderLimitError, cashPaymentDisabledError, hydrateCashPaymentsEnabled, isCashOrderWithinLimit, isCashPaymentEnabledForRestaurant } from "./paymentPolicy.js";
 import { calculateMarketplaceBreakdown, DEFAULT_PARTNER_COMMISSION_BPS } from "./marketplaceAccounting.js";
 import { postMarketplaceOrderLedger, preparePartnerPayoutBatch } from "./marketplaceLedger.js";
 import { extractAndParseMenu, readAssetBytes } from "./menuImport.js";
@@ -8154,6 +8154,7 @@ async function start() {
     await ensureExpiresAtTtlIndex("employee_sessions");
     await ensureExpiresAtTtlIndex("employee_password_resets");
     await ensureIndexes();
+    await hydrateCashPaymentsEnabled();
     await ensureCustomerEngagementIndexes();
     await backfillEmployeeCodes();
     startRealtimeRelay();

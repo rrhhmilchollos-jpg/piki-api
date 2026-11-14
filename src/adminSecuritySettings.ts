@@ -3,6 +3,7 @@ import mongoose, { Schema } from "mongoose";
 import { requireOwner } from "./auth.js";
 import { EmployeeSession } from "./employeeSessions.js";
 import { hashSessionToken } from "./employeeAuth.js";
+import { CASH_PAYMENTS_ENABLED, setCashPaymentsEnabled } from "./paymentPolicy.js";
 
 const securitySchema = new Schema({
   twoFactorEnabled: { type: Boolean, default: true },
@@ -37,7 +38,7 @@ const defaultGlobalValues = {
   baseDeliveryFee: 2.5, pricePerKm: 0.65, merchantCommission: 18, demandSurcharge: 12, weatherSurcharge: 8,
   openingTime: "08:00", closingTime: "23:30", deliveryRadiusKm: 8, prepTimeMinutes: 20, riderOfferTimeoutMinutes: 2,
   maintenanceMode: false, stripeEnabled: true, stripePublicKey: "", paypalEnabled: false, paypalClientId: "",
-  localTerminalEnabled: true, localTerminalName: "Terminal PIKI · Valencia",
+  localTerminalEnabled: true, localTerminalName: "Terminal PIKI · Valencia", cashPaymentsEnabled: CASH_PAYMENTS_ENABLED,
 };
 
 function requestIp(req: Request) { return req.ip || req.headers["x-forwarded-for"]?.toString().split(",")[0]?.trim() || "unknown"; }
@@ -66,11 +67,14 @@ export function mountAdminSecuritySettings(app: Express) {
   });
   app.get("/api/v1/admin/global-config", requireOwner(), async (_req: Request, res: Response) => {
     const config = await GlobalConfig.findOneAndUpdate({ configKey: "default" }, { $setOnInsert: { values: defaultGlobalValues } }, { upsert: true, new: true, setDefaultsOnInsert: true }).lean().exec();
-    return res.json({ settings: { ...defaultGlobalValues, ...(config?.values as Record<string, unknown> || {}) } });
+    const settings = { ...defaultGlobalValues, ...(config?.values as Record<string, unknown> || {}), cashPaymentsEnabled: typeof (config?.values as any)?.cashPaymentsEnabled === "boolean" ? Boolean((config?.values as any).cashPaymentsEnabled) : CASH_PAYMENTS_ENABLED };
+    setCashPaymentsEnabled(Boolean(settings.cashPaymentsEnabled));
+    return res.json({ settings });
   });
   app.put("/api/v1/admin/global-config", requireOwner(), async (req: Request, res: Response) => {
     const settings = { ...defaultGlobalValues, ...(req.body || {}) };
     const config = await GlobalConfig.findOneAndUpdate({ configKey: "default" }, { $set: { values: settings, updatedBy: req.auth?.employeeId || null } }, { upsert: true, new: true, setDefaultsOnInsert: true }).lean().exec();
+    setCashPaymentsEnabled(Boolean(settings.cashPaymentsEnabled));
     await logAudit(req, "Actualizó la configuración global", "global_configs", { changedKeys: Object.keys(req.body || {}) });
     return res.json({ settings: { ...defaultGlobalValues, ...(config?.values as Record<string, unknown> || {}) } });
   });
