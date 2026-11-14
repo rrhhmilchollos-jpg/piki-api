@@ -100,7 +100,7 @@ test("contratos de catálogo y carta con handlers reales, consultas en memoria y
   const menuRequest = (body: any = {}, params: any = {}, role = "partner", requested = restaurantId): any => ({ body, params, auth: { role, tenantId, employeeId }, header: (name: string) => name === "x-piki-restaurant-id" ? requested : name === "authorization" ? `Bearer ${bearer}` : undefined });
   const call = async (method: string, path: string, req: any) => { const res = response(); await handler(method, path)(req, res); return res; };
 
-  for (const flag of [false, true]) for (const explicit of [undefined, 1800]) await t.test(`REST + tRPC + quote: final=${flag}, perfil=${explicit ?? "legacy20"}`, async () => {
+  for (const flag of [false, true]) for (const explicit of [undefined, 1800]) await t.test(`REST + tRPC + quote: final=${flag}, perfil=${explicit ?? "default18"}`, async () => {
     stored = fixture({ priceIncludesCommission: flag, partnerProfile: explicit === undefined ? {} : { commissionRateBps: explicit } });
     const before = structuredClone(stored);
     const rest = await call("get", "/api/v1/catalog/restaurants", { query: {} });
@@ -110,7 +110,7 @@ test("contratos de catálogo y carta con handlers reales, consultas en memoria y
     const quote = await trpc("order.quote", { restaurantId, items: [{ id: "dish", quantity: 1, selections: selection }] });
     const restItem = rest.body.restaurants[0].menu[0];
     const rpcItem = rpc.body.result.data.json.menu[0];
-    const multiplier = flag ? 1 : 1 + (explicit ?? 2000) / 10000;
+    const multiplier = flag ? 1 : 1 + (explicit ?? 1800) / 10000;
     assert.equal(restItem.price, Math.round(10 * multiplier * 100) / 100);
     assert.equal(rpcItem.price, restItem.price);
     assert.equal(list.body.result.data.json[0].menu[0].price, restItem.price);
@@ -151,9 +151,9 @@ test("contratos de catálogo y carta con handlers reales, consultas en memoria y
 
   await t.test("perfil válido prevalece incluso sobre slug legacy; inválido conserva defaults", () => {
     assert.equal(customerCommissionRate({ slug: "alibaba-kebab-xativa", partnerProfile: { commissionRateBps: 1800 } }), 0.18);
-    assert.equal(customerCommissionRate({ slug: "alibaba-kebab-xativa" }), 0.20);
+    assert.equal(customerCommissionRate({ slug: "alibaba-kebab-xativa" }), 0.18);
     assert.equal(customerCommissionRate({ partnerProfile: { commissionRateBps: 0 } }), 0);
-    for (const value of [NaN, -1, 10001, 1.5, "1800", null]) assert.equal(customerCommissionRate({ partnerProfile: { commissionRateBps: value as any } }), 0.20);
+    for (const value of [NaN, -1, 10001, 1.5, "1800", null]) assert.equal(customerCommissionRate({ partnerProfile: { commissionRateBps: value as any } }), 0.18);
   });
 
   await t.test("POST orders rechaza estados no operables y producto pausado antes de cualquier efecto", async () => {

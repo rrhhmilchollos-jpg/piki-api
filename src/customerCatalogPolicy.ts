@@ -64,11 +64,7 @@ export function presentCustomerCatalogRestaurant<T extends { name: string; slug?
 }
 export const ALIBABA_KEBAB_SLUG = "alibaba-kebab-xativa";
 export const GOLDEN_FOUNDER_SLUGS = [ALIBABA_KEBAB_SLUG, "rooster-kebab-xativa"] as const;
-export const PARTNER_COMMISSION_RATES: Record<string, number> = {
-  [ALIBABA_KEBAB_SLUG]: 0.20,
-  "rooster-kebab-xativa": 0.20,
-};
-export const DEFAULT_CUSTOMER_COMMISSION_RATE = 0.20;
+export const DEFAULT_CUSTOMER_COMMISSION_RATE = 0.18;
 const ALIBABA_OPTIONS = {
   drinks: [
     ["coca-cola", "Coca-Cola Original", 0], ["coca-cola-zero", "Coca-Cola Zero", 0],
@@ -91,7 +87,7 @@ function alibabaModifierGroups(item: Record<string, any>) {
 export function customerCommissionRate(restaurant: { slug?: string; partnerProfile?: { commissionRateBps?: number } }): number {
   const explicit = restaurant.partnerProfile?.commissionRateBps;
   if (typeof explicit === "number" && Number.isInteger(explicit) && explicit >= 0 && explicit <= 10_000) return explicit / 10_000;
-  return PARTNER_COMMISSION_RATES[restaurant.slug || ""] ?? DEFAULT_CUSTOMER_COMMISSION_RATE;
+  return DEFAULT_CUSTOMER_COMMISSION_RATE;
 }
 export function customerMenuPrice(value: unknown, rate: number) {
   return rate === 0 ? value : Number((Math.ceil(Math.max(0, Number(value || 0) * 100) * (1 + rate) - 1e-9) / 100).toFixed(2));

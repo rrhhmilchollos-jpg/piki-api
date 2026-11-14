@@ -4,6 +4,7 @@ export type MarketplaceOrderAmounts = {
   serviceFeeCents: number;
   commissionRateBps: number;
   riderEarningsCents: number;
+  priceIncludesCommission?: boolean;
 };
 
 export type MarketplaceBreakdown = MarketplaceOrderAmounts & {
@@ -37,8 +38,10 @@ export function calculateMarketplaceBreakdown(input: MarketplaceOrderAmounts): M
   const serviceFeeCents = cents(input.serviceFeeCents);
   const commissionRateBps = bps(input.commissionRateBps);
   const riderEarningsCents = cents(input.riderEarningsCents);
-  const platformCommissionCents = Math.floor((subtotalCents * commissionRateBps) / 10_000);
-  const partnerPayoutCents = subtotalCents - platformCommissionCents;
+  const partnerPayoutCents = input.priceIncludesCommission === true
+    ? Math.floor(subtotalCents / (1 + commissionRateBps / 10_000))
+    : subtotalCents - Math.floor((subtotalCents * commissionRateBps) / 10_000);
+  const platformCommissionCents = subtotalCents - partnerPayoutCents;
   const customerFeesCents = deliveryFeeCents + serviceFeeCents;
   const customerTotalCents = subtotalCents + customerFeesCents;
   const platformNetBeforeProcessingCents = platformCommissionCents + customerFeesCents - riderEarningsCents;
@@ -48,6 +51,7 @@ export function calculateMarketplaceBreakdown(input: MarketplaceOrderAmounts): M
     serviceFeeCents,
     commissionRateBps,
     riderEarningsCents,
+    priceIncludesCommission: input.priceIncludesCommission === true,
     customerFeesCents,
     customerTotalCents,
     platformCommissionCents,

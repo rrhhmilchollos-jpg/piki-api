@@ -40,7 +40,7 @@ const storeSchema = z.object({
   partnerCode: z.string().trim().min(2).max(80).optional(),
   fulfillmentMode: z.enum(["partner_delivery", "assisted_purchase"]).default("partner_delivery"),
   deliveryFeeCents: z.number().int().min(0).max(100_000).default(299),
-  commissionRateBps: z.number().int().min(0).max(10_000).default(2_000),
+  commissionRateBps: z.number().int().min(0).max(10_000).default(1_800),
   image: z.string().url().max(1_200).optional(),
   tagline: z.string().trim().max(240).default(""),
   menu: z.array(localItemSchema).min(1).max(500),

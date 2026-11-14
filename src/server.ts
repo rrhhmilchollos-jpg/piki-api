@@ -1514,6 +1514,32 @@ app.post("/api/v1/admin/employees/:id/send-activation", requireOwner(), async (r
   }); } catch { warning = "CREDENTIAL_AUDIT_FAILED_AFTER_SEND"; }
   return res.json({ sent: true, surface, recipient: target.email, warning, message: `Se ha enviado un enlace de activación a ${target.email}.` });
 });
+app.patch("/api/v1/admin/employees/:id/profile", requireOwner(), async (req, res) => {
+  const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
+  if (!id) return res.status(400).json({ error: "INVALID_EMPLOYEE_ID" });
+  const parsed = employeeProfileUpdateSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "INVALID_EMPLOYEE_PROFILE", details: parsed.error.flatten() });
+  const target = await EmployeeAccount.findById(id).select("_id name email jobRole ownerProtected photoUrl tenantId").lean().exec() as any;
+  if (!target) return res.status(404).json({ error: "EMPLOYEE_NOT_FOUND" });
+  if (target.ownerProtected || target.email === ownerEmail) return res.status(403).json({ error: "OWNER_ACCOUNT_PROTECTED" });
+  const employee = await EmployeeAccount.findOneAndUpdate(
+    { _id: id, ...(target.tenantId && req.auth?.tenantId ? { tenantId: req.auth.tenantId } : {}) },
+    { $set: { photoUrl: parsed.data.photoUrl } },
+    { new: true, runValidators: true },
+  ).select("_id name email jobRole photoUrl tenantId").lean().exec() as any;
+  if (!employee) return res.status(404).json({ error: "EMPLOYEE_NOT_FOUND" });
+  await recordGovernanceEvent({
+    actor: { employeeId: req.auth?.employeeId, role: req.auth?.role, tenantId: (req.auth as any)?.tenantId },
+    action: "employee_profile_photo_updated",
+    targetType: "employee",
+    targetId: employee._id,
+    before: { hasPhoto: Boolean(target.photoUrl) },
+    after: { hasPhoto: Boolean(employee.photoUrl) },
+    reason: "Foto de perfil actualizada por Administración; el contenido no se registra en auditoría.",
+  });
+  res.setHeader("Cache-Control", "private, no-store");
+  return res.json({ updated: true, employee: { id: String(employee._id), name: employee.name, fullName: employee.name, email: employee.email, jobRole: employee.jobRole, photoUrl: employee.photoUrl ?? null } });
+});
 app.patch("/api/v1/admin/employees/:id/authorization", requireOwner(), async (req, res) => {
   const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id); if (!id) return res.status(400).json({ error: "INVALID_EMPLOYEE_ID" });
   const parsed = z.object({
@@ -4786,6 +4812,7 @@ app.post("/api/v1/orders", rateLimit(20, 60_000, "orders-create"), async (req, r
     serviceFeeCents,
     commissionRateBps: Number(restaurant.partnerProfile?.commissionRateBps ?? DEFAULT_PARTNER_COMMISSION_BPS),
     riderEarningsCents: configuredRiderPayoutCents(),
+    priceIncludesCommission: restaurant.priceIncludesCommission === true,
   });
   if (marketplace.customerTotalCents !== totalCents) return res.status(500).json({ error: "MARKETPLACE_TOTAL_MISMATCH" });
   if (!isCashOrderWithinLimit(parsed.data.paymentMethod, totalCents)) return res.status(422).json(cashOrderLimitError(totalCents));
@@ -5148,6 +5175,7 @@ app.post("/api/v1/internal/customer-orders/sync", async (req, res) => {
     serviceFeeCents: input.serviceFeeCents,
     commissionRateBps: Math.round(customerCommissionRate(restaurant) * 10_000),
     riderEarningsCents: configuredRiderPayoutCents(),
+    priceIncludesCommission: restaurant.priceIncludesCommission === true,
   });
   if (marketplace.customerTotalCents !== input.totalCents) return res.status(409).json({ error: "MARKETPLACE_TOTAL_MISMATCH" });
   // Customer is the source of truth: never rebuild lines from a second menu copy.

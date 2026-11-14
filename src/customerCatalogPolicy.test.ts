@@ -46,9 +46,9 @@ test('la comisión se aplica una sola vez cuando el precio guardado ya la incluy
     modifiers: [{ id: 'extra', name: 'Extra', price: 1, options: [{ id: 'cheese', name: 'Queso', price: 2 }] }],
   }];
   const basePriced = customerMenuForRestaurant({ slug: 'pizzeria', menu, priceIncludesCommission: false });
-  assert.equal(basePriced[0].price, 12);
-  assert.equal(basePriced[0].modifiers[0].price, 1.2);
-  assert.equal(basePriced[0].modifierGroups[0].options[0].price, 2.4);
+  assert.equal(basePriced[0].price, 11.8);
+  assert.equal(basePriced[0].modifiers[0].price, 1.18);
+  assert.equal(basePriced[0].modifierGroups[0].options[0].price, 2.36);
 
   const commissionIncluded = customerMenuForRestaurant({ slug: 'pizzeria', menu, priceIncludesCommission: true });
   assert.equal(commissionIncluded[0].price, 10);

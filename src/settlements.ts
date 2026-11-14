@@ -1,3 +1,5 @@
+import { calculateMarketplaceBreakdown, DEFAULT_PARTNER_COMMISSION_BPS } from "./marketplaceAccounting.js";
+
 export type SettlementOrder = {
   publicCode: string;
   subtotalCents: number;
@@ -6,6 +8,7 @@ export type SettlementOrder = {
   distanceKm: number;
   tipCents?: number;
   incentiveCents?: number;
+  priceIncludesCommission?: boolean;
 };
 
 export type SettlementLine = {
@@ -39,18 +42,24 @@ export function calculateSettlement(orders: SettlementOrder[], options?: { partn
   const riderBaseCents = options?.riderBaseCents ?? 250;
   const riderPerKmCents = options?.riderPerKmCents ?? 60;
   const lines = orders.map((order): SettlementLine => {
-    // Si el precio de venta ya lleva la comision incluida, el local cobra el
-    // precio base (subtotal / (1 + comision)); si no, se descuenta del subtotal.
-    const partnerNetCents = (order as SettlementOrder & { priceIncludesCommission?: boolean }).priceIncludesCommission
-      ? cents(order.subtotalCents / (1 + partnerCommissionRate))
-      : Math.max(0, order.subtotalCents - cents(order.subtotalCents * partnerCommissionRate));
-    const partnerCommissionCents = Math.max(0, order.subtotalCents - partnerNetCents);
     const riderDistanceCents = cents(order.distanceKm * riderPerKmCents);
     const riderIncentiveCents = cents(order.incentiveCents || 0);
     const riderTipCents = cents(order.tipCents || 0);
     const riderTotalCents = riderBaseCents + riderDistanceCents + riderIncentiveCents + riderTipCents;
     const grossCents = order.subtotalCents + order.deliveryFeeCents + order.serviceFeeCents + riderTipCents;
-    const platformNetCents = grossCents - partnerNetCents - riderTotalCents;
+    const marketplace = calculateMarketplaceBreakdown({
+      subtotalCents: order.subtotalCents,
+      deliveryFeeCents: order.deliveryFeeCents,
+      serviceFeeCents: order.serviceFeeCents,
+      commissionRateBps: Math.round(partnerCommissionRate * 10_000) || DEFAULT_PARTNER_COMMISSION_BPS,
+      riderEarningsCents: riderTotalCents,
+      priceIncludesCommission: order.priceIncludesCommission === true,
+    });
+    const partnerNetCents = marketplace.partnerPayoutCents;
+    const partnerCommissionCents = marketplace.platformCommissionCents;
+    // El tip se liquida íntegramente al rider; el motor canónico mantiene las
+    // tarifas y la comisión separadas del tip por diseño.
+    const platformNetCents = marketplace.platformNetBeforeProcessingCents + riderTipCents;
     return { publicCode: order.publicCode, grossCents, partnerCommissionCents, partnerNetCents, riderBaseCents, riderDistanceCents, riderIncentiveCents, riderTipCents, riderTotalCents, platformNetCents };
   });
   const totals = lines.reduce((sum, line) => {
