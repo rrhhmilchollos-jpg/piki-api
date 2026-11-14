@@ -29,6 +29,8 @@ import { waitlistRouter } from "./waitlist.js";
 import express from "express";
 import mongoose from "mongoose";
 import { z } from "zod";
+import { RiderPersonnelRecord } from "./models.js";
+import { decryptRiderPersonnelField, encryptRiderPersonnelField, riderPersonnelCompleteness, riderPersonnelEncryptionConfigured, riderPersonnelFields, riderPersonnelPatchSchema, validRiderIban, type RiderPersonnelField } from "./riderPersonnel.js";
 import { CashLedgerEntry, CustomerAccount, DispatchDecision, DispatchOutbox, DocumentRequest, EmployeeAccount, AccessAuthorization, Fleet, Order, Restaurant, PartnerAsset, PartnerLocalityGroup, MenuImportDraft, Rider, RiderApplication, PartnerLead, RiderLead, RiderIncident, RiderOrderMessage, RiderSlot, SignatureRequest, Zone, PushSubscription, RealtimeEvent, Notification, Tenant, TenantMembership, RiderAssignmentReservation, SupportTicket, OnboardingRequest, TrackingSession, RiderPayoutBatch, PartnerPayoutBatch, GovernanceAuditEvent, LocationSample, ensureIndexes } from "./models.js";
 import { RiderShiftIncentiveMetric } from "./riderIncentivesModels.js";
 import { normalizeLeadEmail, partnerLeadSubmissionSchema, riderLeadSubmissionSchema, webLeadReviewSchema, webLeadStatusSchema } from "./webLeads.js";
@@ -3925,6 +3927,126 @@ app.get("/api/v1/riders", requireRole("admin", "fleet"), async (req, res) => {
     Rider.find(riderFilter).sort({ name: 1, _id: 1 }).skip(pagination.offset).limit(pagination.limit).lean().exec(),
   ]);
   return res.json({ riders, total, limit: pagination.limit, offset: pagination.offset, hasMore: pagination.offset + riders.length < total });
+});
+
+const riderPersonnelCipherPath: Record<RiderPersonnelField, string> = {
+  homeAddress: "homeAddressEncrypted",
+  identityDocumentNumber: "identityDocumentNumberEncrypted",
+  bankName: "bankNameEncrypted",
+  bankAccountHolder: "bankAccountHolderEncrypted",
+  iban: "ibanEncrypted",
+};
+app.get("/api/v1/admin/riders/personnel", requireOwner(), async (req, res) => {
+  const pagination = parseRiderListPagination(req.query.limit, req.query.offset, 500);
+  if (!pagination) return res.status(400).json({ error: "INVALID_RIDER_PAGINATION" });
+  const riderFilter = { isTestRider: { $ne: true } };
+  const [total, riders] = await Promise.all([
+    Rider.countDocuments(riderFilter).exec(),
+    Rider.find(riderFilter).select("riderCode name firstName lastName email phone city vehicle status lifecycleStatus fleetId zoneSlug").sort({ name: 1, _id: 1 }).skip(pagination.offset).limit(pagination.limit).lean().exec(),
+  ]) as [number, any[]];
+  const riderIds = riders.map((rider) => rider._id);
+  const records = riderIds.length ? await RiderPersonnelRecord.find({ riderId: { $in: riderIds } }).select("riderId +homeAddressEncrypted +identityDocumentNumberEncrypted +bankNameEncrypted +bankAccountHolderEncrypted +ibanEncrypted").lean().exec() as any[] : [];
+  const recordByRider = new Map(records.map((record) => [String(record.riderId), record]));
+  return res.json({
+    total,
+    limit: pagination.limit,
+    offset: pagination.offset,
+    hasMore: pagination.offset + riders.length < total,
+    encryptionReady: riderPersonnelEncryptionConfigured(),
+    riders: riders.map((rider) => ({
+      id: String(rider._id),
+      riderCode: rider.riderCode || publicRiderCode(rider._id),
+      name: rider.name,
+      firstName: rider.firstName || null,
+      lastName: rider.lastName || null,
+      email: rider.email,
+      phone: rider.phone || "",
+      city: rider.city || "",
+      vehicle: rider.vehicle || "",
+      status: rider.status || "offline",
+      lifecycleStatus: rider.lifecycleStatus || "active",
+      fleetId: rider.fleetId ? String(rider.fleetId) : null,
+      zoneSlug: rider.zoneSlug || null,
+      personnel: riderPersonnelCompleteness(recordByRider.get(String(rider._id))),
+    })),
+  });
+});
+app.get("/api/v1/admin/riders/:id/personnel", requireOwner(), async (req, res) => {
+  const riderId = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
+  if (!riderId) return res.status(400).json({ error: "INVALID_RIDER_ID" });
+  if (!riderPersonnelEncryptionConfigured()) return res.status(503).json({ error: "RIDER_PII_ENCRYPTION_NOT_CONFIGURED" });
+  const rider = await Rider.findOne({ _id: riderId, isTestRider: { $ne: true } }).select("_id tenantId riderCode name email phone city vehicle status lifecycleStatus").lean().exec() as any;
+  if (!rider) return res.status(404).json({ error: "RIDER_NOT_FOUND" });
+  const record = await RiderPersonnelRecord.findOne({ riderId }).select("+homeAddressEncrypted +identityDocumentNumberEncrypted +bankNameEncrypted +bankAccountHolderEncrypted +ibanEncrypted").lean().exec() as any;
+  const actorId = objectId(String(req.auth?.employeeId || ""));
+  if (!actorId) return res.status(403).json({ error: "SUPERADMIN_ONLY" });
+  await GovernanceAuditEvent.create({
+    tenantId: rider.tenantId || null,
+    actorEmployeeId: actorId,
+    actorRole: "admin",
+    action: "rider_personnel_record_viewed",
+    targetType: "rider",
+    targetId: riderId,
+    after: { fields: riderPersonnelFields },
+    reason: "Acceso superadmin a expediente personal protegido; no registrar valores personales.",
+  });
+  try {
+    return res.json({
+      rider: { id: String(rider._id), riderCode: rider.riderCode || publicRiderCode(rider._id), name: rider.name, email: rider.email, phone: rider.phone || "", city: rider.city || "", vehicle: rider.vehicle || "", status: rider.status || "offline", lifecycleStatus: rider.lifecycleStatus || "active" },
+      record: Object.fromEntries(riderPersonnelFields.map((field) => [field, decryptRiderPersonnelField(record?.[riderPersonnelCipherPath[field]], String(riderId), field)])),
+      updatedAt: record?.updatedAt || null,
+    });
+  } catch {
+    return res.status(500).json({ error: "RIDER_PII_DECRYPT_FAILED" });
+  }
+});
+app.patch("/api/v1/admin/riders/:id/personnel", requireOwner(), async (req, res) => {
+  const riderId = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
+  if (!riderId) return res.status(400).json({ error: "INVALID_RIDER_ID" });
+  const parsed = riderPersonnelPatchSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "INVALID_RIDER_PERSONNEL_DATA", fields: Object.keys(parsed.error.flatten().fieldErrors) });
+  if (parsed.data.iban?.trim() && !validRiderIban(parsed.data.iban)) return res.status(400).json({ error: "INVALID_IBAN" });
+  if (!riderPersonnelEncryptionConfigured()) return res.status(503).json({ error: "RIDER_PII_ENCRYPTION_NOT_CONFIGURED" });
+  const rider = await Rider.findOne({ _id: riderId, isTestRider: { $ne: true } }).select("_id tenantId").lean().exec() as any;
+  if (!rider) return res.status(404).json({ error: "RIDER_NOT_FOUND" });
+  const actorId = objectId(String(req.auth?.employeeId || ""));
+  if (!actorId) return res.status(403).json({ error: "SUPERADMIN_ONLY" });
+  const encryptedUpdate: Record<string, string | null> = {};
+  for (const field of Object.keys(parsed.data) as RiderPersonnelField[]) {
+    const value = parsed.data[field];
+    if (value === undefined) continue;
+    const normalized = field === "iban" ? value.replace(/\s+/g, "").toUpperCase() : value;
+    encryptedUpdate[riderPersonnelCipherPath[field]] = encryptRiderPersonnelField(normalized, String(riderId), field);
+  }
+  const session = await mongoose.startSession();
+  let updatedAt: Date | null = null;
+  try {
+    await session.withTransaction(async () => {
+      const saved = await RiderPersonnelRecord.findOneAndUpdate(
+        { riderId },
+        { $set: { ...encryptedUpdate, updatedByEmployeeId: actorId }, $setOnInsert: { riderId, tenantId: rider.tenantId || null, createdByEmployeeId: actorId } },
+        { new: true, upsert: true, runValidators: true, setDefaultsOnInsert: true, session },
+      ).select("updatedAt").exec() as any;
+      if (!saved) throw new Error("RIDER_PERSONNEL_SAVE_FAILED");
+      await GovernanceAuditEvent.create([{
+        tenantId: rider.tenantId || null,
+        actorEmployeeId: actorId,
+        actorRole: "admin",
+        action: "rider_personnel_record_updated",
+        targetType: "rider",
+        targetId: riderId,
+        before: null,
+        after: { changedFields: Object.keys(parsed.data) },
+        reason: "Actualización cifrada del expediente personal; la auditoría contiene nombres de campos, nunca sus valores.",
+      }], { session });
+      updatedAt = saved.updatedAt || new Date();
+    });
+    return res.json({ updated: true, fieldsUpdated: Object.keys(parsed.data), updatedAt });
+  } catch {
+    return res.status(500).json({ error: "RIDER_PERSONNEL_SAVE_FAILED" });
+  } finally {
+    await session.endSession();
+  }
 });
 
 const riderLifecycleStatuses = ["pending_documents", "active", "suspended", "terminated"] as const;

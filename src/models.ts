@@ -367,6 +367,18 @@ riderSchema.add({
   firstName: { type: String, trim: true, default: null, maxlength: 80, validate: (value: unknown) => riderFirstNameSchema.safeParse(value).success },
   lastName: { type: String, trim: true, default: null, maxlength: 120, validate: (value: unknown) => riderLastNameSchema.safeParse(value).success },
 });
+const riderPersonnelRecordSchema = new Schema({
+  tenantId: { type: Schema.Types.ObjectId, ref: "Tenant", default: null, index: true },
+  riderId: { type: Schema.Types.ObjectId, ref: "Rider", required: true },
+  homeAddressEncrypted: { type: String, default: null, select: false },
+  identityDocumentNumberEncrypted: { type: String, default: null, select: false },
+  bankNameEncrypted: { type: String, default: null, select: false },
+  bankAccountHolderEncrypted: { type: String, default: null, select: false },
+  ibanEncrypted: { type: String, default: null, select: false },
+  createdByEmployeeId: { type: Schema.Types.ObjectId, ref: "EmployeeAccount", default: null },
+  updatedByEmployeeId: { type: Schema.Types.ObjectId, ref: "EmployeeAccount", default: null },
+}, { timestamps: true, collection: "rider_personnel_records" });
+riderPersonnelRecordSchema.index({ riderId: 1 }, { unique: true });
 const onboardingRequestSchema = new Schema({
   tenantId: { type: Schema.Types.ObjectId, ref: "Tenant", default: null, index: true },
   requestedBy: { type: Schema.Types.ObjectId, ref: "EmployeeAccount", required: true, index: true },
@@ -459,6 +471,7 @@ export const PartnerAsset = mongoose.models.PartnerAsset || mongoose.model("Part
 export const PartnerLocalityGroup = mongoose.models.PartnerLocalityGroup || mongoose.model("PartnerLocalityGroup", partnerLocalityGroupSchema);
 export const MenuImportDraft = mongoose.models.MenuImportDraft || mongoose.model("MenuImportDraft", menuImportDraftSchema);
 export const Rider = mongoose.models.Rider || mongoose.model("Rider", riderSchema);
+export const RiderPersonnelRecord = mongoose.models.RiderPersonnelRecord || mongoose.model("RiderPersonnelRecord", riderPersonnelRecordSchema);
 export const Fleet = mongoose.models.Fleet || mongoose.model("Fleet", fleetSchema);
 export const Order = mongoose.models.Order || mongoose.model("Order", orderSchema);
 export const Zone = mongoose.models.Zone || mongoose.model("Zone", zoneSchema);
@@ -495,6 +508,7 @@ export const TrackingSession = mongoose.models.TrackingSession || mongoose.model
 export const LocationSample = mongoose.models.LocationSample || mongoose.model("LocationSample", locationSampleSchema);
 
 export async function ensureIndexes() {
+  await RiderPersonnelRecord.init();
   // Remove unique indexes from older schema versions before initialization.
   for (const [model, indexName] of [[Rider, "riderCode_1"], [EmployeeAccount, "portfolioId_1"], [Fleet, "name_1"], [Zone, "name_1"], [Zone, "slug_1"], [PartnerLocalityGroup, "localityKey_1"], [RiderSlot, "riderId_1_date_1_startTime_1"]] as const) {
     try { await model.collection.dropIndex(indexName); } catch (error: any) {
