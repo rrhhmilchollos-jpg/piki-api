@@ -31,6 +31,10 @@ test('legacy access-audit enum rejects partner_created; no live write',()=>{
  const audit=new AccessAuthorization({employeeId:'000000000000000000000001',actorEmployeeId:'000000000000000000000001',action:'partner_created',nextStatus:'pending_review',nextRole:'partner',accessLevel:'superadmin'});
  assert.ok(audit.validateSync()?.errors.action);
 });
+test('protected partner data audit action is accepted by the access-audit enum',()=>{
+ const audit=new AccessAuthorization({employeeId:'000000000000000000000001',actorEmployeeId:'000000000000000000000001',action:'partner_sensitive_data_updated',previousStatus:'approved',nextStatus:'approved',previousRole:'partner',nextRole:'partner',accessLevel:'superadmin',reason:'Protected partner fields updated; values omitted.'});
+ assert.equal(audit.validateSync(),undefined);
+});
 test('restaurant creation uses valid governance audit, not a role grant',()=>{
  const audit=new GovernanceAuditEvent({tenantId:tenant,actorEmployeeId:'000000000000000000000001',actorRole:'admin',action:'partner_created',targetType:'restaurant',targetId:'000000000000000000000002',before:null,after:{isActive:false,onboardingStatus:'pending_review'}});
  assert.equal(audit.validateSync(),undefined);
