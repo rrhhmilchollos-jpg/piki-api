@@ -2355,7 +2355,10 @@ app.patch("/api/v1/partners/store/status", requirePartnerSurface(), async (req, 
   if (!restaurantId) return res.status(403).json({ error: access?.restaurantIds.length ? "PARTNER_RESTAURANT_ACCESS_DENIED" : "PARTNER_RESTAURANT_NOT_ASSIGNED" });
   const parsed = z.object({ status: z.enum(["open", "paused"]) }).safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_STORE_STATUS" });
-  const restaurant = await Restaurant.findOneAndUpdate({ _id: restaurantId, onboardingStatus: "approved", ...partnerTenantScope(req) }, { $set: { isActive: parsed.data.status === "open" } }, { new: true }).select("_id name isActive").lean().exec() as any;
+  // Owners and Partners must be able to prepare, pause and reopen a local
+  // while its commercial file is under review. Public ordering remains gated
+  // by the separate publication/readiness policy.
+  const restaurant = await Restaurant.findOneAndUpdate({ _id: restaurantId, onboardingStatus: { $in: ["approved", "pending_review"] }, ...partnerTenantScope(req) }, { $set: { isActive: parsed.data.status === "open" } }, { new: true }).select("_id name isActive onboardingStatus").lean().exec() as any;
   if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
   invalidateCatalogCache();
   void publishCatalogUpdate(restaurant._id, "partner.store.status.updated");
@@ -2385,7 +2388,7 @@ app.get("/api/v1/partners/store/hours", requirePartnerSurface(), async (req, res
   if (!allowed) return res.status(403).json({ error: "PARTNER_PERMISSION_DENIED", permission: "store:write" });
   const restaurantId = await employeeRestaurant(req, access);
   if (!restaurantId) return res.status(403).json({ error: "PARTNER_RESTAURANT_NOT_ASSIGNED" });
-  const restaurant = await Restaurant.findOne({ _id: restaurantId, onboardingStatus: "approved", ...partnerTenantScope(req) }).select("_id name isActive partnerProfile.openingHours").lean().exec() as any;
+  const restaurant = await Restaurant.findOne({ _id: restaurantId, onboardingStatus: { $in: ["approved", "pending_review"] }, ...partnerTenantScope(req) }).select("_id name isActive onboardingStatus partnerProfile.openingHours").lean().exec() as any;
   if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
   return res.json({ restaurantId: String(restaurant._id), name: restaurant.name, isOpen: partnerIsOpenNow(restaurant), paused: !restaurant.isActive, openingHours: restaurant.partnerProfile?.openingHours || {} });
 });
@@ -2397,7 +2400,7 @@ app.patch("/api/v1/partners/store/hours", requirePartnerSurface(), async (req, r
   if (!restaurantId) return res.status(403).json({ error: "PARTNER_RESTAURANT_NOT_ASSIGNED" });
   if (!parsed.success) return res.status(400).json({ error: "INVALID_OPENING_HOURS", details: parsed.error.flatten() });
   const openingHours = pikiManagedOpeningHours(parsed.data);
-  const restaurant = await Restaurant.findOneAndUpdate({ _id: restaurantId, onboardingStatus: "approved", ...partnerTenantScope(req) }, { $set: { "partnerProfile.openingHours": openingHours } }, { new: true }).select("_id name isActive partnerProfile.openingHours").lean().exec() as any;
+  const restaurant = await Restaurant.findOneAndUpdate({ _id: restaurantId, onboardingStatus: { $in: ["approved", "pending_review"] }, ...partnerTenantScope(req) }, { $set: { "partnerProfile.openingHours": openingHours } }, { new: true }).select("_id name isActive onboardingStatus partnerProfile.openingHours").lean().exec() as any;
   if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
   invalidateCatalogCache();
   void publishCatalogUpdate(restaurant._id, "partner.store.hours.updated");
