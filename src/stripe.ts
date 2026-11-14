@@ -375,3 +375,15 @@ export async function captureStripePaymentIntent(paymentIntentId: string) {
   if (intent.status !== "succeeded") throw new Error(`STRIPE_CAPTURE_STATUS_${intent.status}`);
   return intent;
 }
+
+export const CUSTOMER_SERVICE_FEE_CENTS = 299;
+export const PARTNER_COMMISSION_RATE = 0.23;
+
+export function buildStripePricing(input: { items: Array<{ quantity: number; unitPriceCents: number }>; deliveryFeeCents: number }) {
+  const subtotalCents = input.items.reduce((sum, item) => sum + item.quantity * item.unitPriceCents, 0);
+  const deliveryFeeCents = Math.max(0, Math.round(input.deliveryFeeCents));
+  const serviceFeeCents = CUSTOMER_SERVICE_FEE_CENTS;
+  const totalCents = subtotalCents + deliveryFeeCents + serviceFeeCents;
+  const partnerCommissionCents = Math.round(subtotalCents * PARTNER_COMMISSION_RATE);
+  return { subtotalCents, deliveryFeeCents, serviceFeeCents, totalCents, partnerCommissionCents, partnerNetCents: subtotalCents - partnerCommissionCents };
+}
