@@ -92,6 +92,19 @@ Los clientes deben enviar `X-PIKI-Surface`, credenciales válidas y conservar `L
 
 El archivo `.env` no se versiona. Las credenciales se configuran en Render y los clientes solo consumen la API pública a través de HTTPS. Los orígenes autorizados se controlan con `CORS_ORIGINS`.
 
+### Arranque seguro durante la recuperación de MongoDB
+
+Estos dos flags están desactivados por defecto (ausentes o `false`) y solo admiten el valor literal `true` para habilitarse:
+
+- `PIKI_QA_EXPIRY_PURGE_ENABLED`: habilita la purga de partners QA expirados al arrancar y su intervalo de 60 segundos. Sin opt-in no se ejecuta ni se programa esa purga.
+- `PIKI_BOOTSTRAP_DATA_REPAIR_ENABLED`: habilita `ensureMrRoosterOperational` al arrancar, que puede reescribir campos operativos y sembrar una carta vacía. `REPAIR_MR_ROOSTER_MENU=true` por sí solo no activa esta reparación de arranque.
+
+Mantener ambos ausentes o en `false` al restaurar la base. No son un modo de solo lectura: el mantenimiento de índices, backfills, otros workers y sus flags existentes siguen intactos. Activarlos solo en una ventana controlada y con copia previa.
+
+El Blueprint declara `DELIVERY_QR_SECRET` con `sync: false` tanto en web como en worker; sus valores deben configurarse únicamente en el gestor privado de secretos, junto con `PICKUP_QR_SECRET`. El health check web usa `/ready` (503 si MongoDB no está listo), mientras `/health` solo verifica el proceso HTTP. `/ready` comprueba el estado de conexión, no ejecuta un ping ni valida la restauración de datos.
+
+Prueba local de estos guards, sin importar el servidor ni conectar a MongoDB: `npx --no-install tsx --test src/serverStartupSafety.test.ts`.
+
 ## Próxima integración
 
 La siguiente iteración introduce autenticación por rol, una máquina de estados transaccional de pedido, pagos y el motor de asignación de riders. El modelo ya contiene índices por categoría, actividad, estado de pedido, identificador público y geoíndices para las posiciones que se habilitarán al activar el servicio de localización.

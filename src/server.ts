@@ -8160,9 +8160,13 @@ async function start() {
     startNotificationWorker();
     startGoogleBusinessSyncWorker();
     await repairConfiguredPartnerAccess();
-    await purgeExpiredQaPartner();
-    setInterval(() => { void purgeExpiredQaPartner().catch((error) => console.warn("QA partner purge failed", error instanceof Error ? error.message : String(error))); }, 60_000).unref();
-    await ensureMrRoosterOperational();
+    if (process.env.PIKI_QA_EXPIRY_PURGE_ENABLED === "true") {
+      await purgeExpiredQaPartner();
+      setInterval(() => { void purgeExpiredQaPartner().catch((error) => console.warn("QA partner purge failed", error instanceof Error ? error.message : String(error))); }, 60_000).unref();
+    }
+    if (process.env.PIKI_BOOTSTRAP_DATA_REPAIR_ENABLED === "true") {
+      await ensureMrRoosterOperational();
+    }
     await purgeTestDataIfEnabled();
     databaseReady = true;
     if (process.env.RUN_TENANT_MIGRATION === "true") {
