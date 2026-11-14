@@ -118,6 +118,7 @@ import { releaseCodHoldAfterCashPayment } from "./codHoldSweep.js";
 import { CodHold } from "./codHolds.js";
 import { releaseCodOrder } from "./stripePayments.js";
 import { adjustEtaLabel, currentWeather, distanceKm } from "./weather.js";
+import { publicRestaurantPaymentCapabilities } from "./publicRestaurantPaymentCapabilities.js";
 
 export const app = express();
 app.set("trust proxy", 1);
@@ -1694,7 +1695,7 @@ app.get("/api/v1/catalog/restaurants", async (req, res) => {
   const restaurants = await Restaurant.find(filter)
     // Explicit inclusion avoids MongoDB path-collision errors caused by
     // partnerProfile.documents having select:false nested fields.
-    .select("slug name cuisine category locality partnerGroupKey listingType fulfillmentMode goldFounder tagline etaMinutes deliveryFeeCents cashPaymentsEnabled rating reviews promoted image accent phone address location menu menuRevision priceIncludesCommission isActive onboardingStatus availabilityStatus upcomingAt upcomingMessage partnerProfile.commissionRateBps partnerProfile.openingHours partnerProfile.postalCode partnerProfile.city partnerProfile.province")
+    .select("slug name cuisine category locality partnerGroupKey listingType fulfillmentMode fulfillmentModel paymentMethods bizumOnly goldFounder tagline etaMinutes deliveryFeeCents cashPaymentsEnabled rating reviews promoted image accent phone address location menu menuRevision priceIncludesCommission isActive onboardingStatus availabilityStatus upcomingAt upcomingMessage partnerProfile.commissionRateBps partnerProfile.openingHours partnerProfile.postalCode partnerProfile.city partnerProfile.province")
     .sort({ promoted: -1, rating: -1, reviews: -1 }).lean().exec();
   const catalogPriority: Record<string, number> = {
     "alibaba-kebab-xativa": 0,
@@ -1712,7 +1713,7 @@ app.get("/api/v1/catalog/restaurants", async (req, res) => {
     const presented = presentCustomerCatalogRestaurant({ ...restaurant, postalCode: restaurant.partnerProfile?.postalCode || postalCodeFromAddress, locality: restaurant.locality || restaurant.partnerProfile?.city || null, menu: canonicalRestaurantMenu(restaurant) });
     const remaining = Math.max(0, FREE_DELIVERY_LAUNCH_LIMIT - (orderCountByRestaurant.get(String(restaurant._id)) || 0));
     const launchWindow = isFreeDeliveryLaunchWindow();
-    return { ...presented, minimumOrderCents: Number(process.env.PIKI_MINIMUM_ORDER_CENTS || 500), fulfillmentMode: presented.fulfillmentMode || restaurant.fulfillmentMode || (restaurant.listingType === "local_directory" ? "assisted_purchase" : "partner_delivery"), freeDeliveryEligible: launchWindow && remaining > 0, freeDeliveryOrdersRemaining: launchWindow ? remaining : 0 };
+    return { ...presented, ...publicRestaurantPaymentCapabilities(restaurant), minimumOrderCents: Number(process.env.PIKI_MINIMUM_ORDER_CENTS || 500), fulfillmentMode: presented.fulfillmentMode || restaurant.fulfillmentMode || (restaurant.listingType === "local_directory" ? "assisted_purchase" : "partner_delivery"), freeDeliveryEligible: launchWindow && remaining > 0, freeDeliveryOrdersRemaining: launchWindow ? remaining : 0 };
   }) };
   if (CATALOG_CACHE_MS > 0) catalogCache.set(cacheKey, { expiresAt: Date.now() + CATALOG_CACHE_MS, body });
   res.setHeader("Cache-Control", "no-store, no-cache, max-age=0, must-revalidate");

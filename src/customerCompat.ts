@@ -20,6 +20,7 @@ import { CustomerQuoteConflict, assertCustomerQuoteExpectation, customerOrderQuo
 import { SourceOrderFeeError } from "./sourceOrderFee.js";
 import { customerDeliveryIsActive, profilePhotoSchema, publicProfilePhoto } from "./profileIdentityPolicy.js";
 import { customerAssignedRider } from "./customerRiderTracking.js";
+import { publicRestaurantPaymentCapabilities } from "./publicRestaurantPaymentCapabilities.js";
 
 const COOKIE = "piki_customer_session";
 let dispatchCustomerOrder: ((orderId: string) => Promise<unknown>) | null = null;
@@ -186,6 +187,7 @@ function restaurantView(row: any) {
     onboardingStatus: row.onboardingStatus,
     listingType: row.listingType || "official_partner",
     fulfillmentMode: row.fulfillmentMode || (row.listingType === "local_directory" ? "assisted_purchase" : "partner_delivery"),
+    ...publicRestaurantPaymentCapabilities(row),
     cashPaymentsEnabled: isCashPaymentEnabledForRestaurant(row),
     cuisine: row.cuisine,
     category: row.category,
