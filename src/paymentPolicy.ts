@@ -1,4 +1,6 @@
 export const MAX_CASH_ORDER_CENTS = 4_899;
+/** Production kill-switch: COD is closed unless explicitly enabled in Render. */
+export const CASH_PAYMENTS_ENABLED = process.env.PIKI_CASH_PAYMENTS_ENABLED === "true";
 
 export type CashPaymentMethod = "cash" | "stripe" | string | undefined | null;
 export type CashPaymentPartner = { slug?: string | null; name?: string | null; cashPaymentsEnabled?: boolean | null };
@@ -9,10 +11,9 @@ export type CashPaymentPartner = { slug?: string | null; name?: string | null; c
  * Alibaba Kebab Xàtiva is permanently online-only by the partner's request.
  */
 export function isCashPaymentEnabledForRestaurant(_restaurant: CashPaymentPartner): boolean {
-  // Todos los partners aceptan contra reembolso, sin excepciones por local.
-  // La proteccion frente a impagos es el bloqueo en tarjeta del pedido, no la
-  // restriccion del metodo de pago.
-  return true;
+  // La garantía de tarjeta, el barrido y la liquidación ya están implementados;
+  // el interruptor global evita exponer COD hasta que Operaciones lo autorice.
+  return CASH_PAYMENTS_ENABLED;
 }
 
 export function cashPaymentDisabledError(restaurant: CashPaymentPartner) {

@@ -76,7 +76,7 @@ import { partnerBasicProfileSchema } from "./partnerProfilePolicy.js";
 import { quoteMenuItem, usesReferenceAddOns } from "./menuModifiers.js";
 import { pointDistanceMeters } from "./pickupPolicy.js";
 import { buildLegacyRiderSupportTicketFilter, buildRiderSupportTicketFilter } from "./supportTicketScope.js";
-import { cashOrderLimitError, cashPaymentDisabledError, isCashOrderWithinLimit, isCashPaymentEnabledForRestaurant } from "./paymentPolicy.js";
+import { CASH_PAYMENTS_ENABLED, cashOrderLimitError, cashPaymentDisabledError, isCashOrderWithinLimit, isCashPaymentEnabledForRestaurant } from "./paymentPolicy.js";
 import { calculateMarketplaceBreakdown, DEFAULT_PARTNER_COMMISSION_BPS } from "./marketplaceAccounting.js";
 import { postMarketplaceOrderLedger, preparePartnerPayoutBatch } from "./marketplaceLedger.js";
 import { extractAndParseMenu, readAssetBytes } from "./menuImport.js";
@@ -1640,7 +1640,7 @@ app.post("/api/v1/admin/orders/:id/confirm-bizum", requireRole("admin", "finance
   await Promise.all([dispatch, publishOrderIntakeEvents(updated, { settlement: "paid", message: "Bizum conciliado por PIKI; pedido liberado para dispatch." })]);
   return res.json({ order: { id: updated._id, publicCode: updated.publicCode, paymentState: updated.paymentState, totalCents: updated.totalCents }, idempotent: false });
 });
-app.get("/api/v1/payments/status", (_req, res) => res.json({ provider: "stripe" }));
+app.get("/api/v1/payments/status", (_req, res) => res.json({ provider: "stripe", cashPaymentsEnabled: CASH_PAYMENTS_ENABLED }));
 app.get("/api/v1/signatures/status", (_req, res) => res.json({ provider: "signaturit" }));
 app.post("/api/v1/admin/signatures", requireRole("admin"), async (req, res) => {
   const parsed = z.object({ entityType: z.enum(["partner", "rider", "employee"]), entityId: z.string().regex(/^[a-f\d]{24}$/), signerName: z.string().min(2).max(160), signerEmail: z.string().email(), subject: z.string().min(2).max(200), documentName: z.string().min(1).max(180), documentBase64: z.string().min(20).max(8_000_000) }).safeParse(req.body);
