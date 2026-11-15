@@ -62,7 +62,7 @@ export function stripePaymentIntentId(object: StripeWebhookObject): string | und
  */
 export function shouldPublishOperationalIntake(order: any, transition: StripePaymentTransition): boolean {
   return transition.activatesOperationalIntake
-    && order?.paymentMethod === "stripe"
+    && ["stripe", "bizum"].includes(String(order?.paymentMethod))
     && ["authorized", "paid"].includes(String(order?.paymentState))
     && order?.status === "pending"
     && order?.assignmentState === "unassigned";

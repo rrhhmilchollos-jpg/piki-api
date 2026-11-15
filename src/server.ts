@@ -76,7 +76,7 @@ import { partnerBasicProfileSchema } from "./partnerProfilePolicy.js";
 import { quoteMenuItem, usesReferenceAddOns } from "./menuModifiers.js";
 import { pointDistanceMeters } from "./pickupPolicy.js";
 import { buildLegacyRiderSupportTicketFilter, buildRiderSupportTicketFilter } from "./supportTicketScope.js";
-import { CASH_PAYMENTS_ENABLED, cashOrderLimitCents, cashOrderLimitError, cashPaymentDisabledError, hydrateCashPaymentsEnabled, isCashOrderWithinLimit, isCashPaymentEnabledForRestaurant } from "./paymentPolicy.js";
+import { CASH_PAYMENTS_ENABLED, cashOrderLimitCents, cashOrderLimitError, cashPaymentDisabledError, hydrateCashPaymentsEnabled, isCashOrderWithinLimit, isCashPaymentEnabledForRestaurant, isOnlinePaymentMethod } from "./paymentPolicy.js";
 import { calculateMarketplaceBreakdown, DEFAULT_PARTNER_COMMISSION_BPS } from "./marketplaceAccounting.js";
 import { postMarketplaceOrderLedger, preparePartnerPayoutBatch } from "./marketplaceLedger.js";
 import { extractAndParseMenu, readAssetBytes } from "./menuImport.js";
@@ -4947,7 +4947,7 @@ app.delete("/api/v1/rider-slots/:id", requireRole("admin", "fleet"), async (req,
 app.post("/api/v1/orders", rateLimit(20, 60_000, "orders-create"), async (req, res) => {
   const parsed = createOrderSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_ORDER", details: parsed.error.flatten() });
-  if (!["cash", "stripe"].includes(parsed.data.paymentMethod)) return res.status(409).json({ error: "PAYMENT_METHOD_UNAVAILABLE", message: "Método de pago no disponible." });
+  if (!["cash", "stripe", "bizum"].includes(parsed.data.paymentMethod)) return res.status(409).json({ error: "PAYMENT_METHOD_UNAVAILABLE", message: "Método de pago no disponible." });
   const restaurantObjectId = objectId(parsed.data.restaurantId);
   if (!restaurantObjectId) return res.status(400).json({ error: "INVALID_RESTAURANT_ID" });
   const restaurant = await Restaurant.findOne({ _id: restaurantObjectId, ...CUSTOMER_ORDERABLE_RESTAURANT_FILTER }).lean().exec() as any;
@@ -5336,7 +5336,7 @@ app.post("/api/v1/customer/referrals/claim", async (req, res) => {
   return res.status(201).json({ referral });
 });
 
-const customerOrderSyncSchema = z.object({ publicCode: z.string().trim().min(6).max(64), restaurantSlug: z.string().trim().min(1).max(120), customerId: z.string().nullable().optional(), customerName: z.string().trim().max(160).nullable().optional(), deliveryAddress: z.string().trim().min(5).max(1000), deliveryNote: z.string().trim().max(500).default(""), deliveryLocation: z.object({ latitude: z.number().finite(), longitude: z.number().finite() }).nullable().optional(), items: z.array(z.object({ itemId: z.string().min(1), name: z.string().min(1), quantity: z.number().int().min(1).max(20), unitPriceCents: z.number().int().min(0), totalCents: z.number().int().min(0).optional() })).min(1), subtotalCents: z.number().int().min(0), deliveryFeeCents: z.number().int().min(0), serviceFeeCents: z.number().int().min(0), totalCents: z.number().int().min(0), paymentMethod: z.enum(["stripe", "cash", "bizum_manual"]).default("stripe"), paymentState: z.enum(["pending", "authorized", "paid", "failed", "refunded"]).default("pending"), stripeCheckoutSessionId: z.string().nullable().optional(), stripePaymentIntentId: z.string().nullable().optional() });
+const customerOrderSyncSchema = z.object({ publicCode: z.string().trim().min(6).max(64), restaurantSlug: z.string().trim().min(1).max(120), customerId: z.string().nullable().optional(), customerName: z.string().trim().max(160).nullable().optional(), deliveryAddress: z.string().trim().min(5).max(1000), deliveryNote: z.string().trim().max(500).default(""), deliveryLocation: z.object({ latitude: z.number().finite(), longitude: z.number().finite() }).nullable().optional(), items: z.array(z.object({ itemId: z.string().min(1), name: z.string().min(1), quantity: z.number().int().min(1).max(20), unitPriceCents: z.number().int().min(0), totalCents: z.number().int().min(0).optional() })).min(1), subtotalCents: z.number().int().min(0), deliveryFeeCents: z.number().int().min(0), serviceFeeCents: z.number().int().min(0), totalCents: z.number().int().min(0), paymentMethod: z.enum(["stripe", "cash", "bizum"]).default("stripe"), paymentState: z.enum(["pending", "authorized", "paid", "failed", "refunded"]).default("pending"), stripeCheckoutSessionId: z.string().nullable().optional(), stripePaymentIntentId: z.string().nullable().optional() });
 app.post("/api/v1/internal/customer-orders/sync", async (req, res) => {
   const expected = process.env.PIKI_CUSTOMER_SYNC_SECRET;
   if (!expected || req.header("x-piki-customer-sync-secret") !== expected) return res.status(401).json({ error: "INVALID_SYNC_AUTH" });
@@ -5499,7 +5499,7 @@ app.post("/api/v1/payments/checkout", rateLimit(20, 60_000, "payments-checkout")
   const order = (id ? await Order.findById(id).lean().exec() : await Order.findOne({ publicCode: parsed.data.orderId }).lean().exec()) as any;
   if (!order) return res.status(404).json({ error: "ORDER_NOT_FOUND" });
   if (!checkoutTokenIsValid(order.publicCode, parsed.data.checkoutToken)) return res.status(403).json({ error: "INVALID_CHECKOUT_TOKEN" });
-  if (order.paymentMethod !== "stripe") return res.status(409).json({ error: "ORDER_USES_CASH", message: "Este pedido está configurado para pago en efectivo." });
+  if (!["stripe", "bizum"].includes(String(order.paymentMethod))) return res.status(409).json({ error: "ORDER_USES_CASH", message: "Este pedido no está configurado para pago online." });
   if (["authorized", "paid"].includes(order.paymentState)) return res.status(409).json({ error: "ORDER_ALREADY_PAID" });
   // Revalidate the authorized restaurant's SOURCE tariff before coupon/credit
   // mutations or Stripe. Compare the recorded base, not a benefit-discounted fee.
@@ -5533,7 +5533,7 @@ app.post("/api/v1/payments/checkout", rateLimit(20, 60_000, "payments-checkout")
       deliveryFeeCents: Number(order.deliveryFeeCents || 0),
       serviceFeeCents: Number(order.serviceFeeCents || 0),
       discountCents: creditAppliedCents + couponAppliedCents,
-      preferredPaymentMethod: "stripe",
+      preferredPaymentMethod: order.paymentMethod === "bizum" ? "bizum" : "stripe",
     });
     await Order.updateOne({ _id: order._id, paymentState: "pending" }, { $set: { stripeCheckoutSessionId: session.id, creditAppliedCents, couponAppliedCents, appliedCouponId, totalCents: Number(order.totalCents || 0) - creditAppliedCents - couponAppliedCents }, $inc: { version: 1 } }).exec();
     return res.status(201).json({ checkoutUrl: session.url, sessionId: session.id, orderId: String(order._id), publicCode: order.publicCode, creditAppliedCents, couponAppliedCents, priceBreakdown: calculatePriceBreakdown({ subtotalCents: Number(order.subtotalCents || 0), deliveryFeeCents: Number(order.deliveryFeeCents || 0), serviceFeeCents: Number(order.serviceFeeCents || 0), discountCents: creditAppliedCents + couponAppliedCents }) });
@@ -6366,7 +6366,7 @@ app.post("/api/v1/riders/:riderId/orders/:orderId/confirm-delivery", requireRole
   const deliveryDistanceMeters = pointDistanceMeters(rider.location, confirmedOrder.deliveryLocation);
   if (deliveryDistanceMeters == null) return res.status(409).json({ error: "DELIVERY_LOCATION_REQUIRED", message: "No se puede verificar la entrega: falta una ubicación GPS válida del cliente." });
   const outsideGpsRadius = deliveryDistanceMeters > DELIVERY_CONFIRMATION_RADIUS_METERS;
-  if (confirmedOrder.paymentMethod === "stripe") {
+  if (isOnlinePaymentMethod(confirmedOrder.paymentMethod)) {
     const paymentAction = stripeDeliveryPaymentAction(confirmedOrder);
     if (paymentAction === "reject") return res.status(409).json({ error: "PAYMENT_NOT_AUTHORIZED", message: "El pago online todavía no está pagado ni autorizado para capturarse." });
     if (paymentAction === "capture_authorization") {
@@ -6394,7 +6394,7 @@ app.post("/api/v1/riders/:riderId/orders/:orderId/confirm-delivery", requireRole
   // version race. Status/rider/assignment predicates remain the concurrency
   // guard, and Stripe orders must be authorized or already marked paid.
   const deliveredAt = new Date();
-  const updated = await Order.findOneAndUpdate({ _id: orderId, riderId, assignmentState: "assigned", status: "on_the_way", ...(confirmedOrder.paymentMethod === "stripe" ? { paymentState: { $in: ["authorized", "paid"] } } : {}) }, { $set: { status: "delivered", deliveredAt, archivedAt: deliveredAt, paymentState: "paid", deliveryProof: { method: credential.method, riderId, confirmedAt: deliveredAt, idempotencyKey: credential.idempotencyKey, gpsDistanceMeters: deliveryDistanceMeters, gpsOutsideConfiguredRadius: outsideGpsRadius } }, $inc: { version: 1 }, $push: { statusHistory: { status: "delivered", actorRole: "rider", reason: confirmedOrder.paymentMethod === "cash" ? "Entrega confirmada y cobro en efectivo registrado" : "Entrega confirmada por el Rider" } } }, { new: true }).lean().exec();
+  const updated = await Order.findOneAndUpdate({ _id: orderId, riderId, assignmentState: "assigned", status: "on_the_way", ...(isOnlinePaymentMethod(confirmedOrder.paymentMethod) ? { paymentState: { $in: ["authorized", "paid"] } } : {}) }, { $set: { status: "delivered", deliveredAt, archivedAt: deliveredAt, paymentState: "paid", deliveryProof: { method: credential.method, riderId, confirmedAt: deliveredAt, idempotencyKey: credential.idempotencyKey, gpsDistanceMeters: deliveryDistanceMeters, gpsOutsideConfiguredRadius: outsideGpsRadius } }, $inc: { version: 1 }, $push: { statusHistory: { status: "delivered", actorRole: "rider", reason: confirmedOrder.paymentMethod === "cash" ? "Entrega confirmada y cobro en efectivo registrado" : "Entrega confirmada por el Rider" } } }, { new: true }).lean().exec();
   if (!updated) {
     const delivered = await Order.findOne({ _id: orderId, riderId, assignmentState: "assigned", status: "delivered" }).lean().exec() as any;
     if (delivered) return res.json(deliveredConfirmationResponse(delivered, true, delivered.deliveryProof?.gpsDistanceMeters ?? null, Boolean(delivered.deliveryProof?.gpsOutsideConfiguredRadius)));

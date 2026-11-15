@@ -15,7 +15,13 @@ export async function hydrateCashPaymentsEnabled() {
   }
 }
 
-export type CashPaymentMethod = "cash" | "stripe" | string | undefined | null;
+export type CashPaymentMethod = "cash" | "stripe" | "bizum" | string | undefined | null;
+
+/** Métodos online que se confirman mediante Stripe y nunca requieren cobro al Rider. */
+export const ONLINE_PAYMENT_METHODS = ["stripe", "bizum"] as const;
+export function isOnlinePaymentMethod(value: unknown): value is (typeof ONLINE_PAYMENT_METHODS)[number] {
+  return ONLINE_PAYMENT_METHODS.includes(value as (typeof ONLINE_PAYMENT_METHODS)[number]);
+}
 export type CashPaymentPartner = { slug?: string | null; name?: string | null; cashPaymentsEnabled?: boolean | null; cashOrderMaxCents?: number | null; cashOrderMinCents?: number | null };
 export function cashOrderLimitCents(restaurant?: CashPaymentPartner | null): number {
   const configured = Number(restaurant?.cashOrderMaxCents);

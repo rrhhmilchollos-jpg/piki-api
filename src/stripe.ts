@@ -17,7 +17,7 @@ import { applyPikiPassEvent } from "./pikiPassBilling.js";
 
 const stripeSecretKey = process.env.STRIPE_SECRET_KEY;
 export const stripe = stripeSecretKey ? new Stripe(stripeSecretKey) : null;
-const stripeBizumEnabled = process.env.STRIPE_BIZUM_ENABLED === "true";
+const stripeBizumEnabled = process.env.STRIPE_BIZUM_ENABLED !== "false";
 const PROCESSING_LEASE_MS = 5 * 60_000;
 
 export function stripeConfigured() {
@@ -244,17 +244,16 @@ async function applyPaymentTransition(input: { orderCode: string; paymentState: 
   const session = await mongoose.startSession();
   try {
     await session.withTransaction(async () => {
-      const transitioned = await Order.findOneAndUpdate(
-        {
-          publicCode: input.orderCode,
-          paymentMethod: "stripe",
-          paymentState: { $in: isCancellation ? ["pending", "authorized"] : allowedPriorPaymentStates(input.paymentState) },
-          ...(isCancellation ? { stripePaymentIntentId: paymentIntentId, cashCollectedAt: null } : {}),
-        },
-        update,
-        { new: true, session },
-      ).lean().exec() as any;
+      const transitionFilter = (paymentMethod: "stripe" | "bizum") => ({
+        publicCode: input.orderCode,
+        paymentMethod,
+        paymentState: { $in: isCancellation ? ["pending", "authorized"] : allowedPriorPaymentStates(input.paymentState) },
+        ...(isCancellation ? { stripePaymentIntentId: paymentIntentId, cashCollectedAt: null } : {}),
+      });
+      const transition = async (paymentMethod: "stripe" | "bizum") => Order.findOneAndUpdate(transitionFilter(paymentMethod), update, { new: true, session }).lean().exec() as any;
+      const transitioned = await transition("stripe") || await transition("bizum");
       const order = transitioned || await Order.findOne({ publicCode: input.orderCode }).session(session).lean().exec() as any;
+      if (order && !["stripe", "bizum"].includes(String(order.paymentMethod))) throw new StripeWebhookProcessingError("STRIPE_ORDER_PAYMENT_METHOD_UNSUPPORTED");
       if (isCancellation && order && order.stripePaymentIntentId !== paymentIntentId) {
         throw new StripeWebhookProcessingError("STRIPE_CANCELATION_PI_MISMATCH");
       }

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { CASH_PAYMENTS_ENABLED, isCashPaymentEnabledForRestaurant, setCashPaymentsEnabled } from "./paymentPolicy.js";
+import { CASH_PAYMENTS_ENABLED, isCashPaymentEnabledForRestaurant, isCashOrderWithinLimit, setCashPaymentsEnabled } from "./paymentPolicy.js";
 import { allowedPaymentMethods, paymentDecision, bizumReferenceFor, canChargeCard, remainingCardCents } from "./fulfillment.js";
 
 test("un local bizumOnly acepta bizum y contra reembolso cuando el interruptor lo habilita", () => {
@@ -49,4 +49,14 @@ test("la tarjeta virtual nunca permite gastar más del presupuesto", () => {
   assert.equal(canChargeCard(card, 301), false);
   assert.equal(canChargeCard({ ...card, status: "settled" }, 100), false);
   assert.equal(canChargeCard(card, 0), false);
+});
+
+
+test("Bizum está disponible para cualquier partner e importe y no se trata como efectivo", () => {
+  const previous = CASH_PAYMENTS_ENABLED;
+  try {
+    setCashPaymentsEnabled(false);
+    assert.equal(paymentDecision({ name: "Partner con configuración legacy", paymentMethods: ["cash"] }, "bizum").ok, true);
+    assert.equal(isCashOrderWithinLimit("bizum", 999_999_999), true);
+  } finally { setCashPaymentsEnabled(previous); }
 });

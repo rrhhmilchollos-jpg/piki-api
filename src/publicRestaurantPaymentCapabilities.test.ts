@@ -40,15 +40,15 @@ const restaurantView = evaluate(declaration(compatSource, "restaurantView"), "re
   customerCatalogRestaurantName, customerMenuForRestaurant, isCashPaymentEnabledForRestaurant: enabledPolicy.isCashPaymentEnabledForTest, modifierGroupsForItem,
 });
 const cases: Array<{ name: string; row: Record<string, any>; methods: string[]; bizumOnly?: boolean; model?: string }> = [
-  { name: "legacy absent fields", row: {}, methods: ["stripe", "cash"] },
+  { name: "legacy absent fields", row: {}, methods: ["stripe", "bizum", "cash"] },
   { name: "Bizum precedence", row: { bizumOnly: true, paymentMethods: ["stripe", "unknown"] }, methods: ["bizum", "cash"], bizumOnly: true },
   { name: "configured Bizum", row: { paymentMethods: ["bizum"] }, methods: ["bizum", "cash"] },
-  { name: "configured cash", row: { paymentMethods: ["cash"], cashPaymentsEnabled: false }, methods: ["cash"] },
-  { name: "invalid configuration fallback", row: { paymentMethods: ["unknown"], bizumOnly: "true", fulfillmentModel: "unknown" }, methods: ["stripe", "cash"] },
-  { name: "empty configuration fallback", row: { paymentMethods: [] }, methods: ["stripe", "cash"] },
-  { name: "null legacy configuration", row: { paymentMethods: null, bizumOnly: null, fulfillmentModel: null }, methods: ["stripe", "cash"] },
+  { name: "configured cash", row: { paymentMethods: ["cash"], cashPaymentsEnabled: false }, methods: ["cash", "bizum"] },
+  { name: "invalid configuration fallback", row: { paymentMethods: ["unknown"], bizumOnly: "true", fulfillmentModel: "unknown" }, methods: ["stripe", "bizum", "cash"] },
+  { name: "empty configuration fallback", row: { paymentMethods: [] }, methods: ["stripe", "bizum", "cash"] },
+  { name: "null legacy configuration", row: { paymentMethods: null, bizumOnly: null, fulfillmentModel: null }, methods: ["stripe", "bizum", "cash"] },
   { name: "rider purchase", row: { paymentMethods: ["stripe", "bizum"], fulfillmentModel: "rider_purchase", fulfillmentMode: "partner_delivery" }, methods: ["stripe", "bizum", "cash"], model: "rider_purchase" },
-  { name: "delivery mode is not fulfillment model", row: { fulfillmentMode: "assisted_purchase" }, methods: ["stripe", "cash"] },
+  { name: "delivery mode is not fulfillment model", row: { fulfillmentMode: "assisted_purchase" }, methods: ["stripe", "bizum", "cash"] },
 ];
 function fixture(index: number, overrides: Record<string, any> = {}) {
   return { _id: String(index), slug: `synthetic-${index}`, name: `Synthetic ${index}`, isActive: true, onboardingStatus: "approved", availabilityStatus: "available", listingType: "official_partner", fulfillmentMode: "partner_delivery", priceIncludesCommission: true, menu: [{ id: "dish", name: "Dish", price: 12.37, available: true, allergens: null }], ...overrides };
@@ -82,14 +82,14 @@ test("public helper preserves canonical methods, strict boolean and existing ful
 
 test("the global COD kill-switch removes cash even when legacy restaurant data opts in", () => {
   const closed = buildPolicy(false);
-  assert.deepEqual(closed.policy.allowedPaymentMethods({ cashPaymentsEnabled: true }), ["stripe"]);
+  assert.deepEqual(closed.policy.allowedPaymentMethods({ cashPaymentsEnabled: true }), ["stripe", "bizum"]);
   const decision = closed.policy.paymentDecision({ name: "Synthetic", cashPaymentsEnabled: true }, "cash");
   assert.equal(decision.ok, false);
-  assert.deepEqual(decision.allowed, ["stripe"]);
-  assert.deepEqual(closed.publicRestaurantPaymentCapabilities({ cashPaymentsEnabled: true }).allowedPaymentMethods, ["stripe"]);
+  assert.deepEqual(decision.allowed, ["stripe", "bizum"]);
+  assert.deepEqual(closed.publicRestaurantPaymentCapabilities({ cashPaymentsEnabled: true }).allowedPaymentMethods, ["stripe", "bizum"]);
 });
 
-test("DTO capabilities agree with the unchanged quote paymentDecision", () => {
+test("DTO capabilities agree with the quote paymentDecision", () => {
   assert.match(declaration(compatSource, "handleCustomerTrpcSingle"), /const decision = paymentDecision\(restaurant, paymentMethod\)/);
   for (const entry of cases) {
     for (const method of ["stripe", "bizum", "cash"]) {
