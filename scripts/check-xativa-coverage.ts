@@ -13,7 +13,8 @@ assert.equal(outside.covered, false);
 assert.equal(outside.reason, "OUTSIDE_XATIVA_RADIUS");
 assert.equal(outside.deliveryFeeCents, null);
 
-assert.deepEqual(requiredVehiclesForRoute(3), []);
-assert.deepEqual(requiredVehiclesForRoute(3.001), ["motorcycle", "car"]);
-assert.deepEqual(requiredVehiclesForRoute(null), ["motorcycle", "car"]);
+assert.deepEqual(requiredVehiclesForRoute(1.499), []);
+assert.deepEqual(requiredVehiclesForRoute(1.5), ["motorcycle", "scooter", "car"]);
+assert.deepEqual(requiredVehiclesForRoute(3), ["motorcycle", "scooter", "car"]);
+assert.deepEqual(requiredVehiclesForRoute(null), ["motorcycle", "scooter", "car"]);
 console.log("xativa coverage policy checks passed", { center, outside });
