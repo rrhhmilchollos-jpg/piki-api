@@ -29,7 +29,7 @@ import { waitlistRouter } from "./waitlist.js";
 import express from "express";
 import mongoose from "mongoose";
 import { z } from "zod";
-import { CashLedgerEntry, CustomerAccount, DispatchDecision, DispatchOutbox, DocumentRequest, EmployeeAccount, AccessAuthorization, Fleet, Order, Restaurant, PartnerAsset, PartnerLocalityGroup, MenuImportDraft, Rider, RiderApplication, PartnerLead, RiderLead, RiderIncident, RiderOrderMessage, RiderSlot, SignatureRequest, Zone, PushSubscription, RealtimeEvent, Notification, Tenant, TenantMembership, RiderAssignmentReservation, SupportTicket, OnboardingRequest, TrackingSession, RiderPayoutBatch, PartnerPayoutBatch, GovernanceAuditEvent, LocationSample, ensureIndexes } from "./models.js";
+import { CashLedgerEntry, CustomerAccount, DispatchDecision, DispatchOutbox, DocumentRequest, EmployeeAccount, AccessAuthorization, Fleet, Order, Restaurant, PartnerAsset, PartnerLocalityGroup, MenuImportDraft, Rider, RiderApplication, PartnerLead, RiderLead, RiderIncident, RiderOrderMessage, RiderSlot, SignatureRequest, Zone, PushSubscription, RealtimeEvent, Notification, Tenant, TenantMembership, RiderAssignmentReservation, SupportTicket, OnboardingRequest, TrackingSession, RiderPayoutBatch, RiderCashSettlement, PartnerPayoutBatch, GovernanceAuditEvent, LocationSample, ensureIndexes } from "./models.js";
 import { RiderShiftIncentiveMetric } from "./riderIncentivesModels.js";
 import { normalizeLeadEmail, partnerLeadSubmissionSchema, riderLeadSubmissionSchema, webLeadReviewSchema, webLeadStatusSchema } from "./webLeads.js";
 import { assertTransition, calculateEtaRange, transitionSchema, validateCoordinates } from "./algorithms/index.js";
@@ -2988,6 +2988,19 @@ app.patch("/api/v1/admin/restaurants/:id/settings", requireOwner(), async (req, 
   return res.json({ updated: true, restaurant: { ...restaurant, id: String(restaurant._id), partnerCode: restaurant.partnerCode || publicPartnerCode(restaurant._id), commissionRateBps: Number(restaurant.partnerProfile?.commissionRateBps ?? DEFAULT_PARTNER_COMMISSION_BPS), commissionPercent: Number(restaurant.partnerProfile?.commissionRateBps ?? DEFAULT_PARTNER_COMMISSION_BPS) / 100 } });
 });
 
+app.post("/api/v1/admin/restaurants/:id/publish-customer", requireOwner(), async (req, res) => {
+  const id = objectId(String(req.params.id));
+  if (!id) return res.status(400).json({ error: "INVALID_RESTAURANT_ID" });
+  const current = await Restaurant.findOne({ _id: id, ...tenantScope(req) }).select("_id slug name locality menu listingType onboardingStatus isActive availabilityStatus internalDemo fulfillmentMode").lean().exec() as any;
+  if (!current) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
+  const menuCount = Array.isArray(current.menu) ? current.menu.filter((item: any) => item && String(item.id || item.name || "").trim()).length : 0;
+  if (!menuCount) return res.status(409).json({ error: "PARTNER_MENU_REQUIRED", message: "El Partner tiene que disponer de una carta antes de publicarse en Customer." });
+  const updated = await Restaurant.findOneAndUpdate({ _id: id, ...tenantScope(req) }, { $set: { listingType: "official_partner", onboardingStatus: "approved", isActive: true, availabilityStatus: "available", internalDemo: false, fulfillmentMode: "partner_delivery" } }, { new: true }).select("_id slug name locality listingType onboardingStatus isActive availabilityStatus internalDemo fulfillmentMode menu").lean().exec() as any;
+  invalidateCatalogCache();
+  void publishCatalogUpdate(updated._id, "admin.restaurant.published.customer");
+  await recordGovernanceEvent({ actor: { employeeId: req.auth?.employeeId, role: "superadmin", tenantId: (req.auth as any)?.tenantId }, action: "partner_published_customer", targetType: "restaurant", targetId: id, before: current, after: updated, reason: "Publicación explícita en el catálogo Customer desde PIKI Admin." });
+  return res.json({ published: true, restaurant: { id: String(updated._id), slug: updated.slug, name: updated.name, locality: updated.locality, menuCount, listingType: updated.listingType, onboardingStatus: updated.onboardingStatus, isActive: updated.isActive, availabilityStatus: updated.availabilityStatus, fulfillmentMode: updated.fulfillmentMode } });
+});
 app.get("/api/v1/admin/restaurants/:id/sensitive-data", requireRole("admin"), async (req, res) => {
   const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
   if (!id) return res.status(400).json({ error: "INVALID_RESTAURANT_ID" });
@@ -7721,6 +7734,74 @@ app.patch("/api/v1/admin/partners/:id/settings", requireOwner(), async (req, res
 app.get("/api/v1/admin/governance/audit", requireRole("admin"), async (req, res) => {
   const limit = Math.min(Math.max(Number(req.query.limit || 100), 1), 500);
   return res.json({ events: await GovernanceAuditEvent.find(tenantScope(req)).sort({ createdAt: -1 }).limit(limit).lean().exec() });
+});
+const cashPolicyInputSchema = z.object({
+  enabled: z.boolean().optional(),
+  maxOrderCents: z.number().int().min(0).max(1_000_000).optional(),
+  minOrderCents: z.number().int().min(0).max(1_000_000).optional(),
+  outstandingMaxCents: z.number().int().min(0).max(10_000_000).optional(),
+  reason: z.string().trim().max(500).default(""),
+}).strict();
+app.get("/api/v1/admin/restaurants/:id/cash-policy", requireOwner(), async (req, res) => {
+  const id = objectId(String(req.params.id));
+  if (!id) return res.status(400).json({ error: "INVALID_RESTAURANT_ID" });
+  const restaurant = await Restaurant.findOne({ _id: id, ...tenantScope(req) }).select("_id slug name cashPaymentsEnabled cashOrderMaxCents cashOrderMinCents cashOutstandingMaxCents cashPolicyUpdatedAt cashPolicyUpdatedBy cashPolicyReason").lean().exec() as any;
+  if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
+  return res.json({ policy: { restaurantId: String(restaurant._id), slug: restaurant.slug, name: restaurant.name, enabled: Boolean(restaurant.cashPaymentsEnabled), maxOrderCents: Number(restaurant.cashOrderMaxCents ?? 4_899), minOrderCents: Number(restaurant.cashOrderMinCents ?? 0), outstandingMaxCents: Number(restaurant.cashOutstandingMaxCents ?? 10_000), updatedAt: restaurant.cashPolicyUpdatedAt || null, updatedBy: restaurant.cashPolicyUpdatedBy || null, reason: restaurant.cashPolicyReason || "" } });
+});
+app.patch("/api/v1/admin/restaurants/:id/cash-policy", requireOwner(), async (req, res) => {
+  const id = objectId(String(req.params.id));
+  const parsed = cashPolicyInputSchema.safeParse(req.body);
+  if (!id || !parsed.success) return res.status(400).json({ error: "INVALID_CASH_POLICY", details: parsed.success ? undefined : parsed.error.flatten() });
+  if (parsed.data.maxOrderCents !== undefined && parsed.data.minOrderCents !== undefined && parsed.data.minOrderCents > parsed.data.maxOrderCents) return res.status(400).json({ error: "CASH_MIN_EXCEEDS_MAX" });
+  const current = await Restaurant.findOne({ _id: id, ...tenantScope(req) }).select("_id slug name cashPaymentsEnabled cashOrderMaxCents cashOrderMinCents cashOutstandingMaxCents cashPolicyUpdatedAt cashPolicyUpdatedBy cashPolicyReason").lean().exec() as any;
+  if (!current) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
+  const update: Record<string, unknown> = { cashPolicyUpdatedAt: new Date(), cashPolicyUpdatedBy: objectId(String(req.auth?.employeeId || "")), cashPolicyReason: parsed.data.reason };
+  if (parsed.data.enabled !== undefined) update.cashPaymentsEnabled = parsed.data.enabled;
+  if (parsed.data.maxOrderCents !== undefined) update.cashOrderMaxCents = parsed.data.maxOrderCents;
+  if (parsed.data.minOrderCents !== undefined) update.cashOrderMinCents = parsed.data.minOrderCents;
+  if (parsed.data.outstandingMaxCents !== undefined) update.cashOutstandingMaxCents = parsed.data.outstandingMaxCents;
+  const updated = await Restaurant.findOneAndUpdate({ _id: id, ...tenantScope(req) }, { $set: update }, { new: true }).select("_id slug name cashPaymentsEnabled cashOrderMaxCents cashOrderMinCents cashOutstandingMaxCents cashPolicyUpdatedAt cashPolicyUpdatedBy cashPolicyReason").lean().exec() as any;
+  await recordGovernanceEvent({ actor: { employeeId: req.auth?.employeeId, role: "superadmin", tenantId: (req.auth as any)?.tenantId }, action: "partner_cash_policy_updated", targetType: "restaurant", targetId: id, before: current, after: updated, reason: parsed.data.reason || "Política de efectivo actualizada desde Admin." });
+  return res.json({ updated: true, policy: { restaurantId: String(updated._id), slug: updated.slug, name: updated.name, enabled: Boolean(updated.cashPaymentsEnabled), maxOrderCents: Number(updated.cashOrderMaxCents ?? 4_899), minOrderCents: Number(updated.cashOrderMinCents ?? 0), outstandingMaxCents: Number(updated.cashOutstandingMaxCents ?? 10_000), updatedAt: updated.cashPolicyUpdatedAt || null, updatedBy: updated.cashPolicyUpdatedBy || null, reason: updated.cashPolicyReason || "" } });
+});
+const cashSettlementPeriodSchema = z.object({ riderId: z.string().regex(/^[a-f\d]{24}$/i), periodStart: z.coerce.date(), periodEnd: z.coerce.date(), reference: z.string().trim().min(3).max(120).optional(), note: z.string().trim().max(1000).default("") }).refine((value) => value.periodEnd > value.periodStart, "INVALID_SETTLEMENT_PERIOD");
+app.get("/api/v1/finance/rider-cash-settlements", requireRole("admin", "finance"), async (req, res) => {
+  const settlements = await RiderCashSettlement.find(tenantScope(req)).sort({ createdAt: -1 }).limit(200).lean().exec();
+  return res.json({ settlements });
+});
+app.post("/api/v1/finance/rider-cash-settlements/prepare", requireRole("admin", "finance"), async (req, res) => {
+  const parsed = cashSettlementPeriodSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "INVALID_CASH_SETTLEMENT_PERIOD", details: parsed.error.flatten() });
+  const riderId = objectId(parsed.data.riderId); if (!riderId) return res.status(400).json({ error: "INVALID_RIDER_ID" });
+  const rider = await Rider.findOne({ _id: riderId, ...tenantScope(req) }).select("_id riderCode name").lean().exec() as any;
+  if (!rider) return res.status(404).json({ error: "RIDER_NOT_FOUND" });
+  const entries = await CashLedgerEntry.find({ ...tenantScope(req), riderId, direction: "in", settlementId: null, createdAt: { $gte: parsed.data.periodStart, $lt: parsed.data.periodEnd } }).sort({ createdAt: 1 }).lean().exec() as any[];
+  if (!entries.length) return res.status(409).json({ error: "NO_CASH_ENTRIES_TO_SETTLE" });
+  const amountCents = entries.reduce((sum, entry) => sum + Number(entry.amountCents || 0), 0);
+  const reference = parsed.data.reference || `cash-${String(riderId).slice(-8)}-${parsed.data.periodStart.toISOString().slice(0, 10)}`;
+  const idempotencyKey = `rider-cash-settlement:${String(riderId)}:${parsed.data.periodStart.toISOString()}:${parsed.data.periodEnd.toISOString()}`;
+  const settlement = await RiderCashSettlement.findOneAndUpdate({ idempotencyKey }, { $setOnInsert: { tenantId: (req.auth as any)?.tenantId || null, riderId, entryIds: entries.map((entry) => entry._id), periodStart: parsed.data.periodStart, periodEnd: parsed.data.periodEnd, amountCents, reference, note: parsed.data.note, idempotencyKey, status: "pending_review", createdBy: objectId(String(req.auth?.employeeId || "")) } }, { upsert: true, new: true, setDefaultsOnInsert: true }).lean().exec() as any;
+  await CashLedgerEntry.updateMany({ _id: { $in: entries.map((entry) => entry._id) }, settlementId: null }, { $set: { settlementId: settlement._id } }).exec();
+  await recordGovernanceEvent({ actor: { employeeId: req.auth?.employeeId, role: req.auth?.role, tenantId: (req.auth as any)?.tenantId }, action: "rider_cash_settlement_prepared", targetType: "rider_cash_settlement", targetId: settlement._id, after: { riderId, amountCents, entryCount: entries.length, status: settlement.status }, reason: "Liquidación de efectivo preparada para revisión." });
+  return res.status(201).json({ prepared: true, settlement, rider: { id: String(rider._id), riderCode: rider.riderCode || publicRiderCode(rider._id), name: rider.name } });
+});
+app.post("/api/v1/finance/rider-cash-settlements/:id/approve", requireRole("admin", "finance"), async (req, res) => {
+  const id = objectId(String(req.params.id)); if (!id) return res.status(400).json({ error: "INVALID_CASH_SETTLEMENT_ID" });
+  const settlement = await RiderCashSettlement.findOneAndUpdate({ _id: id, ...tenantScope(req), status: "pending_review" }, { $set: { status: "approved", reviewedAt: new Date(), reviewedBy: objectId(String(req.auth?.employeeId || "")) } }, { new: true }).lean().exec() as any;
+  if (!settlement) return res.status(409).json({ error: "CASH_SETTLEMENT_NOT_PENDING" });
+  await recordGovernanceEvent({ actor: { employeeId: req.auth?.employeeId, role: req.auth?.role, tenantId: (req.auth as any)?.tenantId }, action: "rider_cash_settlement_approved", targetType: "rider_cash_settlement", targetId: id, after: settlement, reason: "Liquidación de efectivo aprobada desde Admin." });
+  return res.json({ approved: true, settlement });
+});
+app.post("/api/v1/finance/rider-cash-settlements/:id/complete", requireRole("admin", "finance"), async (req, res) => {
+  const id = objectId(String(req.params.id)); const parsed = z.object({ reference: z.string().trim().min(3).max(120), note: z.string().trim().max(1000).default("") }).safeParse(req.body);
+  if (!id || !parsed.success) return res.status(400).json({ error: "INVALID_CASH_SETTLEMENT_COMPLETION" });
+  const settlement = await RiderCashSettlement.findOne({ _id: id, ...tenantScope(req), status: "approved" }).lean().exec() as any;
+  if (!settlement) return res.status(409).json({ error: "CASH_SETTLEMENT_NOT_APPROVED" });
+  await CashLedgerEntry.findOneAndUpdate({ idempotencyKey: `cash-settlement:${String(id)}:handover` }, { $setOnInsert: { tenantId: settlement.tenantId, orderId: null, restaurantId: null, riderId: settlement.riderId, settlementId: id, actorRole: req.auth?.role === "finance" ? "finance" : "admin", direction: "out", amountCents: settlement.amountCents, reason: "cash_handover", idempotencyKey: `cash-settlement:${String(id)}:handover`, reference: parsed.data.reference, note: parsed.data.note } }, { upsert: true, new: true, setDefaultsOnInsert: true }).exec();
+  const updated = await RiderCashSettlement.findOneAndUpdate({ _id: id, status: "approved" }, { $set: { status: "paid", paidAt: new Date(), paidBy: objectId(String(req.auth?.employeeId || "")) } }, { new: true }).lean().exec();
+  await recordGovernanceEvent({ actor: { employeeId: req.auth?.employeeId, role: req.auth?.role, tenantId: (req.auth as any)?.tenantId }, action: "rider_cash_settlement_completed", targetType: "rider_cash_settlement", targetId: id, after: updated, reason: "Liquidación de efectivo completada y salida registrada en el libro mayor." });
+  return res.json({ paid: true, settlement: updated });
 });
 app.post("/api/v1/finance/payout-batches/:id/approve", requireRole("admin", "finance"), async (req, res) => {
   const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id); if (!id) return res.status(400).json({ error: "INVALID_PAYOUT_BATCH_ID" });
