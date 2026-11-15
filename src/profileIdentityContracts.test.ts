@@ -143,6 +143,51 @@ test("Customer profile/tracking require real Customer session; anonymous auth.me
   assert.equal((await trpc("auth.me", {}, "GET", false)).value, null);
   for (const procedure of ["customer.profile.get", "customer.profile.update", "order.get", "order.customerTracking"]) assert.equal((await trpc(procedure, {}, "POST", false)).code, 401);
 });
+test("customer.orders.list returns the authenticated customer's complete receipt snapshot", async (t) => {
+  mockCustomer(t);
+  const createdAt = new Date("2026-11-10T12:00:00.000Z");
+  const item = { itemId: "dish-1", name: "Gyozas", quantity: 2, unitPriceCents: 575, selectedOptions: [{ groupId: "sauce", groupName: "Salsa", optionId: "spicy", optionName: "Picante", unitPriceCents: 0 }] };
+  const order = { ...ownedOrder, status: "ready_for_pickup", assignmentState: "unassigned", riderId: null, paymentMethod: "bizum", paymentState: "paid", totalCents: 3150, deliveryAddress: "Calle de prueba 4", deliveryNote: "Sin cebolla", routeDurationMinutes: 25, createdAt, updatedAt: createdAt, items: [item] };
+  t.mock.method(Order as any, "find", (filter: any) => {
+    assert.deepEqual(filter, { customerId: ids.customer });
+    return q([order], (fields) => { for (const field of ["paymentMethod", "deliveryAddress", "deliveryNote", "items"]) assert(fields.includes(field)); }, (limit) => assert.equal(limit, 100));
+  });
+  t.mock.method(Restaurant as any, "find", (filter: any) => { assert.deepEqual(filter, { _id: { $in: [ids.restaurant] } }); return q([{ _id: ids.restaurant, name: "Fixture Restaurant" }]); });
+  const result = await trpc("customer.orders.list");
+  assert.equal(result.code, 200);
+  assert.equal(result.value[0].restaurant, "Fixture Restaurant");
+  assert.equal(result.value[0].paymentState, "paid");
+  assert.equal(result.value[0].paymentMethod, "bizum");
+  assert.equal(result.value[0].totalCents, 3150);
+  assert.equal(result.value[0].address, "Calle de prueba 4");
+  assert.equal(result.value[0].deliveryNote, "Sin cebolla");
+  assert.deepEqual(result.value[0].items, [{ id: "dish-1", name: "Gyozas", quantity: 2, unitPriceCents: 575, selectedOptions: [{ groupName: "Salsa", optionName: "Picante" }] }]);
+});
+
+test("order.get returns a private, customer-owned order receipt with payment, address and item snapshots", async (t) => {
+  mockCustomer(t);
+  const createdAt = new Date("2026-11-10T12:00:00.000Z");
+  const item = { itemId: "dish-2", name: "Ramen", quantity: 1, unitPriceCents: 1290, selectedOptions: [] };
+  const order = { ...ownedOrder, status: "preparing", assignmentState: "unassigned", riderId: null, paymentMethod: "stripe", paymentState: "paid", totalCents: 1490, deliveryAddress: "Avenida de prueba 9", deliveryNote: "Llamar al llegar", createdAt, updatedAt: createdAt, items: [item] };
+  t.mock.method(Order as any, "findOne", (filter: any) => {
+    assert.deepEqual(filter, { publicCode: ownedOrder.publicCode, customerId: ids.customer });
+    return q(order, (fields) => { for (const field of ["paymentMethod", "paymentState", "totalCents", "deliveryAddress", "deliveryNote", "createdAt", "items"]) assert(fields.includes(field)); });
+  });
+  t.mock.method(Restaurant as any, "findById", () => q({ name: "Fixture Restaurant" }));
+  const result = await trpc("order.get", { id: ownedOrder.publicCode });
+  assert.equal(result.code, 200);
+  assert.equal(result.value.status, "preparing");
+  assert.equal(result.value.restaurant, "Fixture Restaurant");
+  assert.equal(result.value.paymentState, "paid");
+  assert.equal(result.value.paymentMethod, "stripe");
+  assert.equal(result.value.totalCents, 1490);
+  assert.equal(result.value.address, "Avenida de prueba 9");
+  assert.equal(result.value.deliveryNote, "Llamar al llegar");
+  assert.deepEqual(result.value.items, [{ id: "dish-2", name: "Ramen", quantity: 1, unitPriceCents: 1290, selectedOptions: [] }]);
+  assert.equal(result.headers["Cache-Control"], "private, no-store");
+  for (const field of ["customerId", "tenantId", "stripeCheckoutSessionId", "bizumReference"]) assert.equal(Object.hasOwn(result.value, field), false);
+});
+
 function trackingMocks(t: any, order: any, rider: any = trackedRider) {
   mockCustomer(t);
   t.mock.method(Order as any, "findOne", (filter: any) => { assert.deepEqual(filter, { publicCode: ownedOrder.publicCode, customerId: ids.customer }); return q(order, (fields) => assert(fields.includes("tenantId"))); });

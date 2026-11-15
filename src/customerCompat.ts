@@ -76,6 +76,25 @@ export function customerDisplayStatus(value: unknown): string {
   return canonicalStatus === "ready_for_pickup" ? "ready" : canonicalStatus;
 }
 
+function customerOrderItemsView(value: unknown) {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((item: any) => {
+    if (!item || typeof item !== "object") return [];
+    const id = typeof item.itemId === "string" ? item.itemId.trim() : typeof item.id === "string" ? item.id.trim() : "";
+    const name = typeof item.name === "string" && item.name.trim() ? item.name.trim().slice(0, 200) : id;
+    const quantity = Number(item.quantity);
+    if (!id || !Number.isInteger(quantity) || quantity < 1 || quantity > 20) return [];
+    const unitPriceCents = Number(item.unitPriceCents);
+    const selectedOptions = Array.isArray(item.selectedOptions) ? item.selectedOptions.flatMap((option: any) => {
+      if (!option || typeof option !== "object") return [];
+      const groupName = typeof option.groupName === "string" ? option.groupName.trim().slice(0, 100) : "";
+      const optionName = typeof option.optionName === "string" ? option.optionName.trim().slice(0, 120) : "";
+      return groupName && optionName ? [{ groupName, optionName }] : [];
+    }) : [];
+    return [{ id, name, quantity, ...(Number.isFinite(unitPriceCents) && unitPriceCents >= 0 ? { unitPriceCents } : {}), selectedOptions }];
+  });
+}
+
 function inputOf(req: Request): any {
   const body = req.body ?? {};
   const parsedBody = parseCustomerTrpcInput(body);
@@ -280,10 +299,10 @@ async function handleCustomerTrpcSingle(req: Request, res: Response) {
     if (procedure === "customer.orders.list") {
       const user = await currentCustomer(req) as any;
       if (!user) return fail(res, "Inicia sesión para consultar tus pedidos.", "AUTH_REQUIRED");
-      const orders = await Order.find({ customerId: String(user._id) }).sort({ createdAt: -1 }).limit(100).select("publicCode status restaurantId totalCents createdAt updatedAt paymentState assignmentState routeDurationMinutes items").lean().exec() as any[];
+      const orders = await Order.find({ customerId: String(user._id) }).sort({ createdAt: -1 }).limit(100).select("publicCode status restaurantId totalCents createdAt updatedAt paymentState paymentMethod assignmentState routeDurationMinutes deliveryAddress deliveryNote items").lean().exec() as any[];
       const restaurants = await Restaurant.find({ _id: { $in: orders.map((order) => order.restaurantId) } }).select("name").lean().exec() as any[];
       const names = new Map(restaurants.map((restaurant) => [String(restaurant._id), restaurant.name]));
-      return reply(res, orders.map((order) => ({ id: order.publicCode, restaurant: names.get(String(order.restaurantId)) || "Restaurante PIKI", status: customerDisplayStatus(order.status), operationalStatus: order.status, total: Number(order.totalCents || 0) / 100, createdAt: order.createdAt, updatedAt: order.updatedAt, active: !["delivered", "cancelled"].includes(order.status), paymentState: order.paymentState, assignmentState: order.assignmentState, eta: order.routeDurationMinutes ? `${order.routeDurationMinutes} min` : "actualizando…", items: order.items || [] })));
+      return reply(res, orders.map((order) => ({ id: order.publicCode, restaurant: names.get(String(order.restaurantId)) || "Restaurante PIKI", status: customerDisplayStatus(order.status), operationalStatus: order.status, total: Number(order.totalCents || 0) / 100, totalCents: Number(order.totalCents || 0), createdAt: order.createdAt, updatedAt: order.updatedAt, active: !["delivered", "cancelled"].includes(order.status), paymentState: order.paymentState, paymentMethod: order.paymentMethod || null, assignmentState: order.assignmentState, eta: order.routeDurationMinutes ? `${order.routeDurationMinutes} min` : "actualizando…", address: order.deliveryAddress || "", deliveryNote: order.deliveryNote || "", items: customerOrderItemsView(order.items) })));
     }
     if (procedure === "customer.support.list") {
       const user = await currentCustomer(req) as any;
@@ -366,14 +385,14 @@ async function handleCustomerTrpcSingle(req: Request, res: Response) {
       const user = await currentCustomer(req) as any;
       if (!user) return fail(res, "Inicia sesión con la cuenta que realizó el pedido.", "AUTH_REQUIRED");
       const publicCode = String(input?.id || "").trim();
-      const order = await Order.findOne({ publicCode, customerId: String(user._id) }).select("_id publicCode tenantId status restaurantId riderId assignmentState routeDurationMinutes deliveryAddress paymentState").lean().exec() as any;
+      const order = await Order.findOne({ publicCode, customerId: String(user._id) }).select("_id publicCode tenantId status restaurantId riderId assignmentState routeDurationMinutes deliveryAddress deliveryNote paymentState paymentMethod totalCents createdAt updatedAt items").lean().exec() as any;
       if (!order) return fail(res, "Pedido no encontrado", "NOT_FOUND");
       const restaurant = await Restaurant.findById(order.restaurantId).select("name").lean().exec() as any;
       res.setHeader("Cache-Control", "private, no-store");
       const { identity, rider } = await customerAssignedRider(order);
       const publicOrder = { status: customerDisplayStatus(order.status), operationalStatus: order.status, assignmentState: order.assignmentState, ...identity };
       if (procedure === "order.get") {
-        return reply(res, { id: order.publicCode, restaurant: restaurant?.name || "Pedido PIKI", ...publicOrder, eta: order.routeDurationMinutes ? `${order.routeDurationMinutes} min` : "actualizando…" });
+        return reply(res, { id: order.publicCode, restaurant: restaurant?.name || "Pedido PIKI", ...publicOrder, eta: order.routeDurationMinutes ? `${order.routeDurationMinutes} min` : "actualizando…", totalCents: Number(order.totalCents || 0), paymentState: order.paymentState || null, paymentMethod: order.paymentMethod || null, address: order.deliveryAddress || "", deliveryNote: order.deliveryNote || "", createdAt: order.createdAt || null, updatedAt: order.updatedAt || null, items: customerOrderItemsView(order.items) });
       }
       // Assignment identity precedes pickup, but GPS and chat keep their delivery-only gate.
       const active = customerDeliveryIsActive(order) && Boolean(rider);
@@ -517,7 +536,7 @@ async function handleCustomerTrpcSingle(req: Request, res: Response) {
             await debitQuotedCustomerCredits(String(user._id), wallet, creditAppliedCents, orderSession);
             creditExpiresAt = (wallet as any)?.pikiCreditsExpiresAt;
           }
-          const orderPayload = { publicCode: code, fulfillmentModel: decision.riderPurchase ? "rider_purchase" : "partner_managed", bizumReference: decision.method === "bizum" ? bizumReferenceFor(code) : null, tenantId: restaurant.tenantId || null, restaurantId: restaurant._id, customerId: String(user._id), items: normalized, deliveryAddress: String(input.address || "").trim(), deliveryLocation: { type: "Point", coordinates: deliveryPoint }, pickupLocation: { type: "Point", coordinates: [...restaurantPoint] }, coveragePolicySlug: coverage.policySlug, coveragePolicyVersion: coverage.policyVersion, coverageDecision: coverage.reason, straightLineDistanceKm: coverage.straightLineDistanceKm, withinMunicipality: coverage.withinMunicipality, deliveryBaseFeeCents: coverage.deliveryBaseFeeCents, outsideMunicipalitySurchargeCents: coverage.outsideMunicipalitySurchargeCents, routeDistanceKm: route.routeDistanceKm, routeDurationMinutes: route.routeDurationMinutes, routeProvider: route.routeProvider, routingDegraded: route.routingDegraded, requiredVehicleClasses: route.requiredVehicleClasses, subtotalCents, deliveryFeeCents: deliveryCents, serviceFeeCents: serviceCents, creditAppliedCents, totalCents, paymentMethod, paymentState: "pending", statusHistory: [{ status: "pending", actorRole: "customer", reason: paymentMethod === "cash" ? "Pedido a contrarreembolso; cobro pendiente hasta la entrega" : "Pedido pendiente de confirmación del pago online" }]  };
+          const orderPayload = { publicCode: code, fulfillmentModel: decision.riderPurchase ? "rider_purchase" : "partner_managed", bizumReference: decision.method === "bizum" ? bizumReferenceFor(code) : null, tenantId: restaurant.tenantId || null, restaurantId: restaurant._id, customerId: String(user._id), items: normalized, deliveryAddress: String(input.address || "").trim(), deliveryNote: String(input.deliveryNote || "").trim().slice(0, 500), deliveryLocation: { type: "Point", coordinates: deliveryPoint }, pickupLocation: { type: "Point", coordinates: [...restaurantPoint] }, coveragePolicySlug: coverage.policySlug, coveragePolicyVersion: coverage.policyVersion, coverageDecision: coverage.reason, straightLineDistanceKm: coverage.straightLineDistanceKm, withinMunicipality: coverage.withinMunicipality, deliveryBaseFeeCents: coverage.deliveryBaseFeeCents, outsideMunicipalitySurchargeCents: coverage.outsideMunicipalitySurchargeCents, routeDistanceKm: route.routeDistanceKm, routeDurationMinutes: route.routeDurationMinutes, routeProvider: route.routeProvider, routingDegraded: route.routingDegraded, requiredVehicleClasses: route.requiredVehicleClasses, subtotalCents, deliveryFeeCents: deliveryCents, serviceFeeCents: serviceCents, creditAppliedCents, totalCents, paymentMethod, paymentState: "pending", statusHistory: [{ status: "pending", actorRole: "customer", reason: paymentMethod === "cash" ? "Pedido a contrarreembolso; cobro pendiente hasta la entrega" : "Pedido pendiente de confirmación del pago online" }]  };
           const created = await Order.create([orderPayload], { session: orderSession });
           order = created[0];
           if (paymentMethod === "cash") {
