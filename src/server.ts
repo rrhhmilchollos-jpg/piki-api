@@ -100,6 +100,7 @@ import { markPartnerBatchPaid, markRiderBatchPaid, publicPartnerCode, publicRide
 import { legacyOpeningHoursProjection, normalizeOpeningHours, openingHoursSchema } from "./openingHours.js";
 import { PRL_COURSE_VERSION, PRL_PASS_MARK, PrlEnrollment, certificateIssuer, certificateMode, createPrlToken, hashPrlToken, prlQuestions, publicPrlEnrollment } from "./prlTraining.js";
 import { GoogleBusinessConnection, GoogleOauthState, MunicipalExpansion } from "./expansionModels.js";
+import { KAZOKU_INFORMATION_IDS, KAZOKU_INFORMATION_TENANT } from "./publicPartnerInformation.js";
 import { decryptGoogleSecret, exchangeGoogleCode, fromGoogleLocationHours, googleAuthorizationUrl, googleBusinessConfiguration, googleBusinessConfigured, googleBusinessScopes, listGoogleAccounts, listGoogleLocations, readGoogleLocation, toGoogleLocationHours, updateGoogleLocationHours, encryptGoogleSecret } from "./googleBusinessProfile.js";
 import { deliveredConfirmationResponse, deliveryCredentialNotLockedFilter, deliveryFailureAtomicUpdate, deliveryFailureLock, parseDeliveryCredential, stripeDeliveryPaymentAction } from "./deliveryConfirmation.js";
 import { fleetPublicView } from "./fleetView.js";
@@ -8301,7 +8302,19 @@ async function repairConfiguredPartnerAccess() {
       { $set: { availabilityStatus: "available", upcomingMessage: "", isActive: true, image: KINGS_TACOS_COVER_IMAGE, promoted: false } },
     ).exec();
   }
-  const portfolioIds = [restaurant._id, ...assignedRestaurants.map((location: any) => location._id)];
+  // Explicit launch decision for the two existing Kazoku records. Their
+  // persisted menus are already the source of truth (101 items each); null
+  // allergen metadata is preserved and is not used as a publication gate.
+  // This narrowly scoped repair never affects any other Partner or menu.
+  const kazokuGoLive = process.env.REPAIR_PARTNER_KAZOKU_GO_LIVE === "true" || email === ownerEmail;
+  if (kazokuGoLive) {
+    await Restaurant.updateMany(
+      { _id: { $in: KAZOKU_INFORMATION_IDS.map((id) => objectId(id)) }, tenantId: objectId(KAZOKU_INFORMATION_TENANT), listingType: "official_partner", internalDemo: { $ne: true } },
+      { $set: { onboardingStatus: "approved", isActive: true, availabilityStatus: "available", upcomingMessage: "" } },
+    ).exec();
+    console.log(JSON.stringify({ event: "kazoku_go_live", restaurantIds: [...KAZOKU_INFORMATION_IDS], tenantId: KAZOKU_INFORMATION_TENANT, menuPreserved: true, allergenMetadataPreserved: true }));
+  }
+  const portfolioIds = [restaurant._id, ...assignedRestaurants.map((location: any) => location._id), ...(kazokuGoLive ? KAZOKU_INFORMATION_IDS.map((id) => objectId(id)) : [])];
   const assignedSlugs = new Set(assignedRestaurants.map((location: any) => location.slug));
   if (includeXativaTestPortfolio && COMING_SOON_SLUGS.some((slug) => !assignedSlugs.has(slug))) {
     throw new Error("Configured Xàtiva test portfolio does not match the public catalog");
