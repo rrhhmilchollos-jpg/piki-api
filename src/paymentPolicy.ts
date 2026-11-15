@@ -16,7 +16,15 @@ export async function hydrateCashPaymentsEnabled() {
 }
 
 export type CashPaymentMethod = "cash" | "stripe" | string | undefined | null;
-export type CashPaymentPartner = { slug?: string | null; name?: string | null; cashPaymentsEnabled?: boolean | null };
+export type CashPaymentPartner = { slug?: string | null; name?: string | null; cashPaymentsEnabled?: boolean | null; cashOrderMaxCents?: number | null; cashOrderMinCents?: number | null };
+export function cashOrderLimitCents(restaurant?: CashPaymentPartner | null): number {
+  const configured = Number(restaurant?.cashOrderMaxCents);
+  return Number.isFinite(configured) ? Math.max(0, Math.min(MAX_CASH_ORDER_CENTS, Math.round(configured))) : MAX_CASH_ORDER_CENTS;
+}
+export function cashOrderMinimumCents(restaurant?: CashPaymentPartner | null): number {
+  const configured = Number(restaurant?.cashOrderMinCents);
+  return Number.isFinite(configured) ? Math.max(0, Math.round(configured)) : 0;
+}
 
 /**
  * Cash is controlled by the global operations kill-switch. Legacy partner
@@ -36,15 +44,18 @@ export function cashPaymentDisabledError(restaurant: CashPaymentPartner) {
 }
 
 /** The cash cap applies to one final customer order, never to a rider handover. */
-export function isCashOrderWithinLimit(paymentMethod: CashPaymentMethod, totalCents: number): boolean {
-  return paymentMethod !== "cash" || (Number.isInteger(totalCents) && totalCents >= 0 && totalCents <= MAX_CASH_ORDER_CENTS);
+export function isCashOrderWithinLimit(paymentMethod: CashPaymentMethod, totalCents: number, maxCents = MAX_CASH_ORDER_CENTS): boolean {
+  return paymentMethod !== "cash" || (Number.isInteger(totalCents) && totalCents >= 0 && totalCents <= maxCents);
 }
 
-export function cashOrderLimitError(totalCents: number) {
+export function cashOrderLimitError(totalCents: number, maxCents = MAX_CASH_ORDER_CENTS) {
+  const limitMessage = maxCents === MAX_CASH_ORDER_CENTS
+    ? `${MAX_CASH_ORDER_CENTS} céntimos (€48,99)`
+    : `${(maxCents / 100).toFixed(2).replace(".", ",")} €`;
   return {
     error: "CASH_ORDER_TOTAL_EXCEEDS_LIMIT",
-    message: `Los pedidos en efectivo no pueden superar ${MAX_CASH_ORDER_CENTS} céntimos (€48,99) sobre el total final. Selecciona pago online.`,
-    maxCashOrderCents: MAX_CASH_ORDER_CENTS,
+    message: `Los pedidos en efectivo no pueden superar ${limitMessage} sobre el total final. Selecciona pago online.`,
+    maxCashOrderCents: maxCents,
     totalCents,
   } as const;
 }

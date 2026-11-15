@@ -76,7 +76,7 @@ import { partnerBasicProfileSchema } from "./partnerProfilePolicy.js";
 import { quoteMenuItem, usesReferenceAddOns } from "./menuModifiers.js";
 import { pointDistanceMeters } from "./pickupPolicy.js";
 import { buildLegacyRiderSupportTicketFilter, buildRiderSupportTicketFilter } from "./supportTicketScope.js";
-import { CASH_PAYMENTS_ENABLED, cashOrderLimitError, cashPaymentDisabledError, hydrateCashPaymentsEnabled, isCashOrderWithinLimit, isCashPaymentEnabledForRestaurant } from "./paymentPolicy.js";
+import { CASH_PAYMENTS_ENABLED, cashOrderLimitCents, cashOrderLimitError, cashPaymentDisabledError, hydrateCashPaymentsEnabled, isCashOrderWithinLimit, isCashPaymentEnabledForRestaurant } from "./paymentPolicy.js";
 import { calculateMarketplaceBreakdown, DEFAULT_PARTNER_COMMISSION_BPS } from "./marketplaceAccounting.js";
 import { postMarketplaceOrderLedger, preparePartnerPayoutBatch } from "./marketplaceLedger.js";
 import { extractAndParseMenu, readAssetBytes } from "./menuImport.js";
@@ -5001,7 +5001,8 @@ app.post("/api/v1/orders", rateLimit(20, 60_000, "orders-create"), async (req, r
     priceIncludesCommission: restaurant.priceIncludesCommission === true,
   });
   if (marketplace.customerTotalCents !== totalCents) return res.status(500).json({ error: "MARKETPLACE_TOTAL_MISMATCH" });
-  if (!isCashOrderWithinLimit(parsed.data.paymentMethod, totalCents)) return res.status(422).json(cashOrderLimitError(totalCents));
+  const partnerCashLimitCents = cashOrderLimitCents(restaurant);
+  if (!isCashOrderWithinLimit(parsed.data.paymentMethod, totalCents, partnerCashLimitCents)) return res.status(422).json(cashOrderLimitError(totalCents, partnerCashLimitCents));
   const { publicCode, displayCode, displayCodeDate } = await createOrderCodes();
   const dailyCode = { displayCode, displayCodeDate };
   const order = await Order.create({ tenantId: restaurant.tenantId || null, publicCode, ...dailyCode, restaurantId: restaurant._id, customerId: authenticatedCustomer?._id || null, customerName: String(authenticatedCustomer?.name || "").trim(), items: normalizedItems, deliveryAddress: parsed.data.deliveryAddress, deliveryNote: parsed.data.deliveryNote, deliveryLocation: { type: "Point", coordinates: deliveryPoint }, pickupLocation: restaurant.location || undefined, coveragePolicySlug: coverage.policySlug, coveragePolicyVersion: coverage.policyVersion, coverageDecision: coverage.reason, straightLineDistanceKm: coverage.straightLineDistanceKm, withinMunicipality: withinSameOperationalCity(restaurant.location?.coordinates, deliveryPoint), deliveryBaseFeeCents: coverage.deliveryBaseFeeCents, outsideMunicipalitySurchargeCents: coverage.outsideMunicipalitySurchargeCents, routeDistanceKm: route.routeDistanceKm, routeDurationMinutes: route.routeDurationMinutes, routeProvider: route.routeProvider, routingDegraded: route.routingDegraded, requiredVehicleClasses: route.requiredVehicleClasses, subtotalCents, deliveryFeeCents, serviceFeeCents, totalCents,
@@ -5354,7 +5355,8 @@ app.post("/api/v1/internal/customer-orders/sync", async (req, res) => {
   }
   const freeDelivery = await freeDeliveryState(restaurant);
   const effectiveDeliveryFeeCents = freeDelivery.eligible ? 0 : input.deliveryFeeCents;
-  if (!isCashOrderWithinLimit(input.paymentMethod, input.totalCents)) return res.status(422).json(cashOrderLimitError(input.totalCents));
+  const partnerCashLimitCents = cashOrderLimitCents(restaurant);
+  if (!isCashOrderWithinLimit(input.paymentMethod, input.totalCents, partnerCashLimitCents)) return res.status(422).json(cashOrderLimitError(input.totalCents, partnerCashLimitCents));
   const marketplace = calculateMarketplaceBreakdown({
     subtotalCents: input.subtotalCents,
     deliveryFeeCents: effectiveDeliveryFeeCents,
@@ -5375,7 +5377,7 @@ app.post("/api/v1/internal/customer-orders/sync", async (req, res) => {
   });
   const canonicalSubtotalCents = canonicalItems.reduce((sum, item) => sum + item.unitPriceCents * item.quantity, 0);
   const canonicalTotalCents = canonicalSubtotalCents + effectiveDeliveryFeeCents + input.serviceFeeCents;
-  if (!isCashOrderWithinLimit(input.paymentMethod, canonicalTotalCents)) return res.status(422).json(cashOrderLimitError(canonicalTotalCents));
+  if (!isCashOrderWithinLimit(input.paymentMethod, canonicalTotalCents, partnerCashLimitCents)) return res.status(422).json(cashOrderLimitError(canonicalTotalCents, partnerCashLimitCents));
   const order = await Order.findOneAndUpdate({ publicCode: input.publicCode }, { $set: { tenantId: restaurant.tenantId || null, restaurantId: restaurant._id, customerId: input.customerId || null, ...(input.customerName !== undefined ? { customerName: input.customerName || "" } : {}), items: canonicalItems, deliveryAddress: input.deliveryAddress, deliveryNote: input.deliveryNote, deliveryLocation: location, subtotalCents: canonicalSubtotalCents, deliveryFeeCents: effectiveDeliveryFeeCents, serviceFeeCents: input.serviceFeeCents, totalCents: canonicalTotalCents, marketplaceCommissionRateBps: marketplace.commissionRateBps, marketplaceCommissionCents: marketplace.platformCommissionCents, partnerPayoutCents: marketplace.partnerPayoutCents, riderEarningsCents: marketplace.riderEarningsCents, platformNetBeforeProcessingCents: marketplace.platformNetBeforeProcessingCents, payoutStatus: "pending", paymentMethod: input.paymentMethod, paymentState: input.paymentState, ...(input.stripeCheckoutSessionId !== undefined ? { stripeCheckoutSessionId: input.stripeCheckoutSessionId } : {}), ...(input.stripePaymentIntentId !== undefined ? { stripePaymentIntentId: input.stripePaymentIntentId } : {}) }, $setOnInsert: { publicCode: input.publicCode, ...syncGeography, status: "pending", assignmentState: "unassigned", statusHistory: [{ status: "pending", actorRole: "system", reason: "Pedido sincronizado desde PIKI Customer" }] } }, { upsert: true, new: true, setDefaultsOnInsert: true }).lean().exec() as any;
   const newlyPaid = ["authorized", "paid"].includes(input.paymentState) && !["authorized", "paid"].includes(existing?.paymentState || "");
   const newCashOrder = input.paymentMethod === "cash" && !existing;

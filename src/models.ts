@@ -81,8 +81,10 @@ const cashLedgerEntrySchema = new Schema({
   tenantId: { type: Schema.Types.ObjectId, ref: "Tenant", default: null, index: true },
   // Handover entries reconcile a rider balance and therefore do not belong to a single order.
   orderId: { type: Schema.Types.ObjectId, ref: "Order", default: null, index: true },
+  restaurantId: { type: Schema.Types.ObjectId, ref: "Restaurant", default: null, index: true },
   riderId: { type: Schema.Types.ObjectId, ref: "Rider", required: true, index: true },
-  actorRole: { type: String, enum: ["rider", "admin", "fleet"], required: true },
+  settlementId: { type: Schema.Types.ObjectId, ref: "RiderCashSettlement", default: null, index: true },
+  actorRole: { type: String, enum: ["rider", "admin", "fleet", "finance"], required: true },
   direction: { type: String, enum: ["in", "out"], required: true },
   amountCents: { type: Number, required: true, min: 0 },
   reason: { type: String, enum: ["customer_cash_collection", "cash_handover", "cash_adjustment"], required: true },
@@ -91,6 +93,36 @@ const cashLedgerEntrySchema = new Schema({
   reference: { type: String, default: "", index: true },
 }, { timestamps: true, collection: "cash_ledger_entries" });
 cashLedgerEntrySchema.index({ riderId: 1, createdAt: -1 });
+cashLedgerEntrySchema.index({ tenantId: 1, restaurantId: 1, createdAt: -1 });
+cashLedgerEntrySchema.index({ riderId: 1, settlementId: 1, createdAt: -1 });
+
+/**
+ * A settlement is the auditable business operation that closes one or more
+ * cash-ledger entries. Ledger rows remain immutable; a settlement only links
+ * them and records approval/payment state.
+ */
+const riderCashSettlementSchema = new Schema({
+  tenantId: { type: Schema.Types.ObjectId, ref: "Tenant", default: null, index: true },
+  riderId: { type: Schema.Types.ObjectId, ref: "Rider", required: true, index: true },
+  entryIds: { type: [Schema.Types.ObjectId], ref: "CashLedgerEntry", default: [] },
+  periodStart: { type: Date, required: true, index: true },
+  periodEnd: { type: Date, required: true, index: true },
+  amountCents: { type: Number, required: true, min: 0 },
+  currency: { type: String, enum: ["eur"], default: "eur" },
+  status: { type: String, enum: ["draft", "pending_review", "approved", "paid", "rejected", "cancelled"], default: "draft", index: true },
+  settlementMethod: { type: String, enum: ["cash", "bank_transfer", "stripe"], default: "cash" },
+  reference: { type: String, required: true, trim: true, maxlength: 120, index: true },
+  idempotencyKey: { type: String, required: true, unique: true, index: true },
+  note: { type: String, default: "", trim: true, maxlength: 1000 },
+  createdBy: { type: Schema.Types.ObjectId, ref: "EmployeeAccount", default: null },
+  reviewedBy: { type: Schema.Types.ObjectId, ref: "EmployeeAccount", default: null },
+  paidBy: { type: Schema.Types.ObjectId, ref: "EmployeeAccount", default: null },
+  reviewedAt: { type: Date, default: null },
+  paidAt: { type: Date, default: null },
+  rejectionReason: { type: String, default: "", maxlength: 1000 },
+}, { timestamps: true, collection: "rider_cash_settlements" });
+riderCashSettlementSchema.index({ tenantId: 1, riderId: 1, status: 1, createdAt: -1 });
+riderCashSettlementSchema.index({ tenantId: 1, periodStart: 1, periodEnd: 1, status: 1 });
 
 const marketplaceLedgerEntrySchema = new Schema({
   tenantId: { type: Schema.Types.ObjectId, ref: "Tenant", default: null, index: true },
@@ -353,6 +385,14 @@ restaurantSchema.index({ isActive: 1, cuisine: 1, promoted: -1, rating: -1, revi
 restaurantSchema.add({ priceIncludesCommission: { type: Boolean, default: false } });
 restaurantSchema.add({ menuRevision: { type: Number, default: 0, min: 0 } });
 restaurantSchema.add({ kitchenAccessRevision: { type: Number, default: 0, min: 0 } });
+restaurantSchema.add({
+  cashOrderMaxCents: { type: Number, default: 4_899, min: 0, max: 1_000_000 },
+  cashOrderMinCents: { type: Number, default: 0, min: 0, max: 1_000_000 },
+  cashOutstandingMaxCents: { type: Number, default: 10_000, min: 0, max: 10_000_000 },
+  cashPolicyUpdatedAt: { type: Date, default: null },
+  cashPolicyUpdatedBy: { type: Schema.Types.ObjectId, ref: "EmployeeAccount", default: null },
+  cashPolicyReason: { type: String, default: "", trim: true, maxlength: 500 },
+});
 restaurantSchema.index({ tenantId: 1, onboardingStatus: 1, createdAt: -1 });
 
 const riderSchema = new Schema({
@@ -465,6 +505,7 @@ export const Zone = mongoose.models.Zone || mongoose.model("Zone", zoneSchema);
 export const MarketplaceLedgerEntry = mongoose.models.MarketplaceLedgerEntry || mongoose.model("MarketplaceLedgerEntry", marketplaceLedgerEntrySchema);
 export const PartnerPayoutBatch = mongoose.models.PartnerPayoutBatch || mongoose.model("PartnerPayoutBatch", partnerPayoutBatchSchema);
 export const RiderPayoutBatch = mongoose.models.RiderPayoutBatch || mongoose.model("RiderPayoutBatch", riderPayoutBatchSchema);
+export const RiderCashSettlement = mongoose.models.RiderCashSettlement || mongoose.model("RiderCashSettlement", riderCashSettlementSchema);
 export const StripeEvent = mongoose.models.StripeEvent || mongoose.model("StripeEvent", stripeEventSchema);
 export const CashLedgerEntry = mongoose.models.CashLedgerEntry || mongoose.model("CashLedgerEntry", cashLedgerEntrySchema);
 export const DispatchDecision = mongoose.models.DispatchDecision || mongoose.model("DispatchDecision", dispatchDecisionSchema);
@@ -502,7 +543,7 @@ export async function ensureIndexes() {
     }
   }
   await Promise.all([syncIndexesWithIndexRaceRecovery(PartnerLocalityGroup), syncIndexesWithIndexRaceRecovery(Fleet), syncIndexesWithIndexRaceRecovery(Zone), syncIndexesWithIndexRaceRecovery(RiderSlot), syncIndexesWithIndexRaceRecovery(RiderReferralProfile), syncIndexesWithIndexRaceRecovery(RiderShiftIncentiveMetric), syncIndexesWithIndexRaceRecovery(RiderIncentiveEntry), syncIndexesWithIndexRaceRecovery(RiderIncentiveBudget)]);
-  await Promise.all([Tenant.init(), TenantMembership.init(), Restaurant.init(), PartnerAsset.init(), PartnerLocalityGroup.init(), MenuImportDraft.init(), Fleet.init(), Order.init(), Zone.init(), MarketplaceLedgerEntry.init(), PartnerPayoutBatch.init(), StripeEvent.init(), CashLedgerEntry.init(), DispatchDecision.init(), DispatchOutbox.init(), RiderIncident.init(), RiderOrderMessage.init(), RiderApplication.init(), PartnerLead.init(), RiderLead.init(), DocumentRequest.init(), CustomerAccount.init(), RiderSlot.init(), SignatureRequest.init(), PasskeyCredential.init(), PasskeyChallenge.init(), PushSubscription.init(), Notification.init(), RealtimeEvent.init(), RiderAssignmentReservation.init(), FreeDeliveryLaunchState.init(), FreeDeliveryClaim.init(), TrackingSession.init(), LocationSample.init(), EmployeeAccount.init(), AccessAuthorization.init(), OnboardingRequest.init(), RiderReferralProfile.init(), RiderShiftIncentiveMetric.init(), RiderIncentiveEntry.init(), RiderIncentiveBudget.init(), RiderTrainingCourse.init(), RiderTrainingAssignment.init(), RiderTrainingResponse.init()]);
+  await Promise.all([Tenant.init(), TenantMembership.init(), Restaurant.init(), PartnerAsset.init(), PartnerLocalityGroup.init(), MenuImportDraft.init(), Fleet.init(), Order.init(), Zone.init(), MarketplaceLedgerEntry.init(), PartnerPayoutBatch.init(), RiderCashSettlement.init(), StripeEvent.init(), CashLedgerEntry.init(), DispatchDecision.init(), DispatchOutbox.init(), RiderIncident.init(), RiderOrderMessage.init(), RiderApplication.init(), PartnerLead.init(), RiderLead.init(), DocumentRequest.init(), CustomerAccount.init(), RiderSlot.init(), SignatureRequest.init(), PasskeyCredential.init(), PasskeyChallenge.init(), PushSubscription.init(), Notification.init(), RealtimeEvent.init(), RiderAssignmentReservation.init(), FreeDeliveryLaunchState.init(), FreeDeliveryClaim.init(), TrackingSession.init(), LocationSample.init(), EmployeeAccount.init(), AccessAuthorization.init(), OnboardingRequest.init(), RiderReferralProfile.init(), RiderShiftIncentiveMetric.init(), RiderIncentiveEntry.init(), RiderIncentiveBudget.init(), RiderTrainingCourse.init(), RiderTrainingAssignment.init(), RiderTrainingResponse.init()]);
   const ridersWithoutCode = await Rider.find({ $or: [{ riderCode: { $exists: false } }, { riderCode: null }, { riderCode: "" }] }).select("_id").lean().exec();
   for (const rider of ridersWithoutCode) {
     const base = `PIKI-R-${String(rider._id).slice(-6).toUpperCase()}`;
