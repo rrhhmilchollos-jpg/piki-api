@@ -6718,7 +6718,7 @@ app.get("/api/v1/riders/session", requireRole("rider"), async (req, res) => {
   // findCurrentRiderSlot expires only ended intervals, including overnight tails.
   const hasActiveOrder = Boolean(await Order.exists({ ...tenant, riderId: rider._id, status: { $nin: ["delivered", "cancelled"] }, assignmentState: { $in: ["offered", "assigned"] } }));
   const hasFreshLocation = Boolean(rider.lastLocationAt && new Date(rider.lastLocationAt).getTime() >= Date.now() - 90_000);
-  const scheduledOnline = rider.lifecycleStatus === "active" && (slot as any)?.status === "active" && hasFreshLocation;
+  const scheduledOnline = rider.lifecycleStatus === "active" && (slot as any)?.status === "active" && hasFreshLocation && !(rider.status === "offline" && hasActiveOrder);
   const effectiveStatus = rider.lifecycleStatus === "active" && rider.status !== "paused" && (scheduledOnline || ["available", "busy"].includes(rider.status))
     ? hasActiveOrder ? "busy" : (slot as any)?.status === "active" ? "available" : "offline"
     : rider.status;
