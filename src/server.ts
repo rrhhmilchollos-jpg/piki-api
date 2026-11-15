@@ -100,7 +100,6 @@ import { markPartnerBatchPaid, markRiderBatchPaid, publicPartnerCode, publicRide
 import { legacyOpeningHoursProjection, normalizeOpeningHours, openingHoursSchema } from "./openingHours.js";
 import { PRL_COURSE_VERSION, PRL_PASS_MARK, PrlEnrollment, certificateIssuer, certificateMode, createPrlToken, hashPrlToken, prlQuestions, publicPrlEnrollment } from "./prlTraining.js";
 import { GoogleBusinessConnection, GoogleOauthState, MunicipalExpansion } from "./expansionModels.js";
-import { KAZOKU_INFORMATION_IDS, KAZOKU_INFORMATION_TENANT } from "./publicPartnerInformation.js";
 import { decryptGoogleSecret, exchangeGoogleCode, fromGoogleLocationHours, googleAuthorizationUrl, googleBusinessConfiguration, googleBusinessConfigured, googleBusinessScopes, listGoogleAccounts, listGoogleLocations, readGoogleLocation, toGoogleLocationHours, updateGoogleLocationHours, encryptGoogleSecret } from "./googleBusinessProfile.js";
 import { deliveredConfirmationResponse, deliveryCredentialNotLockedFilter, deliveryFailureAtomicUpdate, deliveryFailureLock, parseDeliveryCredential, stripeDeliveryPaymentAction } from "./deliveryConfirmation.js";
 import { fleetPublicView } from "./fleetView.js";
@@ -8200,7 +8199,7 @@ async function purgeExpiredQaPartner() {
 }
 
 async function repairConfiguredPartnerAccess() {
-  if (process.env.REPAIR_PARTNER_ACCESS_ENABLED !== "true") return;
+  if (process.env.REPAIR_PARTNER_ACCESS_ENABLED !== "true" || process.env.REPAIR_PARTNER_FORCE !== "true") return;
   // Render does not retroactively synchronize Blueprint variables into this
   // existing service. Keep this one explicitly authorised demonstration
   // owner as a safe bootstrap fallback so its idempotent portfolio repair
@@ -8210,6 +8209,13 @@ async function repairConfiguredPartnerAccess() {
   if (!email) return;
   const account = await EmployeeAccount.findOne({ email }).select("_id email tenantId restaurantId restaurantIds apiRole jobRole roles primaryRole active authorizationStatus ownerProtected").lean().exec() as any;
   if (!account) { console.log(JSON.stringify({ event: "partner_access_repair", email, result: "account_not_found" })); return; }
+  // A restart is not a repair request. Once the account is active and has a
+  // persisted assignment, preserve all operator changes made in Partner or
+  // Admin, including pauses, menu availability and local selection.
+  if (account.active === true && account.authorizationStatus === "approved" && Array.isArray(account.restaurantIds) && account.restaurantIds.length > 0 && process.env.REPAIR_PARTNER_FORCE !== "true") {
+    console.log(JSON.stringify({ event: "partner_access_repair", email, result: "preserved_existing_access", restaurantCount: account.restaurantIds.length }));
+    return;
+  }
 
   // QA solo se crea cuando el slug se solicita explícitamente mediante la
   // reparación autorizada; nunca se recrea de forma implícita al arrancar.
@@ -8286,7 +8292,7 @@ async function repairConfiguredPartnerAccess() {
       { upsert: true, new: true, setDefaultsOnInsert: true },
     ).select("_id slug name").lean().exec()))
     : [];
-  const alibabaGoLive = process.env.REPAIR_PARTNER_ALIBABA_GO_LIVE === "true" || email === "rrhh.milchollos@gmail.com";
+  const alibabaGoLive = process.env.REPAIR_PARTNER_ALIBABA_GO_LIVE === "true";
   if (alibabaGoLive) {
     await Restaurant.updateOne(
       { slug: "alibaba-kebab-xativa", tenantId: account.tenantId || null, onboardingStatus: "approved" },
@@ -8302,19 +8308,7 @@ async function repairConfiguredPartnerAccess() {
       { $set: { availabilityStatus: "available", upcomingMessage: "", isActive: true, image: KINGS_TACOS_COVER_IMAGE, promoted: false } },
     ).exec();
   }
-  // Explicit launch decision for the two existing Kazoku records. Their
-  // persisted menus are already the source of truth (101 items each); null
-  // allergen metadata is preserved and is not used as a publication gate.
-  // This narrowly scoped repair never affects any other Partner or menu.
-  const kazokuGoLive = process.env.REPAIR_PARTNER_KAZOKU_GO_LIVE === "true" || email === ownerEmail;
-  if (kazokuGoLive) {
-    await Restaurant.updateMany(
-      { _id: { $in: KAZOKU_INFORMATION_IDS.map((id) => objectId(id)) }, tenantId: objectId(KAZOKU_INFORMATION_TENANT), listingType: "official_partner", internalDemo: { $ne: true } },
-      { $set: { onboardingStatus: "approved", isActive: true, availabilityStatus: "available", upcomingMessage: "" } },
-    ).exec();
-    console.log(JSON.stringify({ event: "kazoku_go_live", restaurantIds: [...KAZOKU_INFORMATION_IDS], tenantId: KAZOKU_INFORMATION_TENANT, menuPreserved: true, allergenMetadataPreserved: true }));
-  }
-  const portfolioIds = [restaurant._id, ...assignedRestaurants.map((location: any) => location._id), ...(kazokuGoLive ? KAZOKU_INFORMATION_IDS.map((id) => objectId(id)) : [])];
+  const portfolioIds = [restaurant._id, ...assignedRestaurants.map((location: any) => location._id)];
   const assignedSlugs = new Set(assignedRestaurants.map((location: any) => location.slug));
   if (includeXativaTestPortfolio && COMING_SOON_SLUGS.some((slug) => !assignedSlugs.has(slug))) {
     throw new Error("Configured Xàtiva test portfolio does not match the public catalog");
@@ -8339,13 +8333,6 @@ async function repairConfiguredPartnerAccess() {
     },
   ).exec();
   console.log(JSON.stringify({ event: "partner_access_repair", email, result: "repaired", restaurantId: String(restaurant._id), restaurantName: restaurant.name, assignedRestaurantCount: portfolioIds.length, ownerPreserved: isProtectedOwner }));
-}
-async function ensureKazokuGoLive() {
-  const result = await Restaurant.updateMany(
-    { _id: { $in: KAZOKU_INFORMATION_IDS.map((id) => objectId(id)) }, tenantId: objectId(KAZOKU_INFORMATION_TENANT), listingType: "official_partner", internalDemo: { $ne: true } },
-    { $set: { onboardingStatus: "approved", isActive: true, availabilityStatus: "available", upcomingMessage: "" } },
-  ).exec();
-  console.log(JSON.stringify({ event: "kazoku_go_live", restaurantIds: [...KAZOKU_INFORMATION_IDS], tenantId: KAZOKU_INFORMATION_TENANT, matched: result.matchedCount, modified: result.modifiedCount, menuPreserved: true, allergenMetadataPreserved: true }));
 }
 async function ensureMrRoosterOperational() {
   const existing = await Restaurant.findOne({ slug: "rooster-kebab-xativa" }).select("menu").lean().exec() as { menu?: unknown[] } | null;
@@ -8372,7 +8359,7 @@ async function ensureMrRoosterOperational() {
   // in with REPAIR_MR_ROOSTER_MENU=true during a controlled maintenance window.
   if (shouldSeedMenu || process.env.REPAIR_MR_ROOSTER_MENU === "true") setFields.menu = mrRoosterMenu;
   const result = await Restaurant.updateOne(
-    { slug: "rooster-kebab-xativa" },
+    { slug: "rooster-kebab-xativa", $or: [{ menu: { $exists: false } }, { menu: { $size: 0 } }] },
     { $set: setFields },
   ).exec();
   const menuCount = shouldSeedMenu || process.env.REPAIR_MR_ROOSTER_MENU === "true"
@@ -8397,7 +8384,6 @@ async function start() {
     startNotificationWorker();
     startGoogleBusinessSyncWorker();
     await repairConfiguredPartnerAccess();
-    await ensureKazokuGoLive();
     if (process.env.PIKI_QA_EXPIRY_PURGE_ENABLED === "true") {
       await purgeExpiredQaPartner();
       setInterval(() => { void purgeExpiredQaPartner().catch((error) => console.warn("QA partner purge failed", error instanceof Error ? error.message : String(error))); }, 60_000).unref();
