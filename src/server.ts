@@ -8340,6 +8340,13 @@ async function repairConfiguredPartnerAccess() {
   ).exec();
   console.log(JSON.stringify({ event: "partner_access_repair", email, result: "repaired", restaurantId: String(restaurant._id), restaurantName: restaurant.name, assignedRestaurantCount: portfolioIds.length, ownerPreserved: isProtectedOwner }));
 }
+async function ensureKazokuGoLive() {
+  const result = await Restaurant.updateMany(
+    { _id: { $in: KAZOKU_INFORMATION_IDS.map((id) => objectId(id)) }, tenantId: objectId(KAZOKU_INFORMATION_TENANT), listingType: "official_partner", internalDemo: { $ne: true } },
+    { $set: { onboardingStatus: "approved", isActive: true, availabilityStatus: "available", upcomingMessage: "" } },
+  ).exec();
+  console.log(JSON.stringify({ event: "kazoku_go_live", restaurantIds: [...KAZOKU_INFORMATION_IDS], tenantId: KAZOKU_INFORMATION_TENANT, matched: result.matchedCount, modified: result.modifiedCount, menuPreserved: true, allergenMetadataPreserved: true }));
+}
 async function ensureMrRoosterOperational() {
   const existing = await Restaurant.findOne({ slug: "rooster-kebab-xativa" }).select("menu").lean().exec() as { menu?: unknown[] } | null;
   const shouldSeedMenu = !Array.isArray(existing?.menu) || existing.menu.length === 0;
@@ -8390,6 +8397,7 @@ async function start() {
     startNotificationWorker();
     startGoogleBusinessSyncWorker();
     await repairConfiguredPartnerAccess();
+    await ensureKazokuGoLive();
     if (process.env.PIKI_QA_EXPIRY_PURGE_ENABLED === "true") {
       await purgeExpiredQaPartner();
       setInterval(() => { void purgeExpiredQaPartner().catch((error) => console.warn("QA partner purge failed", error instanceof Error ? error.message : String(error))); }, 60_000).unref();
