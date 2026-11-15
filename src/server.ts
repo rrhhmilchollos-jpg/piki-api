@@ -1113,7 +1113,7 @@ app.all("/api/trpc/:procedure", handleCustomerTrpc);
 app.get("/api/v1/auth/status", (_req, res) => res.json({ authentication: "bearer" }));
 const employeeSessionRoles = ["admin", "partner", "rider", "fleet", "commercial", "gerente_comercial_zona", "finance", "support"] as const;
 const partnerOperationalRoles = ["partner_admin", "area_manager", "zone_manager", "store_manager", "manager", "cashier", "cajero", "kitchen", "cocina", "cook", "catalog", "catalogue", "menu_manager", "viewer", "read_only", "solo_lectura"] as const;
-const employeeLoginSchema = z.object({ identifier: z.string().trim().min(3).max(254).optional(), email: z.string().trim().min(3).max(254).optional(), password: z.string().min(8).max(200), role: z.enum(employeeSessionRoles).optional() }).refine((value) => Boolean(value.identifier || value.email), { message: "identifier_required" });
+const employeeLoginSchema = z.object({ identifier: z.string().trim().min(3).max(254).optional(), email: z.string().trim().min(3).max(254).optional(), username: z.string().trim().min(3).max(254).optional(), employeeCode: z.string().trim().min(3).max(254).optional(), password: z.string().min(8).max(200), role: z.enum(employeeSessionRoles).optional() }).refine((value) => Boolean(value.identifier || value.email || value.username || value.employeeCode), { message: "identifier_required" });
 const employeePasswordResetRequestSchema = z.object({ email: z.string().email().max(254) });
 const employeePasswordResetConfirmSchema = z.object({ token: z.string().min(40).max(200), newPassword: z.string().min(12).max(200).regex(/[A-Z]/).regex(/[a-z]/).regex(/[0-9]/) });
 function employeeCodeFor(value: unknown) { return `PIKI-E-${String(value).replace(/[^a-z0-9]/gi, "").slice(-8).toUpperCase()}`; }
@@ -1228,8 +1228,10 @@ app.post("/api/v1/auth/employee/password-reset/confirm", rateLimit(8, 15 * 60_00
 app.post("/api/v1/auth/employee/login", async (req, res) => {
   const parsed = employeeLoginSchema.safeParse(req.body); if (!parsed.success) return res.status(400).json({ error: "INVALID_LOGIN" });
   const requestedSurface = String(req.headers["x-piki-surface"] || "").toLowerCase();
-  const identifier = String(parsed.data.identifier || parsed.data.email || "").trim().toLowerCase();
-  if (requestedSurface === "rider" && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(identifier)) return res.status(400).json({ error: "RIDER_EMAIL_REQUIRED" });
+  // Rider clients in the field have historically used both email and the
+  // stable PIKI employee code. Accept all documented aliases so a stale app
+  // cannot turn a valid credential into an opaque HTTP 400.
+  const identifier = String(parsed.data.identifier || parsed.data.email || parsed.data.username || parsed.data.employeeCode || "").trim().toLowerCase();
   if (String(req.headers["x-piki-surface"] || "").toLowerCase() === "admin" && identifier !== ownerEmail) { /* subadmins are allowed; destructive operations remain superadmin-only */ }
   let employee = await EmployeeAccount.findOne({ $or: [{ email: identifier }, { employeeCode: identifier.toUpperCase() }] }).select("+passwordHash").exec() as any;
   if (!employee && /^piki-p-[a-z0-9-]+$/i.test(identifier)) {
@@ -3356,6 +3358,59 @@ app.patch("/api/v1/admin/rider-leads/:id", requireRole("admin", "commercial", "g
   return res.json({ lead });
 });
 
+app.post("/api/v1/admin/rider-leads/:id/activate", requireRole("admin"), async (req, res) => {
+  const id = objectId(String(req.params.id));
+  const parsed = z.object({ fleetId: z.string().regex(/^[a-f\d]{24}$/).optional(), zoneSlug: z.string().regex(/^[a-z0-9-]+$/).optional() }).safeParse(req.body || {});
+  if (!id || !parsed.success) return res.status(400).json({ error: "INVALID_RIDER_LEAD_ACTIVATION", details: parsed.success ? undefined : parsed.error.flatten() });
+  const scope = await onboardingScope(req);
+  const lead = await RiderLead.findOne({ _id: id, ...scope }).lean().exec() as any;
+  if (!lead) return res.status(404).json({ error: "RIDER_LEAD_NOT_FOUND" });
+  if (lead.status !== "qualified") return res.status(409).json({ error: "RIDER_LEAD_NOT_QUALIFIED", message: "Cualifica el RiderLead antes de activar el perfil operativo." });
+  const zoneSlug = parsed.data.zoneSlug || lead.assignedZoneSlug || lead.requestedZoneSlug;
+  if (!zoneSlug) return res.status(409).json({ error: "RIDER_LEAD_ZONE_REQUIRED", message: "La solicitud no tiene una zona canónica para localizar la Fleet." });
+  const tenantFilter = lead.tenantId ? { tenantId: lead.tenantId } : { tenantId: null };
+  const fleetFilter: Record<string, unknown> = { ...tenantFilter, isActive: true, serviceZones: zoneSlug };
+  if (parsed.data.fleetId) fleetFilter._id = objectId(parsed.data.fleetId);
+  const fleets = await Fleet.find(fleetFilter).select("_id name serviceZones contactEmail tenantId").lean().exec() as any[];
+  if (!fleets.length) return res.status(409).json({ error: "ZONE_FLEET_NOT_FOUND", message: `No existe una Fleet activa para la zona ${zoneSlug}.` });
+  if (fleets.length > 1 && !parsed.data.fleetId) return res.status(409).json({ error: "ZONE_FLEET_AMBIGUOUS", message: "Hay varias Fleets activas para la zona; selecciona una explícitamente." });
+  const fleet = fleets[0];
+  const email = String(lead.email).trim().toLowerCase();
+  const tenantId = lead.tenantId || null;
+  const existingRider = await Rider.findOne({ email }).select("_id tenantId riderCode").lean().exec() as any;
+  if (existingRider && String(existingRider.tenantId || "") != String(tenantId || "")) return res.status(409).json({ error: "RIDER_EMAIL_OWNED_BY_ANOTHER_TENANT" });
+  const existingEmployee = await EmployeeAccount.findOne({ email }).select("_id tenantId jobRole apiRole roles primaryRole ownerProtected active mustChangePassword authorizationStatus").lean().exec() as any;
+  if (existingEmployee && (String(existingEmployee.tenantId || "") != String(tenantId || "") || existingEmployee.ownerProtected === true || existingEmployee.jobRole !== "rider" || existingEmployee.apiRole !== "rider" || (Array.isArray(existingEmployee.roles) && existingEmployee.roles.some((role: unknown) => role !== "rider")))) return res.status(409).json({ error: "EMPLOYEE_EMAIL_ROLE_INCOMPATIBLE", message: "El correo ya pertenece a una cuenta incompatible y no se puede reutilizar como Rider." });
+  const now = new Date();
+  const rider = await Rider.findOneAndUpdate(
+    { email, ...tenantFilter },
+    { $set: { tenantId, ...buildApprovedRiderOperationalProfile({ ...lead, requestedZoneSlug: zoneSlug }), fleetId: fleet._id, zoneSlug, lifecycleStatus: "active", status: "offline" }, $setOnInsert: { riderCode: existingRider?.riderCode || await nextRiderCode() } },
+    { upsert: true, new: true, setDefaultsOnInsert: true },
+  ).lean().exec() as any;
+  const employee = await EmployeeAccount.findOneAndUpdate(
+    { email, ...tenantFilter },
+    { $set: { tenantId, name: lead.name, jobRole: "rider", apiRole: "rider", roles: ["rider"], primaryRole: "rider", accessLevel: "subadmin", authorizationStatus: "approved", authorizedAt: now, authorizedBy: objectId(String(req.auth!.employeeId)), active: true, mustChangePassword: true, fleetId: fleet._id }, $setOnInsert: { employeeCode: `PIKI-E-${String(rider._id).replace(/[^a-z0-9]/gi, "").slice(-8).toUpperCase()}`, passwordHash: hashPassword(generateTemporaryPassword()) } },
+    { upsert: true, new: true, setDefaultsOnInsert: true },
+  ).select("_id name email jobRole apiRole roles primaryRole accessLevel authorizationStatus active mustChangePassword").lean().exec() as any;
+  const alreadyActivated = Boolean(lead.assignedFleetId && String(lead.assignedFleetId) === String(fleet._id) && existingRider && existingEmployee?.active && existingEmployee?.authorizationStatus === "approved");
+  const priorCredentialAudit = await AccessAuthorization.findOne({ employeeId: employee._id, action: "credentials_sent", nextRole: "rider" }).select("_id").lean().exec();
+  let credentialEmail: { sent: boolean; error?: string; surface?: EmployeeCredentialSurface } = { sent: false };
+  const surface = preferredCredentialSurface(employee);
+  if (surface && !priorCredentialAudit) {
+    const delivery = await sendEmployeePasswordLink(employee, surface, "activation");
+    credentialEmail = { sent: delivery.delivery.sent, error: delivery.delivery.error, surface };
+    if (delivery.delivery.sent) await AccessAuthorization.create({ tenantId, employeeId: employee._id, action: "credentials_sent", previousStatus: "approved", nextStatus: "approved", previousRole: "rider", nextRole: "rider", accessLevel: "subadmin", actorEmployeeId: objectId(String(req.auth!.employeeId)), reason: `Enlace de activación enviado para ${employeeCredentialLabels[surface]}.` });
+  }
+  const note = `Rider activado y asignado a Fleet ${fleet.name} (${zoneSlug}).`;
+  const leadUpdate: Record<string, unknown> = { $set: { assignedFleetId: fleet._id, assignedZoneSlug: zoneSlug, routedAt: now, routedBy: objectId(String(req.auth!.employeeId)) } };
+  if (!alreadyActivated) leadUpdate.$push = { history: { status: "qualified", notes: note, actorEmployeeId: objectId(String(req.auth!.employeeId)), changedAt: now } };
+  const updatedLead = await RiderLead.findOneAndUpdate({ _id: id, ...scope }, leadUpdate, { new: true }).lean().exec();
+  if (!alreadyActivated) {
+    await recordGovernanceEvent({ actor: { employeeId: objectId(String(req.auth!.employeeId)), role: req.auth?.role, tenantId }, action: "rider_lead_activated_to_fleet", targetType: "rider", targetId: rider._id, after: { leadId: String(id), riderId: String(rider._id), riderCode: rider.riderCode, fleetId: String(fleet._id), fleetName: fleet.name, zoneSlug, credentialEmailSent: credentialEmail.sent }, reason: "Activación explícita desde la bandeja Admin tras cualificar un RiderLead." });
+    await notifyOnboarding({ channel: "fleet", type: "onboarding.rider_lead.activated", entityId: String(rider._id), tenantId, payload: { leadId: String(id), riderId: String(rider._id), fleetId: String(fleet._id), zoneSlug } });
+  }
+  return res.json({ lead: updatedLead, rider: { id: String(rider._id), riderCode: rider.riderCode, name: rider.name, email: rider.email, fleetId: String(fleet._id), fleetName: fleet.name, zoneSlug }, credentialEmail, created: !existingRider });
+});
 app.post("/api/v1/riders/applications", async (req, res) => {
   const ip = req.ip || req.socket.remoteAddress || "unknown";
   if (!allowRiderApplication(ip)) return res.status(429).json({ error: "APPLICATION_RATE_LIMITED", retryAfterSeconds: 900 });
@@ -6662,8 +6717,10 @@ app.get("/api/v1/riders/session", requireRole("rider"), async (req, res) => {
   const { now, slot } = await findCurrentRiderSlot(rider._id);
   // findCurrentRiderSlot expires only ended intervals, including overnight tails.
   const hasActiveOrder = Boolean(await Order.exists({ ...tenant, riderId: rider._id, status: { $nin: ["delivered", "cancelled"] }, assignmentState: { $in: ["offered", "assigned"] } }));
-  const effectiveStatus = ["available", "busy"].includes(rider.status) && rider.lifecycleStatus === "active"
-    ? hasActiveOrder ? "busy" : (slot as any)?.status === "active" ? rider.status : "offline"
+  const hasFreshLocation = Boolean(rider.lastLocationAt && new Date(rider.lastLocationAt).getTime() >= Date.now() - 90_000);
+  const scheduledOnline = rider.lifecycleStatus === "active" && (slot as any)?.status === "active" && hasFreshLocation;
+  const effectiveStatus = rider.lifecycleStatus === "active" && rider.status !== "paused" && (scheduledOnline || ["available", "busy"].includes(rider.status))
+    ? hasActiveOrder ? "busy" : (slot as any)?.status === "active" ? "available" : "offline"
     : rider.status;
   const update: Record<string, unknown> = { status: effectiveStatus };
   if (!hasActiveOrder && effectiveStatus === "offline") update.activeOrderId = null;
