@@ -2980,7 +2980,9 @@ app.patch("/api/v1/admin/restaurants/:id/status", requireRole("admin"), async (r
   const scope = tenantScope(req);
   const existing = await Restaurant.findOne({ _id: id, ...scope }).lean().exec() as any;
   if (!existing) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
-  if (parsed.data.status === "approved" && existing.onboardingStatus !== "approved" && !partnerLegalProfileReadyForReview(existing.partnerProfile)) return res.status(409).json({ error: "PARTNER_LEGAL_PROFILE_REQUIRED", message: "Completa los datos legales, bancarios y las aceptaciones documentadas antes de aprobar el comercio; los archivos adjuntos son opcionales." });
+  // KYB is an independent compliance workflow. It is intentionally optional for approval;
+  // approval still requires the legal profile and any already-uploaded files to be reviewed.
+  if (parsed.data.status === "approved" && existing.onboardingStatus !== "approved" && !partnerLegalProfileReadyForReview(existing.partnerProfile)) return res.status(409).json({ error: "PARTNER_LEGAL_PROFILE_REQUIRED", message: "Completa los datos legales, bancarios y las aceptaciones documentadas antes de aprobar el comercio; los archivos adjuntos y la verificación KYB son opcionales." });
   if (["approved", "rejected"].includes(parsed.data.status)) {
     const documents = existing.partnerProfile?.documents || [];
     if (documents.some((document: any) => document.status === "received")) return res.status(409).json({ error: "PARTNER_DOCUMENT_REVIEW_REQUIRED", message: "Debes revisar todos los documentos del partner antes de aprobar o rechazar la solicitud." });
