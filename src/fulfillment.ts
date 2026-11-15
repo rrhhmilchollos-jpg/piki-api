@@ -29,7 +29,7 @@ export const DEFAULT_PAYMENT_METHODS: PaymentMethod[] = CASH_PAYMENTS_ENABLED ? 
 /** Métodos permitidos según la configuración del local. `bizumOnly` gana siempre. */
 export function allowedPaymentMethods(restaurant: FulfillmentRestaurant | null | undefined): PaymentMethod[] {
   if (!restaurant) return DEFAULT_PAYMENT_METHODS;
-  // El contra reembolso esta disponible en todos los comercios, sin excepcion.
+  // El interruptor global puede habilitar el contra reembolso para todos los comercios.
   const withCash = (methods: PaymentMethod[]): PaymentMethod[] =>
     !CASH_PAYMENTS_ENABLED || methods.includes("cash") ? methods : [...methods, "cash"];
   if (restaurant.bizumOnly === true) return withCash(["bizum"]);

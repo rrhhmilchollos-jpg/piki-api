@@ -1,9 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { isCashPaymentEnabledForRestaurant } from "./paymentPolicy.js";
+import { CASH_PAYMENTS_ENABLED, isCashPaymentEnabledForRestaurant, setCashPaymentsEnabled } from "./paymentPolicy.js";
 import { allowedPaymentMethods, paymentDecision, bizumReferenceFor, canChargeCard, remainingCardCents } from "./fulfillment.js";
 
-test("un local bizumOnly acepta bizum y contra reembolso", () => {
+test("un local bizumOnly acepta bizum y contra reembolso cuando el interruptor lo habilita", () => {
+  const previous = CASH_PAYMENTS_ENABLED;
+  setCashPaymentsEnabled(true);
+  try {
   const restaurant = { name: "Kings Tacos Xàtiva", bizumOnly: true };
   assert.deepEqual(allowedPaymentMethods(restaurant), ["bizum", "cash"]);
   const blocked = paymentDecision(restaurant, "stripe");
@@ -12,6 +15,7 @@ test("un local bizumOnly acepta bizum y contra reembolso", () => {
   const ok = paymentDecision(restaurant, "bizum");
   assert.equal(ok.ok, true);
   assert.equal(ok.ok === true && ok.paymentState, "pending_bizum_confirmation");
+  } finally { setCashPaymentsEnabled(previous); }
 });
 
 test("la compra por encargo exige prepago y emite tarjeta", () => {
@@ -22,9 +26,15 @@ test("la compra por encargo exige prepago y emite tarjeta", () => {
   assert.equal(decision.ok === true && decision.requiresPrepayment, true);
 });
 
-test("el efectivo está disponible en todos los comercios", () => {
+test("el interruptor global de efectivo prevalece sobre la configuración guardada del comercio", () => {
+  const previous = CASH_PAYMENTS_ENABLED;
   const sinBandera = { name: "Local", slug: "local-x", cashPaymentsEnabled: false };
-  assert.equal(isCashPaymentEnabledForRestaurant(sinBandera), true);
+  try {
+    setCashPaymentsEnabled(false);
+    assert.equal(isCashPaymentEnabledForRestaurant(sinBandera), false);
+    setCashPaymentsEnabled(true);
+    assert.equal(isCashPaymentEnabledForRestaurant(sinBandera), true);
+  } finally { setCashPaymentsEnabled(previous); }
 });
 
 test("la referencia de bizum es corta y única por pedido", () => {

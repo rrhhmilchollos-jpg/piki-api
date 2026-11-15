@@ -19,9 +19,8 @@ export type CashPaymentMethod = "cash" | "stripe" | string | undefined | null;
 export type CashPaymentPartner = { slug?: string | null; name?: string | null; cashPaymentsEnabled?: boolean | null };
 
 /**
- * Cash must be explicitly enabled by a PIKI superadmin per partner. It is not
- * inferred from a legacy order or from a client-provided payment method.
- * Alibaba Kebab Xàtiva is permanently online-only by the partner's request.
+ * Cash is controlled by the global operations kill-switch. Legacy partner
+ * fields and client-provided payment methods cannot bypass a closed switch.
  */
 export function isCashPaymentEnabledForRestaurant(_restaurant: CashPaymentPartner): boolean {
   // La garantía de tarjeta, el barrido y la liquidación ya están implementados;
