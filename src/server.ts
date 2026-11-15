@@ -2873,6 +2873,58 @@ const partnerSensitiveDataSchema = z.object({
   bankAccountHolder: z.string().trim().min(2).max(180).optional(),
 }).strict().refine((value) => Object.keys(value).length > 0, "sensitive_data_required");
 
+const partnerLegalProfileAdminSchema = z.object({
+  legalName: z.string().trim().min(2).max(180).optional(),
+  taxId: z.string().trim().toUpperCase().regex(/^[A-Z0-9][A-Z0-9-]{4,19}$/).optional(),
+  legalForm: z.enum(["autonomo", "sl", "sa", "cooperativa", "otra"]).optional(),
+  representativeName: z.string().trim().min(2).max(160).optional(),
+  representativeRole: z.string().trim().min(2).max(100).optional(),
+  representativeDocument: z.string().trim().min(5).max(30).optional(),
+  fiscalAddress: z.string().trim().min(5).max(280).optional(),
+  operatingAddress: z.string().trim().min(5).max(280).optional(),
+  postalCode: z.string().trim().regex(/^\d{5}$/).optional(),
+  city: z.string().trim().min(2).max(100).optional(),
+  province: z.string().trim().min(2).max(100).optional(),
+  iban: z.string().trim().regex(/^[A-Za-z]{2}\d{2}[A-Za-z0-9]{10,30}$/).transform((value) => value.toUpperCase()).optional(),
+  bankAccountHolder: z.string().trim().min(2).max(180).optional(),
+  cuisine: z.string().trim().min(2).max(100).optional(),
+  vatRate: z.union([z.literal(4), z.literal(10), z.literal(21)]).optional(),
+  commissionAccepted: z.literal(true).optional(),
+  termsAcceptedAt: z.coerce.date().optional(),
+  contractAcceptedAt: z.coerce.date().optional(),
+  privacyAcceptedAt: z.coerce.date().optional(),
+  dataProcessingAcceptedAt: z.coerce.date().optional(),
+  pdaUnits: z.number().int().min(1).max(50).optional(),
+  pdaUnitCostCents: z.union([z.literal(20000), z.literal(30000)]).optional(),
+  pdaCostAcceptedAt: z.coerce.date().optional(),
+}).strict().refine((value) => Object.keys(value).length > 0, "legal_profile_required");
+
+function redactedPartnerLegalProfile(profile: Record<string, any>) {
+  const sensitive = redactedPartnerSensitiveData(profile);
+  return {
+    ...sensitive,
+    legalForm: profile.legalForm || null,
+    representativeName: profile.representativeName || null,
+    representativeRole: profile.representativeRole || null,
+    representativeDocumentPresent: Boolean(profile.representativeDocument),
+    fiscalAddress: profile.fiscalAddress || null,
+    operatingAddress: profile.operatingAddress || null,
+    postalCode: profile.postalCode || null,
+    city: profile.city || null,
+    province: profile.province || null,
+    cuisine: profile.cuisine || null,
+    vatRate: profile.vatRate ?? null,
+    commissionAccepted: profile.commissionAccepted === true,
+    termsAcceptedAt: profile.termsAcceptedAt || null,
+    contractAcceptedAt: profile.contractAcceptedAt || null,
+    privacyAcceptedAt: profile.privacyAcceptedAt || null,
+    dataProcessingAcceptedAt: profile.dataProcessingAcceptedAt || null,
+    pdaUnits: profile.pdaUnits ?? null,
+    pdaUnitCostCents: profile.pdaUnitCostCents ?? null,
+    pdaCostAcceptedAt: profile.pdaCostAcceptedAt || null,
+  };
+}
+
 function validIbanChecksum(value: string): boolean {
   const rearranged = `${value.slice(4)}${value.slice(0, 4)}`;
   let remainder = 0;
@@ -2953,6 +3005,27 @@ app.patch("/api/v1/admin/restaurants/:id/sensitive-data", requireRole("admin"), 
   if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
   await AccessAuthorization.create({ employeeId: objectId(String(req.auth!.employeeId!)), action: "partner_sensitive_data_updated", previousStatus: "approved", nextStatus: "approved", previousRole: "partner", nextRole: "partner", accessLevel: "superadmin", actorEmployeeId: objectId(String(req.auth!.employeeId!)), reason: `Datos fiscales/bancarios actualizados para ${restaurant.name}; valores omitidos por seguridad.` });
   return res.json({ updated: true, sensitive: redactedPartnerSensitiveData(restaurant.partnerProfile || {}) });
+});
+
+app.get("/api/v1/admin/restaurants/:id/legal-profile", requireRole("admin"), async (req, res) => {
+  const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
+  if (!id) return res.status(400).json({ error: "INVALID_RESTAURANT_ID" });
+  const restaurant = await Restaurant.findOne({ _id: id, ...tenantScope(req) }).select("_id partnerProfile").lean().exec() as any;
+  if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
+  return res.json({ restaurantId: String(restaurant._id), legalProfile: redactedPartnerLegalProfile(restaurant.partnerProfile || {}) });
+});
+
+app.patch("/api/v1/admin/restaurants/:id/legal-profile", requireRole("admin"), async (req, res) => {
+  const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
+  if (!id) return res.status(400).json({ error: "INVALID_RESTAURANT_ID" });
+  const parsed = partnerLegalProfileAdminSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "INVALID_PARTNER_LEGAL_PROFILE", details: parsed.error.flatten() });
+  if (parsed.data.iban && !validIbanChecksum(parsed.data.iban)) return res.status(400).json({ error: "INVALID_IBAN", message: "El IBAN no supera la validación de checksum." });
+  const changes = Object.fromEntries(Object.entries(parsed.data).map(([key, value]) => [`partnerProfile.${key}`, value]));
+  const restaurant = await Restaurant.findOneAndUpdate({ _id: id, ...tenantScope(req) }, { $set: changes }, { new: true, runValidators: true }).select("_id name partnerProfile").lean().exec() as any;
+  if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
+  await AccessAuthorization.create({ employeeId: objectId(String(req.auth!.employeeId!)), action: "partner_legal_profile_updated", previousStatus: "approved", nextStatus: "approved", previousRole: "partner", nextRole: "partner", accessLevel: "superadmin", actorEmployeeId: objectId(String(req.auth!.employeeId!)), reason: `Perfil legal de ${restaurant.name} actualizado; valores sensibles omitidos por seguridad.` });
+  return res.json({ updated: true, legalProfile: redactedPartnerLegalProfile(restaurant.partnerProfile || {}) });
 });
 
 app.patch("/api/v1/admin/restaurants/:id/customer-name", requireOwner(), async (req, res) => {
