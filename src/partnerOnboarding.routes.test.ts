@@ -114,8 +114,11 @@ test("persisted Mongoose profile permits new 200 and historical 300 without defa
     const profile = new Profile({ ...input, contractAcceptedAt: input.termsAcceptedAt });
     assert.equal(profile.validateSync(), undefined); assert.equal(profile.pdaUnitCostCents, fee);
   }
+  const withoutRepresentativeDocument = new Profile({ ...application({ representativeDocument: undefined }), contractAcceptedAt: application().termsAcceptedAt });
+  assert.equal(withoutRepresentativeDocument.validateSync(), undefined);
   assert.equal(profileSchema.path("pdaUnitCostCents").defaultValue, undefined);
   assert(partnerSchema.safeParse(application()).success);
+  assert(partnerSchema.safeParse(application({ representativeDocument: undefined })).success);
   assert.equal(partnerSchema.safeParse(application({ pdaUnitCostCents: 30000 })).success, false);
 });
 
@@ -181,10 +184,22 @@ test("new intake accepts exactly zero through five supported document types, nev
   assert.equal(partnerSchema.safeParse(application({ documents })).success, false);
 });
 
+test("new intake accepts omitted representativeDocument while retaining representative identity fields", async () => {
+  for (const path of paths) {
+    const result = await invoke(path, { representativeDocument: undefined });
+    assert.equal(result.status, 201, path);
+    assert.equal(result.records.length, path.includes("onboarding-requests") ? 1 : 2, path);
+    const profile = result.records[0].data.payload ?? result.records[0].data.partnerProfile;
+    assert.equal(profile.representativeName, "Representante");
+    assert.equal(profile.representativeRole, "Administrador");
+    assert.equal(profile.representativeDocument, undefined);
+  }
+});
+
 const reviewRoutes = [["/api/v1/admin/restaurants/:id/status", "approved"], ["/api/v1/admin/restaurants/:id/compliance/status", "verified"]] as const;
 
 test("new intake rejects whitespace-padded underlength legal values before scanning or persistence", async () => {
-  const minimums: Record<string, number> = { legalName: 2, representativeName: 2, representativeRole: 2, representativeDocument: 5, fiscalAddress: 5, operatingAddress: 5, city: 2, province: 2, bankAccountHolder: 2, cuisine: 2 };
+  const minimums: Record<string, number> = { legalName: 2, representativeName: 2, representativeRole: 2, fiscalAddress: 5, operatingAddress: 5, city: 2, province: 2, bankAccountHolder: 2, cuisine: 2 };
   for (const path of paths) {
     for (const [field, minimum] of Object.entries(minimums)) {
       const result = await invoke(path, { [field]: ` ${"A".repeat(minimum - 1)} ` });
@@ -194,6 +209,11 @@ test("new intake rejects whitespace-padded underlength legal values before scann
     assert.equal(result.status, 201);
     const profile = result.records[0].data.payload ?? result.records[0].data.partnerProfile;
     assert.equal(profile.legalName, "Offline Legal"); assert.equal(profile.representativeName, "Representante");
+  }
+  for (const path of paths) {
+    const result = await invoke(path, { representativeDocument: " A " });
+    assert.equal(result.status, 400, `${path} representativeDocument`);
+    assert.equal(result.records.length, 0); assert.equal(result.scans, 0); assert.equal(result.updates.length, 0);
   }
   assert.equal(partnerSchema.safeParse(application({ legalName: " A " })).success, false);
 });
