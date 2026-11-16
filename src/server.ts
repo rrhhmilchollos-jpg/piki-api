@@ -3356,6 +3356,85 @@ app.patch("/api/v1/admin/rider-leads/:id", requireRole("admin", "commercial", "g
   return res.json({ lead });
 });
 
+/**
+ * Ejecuta la parte operativa de una candidatura ya cualificada. La cualificación
+ * sigue siendo una decisión humana; este endpoint solo puede ser invocado desde
+ * la acción explícita del Admin y nunca procesa solicitudes nuevas o descartadas.
+ */
+app.post("/api/v1/admin/rider-leads/:id/activate", requireRole("admin"), async (req, res) => {
+  const id = objectId(String(req.params.id));
+  const actorId = objectId(String(req.auth?.employeeId || ""));
+  if (!id || !actorId) return res.status(400).json({ error: "INVALID_RIDER_LEAD_ID" });
+  const scope = await onboardingScope(req);
+  const session = await mongoose.startSession();
+  let lead: any = null;
+  let employee: any = null;
+  let rider: any = null;
+  let activationSurface: EmployeeCredentialSurface | null = null;
+  try {
+    await session.withTransaction(async () => {
+      const existing = await RiderLead.findOne({ _id: id, ...scope }).session(session).lean().exec() as any;
+      if (!existing) throw Object.assign(new Error("RIDER_LEAD_NOT_FOUND"), { statusCode: 404 });
+      if (existing.operationalStatus === "activated") { lead = existing; rider = { _id: existing.riderId }; employee = { _id: existing.employeeId }; return; }
+      if (existing.operationalStatus === "sending") throw Object.assign(new Error("RIDER_ACTIVATION_IN_PROGRESS"), { statusCode: 409 });
+      if (existing.status !== "qualified") throw Object.assign(new Error("RIDER_LEAD_MUST_BE_QUALIFIED"), { statusCode: 409 });
+      const documents = Array.isArray(existing.documents) ? existing.documents : [];
+      const allDocumentsApproved = documents.length > 0 && documents.every((document: any) => document.status === "approved");
+      const identityApproved = documents.some((document: any) => ["identity", "residence_permit"].includes(document.type) && document.status === "approved");
+      if (!allDocumentsApproved || !identityApproved) throw Object.assign(new Error("RIDER_DOCUMENT_REVIEW_REQUIRED"), { statusCode: 409 });
+      const zoneSlug = String(existing.assignedZoneSlug || existing.requestedZoneSlug || "").trim();
+      if (!zoneSlug) throw Object.assign(new Error("RIDER_ZONE_REQUIRED"), { statusCode: 409 });
+      const tenantFilter = existing.tenantId ? { tenantId: existing.tenantId } : tenantScope(req);
+      const zone = await Zone.findOne({ ...tenantFilter, slug: zoneSlug, isActive: true }).session(session).select("slug").lean().exec();
+      if (!zone) throw Object.assign(new Error("RIDER_ZONE_NOT_ACTIVE"), { statusCode: 409 });
+      const fleet = await Fleet.findOne({ ...tenantFilter, isActive: true, serviceZones: zoneSlug }).session(session).select("_id name serviceZones").lean().exec() as any;
+      if (!fleet) throw Object.assign(new Error("ZONE_FLEET_NOT_FOUND"), { statusCode: 409 });
+      const normalizedEmail = String(existing.email).trim().toLowerCase();
+      const riderScope = existing.tenantId ? { tenantId: existing.tenantId } : { tenantId: null };
+      const existingRider = await Rider.findOne({ email: normalizedEmail }).session(session).select("_id tenantId riderCode").lean().exec() as any;
+      if (existingRider && String(existingRider.tenantId || "") !== String(existing.tenantId || "")) throw Object.assign(new Error("RIDER_EMAIL_OWNED_BY_ANOTHER_TENANT"), { statusCode: 409 });
+      if (existingRider) {
+        rider = await Rider.findOneAndUpdate({ _id: existingRider._id, ...riderScope }, { $set: { name: existing.name, email: normalizedEmail, phone: existing.phone, city: existing.city, availability: existing.availability, vehicle: existing.vehicle, fleetId: fleet._id, zoneSlug, lifecycleStatus: "active", status: "offline", lifecycleChangedAt: new Date(), lifecycleChangedBy: actorId } }, { new: true, session }).lean().exec();
+      } else {
+        const created = await Rider.create([{ tenantId: existing.tenantId || null, riderCode: await nextRiderCode(), name: existing.name, email: normalizedEmail, phone: existing.phone, city: existing.city, availability: existing.availability, vehicle: existing.vehicle, fleetId: fleet._id, zoneSlug, lifecycleStatus: "active", status: "offline", lifecycleChangedAt: new Date(), lifecycleChangedBy: actorId }], { session });
+        rider = created[0].toObject();
+      }
+      const existingEmployee = await EmployeeAccount.findOne({ email: normalizedEmail }).session(session).select("+passwordHash _id tenantId jobRole apiRole roles").lean().exec() as any;
+      if (existingEmployee && existingEmployee.jobRole !== "rider" && existingEmployee.apiRole !== "rider" && !(existingEmployee.roles || []).includes("rider")) throw Object.assign(new Error("EMPLOYEE_EMAIL_ALREADY_USED"), { statusCode: 409 });
+      if (existingEmployee) {
+        employee = await EmployeeAccount.findOneAndUpdate({ _id: existingEmployee._id }, { $set: { tenantId: existing.tenantId || null, name: existing.name, jobRole: "rider", apiRole: "rider", roles: ["rider"], primaryRole: "rider", authorizationStatus: "approved", authorizedAt: new Date(), authorizedBy: actorId, authorizationReason: "Alta operativa tras cualificación y expediente documental aprobado.", active: true, mustChangePassword: true, fleetId: fleet._id, zoneSlugs: [zoneSlug] } }, { new: true, session }).select("_id name email jobRole apiRole roles primaryRole accessLevel authorizationStatus active mustChangePassword").lean().exec();
+      } else {
+        const employeeId = new mongoose.Types.ObjectId();
+        const created = await EmployeeAccount.create([{ _id: employeeId, employeeCode: employeeCodeFor(employeeId), tenantId: existing.tenantId || null, name: existing.name, email: normalizedEmail, jobRole: "rider", apiRole: "rider", roles: ["rider"], primaryRole: "rider", accessLevel: "subadmin", authorizationStatus: "approved", authorizedAt: new Date(), authorizedBy: actorId, authorizationReason: "Alta operativa tras cualificación y expediente documental aprobado.", fleetId: fleet._id, zoneSlugs: [zoneSlug], passwordHash: hashPassword(generateTemporaryPassword()), mustChangePassword: true, active: true }], { session });
+        employee = created[0].toObject();
+      }
+      activationSurface = preferredCredentialSurface(employee);
+      lead = await RiderLead.findOneAndUpdate({ _id: id, ...scope, $or: [{ operationalStatus: { $in: ["pending", "failed"] } }, { operationalStatus: { $exists: false } }] }, { $set: { operationalStatus: "sending", riderId: rider._id, employeeId: employee._id, assignedFleetId: fleet._id, assignedZoneSlug: zoneSlug, activationAttemptedAt: new Date(), activatedAt: new Date(), activatedBy: actorId }, $push: { history: { status: "qualified", notes: `Rider creado y asignado a Fleet ${fleet.name} (${zoneSlug}).`, actorEmployeeId: actorId, changedAt: new Date() } } }, { new: true, session }).lean().exec();
+      if (!lead) throw Object.assign(new Error("RIDER_ACTIVATION_ALREADY_CLAIMED"), { statusCode: 409 });
+      await AccessAuthorization.create([{ tenantId: existing.tenantId || null, employeeId: employee._id, action: "approved", previousStatus: "pending", nextStatus: "approved", previousRole: "rider", nextRole: "rider", accessLevel: "subadmin", actorEmployeeId: actorId, reason: "Alta operativa transaccional desde candidatura cualificada." }], { session });
+    });
+  } catch (error: any) {
+    const status = Number(error?.statusCode) || 500;
+    if (status === 500) console.error("[RIDER_ACTIVATION_FAILED]", error);
+    return res.status(status).json({ error: error?.message || "RIDER_ACTIVATION_FAILED", message: status === 409 ? "La candidatura no puede activarse todavía; revisa cualificación, documentos, zona y Fleet." : undefined });
+  } finally { await session.endSession(); }
+  if (lead?.operationalStatus === "activated") return res.json({ lead, riderId: String(lead.riderId || rider?._id || ""), employeeId: String(lead.employeeId || employee?._id || ""), alreadyActivated: true, activationEmail: { sent: Boolean(lead.activationSentAt) } });
+  let activationEmail: { sent: boolean; error?: string; surface?: EmployeeCredentialSurface } = { sent: false, surface: activationSurface || undefined };
+  if (employee && activationSurface) {
+    try {
+      const delivery = await sendEmployeePasswordLink(employee, activationSurface, "activation");
+      activationEmail = { sent: delivery.delivery.sent, error: delivery.delivery.error, surface: activationSurface };
+      await RiderLead.updateOne({ _id: id, ...scope }, { $set: { operationalStatus: delivery.delivery.sent ? "activated" : "failed", ...(delivery.delivery.sent ? { activationSentAt: new Date() } : {}) } }).exec();
+      if (delivery.delivery.sent) await AccessAuthorization.create({ tenantId: lead.tenantId || null, employeeId: employee._id, action: "credentials_sent", previousStatus: "approved", nextStatus: "approved", previousRole: "rider", nextRole: "rider", accessLevel: "subadmin", actorEmployeeId: actorId, reason: "Enlace de activación enviado una sola vez tras alta operativa." });
+    } catch (error) {
+      activationEmail = { sent: false, error: error instanceof Error ? error.message : "ACTIVATION_EMAIL_FAILED", surface: activationSurface };
+      await RiderLead.updateOne({ _id: id, ...scope }, { $set: { operationalStatus: "failed" } }).exec();
+    }
+  }
+  await notifyOnboarding({ channel: "fleet", type: "onboarding.rider_lead.activated", entityId: String(rider?._id || id), tenantId: lead.tenantId, payload: { leadId: String(id), riderId: String(rider?._id || ""), employeeId: String(employee?._id || ""), fleetId: String(lead.assignedFleetId || ""), zoneSlug: lead.assignedZoneSlug || null } });
+  return res.status(201).json({ lead, riderId: String(rider?._id || ""), employeeId: String(employee?._id || ""), activationEmail, message: activationEmail.sent ? "Rider creado, asignado a Fleet y enlace de activación enviado." : "Rider creado y asignado a Fleet; el enlace no pudo enviarse y queda pendiente de reintento controlado." });
+});
+
 app.post("/api/v1/riders/applications", async (req, res) => {
   const ip = req.ip || req.socket.remoteAddress || "unknown";
   if (!allowRiderApplication(ip)) return res.status(429).json({ error: "APPLICATION_RATE_LIMITED", retryAfterSeconds: 900 });
