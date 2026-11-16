@@ -27,7 +27,7 @@ export const partnerSchema = z.object({
   phone: z.string().min(6).max(40), address: z.string().min(5).max(280),
   legalName: z.string().trim().min(2).max(180), taxId: z.string().trim().regex(/^[A-Za-z0-9-]{5,20}$/),
   legalForm: z.enum(["autonomo", "sl", "sa", "cooperativa", "otra"]),
-  representativeName: z.string().trim().min(2).max(160), representativeRole: z.string().trim().min(2).max(100), representativeDocument: z.string().trim().min(5).max(30),
+  representativeName: z.string().trim().min(2).max(160), representativeRole: z.string().trim().min(2).max(100), representativeDocument: z.string().trim().min(5).max(30).optional(),
   fiscalAddress: z.string().trim().min(5).max(280), operatingAddress: z.string().trim().min(5).max(280), postalCode: z.string().trim().regex(/^\d{5}$/), city: z.string().trim().min(2).max(100), province: z.string().trim().min(2).max(100),
   iban: z.string().trim().regex(/^[A-Z]{2}\d{2}[A-Z0-9]{10,30}$/), bankAccountHolder: z.string().trim().min(2).max(180), cuisine: z.string().trim().min(2).max(100), vatRate: z.union([z.literal(4), z.literal(10), z.literal(21)]),
   commissionAccepted: z.literal(true), termsAcceptedAt: z.coerce.date(), contractAccepted: z.literal(true), privacyAccepted: z.literal(true), dataProcessingAccepted: z.literal(true),

@@ -4,6 +4,7 @@ import type { Request, Response } from "express";
 import { Restaurant, CustomerAccount } from "./models.js";
 import { handleCustomerTrpc } from "./customerCompat.js";
 import { customerMenuForRestaurant, menuItemIsAvailable } from "./customerCatalogPolicy.js";
+import { CASH_PAYMENTS_ENABLED, setCashPaymentsEnabled } from "./paymentPolicy.js";
 
 const menu = [
   { id: "active", name: "Disponible", price: 10, available: true },
@@ -33,14 +34,16 @@ test("public menu hides paused items without removing legacy available products"
 
 test("the actual Customer tRPC catalog route is no-store and omits paused products", async () => {
   const originalFind = Restaurant.find;
+  const previousCashPaymentsEnabled = CASH_PAYMENTS_ENABLED;
   Restaurant.find = (() => query([restaurant])) as any;
+  setCashPaymentsEnabled(true);
   try {
     const res = response();
     await handleCustomerTrpc(request("catalog.list"), res as unknown as Response);
     assert.equal(res.headers["Cache-Control"], "no-store, max-age=0");
     assert.deepEqual(res.body.result.data.json[0].menu.map((item: any) => item.id), ["active", "legacy"]);
     assert.equal(res.body.result.data.json[0].cashPaymentsEnabled, true);
-  } finally { Restaurant.find = originalFind; }
+  } finally { Restaurant.find = originalFind; setCashPaymentsEnabled(previousCashPaymentsEnabled); }
 });
 
 test("a basket retained before a stock pause cannot create a Customer order", async () => {

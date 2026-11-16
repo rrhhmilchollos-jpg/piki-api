@@ -541,10 +541,10 @@ async function handleCustomerTrpcSingle(req: Request, res: Response) {
         if (card) await Order.updateOne({ _id: order._id }, { $set: { virtualCardId: (card as any)._id } }).exec();
       }
       let checkoutUrl: string | null = null;
-      if (procedure === "order.checkout" && paymentMethod === "stripe") {
+      if (procedure === "order.checkout" && ["stripe", "bizum"].includes(paymentMethod)) {
         let session: Awaited<ReturnType<typeof createCheckoutSession>>;
         try {
-          session = await createCheckoutSession({ orderId: String(order._id), publicCode: code, origin: checkoutOrigin(input.origin), customerEmail: user.email, items: normalized.map((item) => ({ name: item.name, quantity: item.quantity, unitPriceCents: item.unitPriceCents })), deliveryFeeCents: deliveryCents, serviceFeeCents: serviceCents, discountCents: creditAppliedCents, preferredPaymentMethod: "stripe" });
+          session = await createCheckoutSession({ orderId: String(order._id), publicCode: code, origin: checkoutOrigin(input.origin), customerEmail: user.email, items: normalized.map((item) => ({ name: item.name, quantity: item.quantity, unitPriceCents: item.unitPriceCents })), deliveryFeeCents: deliveryCents, serviceFeeCents: serviceCents, discountCents: creditAppliedCents, preferredPaymentMethod: paymentMethod === "bizum" ? "bizum" : "stripe" });
         } catch (error) {
           // Compensation is atomic with marking the pending order failed; never
           // extend the original credit TTL or overwrite a newer reward expiry.

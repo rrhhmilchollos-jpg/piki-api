@@ -6,7 +6,7 @@ import { CUSTOMER_CATALOG_RESTAURANT_FILTER, customerCatalogRestaurantName, cust
 import { customerAvailability } from "./customerAvailability.js";
 import { modifierGroupsForItem, usesReferenceAddOns } from "./menuModifiers.js";
 import { canonicalRestaurantMenu } from "./menuContract.js";
-import { isCashPaymentEnabledForRestaurant } from "./paymentPolicy.js";
+import { CASH_PAYMENTS_ENABLED, setCashPaymentsEnabled } from "./paymentPolicy.js";
 
 // Execute only AST-extracted functions: no server/customerCompat/fulfillment
 // module import, real Mongo query, socket, credentials or payment client.
@@ -24,23 +24,31 @@ function evaluate(text: string, expression: string, bindings: Record<string, unk
   return new Function(...Object.keys(bindings), `${output}\nreturn (${expression});`)(...Object.values(bindings));
 }
 const fulfillmentSource = source("./fulfillment.ts");
-const policy = evaluate(["METHODS", "isMethod", "DEFAULT_PAYMENT_METHODS", "allowedPaymentMethods", "isRiderPurchase", "paymentDecision"].map((name) => declaration(fulfillmentSource, name)).join("\n"), "({ allowedPaymentMethods, isRiderPurchase, paymentDecision })", { isCashPaymentEnabledForRestaurant });
-const publicRestaurantPaymentCapabilities = evaluate(declaration(source("./publicRestaurantPaymentCapabilities.ts"), "publicRestaurantPaymentCapabilities"), "publicRestaurantPaymentCapabilities", policy);
+const fulfillmentPolicySource = ["METHODS", "isMethod", "DEFAULT_PAYMENT_METHODS", "allowedPaymentMethods", "isRiderPurchase", "paymentDecision"].map((name) => declaration(fulfillmentSource, name)).join("\n");
+function buildPolicy(cashPaymentsEnabled: boolean) {
+  const isCashPaymentEnabledForTest = () => cashPaymentsEnabled;
+  const policy = evaluate(fulfillmentPolicySource, "({ allowedPaymentMethods, isRiderPurchase, paymentDecision })", { CASH_PAYMENTS_ENABLED: cashPaymentsEnabled, isCashPaymentEnabledForRestaurant: isCashPaymentEnabledForTest });
+  const publicRestaurantPaymentCapabilities = evaluate(declaration(source("./publicRestaurantPaymentCapabilities.ts"), "publicRestaurantPaymentCapabilities"), "publicRestaurantPaymentCapabilities", policy);
+  return { policy, publicRestaurantPaymentCapabilities, isCashPaymentEnabledForTest };
+}
+const enabledPolicy = buildPolicy(true);
+const policy = enabledPolicy.policy;
+const publicRestaurantPaymentCapabilities = enabledPolicy.publicRestaurantPaymentCapabilities;
 const compatSource = source("./customerCompat.ts");
 const restaurantView = evaluate(declaration(compatSource, "restaurantView"), "restaurantView", {
   publicRestaurantPaymentCapabilities, usesReferenceAddOns, restaurantIsWithinOpeningHours, customerAvailability,
-  customerCatalogRestaurantName, customerMenuForRestaurant, isCashPaymentEnabledForRestaurant, modifierGroupsForItem,
+  customerCatalogRestaurantName, customerMenuForRestaurant, isCashPaymentEnabledForRestaurant: enabledPolicy.isCashPaymentEnabledForTest, modifierGroupsForItem,
 });
 const cases: Array<{ name: string; row: Record<string, any>; methods: string[]; bizumOnly?: boolean; model?: string }> = [
-  { name: "legacy absent fields", row: {}, methods: ["stripe", "cash"] },
+  { name: "legacy absent fields", row: {}, methods: ["stripe", "bizum", "cash"] },
   { name: "Bizum precedence", row: { bizumOnly: true, paymentMethods: ["stripe", "unknown"] }, methods: ["bizum", "cash"], bizumOnly: true },
   { name: "configured Bizum", row: { paymentMethods: ["bizum"] }, methods: ["bizum", "cash"] },
-  { name: "configured cash", row: { paymentMethods: ["cash"], cashPaymentsEnabled: false }, methods: ["cash"] },
-  { name: "invalid configuration fallback", row: { paymentMethods: ["unknown"], bizumOnly: "true", fulfillmentModel: "unknown" }, methods: ["stripe", "cash"] },
-  { name: "empty configuration fallback", row: { paymentMethods: [] }, methods: ["stripe", "cash"] },
-  { name: "null legacy configuration", row: { paymentMethods: null, bizumOnly: null, fulfillmentModel: null }, methods: ["stripe", "cash"] },
+  { name: "configured cash", row: { paymentMethods: ["cash"], cashPaymentsEnabled: false }, methods: ["cash", "bizum"] },
+  { name: "invalid configuration fallback", row: { paymentMethods: ["unknown"], bizumOnly: "true", fulfillmentModel: "unknown" }, methods: ["stripe", "bizum", "cash"] },
+  { name: "empty configuration fallback", row: { paymentMethods: [] }, methods: ["stripe", "bizum", "cash"] },
+  { name: "null legacy configuration", row: { paymentMethods: null, bizumOnly: null, fulfillmentModel: null }, methods: ["stripe", "bizum", "cash"] },
   { name: "rider purchase", row: { paymentMethods: ["stripe", "bizum"], fulfillmentModel: "rider_purchase", fulfillmentMode: "partner_delivery" }, methods: ["stripe", "bizum", "cash"], model: "rider_purchase" },
-  { name: "delivery mode is not fulfillment model", row: { fulfillmentMode: "assisted_purchase" }, methods: ["stripe", "cash"] },
+  { name: "delivery mode is not fulfillment model", row: { fulfillmentMode: "assisted_purchase" }, methods: ["stripe", "bizum", "cash"] },
 ];
 function fixture(index: number, overrides: Record<string, any> = {}) {
   return { _id: String(index), slug: `synthetic-${index}`, name: `Synthetic ${index}`, isActive: true, onboardingStatus: "approved", availabilityStatus: "available", listingType: "official_partner", fulfillmentMode: "partner_delivery", priceIncludesCommission: true, menu: [{ id: "dish", name: "Dish", price: 12.37, available: true, allergens: null }], ...overrides };
@@ -72,7 +80,16 @@ test("public helper preserves canonical methods, strict boolean and existing ful
   assert.deepEqual(dto.allowedPaymentMethods, ["bizum", "cash"], "compatibility alias must not mutate canonical array");
 });
 
-test("DTO capabilities agree with the unchanged quote paymentDecision", () => {
+test("the global COD kill-switch removes cash even when legacy restaurant data opts in", () => {
+  const closed = buildPolicy(false);
+  assert.deepEqual(closed.policy.allowedPaymentMethods({ cashPaymentsEnabled: true }), ["stripe", "bizum"]);
+  const decision = closed.policy.paymentDecision({ name: "Synthetic", cashPaymentsEnabled: true }, "cash");
+  assert.equal(decision.ok, false);
+  assert.deepEqual(decision.allowed, ["stripe", "bizum"]);
+  assert.deepEqual(closed.publicRestaurantPaymentCapabilities({ cashPaymentsEnabled: true }).allowedPaymentMethods, ["stripe", "bizum"]);
+});
+
+test("DTO capabilities agree with the quote paymentDecision", () => {
   assert.match(declaration(compatSource, "handleCustomerTrpcSingle"), /const decision = paymentDecision\(restaurant, paymentMethod\)/);
   for (const entry of cases) {
     for (const method of ["stripe", "bizum", "cash"]) {
@@ -117,7 +134,10 @@ test("tRPC catalog.list and catalog.byId execute real extracted handlers with sy
   assert.equal(JSON.stringify(listed).includes("PRIVATE_"), false);
 });
 
-test("REST handler selects policy fields, publishes the same capabilities, and retains private-field exclusion", async () => {
+test("REST handler selects policy fields, publishes the same capabilities, and retains private-field exclusion", async (t) => {
+  const previousCashPaymentsEnabled = CASH_PAYMENTS_ENABLED;
+  setCashPaymentsEnabled(true);
+  t.after(() => setCashPaymentsEnabled(previousCashPaymentsEnabled));
   const file = source("./server.ts");
   const route = file.statements.find((node) => ts.isExpressionStatement(node) && ts.isCallExpression(node.expression) && node.expression.expression.getText(file) === "app.get" && node.expression.arguments[0]?.getText(file) === '"/api/v1/catalog/restaurants"');
   assert.ok(route && ts.isExpressionStatement(route) && ts.isCallExpression(route.expression));

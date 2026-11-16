@@ -121,7 +121,7 @@ export function deliveredConfirmationResponse(order: any, idempotent: boolean, g
 
 /** Online checkout is auto-captured; legacy manual authorizations still need capture. */
 export function stripeDeliveryPaymentAction(order: { paymentMethod?: string; paymentState?: string; stripePaymentIntentId?: string | null }): "already_paid" | "capture_authorization" | "reject" {
-  if (order.paymentMethod !== "stripe") return "reject";
+  if (!["stripe", "bizum"].includes(String(order.paymentMethod))) return "reject";
   if (order.paymentState === "paid") return "already_paid";
   if (order.paymentState === "authorized" && order.stripePaymentIntentId) return "capture_authorization";
   return "reject";

@@ -25,7 +25,7 @@ function handler(method: string, context: Record<string, any>) {
 const query = (value: any) => ({ select() { return this; }, lean() { return this; }, exec: async () => value });
 async function roundtrip(input: unknown, allowed = true) {
   let writes = 0;
-  const row = { _id: "64b000000000000000000001", name: "Offline", isActive: true, partnerProfile: { openingHours: {} as any } };
+  const row = { _id: "64b000000000000000000001", name: "Offline", isActive: true, onboardingStatus: "approved", partnerProfile: { openingHours: {} as any } };
   const context = {
     openingHoursSchema,
     pikiManagedOpeningHours: helper("pikiManagedOpeningHours", { normalizeOpeningHours, legacyOpeningHoursProjection }),
@@ -33,7 +33,7 @@ async function roundtrip(input: unknown, allowed = true) {
     partnerRequestAccess: async () => ({ allowed, access: { restaurantIds: [row._id] } }), employeeRestaurant: async () => row._id,
     tenantScope: () => ({ tenantId: "64b000000000000000000002" }),
     partnerTenantScope: () => ({ tenantId: "64b000000000000000000002" }),
-    Restaurant: { findOne: () => query(row), findOneAndUpdate: (filter: any, update: any) => { writes++; assert.equal(filter.tenantId, "64b000000000000000000002"); assert.equal(filter.onboardingStatus, "approved"); row.partnerProfile.openingHours = update.$set["partnerProfile.openingHours"]; return query(row); } },
+    Restaurant: { findOne: () => query(row), findOneAndUpdate: (filter: any, update: any) => { writes++; assert.equal(filter.tenantId, "64b000000000000000000002"); assert.deepEqual(filter.onboardingStatus, { $in: ["approved", "pending_review"] }); row.partnerProfile.openingHours = update.$set["partnerProfile.openingHours"]; return query(row); } },
     invalidateCatalogCache: () => undefined, publishCatalogUpdate: () => undefined,
   };
   let status = 200; let body: any;

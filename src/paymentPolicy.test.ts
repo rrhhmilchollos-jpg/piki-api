@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { isDispatchablePayment } from "./dispatchEligibility.js";
-import { MAX_CASH_ORDER_CENTS, cashOrderLimitError, isCashOrderWithinLimit, isCashPaymentEnabledForRestaurant } from "./paymentPolicy.js";
+import { CASH_PAYMENTS_ENABLED, MAX_CASH_ORDER_CENTS, cashOrderLimitError, isCashOrderWithinLimit, isCashPaymentEnabledForRestaurant, setCashPaymentsEnabled } from "./paymentPolicy.js";
 
 test("el límite de efectivo se aplica al total final, incluyendo los bordes 4.899/4.900", () => {
   assert.equal(MAX_CASH_ORDER_CENTS, 4_899);
@@ -26,11 +26,22 @@ test("sin retención viva ningún pedido sale a reparto, tampoco el efectivo", (
   assert.equal(isDispatchablePayment("paid", "stripe", 50_000), true);
 });
 
-test("el efectivo se acepta en todos los comercios, Alibaba incluido", () => {
-  assert.equal(isCashPaymentEnabledForRestaurant({ name: "Alibaba", slug: "alibaba-kebab-xativa", cashPaymentsEnabled: false }), true);
-  assert.equal(isCashPaymentEnabledForRestaurant({ name: "Cualquiera", slug: "otro-local" }), true);
+test("el interruptor global de efectivo controla los comercios independientemente de sus datos antiguos", () => {
+  const previous = CASH_PAYMENTS_ENABLED;
+  try {
+    setCashPaymentsEnabled(false);
+    assert.equal(isCashPaymentEnabledForRestaurant({ name: "Alibaba", slug: "alibaba-kebab-xativa", cashPaymentsEnabled: true }), false);
+    assert.equal(isCashPaymentEnabledForRestaurant({ name: "Cualquiera", slug: "otro-local" }), false);
+    setCashPaymentsEnabled(true);
+    assert.equal(isCashPaymentEnabledForRestaurant({ name: "Alibaba", slug: "alibaba-kebab-xativa", cashPaymentsEnabled: false }), true);
+    assert.equal(isCashPaymentEnabledForRestaurant({ name: "Cualquiera", slug: "otro-local" }), true);
+  } finally { setCashPaymentsEnabled(previous); }
 });
 
 test("Mr Rooster Xàtiva queda habilitado para contrareembolso con su slug operativo", () => {
-  assert.equal(isCashPaymentEnabledForRestaurant({ slug: "rooster-kebab-xativa", name: "Mr Rooster Xàtiva", cashPaymentsEnabled: true }), true);
+  const previous = CASH_PAYMENTS_ENABLED;
+  try {
+    setCashPaymentsEnabled(true);
+    assert.equal(isCashPaymentEnabledForRestaurant({ slug: "rooster-kebab-xativa", name: "Mr Rooster Xàtiva", cashPaymentsEnabled: true }), true);
+  } finally { setCashPaymentsEnabled(previous); }
 });

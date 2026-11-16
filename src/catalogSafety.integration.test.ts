@@ -137,7 +137,7 @@ test("contratos de catálogo y carta con handlers reales, consultas en memoria y
     assert.equal(detail.body.result.data.json.canOrder, true);
     const input = { restaurantId, items: [{ id: "dish", quantity: 1 }] };
     assert.equal((await trpc("order.quote", input)).statusCode, 200);
-    const body = { restaurantId, deliveryAddress: "Calle sintética 12", deliveryLocation: { latitude: 38.990276, longitude: -0.521111 }, items: [{ itemId: "dish", quantity: 1 }], paymentMethod: "cash" };
+    const body = { restaurantId, deliveryAddress: "Calle sintética 12", deliveryLocation: { latitude: 38.990276, longitude: -0.521111 }, items: [{ itemId: "dish", quantity: 1 }], paymentMethod: "stripe" };
     assert.equal((await call("post", "/api/v1/orders", { body })).body.error, "RESTAURANT_LOCATION_UNAVAILABLE", "legacy llega a la guarda geográfica sin crear pedidos");
     for (const override of [{ internalDemo: true }, { isActive: false }, { onboardingStatus: "pending_review" }, { onboardingStatus: "rejected" }, { availabilityStatus: "paused" }, { menu: [] }, { fulfillmentMode: "assisted_purchase" }, { slug: "partner-test" }]) {
       stored = fixture({ listingType: "restaurant", ...override });
@@ -157,7 +157,7 @@ test("contratos de catálogo y carta con handlers reales, consultas en memoria y
   });
 
   await t.test("POST orders rechaza estados no operables y producto pausado antes de cualquier efecto", async () => {
-    const body = { restaurantId, deliveryAddress: "Calle sintética 12", deliveryLocation: { latitude: 38.990276, longitude: -0.521111 }, items: [{ itemId: "dish", quantity: 1 }], paymentMethod: "cash" };
+    const body = { restaurantId, deliveryAddress: "Calle sintética 12", deliveryLocation: { latitude: 38.990276, longitude: -0.521111 }, items: [{ itemId: "dish", quantity: 1 }], paymentMethod: "stripe" };
     for (const override of [{ availabilityStatus: "coming_soon" }, { listingType: "local_directory" }, { internalDemo: true }, { slug: "partner-test" }, { isActive: false }, { onboardingStatus: "pending_review" }, { onboardingStatus: "suspended" }, { menu: [] }, { listingType: null }]) {
       stored = fixture(override); filters = [];
       const res = await call("post", "/api/v1/orders", { body });

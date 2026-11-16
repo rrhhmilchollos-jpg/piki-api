@@ -29,7 +29,7 @@ import { waitlistRouter } from "./waitlist.js";
 import express from "express";
 import mongoose from "mongoose";
 import { z } from "zod";
-import { CashLedgerEntry, CustomerAccount, DispatchDecision, DispatchOutbox, DocumentRequest, EmployeeAccount, AccessAuthorization, Fleet, Order, Restaurant, PartnerAsset, PartnerLocalityGroup, MenuImportDraft, Rider, RiderApplication, PartnerLead, RiderLead, RiderIncident, RiderOrderMessage, RiderSlot, SignatureRequest, Zone, PushSubscription, RealtimeEvent, Notification, Tenant, TenantMembership, RiderAssignmentReservation, SupportTicket, OnboardingRequest, TrackingSession, RiderPayoutBatch, PartnerPayoutBatch, GovernanceAuditEvent, LocationSample, ensureIndexes } from "./models.js";
+import { CashLedgerEntry, CustomerAccount, DispatchDecision, DispatchOutbox, DocumentRequest, EmployeeAccount, AccessAuthorization, Fleet, Order, Restaurant, PartnerAsset, PartnerLocalityGroup, MenuImportDraft, Rider, RiderApplication, PartnerLead, RiderLead, RiderIncident, RiderOrderMessage, RiderSlot, SignatureRequest, Zone, PushSubscription, RealtimeEvent, Notification, Tenant, TenantMembership, RiderAssignmentReservation, SupportTicket, OnboardingRequest, TrackingSession, RiderPayoutBatch, RiderCashSettlement, PartnerPayoutBatch, GovernanceAuditEvent, LocationSample, ensureIndexes } from "./models.js";
 import { RiderShiftIncentiveMetric } from "./riderIncentivesModels.js";
 import { normalizeLeadEmail, partnerLeadSubmissionSchema, riderLeadSubmissionSchema, webLeadReviewSchema, webLeadStatusSchema } from "./webLeads.js";
 import { assertTransition, calculateEtaRange, transitionSchema, validateCoordinates } from "./algorithms/index.js";
@@ -59,7 +59,7 @@ import { ORDER_ALERT_RECIPIENT, notifyOrderCancelled, notifyOrderPlaced } from "
 import { startDailySummaryWorker, stopDailySummaryWorker } from "./dailySummaryWorker.js";
 import { BUSINESS_SUMMARY_RECIPIENT, sendDailyBusinessSummary } from "./dailyBusinessSummary.js";
 import { corporateEmailConfiguration, corporateEmailDepartmentForRole, escapeCorporateHtml, sendCorporateEmail, sendLeadContactEmail, verifyCorporateEmailConnection } from "./corporateEmail.js";
-import { activeOperationalOrderStatuses, dispatchableOrderStatuses, dispatchablePaymentFilter, isDispatchableOrderStatus, isDispatchablePayment } from "./dispatchEligibility.js";
+import { activeOperationalOrderStatuses, dispatchableOrderStatuses, dispatchablePaymentFilter, isDispatchableOrderStatus, isDispatchablePayment, partnerKitchenPaymentFilter } from "./dispatchEligibility.js";
 import { canReceivePartnerLocations, partnerCan, partnerPermissions, partnerRolesForEmployee, permissionsForPartnerRoles, type PartnerPermission } from "./partnerAccess.js";
 import { KitchenAccessError, kitchenBindingForEmployee, registerPartnerKitchenAccessRoutes, validateKitchenActivation, type KitchenAccessDependencies } from "./partnerKitchenAccess.js";
 import { assignedRestaurantIds, partnerAccessForRequest as sharedPartnerAccessForRequest, partnerRequestAccess as sharedPartnerRequestAccess, partnerReadinessReason, requirePartnerSurface } from "./partnerOperationalAccess.js";
@@ -76,7 +76,7 @@ import { partnerBasicProfileSchema } from "./partnerProfilePolicy.js";
 import { quoteMenuItem, usesReferenceAddOns } from "./menuModifiers.js";
 import { pointDistanceMeters } from "./pickupPolicy.js";
 import { buildLegacyRiderSupportTicketFilter, buildRiderSupportTicketFilter } from "./supportTicketScope.js";
-import { CASH_PAYMENTS_ENABLED, cashOrderLimitError, cashPaymentDisabledError, hydrateCashPaymentsEnabled, isCashOrderWithinLimit, isCashPaymentEnabledForRestaurant } from "./paymentPolicy.js";
+import { CASH_PAYMENTS_ENABLED, cashOrderLimitCents, cashOrderLimitError, cashPaymentDisabledError, hydrateCashPaymentsEnabled, isCashOrderWithinLimit, isCashPaymentEnabledForRestaurant, isOnlinePaymentMethod } from "./paymentPolicy.js";
 import { calculateMarketplaceBreakdown, DEFAULT_PARTNER_COMMISSION_BPS } from "./marketplaceAccounting.js";
 import { postMarketplaceOrderLedger, preparePartnerPayoutBatch } from "./marketplaceLedger.js";
 import { extractAndParseMenu, readAssetBytes } from "./menuImport.js";
@@ -1113,7 +1113,7 @@ app.all("/api/trpc/:procedure", handleCustomerTrpc);
 app.get("/api/v1/auth/status", (_req, res) => res.json({ authentication: "bearer" }));
 const employeeSessionRoles = ["admin", "partner", "rider", "fleet", "commercial", "gerente_comercial_zona", "finance", "support"] as const;
 const partnerOperationalRoles = ["partner_admin", "area_manager", "zone_manager", "store_manager", "manager", "cashier", "cajero", "kitchen", "cocina", "cook", "catalog", "catalogue", "menu_manager", "viewer", "read_only", "solo_lectura"] as const;
-const employeeLoginSchema = z.object({ identifier: z.string().trim().min(3).max(254).optional(), email: z.string().trim().min(3).max(254).optional(), password: z.string().min(8).max(200), role: z.enum(employeeSessionRoles).optional() }).refine((value) => Boolean(value.identifier || value.email), { message: "identifier_required" });
+const employeeLoginSchema = z.object({ identifier: z.string().trim().min(3).max(254).optional(), email: z.string().trim().min(3).max(254).optional(), username: z.string().trim().min(3).max(254).optional(), employeeCode: z.string().trim().min(3).max(254).optional(), password: z.string().min(8).max(200), role: z.enum(employeeSessionRoles).optional() }).refine((value) => Boolean(value.identifier || value.email || value.username || value.employeeCode), { message: "identifier_required" });
 const employeePasswordResetRequestSchema = z.object({ email: z.string().email().max(254) });
 const employeePasswordResetConfirmSchema = z.object({ token: z.string().min(40).max(200), newPassword: z.string().min(12).max(200).regex(/[A-Z]/).regex(/[a-z]/).regex(/[0-9]/) });
 function employeeCodeFor(value: unknown) { return `PIKI-E-${String(value).replace(/[^a-z0-9]/gi, "").slice(-8).toUpperCase()}`; }
@@ -1228,8 +1228,10 @@ app.post("/api/v1/auth/employee/password-reset/confirm", rateLimit(8, 15 * 60_00
 app.post("/api/v1/auth/employee/login", async (req, res) => {
   const parsed = employeeLoginSchema.safeParse(req.body); if (!parsed.success) return res.status(400).json({ error: "INVALID_LOGIN" });
   const requestedSurface = String(req.headers["x-piki-surface"] || "").toLowerCase();
-  const identifier = String(parsed.data.identifier || parsed.data.email || "").trim().toLowerCase();
-  if (requestedSurface === "rider" && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(identifier)) return res.status(400).json({ error: "RIDER_EMAIL_REQUIRED" });
+  // Rider clients in the field have historically used both email and the
+  // stable PIKI employee code. Accept all documented aliases so a stale app
+  // cannot turn a valid credential into an opaque HTTP 400.
+  const identifier = String(parsed.data.identifier || parsed.data.email || parsed.data.username || parsed.data.employeeCode || "").trim().toLowerCase();
   if (String(req.headers["x-piki-surface"] || "").toLowerCase() === "admin" && identifier !== ownerEmail) { /* subadmins are allowed; destructive operations remain superadmin-only */ }
   let employee = await EmployeeAccount.findOne({ $or: [{ email: identifier }, { employeeCode: identifier.toUpperCase() }] }).select("+passwordHash").exec() as any;
   if (!employee && /^piki-p-[a-z0-9-]+$/i.test(identifier)) {
@@ -2613,7 +2615,7 @@ app.get("/api/v1/partners/kitchen/orders", requirePartnerSurface(), async (req, 
   if (!allowed) return res.status(403).json({ error: "PARTNER_PERMISSION_DENIED", permission: "orders:read" });
   const restaurantId = await employeeRestaurant(req, access);
   if (!restaurantId) return res.status(403).json({ error: access?.restaurantIds.length ? "PARTNER_RESTAURANT_ACCESS_DENIED" : "PARTNER_RESTAURANT_NOT_ASSIGNED" });
-  const orders = await Order.find({ restaurantId, ...partnerTenantScope(req), ...dispatchablePaymentFilter, archivedAt: null, status: { $in: ["pending", "accepted", "preparing", "ready_for_pickup", "picked_up", "on_the_way"] } }).sort({ createdAt: 1 }).lean().exec() as any[];
+  const orders = await Order.find({ restaurantId, ...partnerTenantScope(req), ...partnerKitchenPaymentFilter, archivedAt: null, status: { $in: ["pending", "accepted", "preparing", "ready_for_pickup", "picked_up", "on_the_way"] } }).sort({ createdAt: 1 }).lean().exec() as any[];
   const [restaurantRecord, customers, riders] = await Promise.all([
     Restaurant.findOne({ _id: restaurantId, ...partnerTenantScope(req) }).select("name address phone cuisine location").lean().exec(),
     CustomerAccount.find({ _id: { $in: orders.map((order) => order.customerId).filter(Boolean) }, ...partnerTenantScope(req) }).select("name email").lean().exec(),
@@ -2986,6 +2988,19 @@ app.patch("/api/v1/admin/restaurants/:id/settings", requireOwner(), async (req, 
   return res.json({ updated: true, restaurant: { ...restaurant, id: String(restaurant._id), partnerCode: restaurant.partnerCode || publicPartnerCode(restaurant._id), commissionRateBps: Number(restaurant.partnerProfile?.commissionRateBps ?? DEFAULT_PARTNER_COMMISSION_BPS), commissionPercent: Number(restaurant.partnerProfile?.commissionRateBps ?? DEFAULT_PARTNER_COMMISSION_BPS) / 100 } });
 });
 
+app.post("/api/v1/admin/restaurants/:id/publish-customer", requireOwner(), async (req, res) => {
+  const id = objectId(String(req.params.id));
+  if (!id) return res.status(400).json({ error: "INVALID_RESTAURANT_ID" });
+  const current = await Restaurant.findOne({ _id: id, ...tenantScope(req) }).select("_id slug name locality menu listingType onboardingStatus isActive availabilityStatus internalDemo fulfillmentMode").lean().exec() as any;
+  if (!current) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
+  const menuCount = Array.isArray(current.menu) ? current.menu.filter((item: any) => item && String(item.id || item.name || "").trim()).length : 0;
+  if (!menuCount) return res.status(409).json({ error: "PARTNER_MENU_REQUIRED", message: "El Partner tiene que disponer de una carta antes de publicarse en Customer." });
+  const updated = await Restaurant.findOneAndUpdate({ _id: id, ...tenantScope(req) }, { $set: { listingType: "official_partner", onboardingStatus: "approved", isActive: true, availabilityStatus: "available", internalDemo: false, fulfillmentMode: "partner_delivery" } }, { new: true }).select("_id slug name locality listingType onboardingStatus isActive availabilityStatus internalDemo fulfillmentMode menu").lean().exec() as any;
+  invalidateCatalogCache();
+  void publishCatalogUpdate(updated._id, "admin.restaurant.published.customer");
+  await recordGovernanceEvent({ actor: { employeeId: req.auth?.employeeId, role: "superadmin", tenantId: (req.auth as any)?.tenantId }, action: "partner_published_customer", targetType: "restaurant", targetId: id, before: current, after: updated, reason: "Publicación explícita en el catálogo Customer desde PIKI Admin." });
+  return res.json({ published: true, restaurant: { id: String(updated._id), slug: updated.slug, name: updated.name, locality: updated.locality, menuCount, listingType: updated.listingType, onboardingStatus: updated.onboardingStatus, isActive: updated.isActive, availabilityStatus: updated.availabilityStatus, fulfillmentMode: updated.fulfillmentMode } });
+});
 app.get("/api/v1/admin/restaurants/:id/sensitive-data", requireRole("admin"), async (req, res) => {
   const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id);
   if (!id) return res.status(400).json({ error: "INVALID_RESTAURANT_ID" });
@@ -3356,85 +3371,59 @@ app.patch("/api/v1/admin/rider-leads/:id", requireRole("admin", "commercial", "g
   return res.json({ lead });
 });
 
-/**
- * Ejecuta la parte operativa de una candidatura ya cualificada. La cualificación
- * sigue siendo una decisión humana; este endpoint solo puede ser invocado desde
- * la acción explícita del Admin y nunca procesa solicitudes nuevas o descartadas.
- */
 app.post("/api/v1/admin/rider-leads/:id/activate", requireRole("admin"), async (req, res) => {
   const id = objectId(String(req.params.id));
-  const actorId = objectId(String(req.auth?.employeeId || ""));
-  if (!id || !actorId) return res.status(400).json({ error: "INVALID_RIDER_LEAD_ID" });
+  const parsed = z.object({ fleetId: z.string().regex(/^[a-f\d]{24}$/).optional(), zoneSlug: z.string().regex(/^[a-z0-9-]+$/).optional() }).safeParse(req.body || {});
+  if (!id || !parsed.success) return res.status(400).json({ error: "INVALID_RIDER_LEAD_ACTIVATION", details: parsed.success ? undefined : parsed.error.flatten() });
   const scope = await onboardingScope(req);
-  const session = await mongoose.startSession();
-  let lead: any = null;
-  let employee: any = null;
-  let rider: any = null;
-  let activationSurface: EmployeeCredentialSurface | null = null;
-  try {
-    await session.withTransaction(async () => {
-      const existing = await RiderLead.findOne({ _id: id, ...scope }).session(session).lean().exec() as any;
-      if (!existing) throw Object.assign(new Error("RIDER_LEAD_NOT_FOUND"), { statusCode: 404 });
-      if (existing.operationalStatus === "activated") { lead = existing; rider = { _id: existing.riderId }; employee = { _id: existing.employeeId }; return; }
-      if (existing.operationalStatus === "sending") throw Object.assign(new Error("RIDER_ACTIVATION_IN_PROGRESS"), { statusCode: 409 });
-      if (existing.status !== "qualified") throw Object.assign(new Error("RIDER_LEAD_MUST_BE_QUALIFIED"), { statusCode: 409 });
-      const documents = Array.isArray(existing.documents) ? existing.documents : [];
-      const allDocumentsApproved = documents.length > 0 && documents.every((document: any) => document.status === "approved");
-      const identityApproved = documents.some((document: any) => ["identity", "residence_permit"].includes(document.type) && document.status === "approved");
-      if (!allDocumentsApproved || !identityApproved) throw Object.assign(new Error("RIDER_DOCUMENT_REVIEW_REQUIRED"), { statusCode: 409 });
-      const zoneSlug = String(existing.assignedZoneSlug || existing.requestedZoneSlug || "").trim();
-      if (!zoneSlug) throw Object.assign(new Error("RIDER_ZONE_REQUIRED"), { statusCode: 409 });
-      const tenantFilter = existing.tenantId ? { tenantId: existing.tenantId } : tenantScope(req);
-      const zone = await Zone.findOne({ ...tenantFilter, slug: zoneSlug, isActive: true }).session(session).select("slug").lean().exec();
-      if (!zone) throw Object.assign(new Error("RIDER_ZONE_NOT_ACTIVE"), { statusCode: 409 });
-      const fleet = await Fleet.findOne({ ...tenantFilter, isActive: true, serviceZones: zoneSlug }).session(session).select("_id name serviceZones").lean().exec() as any;
-      if (!fleet) throw Object.assign(new Error("ZONE_FLEET_NOT_FOUND"), { statusCode: 409 });
-      const normalizedEmail = String(existing.email).trim().toLowerCase();
-      const riderScope = existing.tenantId ? { tenantId: existing.tenantId } : { tenantId: null };
-      const existingRider = await Rider.findOne({ email: normalizedEmail }).session(session).select("_id tenantId riderCode").lean().exec() as any;
-      if (existingRider && String(existingRider.tenantId || "") !== String(existing.tenantId || "")) throw Object.assign(new Error("RIDER_EMAIL_OWNED_BY_ANOTHER_TENANT"), { statusCode: 409 });
-      if (existingRider) {
-        rider = await Rider.findOneAndUpdate({ _id: existingRider._id, ...riderScope }, { $set: { name: existing.name, email: normalizedEmail, phone: existing.phone, city: existing.city, availability: existing.availability, vehicle: existing.vehicle, fleetId: fleet._id, zoneSlug, lifecycleStatus: "active", status: "offline", lifecycleChangedAt: new Date(), lifecycleChangedBy: actorId } }, { new: true, session }).lean().exec();
-      } else {
-        const created = await Rider.create([{ tenantId: existing.tenantId || null, riderCode: await nextRiderCode(), name: existing.name, email: normalizedEmail, phone: existing.phone, city: existing.city, availability: existing.availability, vehicle: existing.vehicle, fleetId: fleet._id, zoneSlug, lifecycleStatus: "active", status: "offline", lifecycleChangedAt: new Date(), lifecycleChangedBy: actorId }], { session });
-        rider = created[0].toObject();
-      }
-      const existingEmployee = await EmployeeAccount.findOne({ email: normalizedEmail }).session(session).select("+passwordHash _id tenantId jobRole apiRole roles").lean().exec() as any;
-      if (existingEmployee && existingEmployee.jobRole !== "rider" && existingEmployee.apiRole !== "rider" && !(existingEmployee.roles || []).includes("rider")) throw Object.assign(new Error("EMPLOYEE_EMAIL_ALREADY_USED"), { statusCode: 409 });
-      if (existingEmployee) {
-        employee = await EmployeeAccount.findOneAndUpdate({ _id: existingEmployee._id }, { $set: { tenantId: existing.tenantId || null, name: existing.name, jobRole: "rider", apiRole: "rider", roles: ["rider"], primaryRole: "rider", authorizationStatus: "approved", authorizedAt: new Date(), authorizedBy: actorId, authorizationReason: "Alta operativa tras cualificación y expediente documental aprobado.", active: true, mustChangePassword: true, fleetId: fleet._id, zoneSlugs: [zoneSlug] } }, { new: true, session }).select("_id name email jobRole apiRole roles primaryRole accessLevel authorizationStatus active mustChangePassword").lean().exec();
-      } else {
-        const employeeId = new mongoose.Types.ObjectId();
-        const created = await EmployeeAccount.create([{ _id: employeeId, employeeCode: employeeCodeFor(employeeId), tenantId: existing.tenantId || null, name: existing.name, email: normalizedEmail, jobRole: "rider", apiRole: "rider", roles: ["rider"], primaryRole: "rider", accessLevel: "subadmin", authorizationStatus: "approved", authorizedAt: new Date(), authorizedBy: actorId, authorizationReason: "Alta operativa tras cualificación y expediente documental aprobado.", fleetId: fleet._id, zoneSlugs: [zoneSlug], passwordHash: hashPassword(generateTemporaryPassword()), mustChangePassword: true, active: true }], { session });
-        employee = created[0].toObject();
-      }
-      activationSurface = preferredCredentialSurface(employee);
-      lead = await RiderLead.findOneAndUpdate({ _id: id, ...scope, $or: [{ operationalStatus: { $in: ["pending", "failed"] } }, { operationalStatus: { $exists: false } }] }, { $set: { operationalStatus: "sending", riderId: rider._id, employeeId: employee._id, assignedFleetId: fleet._id, assignedZoneSlug: zoneSlug, activationAttemptedAt: new Date(), activatedAt: new Date(), activatedBy: actorId }, $push: { history: { status: "qualified", notes: `Rider creado y asignado a Fleet ${fleet.name} (${zoneSlug}).`, actorEmployeeId: actorId, changedAt: new Date() } } }, { new: true, session }).lean().exec();
-      if (!lead) throw Object.assign(new Error("RIDER_ACTIVATION_ALREADY_CLAIMED"), { statusCode: 409 });
-      await AccessAuthorization.create([{ tenantId: existing.tenantId || null, employeeId: employee._id, action: "approved", previousStatus: "pending", nextStatus: "approved", previousRole: "rider", nextRole: "rider", accessLevel: "subadmin", actorEmployeeId: actorId, reason: "Alta operativa transaccional desde candidatura cualificada." }], { session });
-    });
-  } catch (error: any) {
-    const status = Number(error?.statusCode) || 500;
-    if (status === 500) console.error("[RIDER_ACTIVATION_FAILED]", error);
-    return res.status(status).json({ error: error?.message || "RIDER_ACTIVATION_FAILED", message: status === 409 ? "La candidatura no puede activarse todavía; revisa cualificación, documentos, zona y Fleet." : undefined });
-  } finally { await session.endSession(); }
-  if (lead?.operationalStatus === "activated") return res.json({ lead, riderId: String(lead.riderId || rider?._id || ""), employeeId: String(lead.employeeId || employee?._id || ""), alreadyActivated: true, activationEmail: { sent: Boolean(lead.activationSentAt) } });
-  let activationEmail: { sent: boolean; error?: string; surface?: EmployeeCredentialSurface } = { sent: false, surface: activationSurface || undefined };
-  if (employee && activationSurface) {
-    try {
-      const delivery = await sendEmployeePasswordLink(employee, activationSurface, "activation");
-      activationEmail = { sent: delivery.delivery.sent, error: delivery.delivery.error, surface: activationSurface };
-      await RiderLead.updateOne({ _id: id, ...scope }, { $set: { operationalStatus: delivery.delivery.sent ? "activated" : "failed", ...(delivery.delivery.sent ? { activationSentAt: new Date() } : {}) } }).exec();
-      if (delivery.delivery.sent) await AccessAuthorization.create({ tenantId: lead.tenantId || null, employeeId: employee._id, action: "credentials_sent", previousStatus: "approved", nextStatus: "approved", previousRole: "rider", nextRole: "rider", accessLevel: "subadmin", actorEmployeeId: actorId, reason: "Enlace de activación enviado una sola vez tras alta operativa." });
-    } catch (error) {
-      activationEmail = { sent: false, error: error instanceof Error ? error.message : "ACTIVATION_EMAIL_FAILED", surface: activationSurface };
-      await RiderLead.updateOne({ _id: id, ...scope }, { $set: { operationalStatus: "failed" } }).exec();
-    }
+  const lead = await RiderLead.findOne({ _id: id, ...scope }).lean().exec() as any;
+  if (!lead) return res.status(404).json({ error: "RIDER_LEAD_NOT_FOUND" });
+  if (lead.status !== "qualified") return res.status(409).json({ error: "RIDER_LEAD_NOT_QUALIFIED", message: "Cualifica el RiderLead antes de activar el perfil operativo." });
+  const zoneSlug = parsed.data.zoneSlug || lead.assignedZoneSlug || lead.requestedZoneSlug;
+  if (!zoneSlug) return res.status(409).json({ error: "RIDER_LEAD_ZONE_REQUIRED", message: "La solicitud no tiene una zona canónica para localizar la Fleet." });
+  const tenantFilter = lead.tenantId ? { tenantId: lead.tenantId } : { tenantId: null };
+  const fleetFilter: Record<string, unknown> = { ...tenantFilter, isActive: true, serviceZones: zoneSlug };
+  if (parsed.data.fleetId) fleetFilter._id = objectId(parsed.data.fleetId);
+  const fleets = await Fleet.find(fleetFilter).select("_id name serviceZones contactEmail tenantId").lean().exec() as any[];
+  if (!fleets.length) return res.status(409).json({ error: "ZONE_FLEET_NOT_FOUND", message: `No existe una Fleet activa para la zona ${zoneSlug}.` });
+  if (fleets.length > 1 && !parsed.data.fleetId) return res.status(409).json({ error: "ZONE_FLEET_AMBIGUOUS", message: "Hay varias Fleets activas para la zona; selecciona una explícitamente." });
+  const fleet = fleets[0];
+  const email = String(lead.email).trim().toLowerCase();
+  const tenantId = lead.tenantId || null;
+  const existingRider = await Rider.findOne({ email }).select("_id tenantId riderCode").lean().exec() as any;
+  if (existingRider && String(existingRider.tenantId || "") != String(tenantId || "")) return res.status(409).json({ error: "RIDER_EMAIL_OWNED_BY_ANOTHER_TENANT" });
+  const existingEmployee = await EmployeeAccount.findOne({ email }).select("_id tenantId jobRole apiRole roles primaryRole ownerProtected active mustChangePassword authorizationStatus").lean().exec() as any;
+  if (existingEmployee && (String(existingEmployee.tenantId || "") != String(tenantId || "") || existingEmployee.ownerProtected === true || existingEmployee.jobRole !== "rider" || existingEmployee.apiRole !== "rider" || (Array.isArray(existingEmployee.roles) && existingEmployee.roles.some((role: unknown) => role !== "rider")))) return res.status(409).json({ error: "EMPLOYEE_EMAIL_ROLE_INCOMPATIBLE", message: "El correo ya pertenece a una cuenta incompatible y no se puede reutilizar como Rider." });
+  const now = new Date();
+  const rider = await Rider.findOneAndUpdate(
+    { email, ...tenantFilter },
+    { $set: { tenantId, ...buildApprovedRiderOperationalProfile({ ...lead, requestedZoneSlug: zoneSlug }), fleetId: fleet._id, zoneSlug, lifecycleStatus: "active", status: "offline" }, $setOnInsert: { riderCode: existingRider?.riderCode || await nextRiderCode() } },
+    { upsert: true, new: true, setDefaultsOnInsert: true },
+  ).lean().exec() as any;
+  const employee = await EmployeeAccount.findOneAndUpdate(
+    { email, ...tenantFilter },
+    { $set: { tenantId, name: lead.name, jobRole: "rider", apiRole: "rider", roles: ["rider"], primaryRole: "rider", accessLevel: "subadmin", authorizationStatus: "approved", authorizedAt: now, authorizedBy: objectId(String(req.auth!.employeeId)), active: true, mustChangePassword: true, fleetId: fleet._id }, $setOnInsert: { employeeCode: `PIKI-E-${String(rider._id).replace(/[^a-z0-9]/gi, "").slice(-8).toUpperCase()}`, passwordHash: hashPassword(generateTemporaryPassword()) } },
+    { upsert: true, new: true, setDefaultsOnInsert: true },
+  ).select("_id name email jobRole apiRole roles primaryRole accessLevel authorizationStatus active mustChangePassword").lean().exec() as any;
+  const alreadyActivated = Boolean(lead.assignedFleetId && String(lead.assignedFleetId) === String(fleet._id) && existingRider && existingEmployee?.active && existingEmployee?.authorizationStatus === "approved");
+  const priorCredentialAudit = await AccessAuthorization.findOne({ employeeId: employee._id, action: "credentials_sent", nextRole: "rider" }).select("_id").lean().exec();
+  let credentialEmail: { sent: boolean; error?: string; surface?: EmployeeCredentialSurface } = { sent: false };
+  const surface = preferredCredentialSurface(employee);
+  if (surface && !priorCredentialAudit) {
+    const delivery = await sendEmployeePasswordLink(employee, surface, "activation");
+    credentialEmail = { sent: delivery.delivery.sent, error: delivery.delivery.error, surface };
+    if (delivery.delivery.sent) await AccessAuthorization.create({ tenantId, employeeId: employee._id, action: "credentials_sent", previousStatus: "approved", nextStatus: "approved", previousRole: "rider", nextRole: "rider", accessLevel: "subadmin", actorEmployeeId: objectId(String(req.auth!.employeeId)), reason: `Enlace de activación enviado para ${employeeCredentialLabels[surface]}.` });
   }
-  await notifyOnboarding({ channel: "fleet", type: "onboarding.rider_lead.activated", entityId: String(rider?._id || id), tenantId: lead.tenantId, payload: { leadId: String(id), riderId: String(rider?._id || ""), employeeId: String(employee?._id || ""), fleetId: String(lead.assignedFleetId || ""), zoneSlug: lead.assignedZoneSlug || null } });
-  return res.status(201).json({ lead, riderId: String(rider?._id || ""), employeeId: String(employee?._id || ""), activationEmail, message: activationEmail.sent ? "Rider creado, asignado a Fleet y enlace de activación enviado." : "Rider creado y asignado a Fleet; el enlace no pudo enviarse y queda pendiente de reintento controlado." });
+  const note = `Rider activado y asignado a Fleet ${fleet.name} (${zoneSlug}).`;
+  const leadUpdate: Record<string, unknown> = { $set: { assignedFleetId: fleet._id, assignedZoneSlug: zoneSlug, routedAt: now, routedBy: objectId(String(req.auth!.employeeId)) } };
+  if (!alreadyActivated) leadUpdate.$push = { history: { status: "qualified", notes: note, actorEmployeeId: objectId(String(req.auth!.employeeId)), changedAt: now } };
+  const updatedLead = await RiderLead.findOneAndUpdate({ _id: id, ...scope }, leadUpdate, { new: true }).lean().exec();
+  if (!alreadyActivated) {
+    await recordGovernanceEvent({ actor: { employeeId: objectId(String(req.auth!.employeeId)), role: req.auth?.role, tenantId }, action: "rider_lead_activated_to_fleet", targetType: "rider", targetId: rider._id, after: { leadId: String(id), riderId: String(rider._id), riderCode: rider.riderCode, fleetId: String(fleet._id), fleetName: fleet.name, zoneSlug, credentialEmailSent: credentialEmail.sent }, reason: "Activación explícita desde la bandeja Admin tras cualificar un RiderLead." });
+    await notifyOnboarding({ channel: "fleet", type: "onboarding.rider_lead.activated", entityId: String(rider._id), tenantId, payload: { leadId: String(id), riderId: String(rider._id), fleetId: String(fleet._id), zoneSlug } });
+  }
+  return res.json({ lead: updatedLead, rider: { id: String(rider._id), riderCode: rider.riderCode, name: rider.name, email: rider.email, fleetId: String(fleet._id), fleetName: fleet.name, zoneSlug }, credentialEmail, created: !existingRider });
 });
-
 app.post("/api/v1/riders/applications", async (req, res) => {
   const ip = req.ip || req.socket.remoteAddress || "unknown";
   if (!allowRiderApplication(ip)) return res.status(429).json({ error: "APPLICATION_RATE_LIMITED", retryAfterSeconds: 900 });
@@ -4958,7 +4947,7 @@ app.delete("/api/v1/rider-slots/:id", requireRole("admin", "fleet"), async (req,
 app.post("/api/v1/orders", rateLimit(20, 60_000, "orders-create"), async (req, res) => {
   const parsed = createOrderSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "INVALID_ORDER", details: parsed.error.flatten() });
-  if (!["cash", "stripe"].includes(parsed.data.paymentMethod)) return res.status(409).json({ error: "PAYMENT_METHOD_UNAVAILABLE", message: "Método de pago no disponible." });
+  if (!["cash", "stripe", "bizum"].includes(parsed.data.paymentMethod)) return res.status(409).json({ error: "PAYMENT_METHOD_UNAVAILABLE", message: "Método de pago no disponible." });
   const restaurantObjectId = objectId(parsed.data.restaurantId);
   if (!restaurantObjectId) return res.status(400).json({ error: "INVALID_RESTAURANT_ID" });
   const restaurant = await Restaurant.findOne({ _id: restaurantObjectId, ...CUSTOMER_ORDERABLE_RESTAURANT_FILTER }).lean().exec() as any;
@@ -5025,7 +5014,8 @@ app.post("/api/v1/orders", rateLimit(20, 60_000, "orders-create"), async (req, r
     priceIncludesCommission: restaurant.priceIncludesCommission === true,
   });
   if (marketplace.customerTotalCents !== totalCents) return res.status(500).json({ error: "MARKETPLACE_TOTAL_MISMATCH" });
-  if (!isCashOrderWithinLimit(parsed.data.paymentMethod, totalCents)) return res.status(422).json(cashOrderLimitError(totalCents));
+  const partnerCashLimitCents = cashOrderLimitCents(restaurant);
+  if (!isCashOrderWithinLimit(parsed.data.paymentMethod, totalCents, partnerCashLimitCents)) return res.status(422).json(cashOrderLimitError(totalCents, partnerCashLimitCents));
   const { publicCode, displayCode, displayCodeDate } = await createOrderCodes();
   const dailyCode = { displayCode, displayCodeDate };
   const order = await Order.create({ tenantId: restaurant.tenantId || null, publicCode, ...dailyCode, restaurantId: restaurant._id, customerId: authenticatedCustomer?._id || null, customerName: String(authenticatedCustomer?.name || "").trim(), items: normalizedItems, deliveryAddress: parsed.data.deliveryAddress, deliveryNote: parsed.data.deliveryNote, deliveryLocation: { type: "Point", coordinates: deliveryPoint }, pickupLocation: restaurant.location || undefined, coveragePolicySlug: coverage.policySlug, coveragePolicyVersion: coverage.policyVersion, coverageDecision: coverage.reason, straightLineDistanceKm: coverage.straightLineDistanceKm, withinMunicipality: withinSameOperationalCity(restaurant.location?.coordinates, deliveryPoint), deliveryBaseFeeCents: coverage.deliveryBaseFeeCents, outsideMunicipalitySurchargeCents: coverage.outsideMunicipalitySurchargeCents, routeDistanceKm: route.routeDistanceKm, routeDurationMinutes: route.routeDurationMinutes, routeProvider: route.routeProvider, routingDegraded: route.routingDegraded, requiredVehicleClasses: route.requiredVehicleClasses, subtotalCents, deliveryFeeCents, serviceFeeCents, totalCents,
@@ -5346,7 +5336,7 @@ app.post("/api/v1/customer/referrals/claim", async (req, res) => {
   return res.status(201).json({ referral });
 });
 
-const customerOrderSyncSchema = z.object({ publicCode: z.string().trim().min(6).max(64), restaurantSlug: z.string().trim().min(1).max(120), customerId: z.string().nullable().optional(), customerName: z.string().trim().max(160).nullable().optional(), deliveryAddress: z.string().trim().min(5).max(1000), deliveryNote: z.string().trim().max(500).default(""), deliveryLocation: z.object({ latitude: z.number().finite(), longitude: z.number().finite() }).nullable().optional(), items: z.array(z.object({ itemId: z.string().min(1), name: z.string().min(1), quantity: z.number().int().min(1).max(20), unitPriceCents: z.number().int().min(0), totalCents: z.number().int().min(0).optional() })).min(1), subtotalCents: z.number().int().min(0), deliveryFeeCents: z.number().int().min(0), serviceFeeCents: z.number().int().min(0), totalCents: z.number().int().min(0), paymentMethod: z.enum(["stripe", "cash", "bizum_manual"]).default("stripe"), paymentState: z.enum(["pending", "authorized", "paid", "failed", "refunded"]).default("pending"), stripeCheckoutSessionId: z.string().nullable().optional(), stripePaymentIntentId: z.string().nullable().optional() });
+const customerOrderSyncSchema = z.object({ publicCode: z.string().trim().min(6).max(64), restaurantSlug: z.string().trim().min(1).max(120), customerId: z.string().nullable().optional(), customerName: z.string().trim().max(160).nullable().optional(), deliveryAddress: z.string().trim().min(5).max(1000), deliveryNote: z.string().trim().max(500).default(""), deliveryLocation: z.object({ latitude: z.number().finite(), longitude: z.number().finite() }).nullable().optional(), items: z.array(z.object({ itemId: z.string().min(1), name: z.string().min(1), quantity: z.number().int().min(1).max(20), unitPriceCents: z.number().int().min(0), totalCents: z.number().int().min(0).optional() })).min(1), subtotalCents: z.number().int().min(0), deliveryFeeCents: z.number().int().min(0), serviceFeeCents: z.number().int().min(0), totalCents: z.number().int().min(0), paymentMethod: z.enum(["stripe", "cash", "bizum"]).default("stripe"), paymentState: z.enum(["pending", "authorized", "paid", "failed", "refunded"]).default("pending"), stripeCheckoutSessionId: z.string().nullable().optional(), stripePaymentIntentId: z.string().nullable().optional() });
 app.post("/api/v1/internal/customer-orders/sync", async (req, res) => {
   const expected = process.env.PIKI_CUSTOMER_SYNC_SECRET;
   if (!expected || req.header("x-piki-customer-sync-secret") !== expected) return res.status(401).json({ error: "INVALID_SYNC_AUTH" });
@@ -5378,7 +5368,8 @@ app.post("/api/v1/internal/customer-orders/sync", async (req, res) => {
   }
   const freeDelivery = await freeDeliveryState(restaurant);
   const effectiveDeliveryFeeCents = freeDelivery.eligible ? 0 : input.deliveryFeeCents;
-  if (!isCashOrderWithinLimit(input.paymentMethod, input.totalCents)) return res.status(422).json(cashOrderLimitError(input.totalCents));
+  const partnerCashLimitCents = cashOrderLimitCents(restaurant);
+  if (!isCashOrderWithinLimit(input.paymentMethod, input.totalCents, partnerCashLimitCents)) return res.status(422).json(cashOrderLimitError(input.totalCents, partnerCashLimitCents));
   const marketplace = calculateMarketplaceBreakdown({
     subtotalCents: input.subtotalCents,
     deliveryFeeCents: effectiveDeliveryFeeCents,
@@ -5399,7 +5390,7 @@ app.post("/api/v1/internal/customer-orders/sync", async (req, res) => {
   });
   const canonicalSubtotalCents = canonicalItems.reduce((sum, item) => sum + item.unitPriceCents * item.quantity, 0);
   const canonicalTotalCents = canonicalSubtotalCents + effectiveDeliveryFeeCents + input.serviceFeeCents;
-  if (!isCashOrderWithinLimit(input.paymentMethod, canonicalTotalCents)) return res.status(422).json(cashOrderLimitError(canonicalTotalCents));
+  if (!isCashOrderWithinLimit(input.paymentMethod, canonicalTotalCents, partnerCashLimitCents)) return res.status(422).json(cashOrderLimitError(canonicalTotalCents, partnerCashLimitCents));
   const order = await Order.findOneAndUpdate({ publicCode: input.publicCode }, { $set: { tenantId: restaurant.tenantId || null, restaurantId: restaurant._id, customerId: input.customerId || null, ...(input.customerName !== undefined ? { customerName: input.customerName || "" } : {}), items: canonicalItems, deliveryAddress: input.deliveryAddress, deliveryNote: input.deliveryNote, deliveryLocation: location, subtotalCents: canonicalSubtotalCents, deliveryFeeCents: effectiveDeliveryFeeCents, serviceFeeCents: input.serviceFeeCents, totalCents: canonicalTotalCents, marketplaceCommissionRateBps: marketplace.commissionRateBps, marketplaceCommissionCents: marketplace.platformCommissionCents, partnerPayoutCents: marketplace.partnerPayoutCents, riderEarningsCents: marketplace.riderEarningsCents, platformNetBeforeProcessingCents: marketplace.platformNetBeforeProcessingCents, payoutStatus: "pending", paymentMethod: input.paymentMethod, paymentState: input.paymentState, ...(input.stripeCheckoutSessionId !== undefined ? { stripeCheckoutSessionId: input.stripeCheckoutSessionId } : {}), ...(input.stripePaymentIntentId !== undefined ? { stripePaymentIntentId: input.stripePaymentIntentId } : {}) }, $setOnInsert: { publicCode: input.publicCode, ...syncGeography, status: "pending", assignmentState: "unassigned", statusHistory: [{ status: "pending", actorRole: "system", reason: "Pedido sincronizado desde PIKI Customer" }] } }, { upsert: true, new: true, setDefaultsOnInsert: true }).lean().exec() as any;
   const newlyPaid = ["authorized", "paid"].includes(input.paymentState) && !["authorized", "paid"].includes(existing?.paymentState || "");
   const newCashOrder = input.paymentMethod === "cash" && !existing;
@@ -5508,7 +5499,7 @@ app.post("/api/v1/payments/checkout", rateLimit(20, 60_000, "payments-checkout")
   const order = (id ? await Order.findById(id).lean().exec() : await Order.findOne({ publicCode: parsed.data.orderId }).lean().exec()) as any;
   if (!order) return res.status(404).json({ error: "ORDER_NOT_FOUND" });
   if (!checkoutTokenIsValid(order.publicCode, parsed.data.checkoutToken)) return res.status(403).json({ error: "INVALID_CHECKOUT_TOKEN" });
-  if (order.paymentMethod !== "stripe") return res.status(409).json({ error: "ORDER_USES_CASH", message: "Este pedido está configurado para pago en efectivo." });
+  if (!["stripe", "bizum"].includes(String(order.paymentMethod))) return res.status(409).json({ error: "ORDER_USES_CASH", message: "Este pedido no está configurado para pago online." });
   if (["authorized", "paid"].includes(order.paymentState)) return res.status(409).json({ error: "ORDER_ALREADY_PAID" });
   // Revalidate the authorized restaurant's SOURCE tariff before coupon/credit
   // mutations or Stripe. Compare the recorded base, not a benefit-discounted fee.
@@ -5542,7 +5533,7 @@ app.post("/api/v1/payments/checkout", rateLimit(20, 60_000, "payments-checkout")
       deliveryFeeCents: Number(order.deliveryFeeCents || 0),
       serviceFeeCents: Number(order.serviceFeeCents || 0),
       discountCents: creditAppliedCents + couponAppliedCents,
-      preferredPaymentMethod: "stripe",
+      preferredPaymentMethod: order.paymentMethod === "bizum" ? "bizum" : "stripe",
     });
     await Order.updateOne({ _id: order._id, paymentState: "pending" }, { $set: { stripeCheckoutSessionId: session.id, creditAppliedCents, couponAppliedCents, appliedCouponId, totalCents: Number(order.totalCents || 0) - creditAppliedCents - couponAppliedCents }, $inc: { version: 1 } }).exec();
     return res.status(201).json({ checkoutUrl: session.url, sessionId: session.id, orderId: String(order._id), publicCode: order.publicCode, creditAppliedCents, couponAppliedCents, priceBreakdown: calculatePriceBreakdown({ subtotalCents: Number(order.subtotalCents || 0), deliveryFeeCents: Number(order.deliveryFeeCents || 0), serviceFeeCents: Number(order.serviceFeeCents || 0), discountCents: creditAppliedCents + couponAppliedCents }) });
@@ -6375,7 +6366,7 @@ app.post("/api/v1/riders/:riderId/orders/:orderId/confirm-delivery", requireRole
   const deliveryDistanceMeters = pointDistanceMeters(rider.location, confirmedOrder.deliveryLocation);
   if (deliveryDistanceMeters == null) return res.status(409).json({ error: "DELIVERY_LOCATION_REQUIRED", message: "No se puede verificar la entrega: falta una ubicación GPS válida del cliente." });
   const outsideGpsRadius = deliveryDistanceMeters > DELIVERY_CONFIRMATION_RADIUS_METERS;
-  if (confirmedOrder.paymentMethod === "stripe") {
+  if (isOnlinePaymentMethod(confirmedOrder.paymentMethod)) {
     const paymentAction = stripeDeliveryPaymentAction(confirmedOrder);
     if (paymentAction === "reject") return res.status(409).json({ error: "PAYMENT_NOT_AUTHORIZED", message: "El pago online todavía no está pagado ni autorizado para capturarse." });
     if (paymentAction === "capture_authorization") {
@@ -6403,7 +6394,7 @@ app.post("/api/v1/riders/:riderId/orders/:orderId/confirm-delivery", requireRole
   // version race. Status/rider/assignment predicates remain the concurrency
   // guard, and Stripe orders must be authorized or already marked paid.
   const deliveredAt = new Date();
-  const updated = await Order.findOneAndUpdate({ _id: orderId, riderId, assignmentState: "assigned", status: "on_the_way", ...(confirmedOrder.paymentMethod === "stripe" ? { paymentState: { $in: ["authorized", "paid"] } } : {}) }, { $set: { status: "delivered", deliveredAt, archivedAt: deliveredAt, paymentState: "paid", deliveryProof: { method: credential.method, riderId, confirmedAt: deliveredAt, idempotencyKey: credential.idempotencyKey, gpsDistanceMeters: deliveryDistanceMeters, gpsOutsideConfiguredRadius: outsideGpsRadius } }, $inc: { version: 1 }, $push: { statusHistory: { status: "delivered", actorRole: "rider", reason: confirmedOrder.paymentMethod === "cash" ? "Entrega confirmada y cobro en efectivo registrado" : "Entrega confirmada por el Rider" } } }, { new: true }).lean().exec();
+  const updated = await Order.findOneAndUpdate({ _id: orderId, riderId, assignmentState: "assigned", status: "on_the_way", ...(isOnlinePaymentMethod(confirmedOrder.paymentMethod) ? { paymentState: { $in: ["authorized", "paid"] } } : {}) }, { $set: { status: "delivered", deliveredAt, archivedAt: deliveredAt, paymentState: "paid", deliveryProof: { method: credential.method, riderId, confirmedAt: deliveredAt, idempotencyKey: credential.idempotencyKey, gpsDistanceMeters: deliveryDistanceMeters, gpsOutsideConfiguredRadius: outsideGpsRadius } }, $inc: { version: 1 }, $push: { statusHistory: { status: "delivered", actorRole: "rider", reason: confirmedOrder.paymentMethod === "cash" ? "Entrega confirmada y cobro en efectivo registrado" : "Entrega confirmada por el Rider" } } }, { new: true }).lean().exec();
   if (!updated) {
     const delivered = await Order.findOne({ _id: orderId, riderId, assignmentState: "assigned", status: "delivered" }).lean().exec() as any;
     if (delivered) return res.json(deliveredConfirmationResponse(delivered, true, delivered.deliveryProof?.gpsDistanceMeters ?? null, Boolean(delivered.deliveryProof?.gpsOutsideConfiguredRadius)));
@@ -6714,7 +6705,10 @@ async function findCurrentRiderSlot(riderId: mongoose.Types.ObjectId) {
   await expireRiderSlots(riderId, now);
   const candidates = await RiderSlot.find({ riderId, date: { $in: [now.date, previousCalendarDate(now.date)] }, status: { $in: ["planned", "active"] } }).sort({ date: 1, startTime: 1 }).lean().exec();
   const slot = candidates.find((candidate: any) => riderSlotIsCurrent(candidate, now));
-  return { now, slot, selfStartAllowed: false };
+  // A current planned/active slot is the authoritative permission to show
+  // “Empezar sesión”. Keep this explicit for clients that consume the
+  // selfStartAllowed field instead of inferring it from `slot`.
+  return { now, slot, selfStartAllowed: Boolean(slot) };
 }
 async function findNextRiderSlot(riderId: mongoose.Types.ObjectId, now: ReturnType<typeof madridNow>) {
   const slots = await RiderSlot.find({ riderId, date: { $gte: now.date }, status: { $in: ["planned", "active"] } }).sort({ date: 1, startTime: 1 }).limit(30).lean().exec();
@@ -6741,8 +6735,10 @@ app.get("/api/v1/riders/session", requireRole("rider"), async (req, res) => {
   const { now, slot } = await findCurrentRiderSlot(rider._id);
   // findCurrentRiderSlot expires only ended intervals, including overnight tails.
   const hasActiveOrder = Boolean(await Order.exists({ ...tenant, riderId: rider._id, status: { $nin: ["delivered", "cancelled"] }, assignmentState: { $in: ["offered", "assigned"] } }));
-  const effectiveStatus = ["available", "busy"].includes(rider.status) && rider.lifecycleStatus === "active"
-    ? hasActiveOrder ? "busy" : (slot as any)?.status === "active" ? rider.status : "offline"
+  const hasFreshLocation = Boolean(rider.lastLocationAt && new Date(rider.lastLocationAt).getTime() >= Date.now() - 90_000);
+  const scheduledOnline = rider.lifecycleStatus === "active" && (slot as any)?.status === "active" && hasFreshLocation && !(rider.status === "offline" && hasActiveOrder);
+  const effectiveStatus = rider.lifecycleStatus === "active" && rider.status !== "paused" && (scheduledOnline || ["available", "busy"].includes(rider.status))
+    ? hasActiveOrder ? "busy" : (slot as any)?.status === "active" ? "available" : "offline"
     : rider.status;
   const update: Record<string, unknown> = { status: effectiveStatus };
   if (!hasActiveOrder && effectiveStatus === "offline") update.activeOrderId = null;
@@ -6760,7 +6756,7 @@ app.get("/api/v1/riders/:id/shift", requireRole("admin", "rider", "fleet"), asyn
   const { now, slot, selfStartAllowed } = await findCurrentRiderSlot(riderId);
   const visibleSlot = slot || await findNextRiderSlot(riderId, now);
   res.setHeader("Cache-Control", "no-store, max-age=0");
-  return res.json({ rider: { id: rider._id, riderCode: rider.riderCode, status: rider.status }, now, serverClock: now, eligible: Boolean(slot) || selfStartAllowed, selfStartAllowed, shift: visibleSlot });
+  return res.json({ rider: { id: rider._id, riderCode: rider.riderCode, status: rider.status }, now, serverClock: now, eligible: Boolean(slot) && selfStartAllowed, selfStartAllowed, shift: visibleSlot });
 });
 
 app.post("/api/v1/riders/:id/shift/start", requireRole("admin", "rider", "fleet"), async (req, res) => {
@@ -7742,6 +7738,74 @@ app.get("/api/v1/admin/governance/audit", requireRole("admin"), async (req, res)
   const limit = Math.min(Math.max(Number(req.query.limit || 100), 1), 500);
   return res.json({ events: await GovernanceAuditEvent.find(tenantScope(req)).sort({ createdAt: -1 }).limit(limit).lean().exec() });
 });
+const cashPolicyInputSchema = z.object({
+  enabled: z.boolean().optional(),
+  maxOrderCents: z.number().int().min(0).max(1_000_000).optional(),
+  minOrderCents: z.number().int().min(0).max(1_000_000).optional(),
+  outstandingMaxCents: z.number().int().min(0).max(10_000_000).optional(),
+  reason: z.string().trim().max(500).default(""),
+}).strict();
+app.get("/api/v1/admin/restaurants/:id/cash-policy", requireOwner(), async (req, res) => {
+  const id = objectId(String(req.params.id));
+  if (!id) return res.status(400).json({ error: "INVALID_RESTAURANT_ID" });
+  const restaurant = await Restaurant.findOne({ _id: id, ...tenantScope(req) }).select("_id slug name cashPaymentsEnabled cashOrderMaxCents cashOrderMinCents cashOutstandingMaxCents cashPolicyUpdatedAt cashPolicyUpdatedBy cashPolicyReason").lean().exec() as any;
+  if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
+  return res.json({ policy: { restaurantId: String(restaurant._id), slug: restaurant.slug, name: restaurant.name, enabled: Boolean(restaurant.cashPaymentsEnabled), maxOrderCents: Number(restaurant.cashOrderMaxCents ?? 4_899), minOrderCents: Number(restaurant.cashOrderMinCents ?? 0), outstandingMaxCents: Number(restaurant.cashOutstandingMaxCents ?? 10_000), updatedAt: restaurant.cashPolicyUpdatedAt || null, updatedBy: restaurant.cashPolicyUpdatedBy || null, reason: restaurant.cashPolicyReason || "" } });
+});
+app.patch("/api/v1/admin/restaurants/:id/cash-policy", requireOwner(), async (req, res) => {
+  const id = objectId(String(req.params.id));
+  const parsed = cashPolicyInputSchema.safeParse(req.body);
+  if (!id || !parsed.success) return res.status(400).json({ error: "INVALID_CASH_POLICY", details: parsed.success ? undefined : parsed.error.flatten() });
+  if (parsed.data.maxOrderCents !== undefined && parsed.data.minOrderCents !== undefined && parsed.data.minOrderCents > parsed.data.maxOrderCents) return res.status(400).json({ error: "CASH_MIN_EXCEEDS_MAX" });
+  const current = await Restaurant.findOne({ _id: id, ...tenantScope(req) }).select("_id slug name cashPaymentsEnabled cashOrderMaxCents cashOrderMinCents cashOutstandingMaxCents cashPolicyUpdatedAt cashPolicyUpdatedBy cashPolicyReason").lean().exec() as any;
+  if (!current) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
+  const update: Record<string, unknown> = { cashPolicyUpdatedAt: new Date(), cashPolicyUpdatedBy: objectId(String(req.auth?.employeeId || "")), cashPolicyReason: parsed.data.reason };
+  if (parsed.data.enabled !== undefined) update.cashPaymentsEnabled = parsed.data.enabled;
+  if (parsed.data.maxOrderCents !== undefined) update.cashOrderMaxCents = parsed.data.maxOrderCents;
+  if (parsed.data.minOrderCents !== undefined) update.cashOrderMinCents = parsed.data.minOrderCents;
+  if (parsed.data.outstandingMaxCents !== undefined) update.cashOutstandingMaxCents = parsed.data.outstandingMaxCents;
+  const updated = await Restaurant.findOneAndUpdate({ _id: id, ...tenantScope(req) }, { $set: update }, { new: true }).select("_id slug name cashPaymentsEnabled cashOrderMaxCents cashOrderMinCents cashOutstandingMaxCents cashPolicyUpdatedAt cashPolicyUpdatedBy cashPolicyReason").lean().exec() as any;
+  await recordGovernanceEvent({ actor: { employeeId: req.auth?.employeeId, role: "superadmin", tenantId: (req.auth as any)?.tenantId }, action: "partner_cash_policy_updated", targetType: "restaurant", targetId: id, before: current, after: updated, reason: parsed.data.reason || "Política de efectivo actualizada desde Admin." });
+  return res.json({ updated: true, policy: { restaurantId: String(updated._id), slug: updated.slug, name: updated.name, enabled: Boolean(updated.cashPaymentsEnabled), maxOrderCents: Number(updated.cashOrderMaxCents ?? 4_899), minOrderCents: Number(updated.cashOrderMinCents ?? 0), outstandingMaxCents: Number(updated.cashOutstandingMaxCents ?? 10_000), updatedAt: updated.cashPolicyUpdatedAt || null, updatedBy: updated.cashPolicyUpdatedBy || null, reason: updated.cashPolicyReason || "" } });
+});
+const cashSettlementPeriodSchema = z.object({ riderId: z.string().regex(/^[a-f\d]{24}$/i), periodStart: z.coerce.date(), periodEnd: z.coerce.date(), reference: z.string().trim().min(3).max(120).optional(), note: z.string().trim().max(1000).default("") }).refine((value) => value.periodEnd > value.periodStart, "INVALID_SETTLEMENT_PERIOD");
+app.get("/api/v1/finance/rider-cash-settlements", requireRole("admin", "finance"), async (req, res) => {
+  const settlements = await RiderCashSettlement.find(tenantScope(req)).sort({ createdAt: -1 }).limit(200).lean().exec();
+  return res.json({ settlements });
+});
+app.post("/api/v1/finance/rider-cash-settlements/prepare", requireRole("admin", "finance"), async (req, res) => {
+  const parsed = cashSettlementPeriodSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "INVALID_CASH_SETTLEMENT_PERIOD", details: parsed.error.flatten() });
+  const riderId = objectId(parsed.data.riderId); if (!riderId) return res.status(400).json({ error: "INVALID_RIDER_ID" });
+  const rider = await Rider.findOne({ _id: riderId, ...tenantScope(req) }).select("_id riderCode name").lean().exec() as any;
+  if (!rider) return res.status(404).json({ error: "RIDER_NOT_FOUND" });
+  const entries = await CashLedgerEntry.find({ ...tenantScope(req), riderId, direction: "in", settlementId: null, createdAt: { $gte: parsed.data.periodStart, $lt: parsed.data.periodEnd } }).sort({ createdAt: 1 }).lean().exec() as any[];
+  if (!entries.length) return res.status(409).json({ error: "NO_CASH_ENTRIES_TO_SETTLE" });
+  const amountCents = entries.reduce((sum, entry) => sum + Number(entry.amountCents || 0), 0);
+  const reference = parsed.data.reference || `cash-${String(riderId).slice(-8)}-${parsed.data.periodStart.toISOString().slice(0, 10)}`;
+  const idempotencyKey = `rider-cash-settlement:${String(riderId)}:${parsed.data.periodStart.toISOString()}:${parsed.data.periodEnd.toISOString()}`;
+  const settlement = await RiderCashSettlement.findOneAndUpdate({ idempotencyKey }, { $setOnInsert: { tenantId: (req.auth as any)?.tenantId || null, riderId, entryIds: entries.map((entry) => entry._id), periodStart: parsed.data.periodStart, periodEnd: parsed.data.periodEnd, amountCents, reference, note: parsed.data.note, idempotencyKey, status: "pending_review", createdBy: objectId(String(req.auth?.employeeId || "")) } }, { upsert: true, new: true, setDefaultsOnInsert: true }).lean().exec() as any;
+  await CashLedgerEntry.updateMany({ _id: { $in: entries.map((entry) => entry._id) }, settlementId: null }, { $set: { settlementId: settlement._id } }).exec();
+  await recordGovernanceEvent({ actor: { employeeId: req.auth?.employeeId, role: req.auth?.role, tenantId: (req.auth as any)?.tenantId }, action: "rider_cash_settlement_prepared", targetType: "rider_cash_settlement", targetId: settlement._id, after: { riderId, amountCents, entryCount: entries.length, status: settlement.status }, reason: "Liquidación de efectivo preparada para revisión." });
+  return res.status(201).json({ prepared: true, settlement, rider: { id: String(rider._id), riderCode: rider.riderCode || publicRiderCode(rider._id), name: rider.name } });
+});
+app.post("/api/v1/finance/rider-cash-settlements/:id/approve", requireRole("admin", "finance"), async (req, res) => {
+  const id = objectId(String(req.params.id)); if (!id) return res.status(400).json({ error: "INVALID_CASH_SETTLEMENT_ID" });
+  const settlement = await RiderCashSettlement.findOneAndUpdate({ _id: id, ...tenantScope(req), status: "pending_review" }, { $set: { status: "approved", reviewedAt: new Date(), reviewedBy: objectId(String(req.auth?.employeeId || "")) } }, { new: true }).lean().exec() as any;
+  if (!settlement) return res.status(409).json({ error: "CASH_SETTLEMENT_NOT_PENDING" });
+  await recordGovernanceEvent({ actor: { employeeId: req.auth?.employeeId, role: req.auth?.role, tenantId: (req.auth as any)?.tenantId }, action: "rider_cash_settlement_approved", targetType: "rider_cash_settlement", targetId: id, after: settlement, reason: "Liquidación de efectivo aprobada desde Admin." });
+  return res.json({ approved: true, settlement });
+});
+app.post("/api/v1/finance/rider-cash-settlements/:id/complete", requireRole("admin", "finance"), async (req, res) => {
+  const id = objectId(String(req.params.id)); const parsed = z.object({ reference: z.string().trim().min(3).max(120), note: z.string().trim().max(1000).default("") }).safeParse(req.body);
+  if (!id || !parsed.success) return res.status(400).json({ error: "INVALID_CASH_SETTLEMENT_COMPLETION" });
+  const settlement = await RiderCashSettlement.findOne({ _id: id, ...tenantScope(req), status: "approved" }).lean().exec() as any;
+  if (!settlement) return res.status(409).json({ error: "CASH_SETTLEMENT_NOT_APPROVED" });
+  await CashLedgerEntry.findOneAndUpdate({ idempotencyKey: `cash-settlement:${String(id)}:handover` }, { $setOnInsert: { tenantId: settlement.tenantId, orderId: null, restaurantId: null, riderId: settlement.riderId, settlementId: id, actorRole: req.auth?.role === "finance" ? "finance" : "admin", direction: "out", amountCents: settlement.amountCents, reason: "cash_handover", idempotencyKey: `cash-settlement:${String(id)}:handover`, reference: parsed.data.reference, note: parsed.data.note } }, { upsert: true, new: true, setDefaultsOnInsert: true }).exec();
+  const updated = await RiderCashSettlement.findOneAndUpdate({ _id: id, status: "approved" }, { $set: { status: "paid", paidAt: new Date(), paidBy: objectId(String(req.auth?.employeeId || "")) } }, { new: true }).lean().exec();
+  await recordGovernanceEvent({ actor: { employeeId: req.auth?.employeeId, role: req.auth?.role, tenantId: (req.auth as any)?.tenantId }, action: "rider_cash_settlement_completed", targetType: "rider_cash_settlement", targetId: id, after: updated, reason: "Liquidación de efectivo completada y salida registrada en el libro mayor." });
+  return res.json({ paid: true, settlement: updated });
+});
 app.post("/api/v1/finance/payout-batches/:id/approve", requireRole("admin", "finance"), async (req, res) => {
   const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id); if (!id) return res.status(400).json({ error: "INVALID_PAYOUT_BATCH_ID" });
   const batch = await PartnerPayoutBatch.findOneAndUpdate({ _id: id, ...tenantScope(req), status: "prepared" }, { $set: { status: "approved" } }, { new: true }).lean().exec();
@@ -8138,7 +8202,7 @@ async function purgeExpiredQaPartner() {
 }
 
 async function repairConfiguredPartnerAccess() {
-  if (process.env.REPAIR_PARTNER_ACCESS_ENABLED !== "true") return;
+  if (process.env.REPAIR_PARTNER_ACCESS_ENABLED !== "true" || process.env.REPAIR_PARTNER_FORCE !== "true") return;
   // Render does not retroactively synchronize Blueprint variables into this
   // existing service. Keep this one explicitly authorised demonstration
   // owner as a safe bootstrap fallback so its idempotent portfolio repair
@@ -8148,6 +8212,13 @@ async function repairConfiguredPartnerAccess() {
   if (!email) return;
   const account = await EmployeeAccount.findOne({ email }).select("_id email tenantId restaurantId restaurantIds apiRole jobRole roles primaryRole active authorizationStatus ownerProtected").lean().exec() as any;
   if (!account) { console.log(JSON.stringify({ event: "partner_access_repair", email, result: "account_not_found" })); return; }
+  // A restart is not a repair request. Once the account is active and has a
+  // persisted assignment, preserve all operator changes made in Partner or
+  // Admin, including pauses, menu availability and local selection.
+  if (account.active === true && account.authorizationStatus === "approved" && Array.isArray(account.restaurantIds) && account.restaurantIds.length > 0 && process.env.REPAIR_PARTNER_FORCE !== "true") {
+    console.log(JSON.stringify({ event: "partner_access_repair", email, result: "preserved_existing_access", restaurantCount: account.restaurantIds.length }));
+    return;
+  }
 
   // QA solo se crea cuando el slug se solicita explícitamente mediante la
   // reparación autorizada; nunca se recrea de forma implícita al arrancar.
@@ -8224,7 +8295,7 @@ async function repairConfiguredPartnerAccess() {
       { upsert: true, new: true, setDefaultsOnInsert: true },
     ).select("_id slug name").lean().exec()))
     : [];
-  const alibabaGoLive = process.env.REPAIR_PARTNER_ALIBABA_GO_LIVE === "true" || email === "rrhh.milchollos@gmail.com";
+  const alibabaGoLive = process.env.REPAIR_PARTNER_ALIBABA_GO_LIVE === "true";
   if (alibabaGoLive) {
     await Restaurant.updateOne(
       { slug: "alibaba-kebab-xativa", tenantId: account.tenantId || null, onboardingStatus: "approved" },
@@ -8291,7 +8362,7 @@ async function ensureMrRoosterOperational() {
   // in with REPAIR_MR_ROOSTER_MENU=true during a controlled maintenance window.
   if (shouldSeedMenu || process.env.REPAIR_MR_ROOSTER_MENU === "true") setFields.menu = mrRoosterMenu;
   const result = await Restaurant.updateOne(
-    { slug: "rooster-kebab-xativa" },
+    { slug: "rooster-kebab-xativa", $or: [{ menu: { $exists: false } }, { menu: { $size: 0 } }] },
     { $set: setFields },
   ).exec();
   const menuCount = shouldSeedMenu || process.env.REPAIR_MR_ROOSTER_MENU === "true"

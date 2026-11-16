@@ -74,6 +74,7 @@ test("dispatch fixes: real handlers with in-memory persistence and forbidden ext
   const { RiderShiftPlanModel } = await import("./shiftPlans.js");
   const { startRealtimeRelay, stopRealtimeRelay } = await import("./realtime.js");
   const server = await import("./server.js");
+  const paymentPolicy = await import("./paymentPolicy.js");
   (globalThis as any).Date = FixedDate;
   const previousDb = Object.getOwnPropertyDescriptor(mongoose.connection, "db");
   const previousState = Object.getOwnPropertyDescriptor(mongoose.connection, "readyState");
@@ -150,6 +151,9 @@ test("dispatch fixes: real handlers with in-memory persistence and forbidden ext
 
   for (const procedure of ["order.create", "order.checkout"]) {
     await t.test(`${procedure}: saves the resolved pickup snapshot, routing and cash gate`, async (s) => {
+      const previousCashPaymentsEnabled = paymentPolicy.CASH_PAYMENTS_ENABLED;
+      paymentPolicy.setCashPaymentsEnabled(true);
+      s.after(() => paymentPolicy.setCashPaymentsEnabled(previousCashPaymentsEnabled));
       const fixture = customerRestaurantFixture(s);
       let stored: any;
       let creations = 0;
@@ -361,9 +365,14 @@ test("dispatch fixes: real handlers with in-memory persistence and forbidden ext
   }
   await t.test("sync insertion derives pickup/routing server-side; ignores client vehicle claims", async (s) => {
     s.mock.method(Order as any, "findOne", () => query(null));
+    s.mock.method(globalThis, "fetch", async (url: any) => {
+      assert.match(String(url), /^https:\/\/router\.project-osrm\.org\/route\/v1\/driving\//);
+      return new Response(JSON.stringify({ code: "Ok", routes: [{ distance: 1000, duration: 180 }] }), { status: 200 });
+    });
     let written: any;
     s.mock.method(Order as any, "findOneAndUpdate", (_filter: any, update: any) => { written = update; return query({ _id: id(), ...update.$setOnInsert, ...update.$set }); });
-    const result = await sync({ ...syncInput, pickupLocation: { coordinates: [0, 0] }, routeDistanceKm: 0.01, withinMunicipality: false });
+    const deliveryLocation = { latitude: point[1] + 0.001, longitude: point[0] + 0.001 };
+    const result = await sync({ ...syncInput, deliveryLocation, pickupLocation: { coordinates: [0, 0] }, routeDistanceKm: 0.01, withinMunicipality: false });
     assert.equal(result.status, 201, JSON.stringify(result.body));
     assert.deepEqual(written.$setOnInsert.pickupLocation.coordinates, point);
     assert.equal(written.$setOnInsert.routeDistanceKm, 1);
