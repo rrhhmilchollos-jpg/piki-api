@@ -76,6 +76,29 @@ export function customerDisplayStatus(value: unknown): string {
   return canonicalStatus === "ready_for_pickup" ? "ready" : canonicalStatus;
 }
 
+const CUSTOMER_TIMELINE = [
+  { key: "paid", label: "Abonado" },
+  { key: "partner", label: "Partner" },
+  { key: "ready", label: "Listo" },
+  { key: "rider", label: "Rider" },
+  { key: "on_the_way", label: "En camino" },
+  { key: "received", label: "Recibido" },
+] as const;
+
+function customerOrderTimeline(order: any) {
+  const status = String(order.status || "pending");
+  const paymentComplete = order.paymentState === "paid" || order.paymentMethod === "cash";
+  const progress = status === "delivered" ? 5 : status === "on_the_way" ? 4 : status === "picked_up" ? 3 : status === "ready_for_pickup" ? 2 : ["accepted", "preparing"].includes(status) ? 1 : 0;
+  const history = Array.isArray(order.statusHistory) ? order.statusHistory : [];
+  const timeFor = (keys: string[]) => history.find((event: any) => keys.includes(String(event.status)))?.at || null;
+  return CUSTOMER_TIMELINE.map((step, index) => ({
+    ...step,
+    completed: index === 0 ? paymentComplete : index <= progress,
+    current: index === 0 ? !paymentComplete : index === progress && status !== "delivered",
+    at: index === 0 ? (paymentComplete ? order.updatedAt || order.createdAt : null) : timeFor(index === 1 ? ["accepted", "preparing", "ready_for_pickup", "picked_up", "on_the_way", "delivered"] : index === 2 ? ["ready_for_pickup", "picked_up", "on_the_way", "delivered"] : index === 3 ? ["picked_up", "on_the_way", "delivered"] : index === 4 ? ["on_the_way", "delivered"] : ["delivered"]),
+  }));
+}
+
 function inputOf(req: Request): any {
   const body = req.body ?? {};
   const parsedBody = parseCustomerTrpcInput(body);
@@ -280,10 +303,10 @@ async function handleCustomerTrpcSingle(req: Request, res: Response) {
     if (procedure === "customer.orders.list") {
       const user = await currentCustomer(req) as any;
       if (!user) return fail(res, "Inicia sesión para consultar tus pedidos.", "AUTH_REQUIRED");
-      const orders = await Order.find({ customerId: String(user._id) }).sort({ createdAt: -1 }).limit(100).select("publicCode status restaurantId totalCents createdAt updatedAt paymentState assignmentState routeDurationMinutes items").lean().exec() as any[];
+      const orders = await Order.find({ customerId: String(user._id) }).sort({ createdAt: -1 }).limit(100).select("publicCode displayCode status restaurantId totalCents createdAt updatedAt paymentState paymentMethod assignmentState routeDurationMinutes items statusHistory deliveryAddress").lean().exec() as any[];
       const restaurants = await Restaurant.find({ _id: { $in: orders.map((order) => order.restaurantId) } }).select("name").lean().exec() as any[];
       const names = new Map(restaurants.map((restaurant) => [String(restaurant._id), restaurant.name]));
-      return reply(res, orders.map((order) => ({ id: order.publicCode, restaurant: names.get(String(order.restaurantId)) || "Restaurante PIKI", status: customerDisplayStatus(order.status), operationalStatus: order.status, total: Number(order.totalCents || 0) / 100, createdAt: order.createdAt, updatedAt: order.updatedAt, active: !["delivered", "cancelled"].includes(order.status), paymentState: order.paymentState, assignmentState: order.assignmentState, eta: order.routeDurationMinutes ? `${order.routeDurationMinutes} min` : "actualizando…", items: order.items || [] })));
+      return reply(res, orders.map((order) => ({ id: order.publicCode, shortOrderNumber: order.displayCode || null, restaurant: names.get(String(order.restaurantId)) || "Restaurante PIKI", status: customerDisplayStatus(order.status), operationalStatus: order.status, total: Number(order.totalCents || 0) / 100, createdAt: order.createdAt, updatedAt: order.updatedAt, active: !["delivered", "cancelled"].includes(order.status), paymentState: order.paymentState, paymentMethod: order.paymentMethod, assignmentState: order.assignmentState, eta: order.routeDurationMinutes ? `${order.routeDurationMinutes} min` : "actualizando…", items: order.items || [], timeline: customerOrderTimeline(order) })));
     }
     if (procedure === "customer.support.list") {
       const user = await currentCustomer(req) as any;
@@ -366,12 +389,12 @@ async function handleCustomerTrpcSingle(req: Request, res: Response) {
       const user = await currentCustomer(req) as any;
       if (!user) return fail(res, "Inicia sesión con la cuenta que realizó el pedido.", "AUTH_REQUIRED");
       const publicCode = String(input?.id || "").trim();
-      const order = await Order.findOne({ publicCode, customerId: String(user._id) }).select("_id publicCode tenantId status restaurantId riderId assignmentState routeDurationMinutes deliveryAddress paymentState").lean().exec() as any;
+      const order = await Order.findOne({ publicCode, customerId: String(user._id) }).select("_id publicCode displayCode tenantId status restaurantId riderId assignmentState routeDurationMinutes deliveryAddress deliveryNote paymentState paymentMethod paymentCapturedAt totalCents subtotalCents deliveryFeeCents serviceFeeCents creditAppliedCents items statusHistory createdAt updatedAt").lean().exec() as any;
       if (!order) return fail(res, "Pedido no encontrado", "NOT_FOUND");
       const restaurant = await Restaurant.findById(order.restaurantId).select("name").lean().exec() as any;
       res.setHeader("Cache-Control", "private, no-store");
       const { identity, rider } = await customerAssignedRider(order);
-      const publicOrder = { status: customerDisplayStatus(order.status), operationalStatus: order.status, assignmentState: order.assignmentState, ...identity };
+      const publicOrder = { status: customerDisplayStatus(order.status), operationalStatus: order.status, assignmentState: order.assignmentState, shortOrderNumber: order.displayCode || null, paymentState: order.paymentState, paymentMethod: order.paymentMethod, totalCents: order.totalCents, subtotalCents: order.subtotalCents, deliveryFeeCents: order.deliveryFeeCents, serviceFeeCents: order.serviceFeeCents, creditAppliedCents: order.creditAppliedCents, address: order.deliveryAddress || "", deliveryNote: order.deliveryNote || "", items: order.items || [], createdAt: order.createdAt, updatedAt: order.updatedAt, timeline: customerOrderTimeline(order), ...identity };
       if (procedure === "order.get") {
         return reply(res, { id: order.publicCode, restaurant: restaurant?.name || "Pedido PIKI", ...publicOrder, eta: order.routeDurationMinutes ? `${order.routeDurationMinutes} min` : "actualizando…" });
       }
