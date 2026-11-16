@@ -1,6 +1,6 @@
-// El filtro de efectivo sin garantía sigue existiendo para auditoría, pero ya
-// no habilita el reparto.
 import { cashOrderWithinLimitFilter, isDispatchableCashOrder } from "./paymentPolicy.js";
+// El filtro de efectivo sin garantía sigue existiendo para auditoría, pero no
+// habilita por sí solo el reparto a un Rider.
 void cashOrderWithinLimitFilter; void isDispatchableCashOrder;
 
 export const dispatchableOrderStatuses = [
@@ -20,12 +20,15 @@ export function isDispatchableOrderStatus(status: string): boolean {
   return (dispatchableOrderStatuses as readonly string[]).includes(status);
 }
 
-// Todo pedido, también los de efectivo, necesita una garantía viva antes de
-// salir a reparto: la tarjeta se retiene (paymentState "authorized") y el rider
-// cobra en la puerta. Sin tarjeta no hay oferta, así el cliente no se queda con
-// un pedido que nadie va a cubrir.
 export const dispatchablePaymentFilter = {
   paymentState: { $in: ["authorized", "paid"] },
+};
+
+// Partner Orders debe poder recibir y mostrar un contrarreembolso pendiente
+// para que el establecimiento lo acepte, pero dispatch sigue exigiendo una
+// garantía de pago viva hasta que Operaciones autorice ese flujo.
+export const partnerKitchenPaymentFilter = {
+  $or: [dispatchablePaymentFilter, cashOrderWithinLimitFilter],
 };
 
 export function isDispatchablePayment(paymentState: string, _paymentMethod?: string, _totalCents?: number): boolean {
