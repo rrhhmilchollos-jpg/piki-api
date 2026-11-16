@@ -37,6 +37,18 @@ test("el interruptor global de efectivo prevalece sobre la configuración guarda
   } finally { setCashPaymentsEnabled(previous); }
 });
 
+test("el catálogo cambia los métodos permitidos al activar o desactivar el interruptor sin reiniciar", () => {
+  const previous = CASH_PAYMENTS_ENABLED;
+  try {
+    setCashPaymentsEnabled(false);
+    assert.deepEqual(allowedPaymentMethods({ name: "Local sin métodos legacy" }), ["stripe", "bizum"]);
+    setCashPaymentsEnabled(true);
+    assert.deepEqual(allowedPaymentMethods({ name: "Local sin métodos legacy" }), ["stripe", "bizum", "cash"]);
+    setCashPaymentsEnabled(false);
+    assert.deepEqual(allowedPaymentMethods({ name: "Local sin métodos legacy" }), ["stripe", "bizum"]);
+  } finally { setCashPaymentsEnabled(previous); }
+});
+
 test("la referencia de bizum es corta y única por pedido", () => {
   assert.equal(bizumReferenceFor("PIKI-ABC123"), "PIKIABC123");
   assert.match(bizumReferenceFor("PIKI-MZ1K9QW2"), /^PIKI[A-Z0-9]{1,8}$/);

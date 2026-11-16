@@ -6705,7 +6705,10 @@ async function findCurrentRiderSlot(riderId: mongoose.Types.ObjectId) {
   await expireRiderSlots(riderId, now);
   const candidates = await RiderSlot.find({ riderId, date: { $in: [now.date, previousCalendarDate(now.date)] }, status: { $in: ["planned", "active"] } }).sort({ date: 1, startTime: 1 }).lean().exec();
   const slot = candidates.find((candidate: any) => riderSlotIsCurrent(candidate, now));
-  return { now, slot, selfStartAllowed: false };
+  // A current planned/active slot is the authoritative permission to show
+  // “Empezar sesión”. Keep this explicit for clients that consume the
+  // selfStartAllowed field instead of inferring it from `slot`.
+  return { now, slot, selfStartAllowed: Boolean(slot) };
 }
 async function findNextRiderSlot(riderId: mongoose.Types.ObjectId, now: ReturnType<typeof madridNow>) {
   const slots = await RiderSlot.find({ riderId, date: { $gte: now.date }, status: { $in: ["planned", "active"] } }).sort({ date: 1, startTime: 1 }).limit(30).lean().exec();
@@ -6753,7 +6756,7 @@ app.get("/api/v1/riders/:id/shift", requireRole("admin", "rider", "fleet"), asyn
   const { now, slot, selfStartAllowed } = await findCurrentRiderSlot(riderId);
   const visibleSlot = slot || await findNextRiderSlot(riderId, now);
   res.setHeader("Cache-Control", "no-store, max-age=0");
-  return res.json({ rider: { id: rider._id, riderCode: rider.riderCode, status: rider.status }, now, serverClock: now, eligible: Boolean(slot) || selfStartAllowed, selfStartAllowed, shift: visibleSlot });
+  return res.json({ rider: { id: rider._id, riderCode: rider.riderCode, status: rider.status }, now, serverClock: now, eligible: Boolean(slot) && selfStartAllowed, selfStartAllowed, shift: visibleSlot });
 });
 
 app.post("/api/v1/riders/:id/shift/start", requireRole("admin", "rider", "fleet"), async (req, res) => {

@@ -24,11 +24,14 @@ export type FulfillmentRestaurant = {
 const METHODS: PaymentMethod[] = ["stripe", "cash", "bizum"];
 const isMethod = (value: unknown): value is PaymentMethod => METHODS.includes(value as PaymentMethod);
 
-export const DEFAULT_PAYMENT_METHODS: PaymentMethod[] = CASH_PAYMENTS_ENABLED ? ["stripe", "bizum", "cash"] : ["stripe", "bizum"];
+/** Read the kill-switch at call time because Admin can change it without restarting the API. */
+export function defaultPaymentMethods(): PaymentMethod[] {
+  return CASH_PAYMENTS_ENABLED ? ["stripe", "bizum", "cash"] : ["stripe", "bizum"];
+}
 
 /** Métodos permitidos según la configuración del local. `bizumOnly` gana siempre. */
 export function allowedPaymentMethods(restaurant: FulfillmentRestaurant | null | undefined): PaymentMethod[] {
-  if (!restaurant) return DEFAULT_PAYMENT_METHODS;
+  if (!restaurant) return defaultPaymentMethods();
   // El interruptor global puede habilitar el contra reembolso para todos los comercios.
   const withBizumAndCash = (methods: PaymentMethod[]): PaymentMethod[] => {
     const withBizum: PaymentMethod[] = methods.includes("bizum") ? methods : [...methods, "bizum"];
@@ -36,7 +39,7 @@ export function allowedPaymentMethods(restaurant: FulfillmentRestaurant | null |
   };
   if (restaurant.bizumOnly === true) return withBizumAndCash(["bizum"]);
   const configured = Array.isArray(restaurant.paymentMethods) ? restaurant.paymentMethods.filter(isMethod) : [];
-  return withBizumAndCash(configured.length ? configured : DEFAULT_PAYMENT_METHODS);
+  return withBizumAndCash(configured.length ? configured : defaultPaymentMethods());
 }
 
 export function isRiderPurchase(restaurant: FulfillmentRestaurant | null | undefined): boolean {
