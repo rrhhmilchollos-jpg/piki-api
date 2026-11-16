@@ -89,12 +89,13 @@ function customerOrderTimeline(order: any) {
   const status = String(order.status || "pending");
   const paymentComplete = order.paymentState === "paid" || order.paymentMethod === "cash";
   const progress = status === "delivered" ? 5 : status === "on_the_way" ? 4 : status === "picked_up" ? 3 : status === "ready_for_pickup" ? 2 : ["accepted", "preparing"].includes(status) ? 1 : 0;
+  const currentIndex = status === "delivered" ? -1 : paymentComplete ? Math.max(1, progress) : 0;
   const history = Array.isArray(order.statusHistory) ? order.statusHistory : [];
   const timeFor = (keys: string[]) => history.find((event: any) => keys.includes(String(event.status)))?.at || null;
   return CUSTOMER_TIMELINE.map((step, index) => ({
     ...step,
     completed: index === 0 ? paymentComplete : index <= progress,
-    current: index === 0 ? !paymentComplete : index === progress && status !== "delivered",
+    current: index === currentIndex,
     at: index === 0 ? (paymentComplete ? order.updatedAt || order.createdAt : null) : timeFor(index === 1 ? ["accepted", "preparing", "ready_for_pickup", "picked_up", "on_the_way", "delivered"] : index === 2 ? ["ready_for_pickup", "picked_up", "on_the_way", "delivered"] : index === 3 ? ["picked_up", "on_the_way", "delivered"] : index === 4 ? ["on_the_way", "delivered"] : ["delivered"]),
   }));
 }
