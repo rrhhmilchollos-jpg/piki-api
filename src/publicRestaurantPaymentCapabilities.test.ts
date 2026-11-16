@@ -24,7 +24,7 @@ function evaluate(text: string, expression: string, bindings: Record<string, unk
   return new Function(...Object.keys(bindings), `${output}\nreturn (${expression});`)(...Object.values(bindings));
 }
 const fulfillmentSource = source("./fulfillment.ts");
-const fulfillmentPolicySource = ["METHODS", "isMethod", "DEFAULT_PAYMENT_METHODS", "allowedPaymentMethods", "isRiderPurchase", "paymentDecision"].map((name) => declaration(fulfillmentSource, name)).join("\n");
+const fulfillmentPolicySource = ["METHODS", "isMethod", "defaultPaymentMethods", "allowedPaymentMethods", "isRiderPurchase", "paymentDecision"].map((name) => declaration(fulfillmentSource, name)).join("\n");
 function buildPolicy(cashPaymentsEnabled: boolean) {
   const isCashPaymentEnabledForTest = () => cashPaymentsEnabled;
   const policy = evaluate(fulfillmentPolicySource, "({ allowedPaymentMethods, isRiderPurchase, paymentDecision })", { CASH_PAYMENTS_ENABLED: cashPaymentsEnabled, isCashPaymentEnabledForRestaurant: isCashPaymentEnabledForTest });
