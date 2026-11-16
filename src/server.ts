@@ -59,7 +59,7 @@ import { ORDER_ALERT_RECIPIENT, notifyOrderCancelled, notifyOrderPlaced } from "
 import { startDailySummaryWorker, stopDailySummaryWorker } from "./dailySummaryWorker.js";
 import { BUSINESS_SUMMARY_RECIPIENT, sendDailyBusinessSummary } from "./dailyBusinessSummary.js";
 import { corporateEmailConfiguration, corporateEmailDepartmentForRole, escapeCorporateHtml, sendCorporateEmail, sendLeadContactEmail, verifyCorporateEmailConnection } from "./corporateEmail.js";
-import { activeOperationalOrderStatuses, dispatchableOrderStatuses, dispatchablePaymentFilter, isDispatchableOrderStatus, isDispatchablePayment } from "./dispatchEligibility.js";
+import { activeOperationalOrderStatuses, dispatchableOrderStatuses, dispatchablePaymentFilter, isDispatchableOrderStatus, isDispatchablePayment, partnerKitchenPaymentFilter } from "./dispatchEligibility.js";
 import { canReceivePartnerLocations, partnerCan, partnerPermissions, partnerRolesForEmployee, permissionsForPartnerRoles, type PartnerPermission } from "./partnerAccess.js";
 import { KitchenAccessError, kitchenBindingForEmployee, registerPartnerKitchenAccessRoutes, validateKitchenActivation, type KitchenAccessDependencies } from "./partnerKitchenAccess.js";
 import { assignedRestaurantIds, partnerAccessForRequest as sharedPartnerAccessForRequest, partnerRequestAccess as sharedPartnerRequestAccess, partnerReadinessReason, requirePartnerSurface } from "./partnerOperationalAccess.js";
@@ -2613,7 +2613,7 @@ app.get("/api/v1/partners/kitchen/orders", requirePartnerSurface(), async (req, 
   if (!allowed) return res.status(403).json({ error: "PARTNER_PERMISSION_DENIED", permission: "orders:read" });
   const restaurantId = await employeeRestaurant(req, access);
   if (!restaurantId) return res.status(403).json({ error: access?.restaurantIds.length ? "PARTNER_RESTAURANT_ACCESS_DENIED" : "PARTNER_RESTAURANT_NOT_ASSIGNED" });
-  const orders = await Order.find({ restaurantId, ...partnerTenantScope(req), ...dispatchablePaymentFilter, archivedAt: null, status: { $in: ["pending", "accepted", "preparing", "ready_for_pickup", "picked_up", "on_the_way"] } }).sort({ createdAt: 1 }).lean().exec() as any[];
+  const orders = await Order.find({ restaurantId, ...partnerTenantScope(req), ...partnerKitchenPaymentFilter, archivedAt: null, status: { $in: ["pending", "accepted", "preparing", "ready_for_pickup", "picked_up", "on_the_way"] } }).sort({ createdAt: 1 }).lean().exec() as any[];
   const [restaurantRecord, customers, riders] = await Promise.all([
     Restaurant.findOne({ _id: restaurantId, ...partnerTenantScope(req) }).select("name address phone cuisine location").lean().exec(),
     CustomerAccount.find({ _id: { $in: orders.map((order) => order.customerId).filter(Boolean) }, ...partnerTenantScope(req) }).select("name email").lean().exec(),
