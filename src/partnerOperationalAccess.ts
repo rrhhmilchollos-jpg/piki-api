@@ -8,7 +8,7 @@ import { kitchenBindingForEmployee, kitchenRestaurantCanOperate, type KitchenBin
 import { isPartnerEmployee, partnerBindingForEmployee, partnerBindingErrorResponse, partnerMembershipForEmployee } from "./employeePartnerBinding.js";
 import { isObjectIdLike } from "./tenantScope.js";
 import { CUSTOMER_HIDDEN_TEST_SLUGS } from "./customerCatalogPolicy.js";
-import { customerAvailability, type CustomerAvailabilityReason } from "./customerAvailability.js";
+import { partnerReadinessBlockers } from "./partnerReadinessDiagnostics.js";
 
 export type PartnerOperationalDependencies = {
   resolveAuth: typeof resolveRole;
@@ -43,7 +43,7 @@ export type PartnerOperationalAccess = {
   tenantId: string;
   ownerPortfolio?: boolean;
 };
-export type PartnerAccessDenial = { status: number; error: string; reason?: CustomerAvailabilityReason };
+export type PartnerAccessDenial = { status: number; error: string; reason?: string };
 const denied = (error: string, status = 403) => ({ access: null, denial: { status, error } });
 const sameId = (a: unknown, b: unknown) => isObjectIdLike(a) && isObjectIdLike(b) && String(a) === String(b);
 
@@ -52,11 +52,9 @@ export function assignedRestaurantIds(employee: any): string[] {
     .filter(isObjectIdLike).map(String))];
 }
 
-export function partnerReadinessReason(restaurant: any): CustomerAvailabilityReason {
+export function partnerReadinessReason(restaurant: any): string {
   if (kitchenRestaurantCanOperate(restaurant)) return "open";
-  if (restaurant?.onboardingStatus !== "approved") return "not_approved";
-  const { reason } = customerAvailability({ ...restaurant, hasMenu: Array.isArray(restaurant?.menu) && restaurant.menu.length > 0 });
-  return reason === "open" ? "not_orderable" : reason;
+  return partnerReadinessBlockers(restaurant)[0] || "not_orderable";
 }
 
 /** No bootstrap import, email discovery, cached session snapshot or claim-only
