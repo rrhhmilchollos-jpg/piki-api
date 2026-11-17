@@ -21,6 +21,7 @@ const partnerDocumentsSchema = z.array(partnerDocumentSchema).max(5).default([])
   });
 });
 
+// Intake schema: unchanged. New applications are still validated strictly.
 export const partnerSchema = z.object({
   name: z.string().min(2).max(160), email: z.string().email(),
   password: z.string().min(12).max(200).regex(/[A-Z]/).regex(/[a-z]/).regex(/[0-9]/),
@@ -47,12 +48,113 @@ const partnerLegalReviewSchema = manualPartnerSchema.pick({
   pdaUnits: true, pdaCostAcceptedAt: true,
 }).extend({ contractAcceptedAt: z.coerce.date(), pdaUnitCostCents: z.union([z.literal(20000), z.literal(30000)]) });
 
+// ---------------------------------------------------------------------------
+// Tolerant normalisation of SAVED profiles. It only fixes the representation of
+// data that is already there (spaces, case, text vs number, accents). It never
+// invents values: anything genuinely missing still fails the review.
+// ---------------------------------------------------------------------------
+
+type LegalForm = "autonomo" | "sl" | "sa" | "cooperativa" | "otra";
+const LEGAL_FORM_ALIASES: Record<string, LegalForm> = {
+  autonomo: "autonomo", empresarioindividual: "autonomo", trabajadorautonomo: "autonomo",
+  sl: "sl", slu: "sl", sociedadlimitada: "sl",
+  sa: "sa", sociedadanonima: "sa",
+  cooperativa: "cooperativa", scoop: "cooperativa",
+  otra: "otra", otro: "otra",
+};
+
+function text(value: unknown): string | undefined {
+  if (typeof value === "number" && Number.isFinite(value)) return String(value);
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  return trimmed || undefined; // "" is treated as not provided
+}
+
+function numberOf(value: unknown): number | undefined {
+  if (typeof value === "number") return Number.isFinite(value) ? value : undefined;
+  const raw = text(value);
+  if (!raw) return undefined;
+  const parsed = Number(raw.replace("%", "").replace(",", "."));
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function acceptedFlag(value: unknown): unknown {
+  if (value === true || value === "true" || value === 1 || value === "1") return true;
+  return value;
+}
+
+function dateValue(value: unknown): unknown {
+  if (value == null) return undefined;
+  if (typeof value === "string" && !value.trim()) return undefined;
+  return value;
+}
+
+function normaliseLegalProfile(profile: Record<string, unknown>): Record<string, unknown> {
+  const next: Record<string, unknown> = { ...profile };
+  const taxId = text(profile.taxId);
+  if (taxId) next.taxId = taxId.replace(/[\s.]/g, "").toUpperCase();
+  const iban = text(profile.iban);
+  if (iban) next.iban = iban.replace(/\s/g, "").toUpperCase();
+  const postalCode = text(profile.postalCode);
+  // A postal code saved as a number loses its leading zero (e.g. 3001 -> 03001).
+  if (postalCode) next.postalCode = /^\d{1,5}$/.test(postalCode) ? postalCode.padStart(5, "0") : postalCode;
+  for (const key of ["legalName", "representativeName", "representativeRole", "fiscalAddress", "operatingAddress", "city", "province", "bankAccountHolder", "cuisine"]) {
+    next[key] = text(profile[key]);
+  }
+  next.representativeDocument = text(profile.representativeDocument); // empty string => not provided
+  const legalForm = text(profile.legalForm);
+  if (legalForm) {
+    const key = legalForm.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().replace(/[^a-z]/g, "");
+    next.legalForm = LEGAL_FORM_ALIASES[key] ?? legalForm;
+  }
+  const vat = numberOf(profile.vatRate);
+  if (vat !== undefined) next.vatRate = vat > 0 && vat < 1 ? Math.round(vat * 100) : vat; // 0.21 => 21
+  const units = numberOf(profile.pdaUnits);
+  if (units !== undefined) next.pdaUnits = units;
+  const unitCost = numberOf(profile.pdaUnitCostCents);
+  // Some legacy records store euros (200/300) instead of cents (20000/30000).
+  if (unitCost !== undefined) next.pdaUnitCostCents = unitCost === 200 || unitCost === 300 ? unitCost * 100 : unitCost;
+  next.commissionAccepted = acceptedFlag(profile.commissionAccepted);
+  for (const key of ["termsAcceptedAt", "contractAcceptedAt", "privacyAcceptedAt", "dataProcessingAcceptedAt", "pdaCostAcceptedAt"]) {
+    next[key] = dateValue(profile[key]);
+  }
+  return next;
+}
+
+const FIELD_LABELS: Record<string, string> = {
+  profile: "Perfil legal", legalName: "Razón social", taxId: "NIF/CIF", legalForm: "Forma jurídica",
+  representativeName: "Nombre del representante", representativeRole: "Cargo del representante",
+  representativeDocument: "Documento del representante", fiscalAddress: "Dirección fiscal",
+  operatingAddress: "Dirección operativa", postalCode: "Código postal", city: "Ciudad", province: "Provincia",
+  iban: "IBAN", bankAccountHolder: "Titular de la cuenta", cuisine: "Tipo de cocina", vatRate: "IVA",
+  commissionAccepted: "Aceptación de comisión", termsAcceptedAt: "Fecha de aceptación de términos",
+  contractAcceptedAt: "Fecha de aceptación del contrato", privacyAcceptedAt: "Fecha de aceptación de privacidad",
+  dataProcessingAcceptedAt: "Fecha de aceptación del tratamiento de datos", pdaCostAcceptedAt: "Fecha de aceptación del coste de PDA",
+  pdaUnits: "Número de PDAs", pdaUnitCostCents: "Coste por PDA",
+};
+
+export type PartnerLegalProfileIssue = { field: string; label: string; reason: "missing" | "invalid" };
+
+/** Exact list of what blocks review. Never includes the values (IBAN, tax id...). */
+export function partnerLegalProfileReviewIssues(profile: unknown): PartnerLegalProfileIssue[] {
+  if (!profile || typeof profile !== "object") return [{ field: "profile", label: FIELD_LABELS.profile, reason: "missing" }];
+  const normalised = normaliseLegalProfile(profile as Record<string, unknown>);
+  const issues = new Map<string, PartnerLegalProfileIssue>();
+  const add = (field: string, reason: "missing" | "invalid") => {
+    if (!issues.has(field)) issues.set(field, { field, label: FIELD_LABELS[field] ?? field, reason });
+  };
+  const parsed = partnerLegalReviewSchema.safeParse(normalised);
+  if (!parsed.success) {
+    for (const issue of parsed.error.issues) {
+      const field = typeof issue.path[0] === "string" ? issue.path[0] : "profile";
+      add(field, normalised[field] === undefined || normalised[field] === null ? "missing" : "invalid");
+    }
+  }
+  return [...issues.values()];
+}
+
 export function partnerLegalProfileReadyForReview(profile: unknown): boolean {
-  if (!profile || typeof profile !== "object") return false;
-  const value = profile as Record<string, unknown>;
-  const timestamps = ["termsAcceptedAt", "contractAcceptedAt", "privacyAcceptedAt", "dataProcessingAcceptedAt", "pdaCostAcceptedAt"];
-  if (timestamps.some((key) => value[key] == null)) return false;
-  return partnerLegalReviewSchema.safeParse(profile).success;
+  return partnerLegalProfileReviewIssues(profile).length === 0;
 }
 
 // Receipt telemetry only: optional attachments never gate intake or approval.
