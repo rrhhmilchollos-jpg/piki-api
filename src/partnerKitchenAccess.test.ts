@@ -264,9 +264,24 @@ test("temporary allergen exception is exact-id and keeps publication/compliance 
   try {
     process.env.PIKI_TEMPORARY_ALLERGEN_EXCEPTION_RESTAURANT_IDS = "6af3dac6508226eb18543af6";
     assert.equal(kitchenRestaurantCanOperate(legacy), true);
-    assert.equal(kitchenRestaurantCanOperate({ ...legacy, _id: "6af5b418579fe6af2a8bb834" }), false);
+    assert.equal(kitchenRestaurantCanOperate({ ...legacy, _id: "6af5b418579fe6af2a8bb835" }), false);
     assert.equal(kitchenRestaurantCanOperate({ ...legacy, isActive: false }), false);
     assert.equal(kitchenRestaurantCanOperate({ ...legacy, marketplaceCompliance: { pikiStatus: "pending" } }), false);
+  } finally {
+    if (previous === undefined) delete process.env.PIKI_TEMPORARY_ALLERGEN_EXCEPTION_RESTAURANT_IDS;
+    else process.env.PIKI_TEMPORARY_ALLERGEN_EXCEPTION_RESTAURANT_IDS = previous;
+  }
+});
+
+test("both approved Kazoku stores keep reception enabled without Render configuration", () => {
+  const h = harness();
+  const previous = process.env.PIKI_TEMPORARY_ALLERGEN_EXCEPTION_RESTAURANT_IDS;
+  try {
+    delete process.env.PIKI_TEMPORARY_ALLERGEN_EXCEPTION_RESTAURANT_IDS;
+    const base = { ...h.db.restaurants[0], onboardingStatus: "approved", isActive: true, availabilityStatus: "available", marketplaceCompliance: { pikiStatus: "verified" }, menu: [{ available: true, allergens: null }] };
+    assert.equal(kitchenRestaurantCanOperate({ ...base, _id: "6af3dac6508226eb18543af6" }), true);
+    assert.equal(kitchenRestaurantCanOperate({ ...base, _id: "6af5b418579fe6af2a8bb834" }), true);
+    assert.equal(kitchenRestaurantCanOperate({ ...base, _id: "6af5b418579fe6af2a8bb835" }), false);
   } finally {
     if (previous === undefined) delete process.env.PIKI_TEMPORARY_ALLERGEN_EXCEPTION_RESTAURANT_IDS;
     else process.env.PIKI_TEMPORARY_ALLERGEN_EXCEPTION_RESTAURANT_IDS = previous;

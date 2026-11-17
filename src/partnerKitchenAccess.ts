@@ -50,6 +50,14 @@ export type KitchenBindingDependencies = {
   memberships: { find(filter: any, options?: any): { toArray(): Promise<any[]> } };
 };
 const kitchenPermissions = ["orders:read", "orders:prepare"];
+// Historical Kazoku menus are already published and active, but some legacy
+// items do not yet carry the normalized allergen array. Keep this allowlist
+// explicit and narrow so a missing Render variable cannot pause those two
+// approved stores, while every other restaurant remains fully validated.
+const TEMPORARY_ALLERGEN_EXCEPTION_RESTAURANT_IDS = new Set([
+  "6af3dac6508226eb18543af6", // Kazoku Xàtiva
+  "6af5b418579fe6af2a8bb834", // Kazoku Algemesí
+]);
 const fail = (code: string, status = 409): never => { throw new KitchenAccessError(status, code); };
 const exactValues = (values: unknown, expected: string[]) => Array.isArray(values)
   && values.length === expected.length && values.every((value, index) => String(value) === expected[index]);
@@ -108,9 +116,10 @@ export function kitchenRestaurantCanOperate(restaurant: any): boolean {
   // Temporary, least-privilege exception for a historical menu whose
   // allergen editor has not yet been completed. Render must contain the exact
   // restaurant id; this never bypasses publication, activation or compliance.
-  const exceptionIds = String(process.env.PIKI_TEMPORARY_ALLERGEN_EXCEPTION_RESTAURANT_IDS || "")
+  const configuredIds = String(process.env.PIKI_TEMPORARY_ALLERGEN_EXCEPTION_RESTAURANT_IDS || "")
     .split(",").map((value) => value.trim().toLowerCase()).filter(Boolean);
-  return exceptionIds.includes(String(restaurant._id || "").toLowerCase());
+  const restaurantId = String(restaurant._id || "").toLowerCase();
+  return TEMPORARY_ALLERGEN_EXCEPTION_RESTAURANT_IDS.has(restaurantId) || configuredIds.includes(restaurantId);
 }
 
 async function actorContext(req: Request, deps: KitchenAccessDependencies, session?: Session) {
