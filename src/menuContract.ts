@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { normalizePikiAllergenList } from "./allergenCatalog.js";
 
 const menuModifierOptionObjectSchema = z.object({
   id: z.string().min(1).max(80),
@@ -66,6 +67,7 @@ function canonicalOptions(group: PartnerMenuItem["modifiers"][number]): Modifier
 export function normalizePartnerMenuItems(items: PartnerMenuItem[]): PartnerMenuItem[] {
   return items.map((item) => ({
     ...item,
+    allergens: normalizePikiAllergenList(item.allergens),
     modifiers: item.modifiers.map((group) => {
       const optionItems = canonicalOptions(group).map((option) => ({ ...option }));
       const availableOptions = optionItems.filter((option) => option.available);

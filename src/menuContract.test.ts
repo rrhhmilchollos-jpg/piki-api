@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { customerMenuForRestaurant } from "./customerCatalogPolicy.js";
 import { canonicalRestaurantMenu, normalizePartnerMenuItems, partnerMenuItemsSchema } from "./menuContract.js";
+import { canonicalPikiAllergenCode, PIKI_ALLERGENS } from "./allergenCatalog.js";
 import { modifierGroupsForItem, quoteMenuItem } from "./menuModifiers.js";
 
 test("conserva optionItems, precios propios y disponibilidad del editor Partner", () => {
@@ -29,6 +30,15 @@ test("migra un menú antiguo que solo tenía options de texto", () => {
   const [item] = normalizePartnerMenuItems(parsed);
   assert.deepEqual(item.modifiers[0].optionItems.map((option) => option.name), ["Yogur", "Picante"]);
   assert.deepEqual(item.modifiers[0].options.map((option) => (option as { price: number }).price), [0.5, 0.5]);
+});
+
+test("normaliza el catálogo de 14 alérgenos a códigos y no adivina etiquetas desconocidas", () => {
+  assert.equal(PIKI_ALLERGENS.length, 14);
+  assert.equal(canonicalPikiAllergenCode("SÉSAMO"), "sesamo");
+  assert.equal(canonicalPikiAllergenCode("fish"), "pescado");
+  assert.equal(canonicalPikiAllergenCode("frutos secos"), null);
+  const parsed = partnerMenuItemsSchema.parse([{ id: "dish-allergens", name: "Plato", price: 8, allergens: ["Cereales con gluten", "pescado", "Etiqueta legacy"] }]);
+  assert.deepEqual(normalizePartnerMenuItems(parsed)[0].allergens, ["gluten", "pescado", "Etiqueta legacy"]);
 });
 
 test("el menú guardado del partner de prueba llega al catálogo público con el mismo producto", () => {

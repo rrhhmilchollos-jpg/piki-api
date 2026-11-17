@@ -65,10 +65,10 @@ test("null/ausencia desconocidos y arrays explícitos sobreviven Zod, normalizac
   for (const allergens of values) {
     const input = { id: "fixture", name: "Plato", price: 7.5, ...(allergens === undefined ? {} : { allergens }) };
     const parsed = normalizePartnerMenuItems(partnerMenuItemsSchema.parse([input]));
-    assert.deepEqual(parsed[0].allergens, allergens ?? null);
+    assert.deepEqual(parsed[0].allergens, allergens === undefined || allergens === null ? null : allergens.length ? ["leche", "gluten"] : []);
     const doc: any = new Restaurant({ name: "Fixture", slug: "offline-only", menu: [input] });
     assert.deepEqual(doc.menu[0].toObject().allergens, allergens ?? null);
-    for (const flag of [false, true]) assert.deepEqual(customerMenuForRestaurant({ menu: parsed, priceIncludesCommission: flag })[0].allergens, allergens ?? null);
+    for (const flag of [false, true]) assert.deepEqual(customerMenuForRestaurant({ menu: parsed, priceIncludesCommission: flag })[0].allergens, allergens === undefined || allergens === null ? null : allergens.length ? ["leche", "gluten"] : []);
   }
   for (const allergens of ["Gluten", [1], Array(31).fill("x")]) assert.equal(partnerMenuItemsSchema.safeParse([{ id: "x", name: "x", price: 1, allergens }]).success, false);
   assert.equal(parseMenuText("Plato 7,50 €").items[0].allergens, null);
