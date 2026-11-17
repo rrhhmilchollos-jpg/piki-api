@@ -20,6 +20,9 @@ services:
         value: https://rider.pikidelivery.com
       - key: PIKI_NATIVE_FORCE_UPDATE_ENABLED
         value: "false"
+      # Excepción de metadatos de carta histórica, no de verificación legal.
+      - key: PIKI_TEMPORARY_ALLERGEN_EXCEPTION_RESTAURANT_IDS
+        value: "6af3dac6508226eb18543af6,6af5b418579fe6af2a8bb834"
       - key: PIKI_EMAIL_FROM
         value: "PIKI Soporte <support@pikidelivery.com>"
       - key: PIKI_EMAIL_FROM_SUPPORT
