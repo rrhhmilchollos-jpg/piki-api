@@ -29,7 +29,7 @@ import { waitlistRouter } from "./waitlist.js";
 import express from "express";
 import mongoose from "mongoose";
 import { z } from "zod";
-import { CashLedgerEntry, CustomerAccount, DispatchDecision, DispatchOutbox, DocumentRequest, EmployeeAccount, AccessAuthorization, Fleet, Order, Restaurant, PartnerAsset, PartnerLocalityGroup, MenuImportDraft, Rider, RiderApplication, PartnerLead, RiderLead, RiderIncident, RiderOrderMessage, RiderSlot, SignatureRequest, Zone, PushSubscription, RealtimeEvent, Notification, Tenant, TenantMembership, RiderAssignmentReservation, SupportTicket, OnboardingRequest, TrackingSession, RiderPayoutBatch, RiderCashSettlement, PartnerPayoutBatch, GovernanceAuditEvent, LocationSample, ensureIndexes } from "./models.js";
+import { CashLedgerEntry, CustomerAccount, DispatchDecision, DispatchOutbox, DocumentRequest, EmployeeAccount, AccessAuthorization, Fleet, Order, QA_RECEPTION_REQUEST_INDEX, Restaurant, PartnerAsset, PartnerLocalityGroup, MenuImportDraft, Rider, RiderApplication, PartnerLead, RiderLead, RiderIncident, RiderOrderMessage, RiderSlot, SignatureRequest, Zone, PushSubscription, RealtimeEvent, Notification, Tenant, TenantMembership, RiderAssignmentReservation, SupportTicket, OnboardingRequest, TrackingSession, RiderPayoutBatch, RiderCashSettlement, PartnerPayoutBatch, GovernanceAuditEvent, LocationSample, ensureIndexes } from "./models.js";
 import { RiderShiftIncentiveMetric } from "./riderIncentivesModels.js";
 import { normalizeLeadEmail, partnerLeadSubmissionSchema, riderLeadSubmissionSchema, webLeadReviewSchema, webLeadStatusSchema } from "./webLeads.js";
 import { assertTransition, calculateEtaRange, transitionSchema, validateCoordinates } from "./algorithms/index.js";
@@ -61,7 +61,7 @@ import { BUSINESS_SUMMARY_RECIPIENT, sendDailyBusinessSummary } from "./dailyBus
 import { corporateEmailConfiguration, corporateEmailDepartmentForRole, escapeCorporateHtml, sendCorporateEmail, sendLeadContactEmail, verifyCorporateEmailConnection } from "./corporateEmail.js";
 import { activeOperationalOrderStatuses, dispatchableOrderStatuses, dispatchablePaymentFilter, isDispatchableOrderStatus, isDispatchablePayment, partnerKitchenPaymentFilter } from "./dispatchEligibility.js";
 import { canReceivePartnerLocations, partnerCan, partnerPermissions, partnerRolesForEmployee, permissionsForPartnerRoles, type PartnerPermission } from "./partnerAccess.js";
-import { KitchenAccessError, kitchenBindingForEmployee, registerPartnerKitchenAccessRoutes, validateKitchenActivation, type KitchenAccessDependencies } from "./partnerKitchenAccess.js";
+import { KitchenAccessError, kitchenBindingForEmployee, kitchenRestaurantCanOperate, registerPartnerKitchenAccessRoutes, validateKitchenActivation, type KitchenAccessDependencies } from "./partnerKitchenAccess.js";
 import { assignedRestaurantIds, partnerAccessForRequest as sharedPartnerAccessForRequest, partnerRequestAccess as sharedPartnerRequestAccess, partnerReadinessReason, requirePartnerSurface } from "./partnerOperationalAccess.js";
 import { awardRiderRecruitmentMilestones, claimRiderReferralCode, completeRiderShiftIncentiveTracking, incentiveProgramStatus, loadRiderIncentiveSnapshot, trackRiderLocationForIncentive, trackRiderShiftStart } from "./riderIncentives.js";
 import { buildApprovedRiderOperationalProfile } from "./riderApproval.js";
@@ -7066,12 +7066,84 @@ setCustomerOrderDispatcher(async (orderId) => {
   return enqueueOrderForDispatch(new mongoose.Types.ObjectId(orderId));
 });
 
+let qaReceptionRequestIndexPromise: Promise<string> | undefined;
+function ensureQaReceptionRequestIndex(): Promise<string> {
+  if (!qaReceptionRequestIndexPromise) {
+    // No general index synchronization/migration: only this exact unique guard.
+    qaReceptionRequestIndexPromise = Order.collection.createIndex(QA_RECEPTION_REQUEST_INDEX.keys, QA_RECEPTION_REQUEST_INDEX.options)
+      .catch((error: unknown) => { qaReceptionRequestIndexPromise = undefined; throw error; });
+  }
+  return qaReceptionRequestIndexPromise!;
+}
+
 /**
  * Creates a short-lived, non-commercial dispatch scenario.  It can only target
  * a dedicated QA rider and is removed through the paired DELETE route, so test
  * traffic never reaches a real rider, partner settlement, or customer history.
+ * Explicit partner_reception mode instead creates one zero-value intake order,
+ * without a Rider or dispatch, for an operational Partner's real reception UI.
  */
-app.post("/api/v1/admin/qa/dispatch-orders", requireRole("admin"), async (req, res) => {
+app.post("/api/v1/admin/qa/dispatch-orders", requireRole("admin"), (req, res, next) => req.body?.mode === "partner_reception" ? requireOwner()(req, res, next) : next(), async (req, res) => {
+  if (req.body?.mode === "partner_reception") {
+    const restaurantSlug = req.body.restaurantSlug;
+    if (typeof restaurantSlug !== "string" || !/^[a-z0-9][a-z0-9-]{1,118}$/.test(restaurantSlug)) return res.status(400).json({ error: "INVALID_QA_RESTAURANT_SLUG" });
+    const requestId = req.body.requestId;
+    if (typeof requestId !== "string" || requestId.length < 1 || requestId.length > 80 || !requestId.trim()) return res.status(400).json({ error: "INVALID_QA_RECEPTION_REQUEST_ID" });
+    const restaurant = await Restaurant.findOne({ ...tenantScope(req), slug: restaurantSlug, isActive: true, onboardingStatus: "approved" })
+      .select("_id tenantId slug location isActive onboardingStatus availabilityStatus listingType internalDemo fulfillmentMode marketplaceCompliance.pikiStatus menu").lean().exec() as any;
+    if (!restaurant || !kitchenRestaurantCanOperate(restaurant)) return res.status(409).json({ error: "QA_REQUESTED_RESTAURANT_UNAVAILABLE" });
+    const coordinates = restaurant.location?.coordinates;
+    if (!mongoose.isValidObjectId(restaurant.tenantId) || restaurant.location?.type !== "Point" || !Array.isArray(coordinates) || coordinates.length !== 2
+      || !coordinates.every((value: unknown) => typeof value === "number") || !validOperationalCoordinates(coordinates)) return res.status(409).json({ error: "QA_RESTAURANT_LOCATION_UNAVAILABLE" });
+    try {
+      await ensureQaReceptionRequestIndex();
+    } catch {
+      return res.status(503).json({ error: "QA_RECEPTION_IDEMPOTENCY_UNAVAILABLE" });
+    }
+    const replayScope = { tenantId: restaurant.tenantId, restaurantId: restaurant._id, isTestOrder: true, qaReceptionRequestId: requestId };
+    // The one approved schema field stores identity only, not publication state.
+    // An exact replay must not claim unknown event success or re-emit anything.
+    const replay = (order: any) => res.status(200).json({ order, qa: { mode: "reception", notification: { published: null, skipped: "IDEMPOTENT_REPLAY", message: "Resultado original de publicación no persistido; no se reemiten eventos." } } });
+    const existing = await Order.findOne(replayScope).lean().exec();
+    if (existing) return replay(existing);
+    const codes = await createOrderCodes();
+    let order: any;
+    try {
+      order = await Order.create({
+        ...replayScope, ...codes, qaRiderId: null, riderId: null,
+        customerName: "PIKI QA · prueba recepción",
+        items: [{ itemId: "qa-partner-reception", name: "PRUEBA QA · NO PREPARAR", quantity: 1, unitPriceCents: 0 }],
+        deliveryAddress: "SIMULACIÓN QA · No preparar ni entregar",
+        deliveryNote: "Pedido de prueba QA sin cobro ni entrega real. No preparar comida. Eliminar tras confirmar recepción.",
+        pickupLocation: { type: "Point", coordinates: [...coordinates] },
+        deliveryLocation: { type: "Point", coordinates: [...coordinates] },
+        paymentMethod: "cash", paymentState: "pending", status: "pending", assignmentState: "unassigned",
+        partnerPaymentRequired: false, partnerPaymentCents: 0, paymentHoldCents: 0, paymentCapturedCents: 0,
+        subtotalCents: 0, deliveryFeeCents: 0, serviceFeeCents: 0, totalCents: 0,
+        deliveryBaseFeeCents: 0, outsideMunicipalitySurchargeCents: 0, creditAppliedCents: 0, couponAppliedCents: 0,
+        wheelRewardCents: 0, tipCents: 0, marketplaceCommissionRateBps: 0, marketplaceCommissionCents: 0,
+        partnerPayoutCents: 0, riderEarningsCents: 0, platformNetBeforeProcessingCents: 0,
+        statusHistory: [{ status: "pending", actorRole: "admin", reason: "Prueba QA de recepción solicitada por Owner. Sin cobro ni entrega real. No preparar comida." }],
+      });
+    } catch (error: any) {
+      // Other unique conflicts (public/display codes, etc.) are not replays.
+      if (error?.code === 11000 && String(error?.message || "").includes(`index: ${QA_RECEPTION_REQUEST_INDEX.options.name} `)) {
+        const winner = await Order.findOne(replayScope).lean().exec();
+        if (winner) return replay(winner);
+      }
+      throw error;
+    }
+    let notification: { published: boolean; error?: string };
+    try {
+      await publishOrderIntakeEvents(order, { settlement: "cash_due", message: "PRUEBA QA · sin cobro, no preparar ni entregar" });
+      notification = { published: true };
+    } catch {
+      // Creation already committed: keep the order, return the failure, never
+      // retry insertion or send again on replay (publication may be partial).
+      notification = { published: false, error: "QA_RECEPTION_NOTIFICATION_FAILED" };
+    }
+    return res.status(201).json({ order, qa: { mode: "reception", notification } });
+  }
   const employee = await employeeScope(req);
   const scope = tenantScope(req);
   const requestedRestaurantSlug = typeof req.body?.restaurantSlug === "string" ? req.body.restaurantSlug.trim().toLowerCase() : "";
