@@ -100,10 +100,17 @@ export async function kitchenBindingForEmployee(employee: any, deps: KitchenBind
  */
 export function kitchenRestaurantCanOperate(restaurant: any): boolean {
   const menu = restaurant?.menu;
-  return isPublishedCustomerPartner(restaurant)
-    && restaurant.marketplaceCompliance?.pikiStatus === "verified"
-    && Array.isArray(menu) && menu.some((item: any) => item.available !== false)
-    && menu.filter((item: any) => item.available !== false).every((item: any) => Array.isArray(item.allergens));
+  if (!isPublishedCustomerPartner(restaurant)
+    || restaurant.marketplaceCompliance?.pikiStatus !== "verified"
+    || !Array.isArray(menu) || !menu.some((item: any) => item.available !== false)) return false;
+  const allergenMetadataComplete = menu.filter((item: any) => item.available !== false).every((item: any) => Array.isArray(item.allergens));
+  if (allergenMetadataComplete) return true;
+  // Temporary, least-privilege exception for a historical menu whose
+  // allergen editor has not yet been completed. Render must contain the exact
+  // restaurant id; this never bypasses publication, activation or compliance.
+  const exceptionIds = String(process.env.PIKI_TEMPORARY_ALLERGEN_EXCEPTION_RESTAURANT_IDS || "")
+    .split(",").map((value) => value.trim().toLowerCase()).filter(Boolean);
+  return exceptionIds.includes(String(restaurant._id || "").toLowerCase());
 }
 
 async function actorContext(req: Request, deps: KitchenAccessDependencies, session?: Session) {

@@ -257,6 +257,22 @@ test("new kitchen operation gate requires approved/active/published menu and kno
   for (const override of [{ isActive: false }, { onboardingStatus: "pending_review" }, { availabilityStatus: "coming_soon" }, { menu: [] }, { menu: [{ available: true, allergens: null }] }, { menu: [{ available: false, allergens: [] }] }, { marketplaceCompliance: { pikiStatus: "pending" } }]) assert.equal(kitchenRestaurantCanOperate({ ...live, ...override }), false);
 });
 
+test("temporary allergen exception is exact-id and keeps publication/compliance gates", () => {
+  const h = harness();
+  const legacy = { ...h.db.restaurants[0], _id: "6af3dac6508226eb18543af6", onboardingStatus: "approved", isActive: true, availabilityStatus: "available", marketplaceCompliance: { pikiStatus: "verified" }, menu: [{ available: true, allergens: null }] };
+  const previous = process.env.PIKI_TEMPORARY_ALLERGEN_EXCEPTION_RESTAURANT_IDS;
+  try {
+    process.env.PIKI_TEMPORARY_ALLERGEN_EXCEPTION_RESTAURANT_IDS = "6af3dac6508226eb18543af6";
+    assert.equal(kitchenRestaurantCanOperate(legacy), true);
+    assert.equal(kitchenRestaurantCanOperate({ ...legacy, _id: "6af5b418579fe6af2a8bb834" }), false);
+    assert.equal(kitchenRestaurantCanOperate({ ...legacy, isActive: false }), false);
+    assert.equal(kitchenRestaurantCanOperate({ ...legacy, marketplaceCompliance: { pikiStatus: "pending" } }), false);
+  } finally {
+    if (previous === undefined) delete process.env.PIKI_TEMPORARY_ALLERGEN_EXCEPTION_RESTAURANT_IDS;
+    else process.env.PIKI_TEMPORARY_ALLERGEN_EXCEPTION_RESTAURANT_IDS = previous;
+  }
+});
+
 const serverSource = ts.createSourceFile("server.ts", readFileSync(new URL("./server.ts", import.meta.url), "utf8"), ts.ScriptTarget.Latest, true);
 function compile(code: string, context: Record<string, any>) {
   context = { isPartnerEmployee, partnerBindingForEmployee, partnerBindingErrorResponse, validatePartnerCredentialTarget, ...context };
