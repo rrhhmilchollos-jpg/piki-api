@@ -4067,7 +4067,7 @@ app.get("/api/v1/riders", requireRole("admin", "fleet"), async (req, res) => {
   if (!pagination) return res.status(400).json({ error: "INVALID_RIDER_PAGINATION" });
   const status = typeof req.query.status === "string" ? req.query.status : undefined;
   const employee = req.auth?.role === "fleet" ? await employeeScope(req) : null;
-  const riderFilter = { ...(status ? { status } : {}), ...buildFleetRiderPickerScope({ tenantId: req.auth?.tenantId, role: req.auth?.role, fleetId: employee?.fleetId }) };
+  const riderFilter = { ...(status ? { status } : {}), isTestRider: { $ne: true }, ...buildFleetRiderPickerScope({ tenantId: req.auth?.tenantId, role: req.auth?.role, fleetId: employee?.fleetId }) };
   const [total, riders] = await Promise.all([
     Rider.countDocuments(riderFilter).exec(),
     Rider.find(riderFilter).sort({ name: 1, _id: 1 }).skip(pagination.offset).limit(pagination.limit).lean().exec(),
@@ -7835,7 +7835,7 @@ app.get("/api/v1/admin/governance/directory", requireRole("admin"), async (req, 
   const tenant = tenantScope(req);
   const [partners, riders] = await Promise.all([
     Restaurant.find(tenant).select("_id partnerCode slug name email phone onboardingStatus marketplaceCompliance.pikiStatus marketplaceCompliance.stripeStatus partnerProfile.commissionRateBps isActive").sort({ name: 1 }).lean().exec(),
-    Rider.find(tenant).select("_id riderCode name email phone lifecycleStatus status fleetId zoneSlug isTestRider").sort({ name: 1 }).lean().exec(),
+    Rider.find({ ...tenant, isTestRider: { $ne: true } }).select("_id riderCode name email phone lifecycleStatus status fleetId zoneSlug isTestRider").sort({ name: 1 }).lean().exec(),
   ]);
   return res.json({ owner: { email: ownerEmail, role: "superadmin" }, partners: partners.map((p: any) => ({ ...p, id: String(p._id), partnerCode: p.partnerCode || publicPartnerCode(p._id), commissionRateBps: Number(p.partnerProfile?.commissionRateBps ?? DEFAULT_PARTNER_COMMISSION_BPS) })), riders: riders.map((r: any) => ({ ...r, id: String(r._id), riderCode: r.riderCode || publicRiderCode(r._id) })) });
 });
@@ -8279,7 +8279,8 @@ app.get("/api/v1/fleet/operations/live", requireRole("admin", "fleet"), async (r
 
 app.get("/api/v1/riders/overview", requireRole("admin", "fleet"), async (_req, res) => {
   const startOfDay = new Date(); startOfDay.setHours(0, 0, 0, 0);
-  const [registered, unassigned, active, completed] = await Promise.all([Rider.countDocuments(), Order.countDocuments({ riderId: null, ...dispatchablePaymentFilter, status: { $in: [...dispatchableOrderStatuses] } }), Order.countDocuments({ riderId: { $ne: null }, status: { $in: ["picked_up", "on_the_way"] } }), Order.countDocuments({ riderId: { $ne: null }, status: "delivered", deliveredAt: { $gte: startOfDay } })]);
+  const realRiders = { isTestRider: { $ne: true } };
+  const [registered, unassigned, active, completed] = await Promise.all([Rider.countDocuments(realRiders), Order.countDocuments({ riderId: null, ...dispatchablePaymentFilter, status: { $in: [...dispatchableOrderStatuses] } }), Order.countDocuments({ riderId: { $ne: null }, status: { $in: ["picked_up", "on_the_way"] } }), Order.countDocuments({ riderId: { $ne: null }, status: "delivered", deliveredAt: { $gte: startOfDay } })]);
   res.json({ service: "piki-api", overview: { registered_riders: registered, unassigned_orders: unassigned, active_deliveries: active, completed_today: completed } });
 });
 
