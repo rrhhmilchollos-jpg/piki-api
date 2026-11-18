@@ -1115,7 +1115,7 @@ app.get("/api/v1/auth/status", (_req, res) => res.json({ authentication: "bearer
 const employeeSessionRoles = ["admin", "partner", "rider", "fleet", "commercial", "gerente_comercial_zona", "finance", "support"] as const;
 const partnerOperationalRoles = ["partner_admin", "area_manager", "zone_manager", "store_manager", "manager", "cashier", "cajero", "kitchen", "cocina", "cook", "catalog", "catalogue", "menu_manager", "viewer", "read_only", "solo_lectura"] as const;
 const employeeLoginSchema = z.object({ identifier: z.string().trim().min(3).max(254).optional(), email: z.string().trim().min(3).max(254).optional(), username: z.string().trim().min(3).max(254).optional(), employeeCode: z.string().trim().min(3).max(254).optional(), password: z.string().min(8).max(200), role: z.enum(employeeSessionRoles).optional() }).refine((value) => Boolean(value.identifier || value.email || value.username || value.employeeCode), { message: "identifier_required" });
-const employeePasswordResetRequestSchema = z.object({ email: z.string().email().max(254) });
+const employeePasswordResetRequestSchema = z.object({ email: z.string().trim().email().max(254) });
 const employeePasswordResetConfirmSchema = z.object({ token: z.string().min(40).max(200), newPassword: z.string().min(12).max(200).regex(/[A-Z]/).regex(/[a-z]/).regex(/[0-9]/) });
 function employeeCodeFor(value: unknown) { return `PIKI-E-${String(value).replace(/[^a-z0-9]/gi, "").slice(-8).toUpperCase()}`; }
 async function backfillEmployeeCodes() {
