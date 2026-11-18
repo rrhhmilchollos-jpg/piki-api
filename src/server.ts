@@ -8079,10 +8079,11 @@ app.get("/api/v1/finance/overview", requireRole("admin", "finance"), async (req,
 app.get("/api/v1/admin/overview", requireRole("admin"), async (req, res) => {
   const startOfDay = new Date(); startOfDay.setHours(0, 0, 0, 0);
   const tenant = tenantScope(req);
+  const riderDirectoryScope = { ...(await fleetRiderFilter(req)), isTestRider: { $ne: true } };
   const [activeRestaurants, pendingRestaurants, riders, openOrders, deliveredToday, gmv] = await Promise.all([
     Restaurant.countDocuments({ ...tenant, isActive: true, onboardingStatus: "approved" }),
     Restaurant.countDocuments({ ...tenant, onboardingStatus: "pending_review" }),
-    Rider.countDocuments({ ...tenant, isTestRider: { $ne: true } }),
+    Rider.countDocuments(riderDirectoryScope),
     Order.countDocuments({ ...tenant, status: { $in: ["pending", "accepted", "preparing", "ready_for_pickup", "picked_up", "on_the_way"] } }),
     Order.countDocuments({ ...tenant, status: "delivered", deliveredAt: { $gte: startOfDay } }),
     Order.aggregate([{ $match: { ...tenant, paymentState: "paid", createdAt: { $gte: startOfDay } } }, { $group: { _id: null, totalCents: { $sum: "$totalCents" }, orders: { $sum: 1 } } }]),
@@ -8151,7 +8152,8 @@ app.get("/api/v1/admin/riders/hours", requireRole("admin", "finance"), async (re
 });
 app.get("/api/v1/admin/operations/live", requireRole("admin"), async (req, res) => {
   const tenant = tenantScope(req);
-  const riders = await Rider.find({ ...tenant, isTestRider: { $ne: true } }).select("riderCode name email status lifecycleStatus lifecycleReason vehicle city location lastLocationAt locationPrivacyExpiresAt geofence activeOrderId fleetId zoneSlug").lean().exec() as any[];
+  const riderDirectoryScope = { ...(await fleetRiderFilter(req)), isTestRider: { $ne: true } };
+  const riders = await Rider.find(riderDirectoryScope).select("riderCode name email status lifecycleStatus lifecycleReason vehicle city location lastLocationAt locationPrivacyExpiresAt geofence activeOrderId fleetId zoneSlug").lean().exec() as any[];
   const riderIds = riders.map((rider) => rider._id);
   const orders = await Order.find({ ...tenant, riderId: { $in: riderIds }, status: { $in: [...activeOperationalOrderStatuses] } }).select("publicCode displayCode status assignmentState deliveryAddress restaurantId customerId riderId").select("+customerPhone").lean().exec() as any[];
   const restaurants = await Restaurant.find({ ...tenant, _id: { $in: orders.map((order) => order.restaurantId) } }).select("name address").lean().exec() as any[];
