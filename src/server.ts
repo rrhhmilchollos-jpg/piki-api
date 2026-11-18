@@ -7012,9 +7012,10 @@ async function assignOrderAutomatically(orderId: mongoose.Types.ObjectId, prefer
     const freshness = new Date(Date.now() - 90_000);
     const currentRiderIds = await currentSlotRiderIds(tenantFilter);
     const useQaRider = Boolean(order.isTestOrder && preferredRiderId);
+    const useLiveQaTarget = Boolean(useQaRider && order.qaLiveRiderTarget === true);
     const riderFilter: Record<string, unknown> = {
       ...tenantFilter,
-      isTestRider: useQaRider ? true : { $ne: true },
+      isTestRider: useLiveQaTarget ? { $ne: true } : useQaRider ? true : { $ne: true },
       _id: { $in: currentRiderIds },
       status: { $in: ["available", "busy"] },
       lifecycleStatus: "active", lastLocationAt: { $gte: freshness, $lte: new Date() },
@@ -7229,6 +7230,49 @@ app.post("/api/v1/admin/qa/dispatch-orders", requireRole("admin"), (req, res, ne
   });
   const current = await Order.findById(order._id).lean().exec();
   return res.status(201).json({ order: current, qa: { riderId: String(qaRider._id), ticketId: String(supportTicket._id), ticketNumber: supportTicket.ticketNumber, expiresAt: expiresAt.toISOString(), dispatch } });
+});
+
+app.post("/api/v1/admin/qa/live-rider-dispatch", requireRole("admin"), requireOwner(), async (req, res) => {
+  const riderId = objectId(String(req.body?.riderId || ""));
+  const restaurantSlug = typeof req.body?.restaurantSlug === "string" ? req.body.restaurantSlug.trim().toLowerCase() : "";
+  const requestId = typeof req.body?.requestId === "string" ? req.body.requestId.trim() : "";
+  if (!riderId || !/^[a-z0-9][a-z0-9-]{1,118}$/.test(restaurantSlug) || !/^[A-Za-z0-9._:-]{8,80}$/.test(requestId)) {
+    return res.status(400).json({ error: "INVALID_LIVE_QA_DISPATCH_PAYLOAD" });
+  }
+  const scope = tenantScope(req);
+  const replay = await Order.findOne({ ...scope, isTestOrder: true, qaLiveDispatchRequestId: requestId }).lean().exec() as any;
+  if (replay) return res.status(200).json({ order: replay, qa: { mode: "live_rider_target", replay: true } });
+  const rider = await Rider.findOne({ _id: riderId, ...scope, isTestRider: { $ne: true } }).lean().exec() as any;
+  if (!rider) return res.status(404).json({ error: "LIVE_QA_RIDER_NOT_FOUND" });
+  const restaurant = await Restaurant.findOne({ ...scope, slug: restaurantSlug, isActive: true, onboardingStatus: "approved" })
+    .select("_id tenantId name location menu isActive onboardingStatus availabilityStatus marketplaceCompliance").lean().exec() as any;
+  if (!restaurant || !kitchenRestaurantCanOperate(restaurant)) return res.status(409).json({ error: "LIVE_QA_RESTAURANT_UNAVAILABLE" });
+  if (!validOperationalCoordinates(restaurant.location?.coordinates)) return res.status(409).json({ error: "LIVE_QA_RESTAURANT_LOCATION_UNAVAILABLE" });
+  if (rider.tenantId && restaurant.tenantId && String(rider.tenantId) !== String(restaurant.tenantId)) return res.status(409).json({ error: "LIVE_QA_TENANT_MISMATCH" });
+  const { publicCode, displayCode, displayCodeDate } = await createOrderCodes();
+  const coordinates = restaurant.location.coordinates;
+  const menuItem = Array.isArray(restaurant.menu) && restaurant.menu[0] ? restaurant.menu[0] : null;
+  const order = await Order.create({
+    tenantId: restaurant.tenantId || null, qaRiderId: rider._id, qaLiveRiderTarget: true, qaLiveDispatchRequestId: requestId,
+    isTestOrder: true, publicCode, displayCode, displayCodeDate, restaurantId: restaurant._id,
+    customerName: "PIKI QA · rider real", items: [{ itemId: String(menuItem?._id || "qa-live-dispatch"), name: String(menuItem?.name || "PRUEBA QA · NO PREPARAR"), quantity: 1, unitPriceCents: 0 }],
+    deliveryAddress: "SIMULACIÓN QA · No realizar entrega", deliveryNote: "Oferta QA dirigida a un Rider real. No recoger, no cobrar ni entregar. Eliminar al finalizar.",
+    pickupLocation: { type: "Point", coordinates: [...coordinates] }, deliveryLocation: { type: "Point", coordinates: [...coordinates] },
+    paymentMethod: "cash", paymentState: "pending", status: "ready_for_pickup", assignmentState: "unassigned",
+    partnerPaymentRequired: false, partnerPaymentCents: 0, paymentHoldCents: 0, paymentCapturedCents: 0,
+    subtotalCents: 0, deliveryFeeCents: 0, serviceFeeCents: 0, totalCents: 0, deliveryBaseFeeCents: 0,
+    outsideMunicipalitySurchargeCents: 0, creditAppliedCents: 0, couponAppliedCents: 0, riderEarningsCents: 0,
+    marketplaceCommissionRateBps: 0, marketplaceCommissionCents: 0, partnerPayoutCents: 0, platformNetBeforeProcessingCents: 0,
+    statusHistory: [{ status: "ready_for_pickup", actorRole: "admin", reason: `QA dirigida al Rider ${String(rider.riderCode || rider._id)}. Sin cobro, recogida ni entrega.` }],
+  });
+  const dispatch = await queueAutomaticDispatch(order._id as mongoose.Types.ObjectId, rider._id as mongoose.Types.ObjectId);
+  if (dispatch.state !== "offered") {
+    await Order.deleteOne({ _id: order._id, isTestOrder: true }).exec();
+    return res.status(409).json({ error: "LIVE_QA_RIDER_NOT_ELIGIBLE", dispatch });
+  }
+  await GovernanceAuditEvent.create({ tenantId: restaurant.tenantId || null, actorEmployeeId: req.auth?.employeeId || null, actorRole: req.auth?.role || "admin", action: "qa_live_rider_dispatch_created", targetType: "rider", targetId: rider._id, after: { orderId: String(order._id), publicCode, restaurantSlug, requestId, expiresAt: dispatch.expiresAt }, reason: "Prueba QA dirigida y temporal; sin cobro ni entrega." }).catch(() => undefined);
+  const current = await Order.findById(order._id).lean().exec();
+  return res.status(201).json({ order: current, qa: { mode: "live_rider_target", riderId: String(rider._id), expiresAt: dispatch.expiresAt, noCommercialSettlement: true } });
 });
 
 app.get("/api/v1/admin/qa/dispatch-orders/:id", requireRole("admin"), async (req, res) => {
