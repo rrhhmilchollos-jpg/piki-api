@@ -307,14 +307,16 @@ test("dispatch online P0: guarded real handlers, memory CAS and forbidden extern
     await reservation.releaseRiderOrderSlot(f.orderId, f.riderId);
     assert.equal(f.rider.status, "offline"); assert.equal(String(f.rider.activeOrderId), String(other)); assert.equal(f.controls.unlockWrites, 0);
   });
-  await t.test("busy assigned GPS after midnight updates telemetry, not status/slot/session TTL", async (s) => {
+  await t.test("busy assigned GPS after midnight refreshes stationary telemetry, not status/slot/session TTL", async (s) => {
     const f = fixture(s, true); f.order.assignmentState = "assigned"; f.order.status = "on_the_way";
     now = RealDate.parse("2026-11-13T23:30:00Z"); f.session.expiresAt = new Date(now + 3600_000); const expiry = f.session.expiresAt.toISOString();
+    const previousPoint = copy(f.rider.location); f.rider.lastLocationAt = new Date(now - 120_000);
     s.mock.method(mongoose, "startSession", async () => ({ withTransaction: async (fn: any) => fn(), endSession: async () => {} }) as any);
     s.mock.method(RiderShiftIncentiveMetric as any, "findOne", () => query(null));
     const req = { ...f.req, params: { id: String(f.riderId) }, body: { latitude: 38.990276, longitude: -0.521111 } };
     const r = response(); await handler("/api/v1/riders/:id/location")(req, r.res);
-    assert.equal(r.state.status, 200); assert.equal(f.rider.status, "busy"); assert.equal(f.session.expiresAt.toISOString(), expiry); assert.equal(f.slots[0].status, "active");
+    assert.equal(r.state.status, 200); assert.deepEqual(f.rider.location, previousPoint); assert.equal(new Date(f.rider.lastLocationAt).getTime(), now);
+    assert.equal(f.rider.status, "busy"); assert.equal(f.session.expiresAt.toISOString(), expiry); assert.equal(f.slots[0].status, "active");
     assert.equal(await policy.loadDispatchOnlineGuard(f.riderId, f.tenantId, 2, { phase: "accept", orderId: f.orderId }), null);
   });
   await t.test("GPS cannot resurrect offline or bypass revoked real session", async (s) => {
