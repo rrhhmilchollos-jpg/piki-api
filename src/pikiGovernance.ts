@@ -10,7 +10,7 @@ export type GovernanceActor = {
 export async function recordGovernanceEvent(input: {
   actor: GovernanceActor;
   action: string;
-  targetType: "restaurant" | "rider" | "employee" | "payout_batch" | "rider_payout_batch" | "rider_cash_settlement" | "system";
+  targetType: "restaurant" | "rider" | "employee" | "payout_batch" | "rider_payout_batch" | "rider_cash_settlement" | "rider_advance" | "system";
   targetId?: mongoose.Types.ObjectId | string | null;
   before?: unknown;
   after?: unknown;

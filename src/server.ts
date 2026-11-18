@@ -29,7 +29,7 @@ import { waitlistRouter } from "./waitlist.js";
 import express from "express";
 import mongoose from "mongoose";
 import { z } from "zod";
-import { CashLedgerEntry, CustomerAccount, DispatchDecision, DispatchOutbox, DocumentRequest, EmployeeAccount, AccessAuthorization, Fleet, Order, QA_RECEPTION_REQUEST_INDEX, Restaurant, PartnerAsset, PartnerLocalityGroup, MenuImportDraft, Rider, RiderApplication, PartnerLead, RiderLead, RiderIncident, RiderOrderMessage, RiderSlot, SignatureRequest, Zone, PushSubscription, RealtimeEvent, Notification, Tenant, TenantMembership, RiderAssignmentReservation, SupportTicket, OnboardingRequest, TrackingSession, RiderPayoutBatch, RiderCashSettlement, PartnerPayoutBatch, GovernanceAuditEvent, LocationSample, ensureIndexes } from "./models.js";
+import { CashLedgerEntry, CustomerAccount, DispatchDecision, DispatchOutbox, DocumentRequest, EmployeeAccount, AccessAuthorization, Fleet, Order, QA_RECEPTION_REQUEST_INDEX, Restaurant, PartnerAsset, PartnerLocalityGroup, MenuImportDraft, Rider, RiderApplication, PartnerLead, RiderLead, RiderIncident, RiderOrderMessage, RiderSlot, SignatureRequest, Zone, PushSubscription, RealtimeEvent, Notification, Tenant, TenantMembership, RiderAssignmentReservation, SupportTicket, OnboardingRequest, TrackingSession, RiderPayoutBatch, RiderAdvanceRequest, RiderCashSettlement, PartnerPayoutBatch, GovernanceAuditEvent, LocationSample, ensureIndexes } from "./models.js";
 import { RiderShiftIncentiveMetric } from "./riderIncentivesModels.js";
 import { normalizeLeadEmail, partnerLeadSubmissionSchema, riderLeadSubmissionSchema, webLeadReviewSchema, webLeadStatusSchema } from "./webLeads.js";
 import { assertTransition, calculateEtaRange, transitionSchema, validateCoordinates } from "./algorithms/index.js";
@@ -7938,6 +7938,82 @@ app.post("/api/v1/finance/payout-batches/:id/pay", requireRole("admin", "finance
   const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id); const parsed = z.object({ externalTransferId: z.string().trim().min(3).max(180), note: z.string().trim().max(1000).optional() }).safeParse(req.body);
   if (!id || !parsed.success) return res.status(400).json({ error: "INVALID_PAYOUT_EXECUTION", details: parsed.success ? undefined : parsed.error.flatten() });
   try { const batch = await markPartnerBatchPaid({ batchId: id, externalTransferId: parsed.data.externalTransferId, actor: { employeeId: req.auth?.employeeId, role: req.auth?.role, tenantId: (req.auth as any)?.tenantId }, note: parsed.data.note }); return res.json({ paid: true, batch }); } catch (error) { return res.status(409).json({ error: error instanceof Error ? error.message : "PAYOUT_EXECUTION_FAILED" }); }
+});
+function spanishAdvanceWindow(now = new Date()) {
+  const parts = new Intl.DateTimeFormat("en-GB", { timeZone: "Europe/Madrid", year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false }).formatToParts(now);
+  const value = (type: string) => Number(parts.find((part) => part.type === type)?.value || 0);
+  const year = value("year"); const month = value("month"); const day = value("day");
+  return { year, month, day, isOpen: day >= 1 && day <= 20, deadlineLabel: `${String(20).padStart(2, "0")}/${String(month).padStart(2, "0")}/${year} 23:59 (hora española)` };
+}
+const riderAdvanceRequestSchema = z.object({ riderId: z.string().regex(/^[a-f\d]{24}$/i), amountCents: z.number().int().positive(), note: z.string().trim().max(1000).default("") });
+const riderSelfAdvanceRequestSchema = z.object({ riderCode: z.string().trim().min(3).max(80), fullName: z.string().trim().min(3).max(180), email: z.string().trim().email().max(240), amountCents: z.number().int().positive(), note: z.string().trim().max(1000).default("") });
+app.post("/api/v1/riders/:id/advances", requireRole("rider"), async (req, res) => {
+  const riderId = objectId(String(req.params.id));
+  const parsed = riderSelfAdvanceRequestSchema.safeParse(req.body);
+  if (!riderId || !parsed.success) return res.status(400).json({ error: "INVALID_RIDER_ADVANCE_REQUEST", details: parsed.success ? undefined : parsed.error.flatten() });
+  if (!(await canAccessRiderShift(riderId, req))) return res.status(403).json({ error: "RIDER_ACCESS_DENIED" });
+  const rider = await Rider.findOne({ _id: riderId, ...tenantScope(req) }).select("_id riderCode name email tenantId").lean().exec() as any;
+  if (!rider) return res.status(404).json({ error: "RIDER_NOT_FOUND" });
+  const normalize = (value: unknown) => String(value || "").trim().toLocaleLowerCase("es-ES");
+  if (normalize(parsed.data.riderCode) !== normalize(rider.riderCode)) return res.status(422).json({ error: "RIDER_ID_MISMATCH", message: "El ID de Rider no coincide con la sesión iniciada." });
+  if (normalize(parsed.data.fullName) !== normalize(rider.name) || normalize(parsed.data.email) !== normalize(rider.email)) return res.status(422).json({ error: "RIDER_IDENTITY_MISMATCH", message: "El nombre y correo deben coincidir con tu perfil Rider." });
+  const window = spanishAdvanceWindow();
+  if (!window.isOpen) return res.status(422).json({ error: "ADVANCE_WINDOW_CLOSED", message: "Los anticipos solo pueden solicitarse hasta el día 20 a las 23:59 hora española." });
+  const tenant = tenantScope(req);
+  const [eligible] = await Order.aggregate([{ $match: { ...tenant, riderId, status: "delivered", paymentState: "paid", payoutStatus: { $in: ["pending", "eligible"] } } }, { $group: { _id: null, amountCents: { $sum: "$riderEarningsCents" } } }]);
+  const generatedSettlementCents = Number(eligible?.amountCents || 0);
+  const maximumAllowedCents = Math.floor(generatedSettlementCents * 0.70);
+  const previous = await RiderAdvanceRequest.aggregate([{ $match: { ...tenant, riderId, status: { $nin: ["rejected", "cancelled"] } } }, { $group: { _id: null, amountCents: { $sum: "$amountCents" } } }]);
+  const committedCents = Number(previous[0]?.amountCents || 0);
+  const availableCents = Math.max(0, maximumAllowedCents - committedCents);
+  if (parsed.data.amountCents > availableCents) return res.status(422).json({ error: "ADVANCE_LIMIT_EXCEEDED", message: `El anticipo no puede superar ${Math.floor(availableCents / 100).toLocaleString("es-ES", { style: "currency", currency: "EUR" })} disponible.` });
+  const idempotencyKey = `rider-self-advance:${String(riderId)}:${new Date().toISOString().slice(0, 10)}:${parsed.data.amountCents}`;
+  const request = await RiderAdvanceRequest.findOneAndUpdate({ idempotencyKey }, { $setOnInsert: { ...tenant, riderId, generatedSettlementCents, amountCents: parsed.data.amountCents, maximumAllowedCents, note: parsed.data.note, idempotencyKey, status: "requested" } }, { upsert: true, new: true, setDefaultsOnInsert: true }).lean().exec();
+  await recordGovernanceEvent({ actor: { employeeId: req.auth?.employeeId, role: req.auth?.role, tenantId: (req.auth as any)?.tenantId }, action: "rider_advance_requested", targetType: "rider_advance", targetId: (request as any)._id, after: { amountCents: parsed.data.amountCents, maximumAllowedCents, generatedSettlementCents }, reason: "Solicitud enviada por el Rider desde su perfil dentro del plazo y del límite del 70%." });
+  void publishRealtimeEvent({ channel: "admin", audienceKey: tenantAudienceKey((rider as any).tenantId, "admin"), tenantId: (rider as any).tenantId, type: "finance.rider_advance_requested", payload: { requestId: String((request as any)._id), riderId: String(riderId), amountCents: parsed.data.amountCents } }).catch(() => undefined);
+  return res.status(201).json({ submitted: true, request: { id: String((request as any)._id), riderId: String(riderId), status: (request as any).status, amountCents: (request as any).amountCents, requestedAt: (request as any).requestedAt } });
+});
+app.get("/api/v1/finance/rider-advances", requireRole("admin", "finance"), async (req, res) => {
+  const tenant = tenantScope(req); const window = spanishAdvanceWindow();
+  const [riders, generated] = await Promise.all([
+    Rider.find({ ...tenant, lifecycleStatus: { $nin: ["terminated", "suspended"] } }).select("_id riderCode name email fleetId employmentType workerType").sort({ name: 1 }).lean().exec() as any,
+    Order.aggregate([{ $match: { ...tenant, status: "delivered", paymentState: "paid", payoutStatus: { $in: ["pending", "eligible"] } } }, { $group: { _id: "$riderId", amountCents: { $sum: "$riderEarningsCents" }, orders: { $sum: 1 } } }]),
+  ]);
+  const riderIds = riders.map((rider: any) => rider._id);
+  const requests = await RiderAdvanceRequest.find({ ...tenant, riderId: { $in: riderIds } }).sort({ requestedAt: -1 }).limit(500).lean().exec() as any[];
+  const committed = new Map<string, number>();
+  for (const request of requests) if (!["rejected", "cancelled"].includes(request.status)) committed.set(String(request.riderId), (committed.get(String(request.riderId)) || 0) + Number(request.amountCents || 0));
+  const generatedMap = new Map(generated.map((row: any) => [String(row._id), { amountCents: Number(row.amountCents || 0), orders: Number(row.orders || 0) }]));
+  return res.json({ policy: { percentage: 70, cutoffDay: 20, timezone: "Europe/Madrid", isOpen: window.isOpen, deadlineLabel: window.deadlineLabel }, riders: riders.map((rider: any) => { const current = generatedMap.get(String(rider._id)) || { amountCents: 0, orders: 0 }; const maximumAllowedCents = Math.floor(current.amountCents * 0.70); const committedCents = committed.get(String(rider._id)) || 0; return { id: String(rider._id), riderCode: rider.riderCode || publicRiderCode(rider._id), name: rider.name, email: rider.email, workerType: rider.workerType || rider.employmentType || (rider.fleetId ? "fleet" : "autonomo"), generatedSettlementCents: current.amountCents, orders: current.orders, maximumAllowedCents, committedCents, availableCents: Math.max(0, maximumAllowedCents - committedCents) }; }), requests: requests.map((request: any) => ({ ...request, id: String(request._id), riderId: String(request.riderId) })) });
+});
+app.post("/api/v1/finance/rider-advances", requireRole("admin", "finance"), async (req, res) => {
+  const parsed = riderAdvanceRequestSchema.safeParse(req.body); if (!parsed.success) return res.status(400).json({ error: "INVALID_RIDER_ADVANCE", details: parsed.error.flatten() });
+  const window = spanishAdvanceWindow(); if (!window.isOpen) return res.status(422).json({ error: "ADVANCE_WINDOW_CLOSED", message: "Los anticipos solo pueden solicitarse hasta el día 20 a las 23:59 hora española." });
+  const riderId = objectId(parsed.data.riderId); if (!riderId) return res.status(400).json({ error: "INVALID_RIDER_ID" });
+  const tenant = tenantScope(req); const rider = await Rider.findOne({ _id: riderId, ...tenant }).select("_id name").lean().exec() as any; if (!rider) return res.status(404).json({ error: "RIDER_NOT_FOUND" });
+  const [eligible] = await Order.aggregate([{ $match: { ...tenant, riderId, status: "delivered", paymentState: "paid", payoutStatus: { $in: ["pending", "eligible"] } } }, { $group: { _id: null, amountCents: { $sum: "$riderEarningsCents" } } }]);
+  const generatedSettlementCents = Number(eligible?.amountCents || 0); const maximumAllowedCents = Math.floor(generatedSettlementCents * 0.70);
+  const previous = await RiderAdvanceRequest.aggregate([{ $match: { ...tenant, riderId, status: { $nin: ["rejected", "cancelled"] } } }, { $group: { _id: null, amountCents: { $sum: "$amountCents" } } }]);
+  const committedCents = Number(previous[0]?.amountCents || 0); const availableCents = Math.max(0, maximumAllowedCents - committedCents);
+  if (parsed.data.amountCents > availableCents) return res.status(422).json({ error: "ADVANCE_LIMIT_EXCEEDED", message: `El anticipo no puede superar ${Math.floor(maximumAllowedCents / 100).toLocaleString("es-ES", { style: "currency", currency: "EUR" })} ni el saldo disponible tras anticipos anteriores.` });
+  const idempotencyKey = `rider-advance:${String(riderId)}:${new Date().toISOString().slice(0, 10)}:${parsed.data.amountCents}`;
+  const request = await RiderAdvanceRequest.findOneAndUpdate({ idempotencyKey }, { $setOnInsert: { ...tenant, riderId, generatedSettlementCents, amountCents: parsed.data.amountCents, maximumAllowedCents, note: parsed.data.note, idempotencyKey, status: "requested" } }, { upsert: true, new: true, setDefaultsOnInsert: true }).lean().exec();
+  await recordGovernanceEvent({ actor: { employeeId: req.auth?.employeeId, role: req.auth?.role, tenantId: (req.auth as any)?.tenantId }, action: "rider_advance_requested", targetType: "rider_advance", targetId: (request as any)._id, after: { amountCents: parsed.data.amountCents, maximumAllowedCents, generatedSettlementCents }, reason: "Solicitud de anticipo dentro del plazo y del límite del 70%." });
+  return res.status(201).json({ request: { ...request, id: String((request as any)._id), riderId: String(riderId) } });
+});
+app.post("/api/v1/finance/rider-advances/:id/approve", requireRole("admin", "finance"), async (req, res) => {
+  const id = objectId(String(req.params.id)); if (!id) return res.status(400).json({ error: "INVALID_RIDER_ADVANCE_ID" });
+  const request = await RiderAdvanceRequest.findOneAndUpdate({ _id: id, ...tenantScope(req), status: "requested" }, { $set: { status: "approved", reviewedAt: new Date(), reviewedBy: objectId(String(req.auth?.employeeId || "")) } }, { new: true }).lean().exec();
+  if (!request) return res.status(409).json({ error: "RIDER_ADVANCE_NOT_REQUESTED" });
+  await recordGovernanceEvent({ actor: { employeeId: req.auth?.employeeId, role: req.auth?.role, tenantId: (req.auth as any)?.tenantId }, action: "rider_advance_approved", targetType: "rider_advance", targetId: id, after: request, reason: "Anticipo aprobado; el pago Stripe requiere ejecución financiera separada." });
+  return res.json({ approved: true, request });
+});
+app.post("/api/v1/finance/rider-advances/:id/reject", requireRole("admin", "finance"), async (req, res) => {
+  const id = objectId(String(req.params.id)); const reason = typeof req.body?.reason === "string" ? req.body.reason.trim().slice(0, 1000) : "Rechazado por Finanzas"; if (!id) return res.status(400).json({ error: "INVALID_RIDER_ADVANCE_ID" });
+  const request = await RiderAdvanceRequest.findOneAndUpdate({ _id: id, ...tenantScope(req), status: "requested" }, { $set: { status: "rejected", rejectionReason: reason, reviewedAt: new Date(), reviewedBy: objectId(String(req.auth?.employeeId || "")) } }, { new: true }).lean().exec();
+  if (!request) return res.status(409).json({ error: "RIDER_ADVANCE_NOT_REQUESTED" });
+  await recordGovernanceEvent({ actor: { employeeId: req.auth?.employeeId, role: req.auth?.role, tenantId: (req.auth as any)?.tenantId }, action: "rider_advance_rejected", targetType: "rider_advance", targetId: id, after: request, reason });
+  return res.json({ rejected: true, request });
 });
 app.post("/api/v1/finance/rider-payouts/prepare", requireRole("admin", "finance"), async (req, res) => {
   const parsed = z.object({ riderId: z.string().regex(/^[a-f\d]{24}$/i), startsAt: z.coerce.date(), endsAt: z.coerce.date() }).refine((value) => value.endsAt > value.startsAt, "INVALID_PAYOUT_PERIOD").safeParse(req.body);
