@@ -61,6 +61,7 @@ import { BUSINESS_SUMMARY_RECIPIENT, sendDailyBusinessSummary } from "./dailyBus
 import { corporateEmailConfiguration, corporateEmailDepartmentForRole, escapeCorporateHtml, sendCorporateEmail, sendLeadContactEmail, verifyCorporateEmailConnection } from "./corporateEmail.js";
 import { activeOperationalOrderStatuses, dispatchableOrderStatuses, dispatchablePaymentFilter, isDispatchableOrderStatus, isDispatchablePayment, partnerKitchenPaymentFilter } from "./dispatchEligibility.js";
 import { canReceivePartnerLocations, partnerCan, partnerPermissions, partnerRolesForEmployee, permissionsForPartnerRoles, type PartnerPermission } from "./partnerAccess.js";
+import { registerPartnerTerminalInventoryRoutes } from "./partnerTerminalInventory.js";
 import { KitchenAccessError, kitchenBindingForEmployee, kitchenRestaurantCanOperate, registerPartnerKitchenAccessRoutes, validateKitchenActivation, type KitchenAccessDependencies } from "./partnerKitchenAccess.js";
 import { assignedRestaurantIds, partnerAccessForRequest as sharedPartnerAccessForRequest, partnerRequestAccess as sharedPartnerRequestAccess, partnerReadinessReason, requirePartnerSurface } from "./partnerOperationalAccess.js";
 import { awardRiderRecruitmentMilestones, claimRiderReferralCode, completeRiderShiftIncentiveTracking, incentiveProgramStatus, loadRiderIncentiveSnapshot, trackRiderLocationForIncentive, trackRiderShiftStart } from "./riderIncentives.js";
@@ -1363,6 +1364,10 @@ const kitchenAccessDependencies: KitchenAccessDependencies = {
   sendActivation: async (employee) => (await sendEmployeePasswordLink(employee, "partner", "activation")).delivery,
 };
 registerPartnerKitchenAccessRoutes(app, kitchenAccessDependencies);
+registerPartnerTerminalInventoryRoutes(app, {
+  ownerMiddleware: requireOwner(),
+  restaurantScope: (req, id) => ({ _id: objectId(id), ...tenantScope(req) }),
+});
 registerOwnerOperatingTenantRoutes(app, {
   requireOwner, resolveAuth: resolveRole, objectId,
   employees: EmployeeAccount.collection, tenants: Tenant.collection,

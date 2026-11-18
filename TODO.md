@@ -10,3 +10,13 @@ Trabajo local sobre `feat/profile-identities-and-rider-tracking-20261113`, base 
 - [x] **Validación offline y entrega.** Pruebas de políticas puras, modelos y contratos mockeados mediante `scripts/offline-validation.mjs`, tests/check/build sin red, DB ni boot real. Entregar resumen de diff, archivos y resultados exactos, indicando límites de la evidencia offline. Mantener permisos y versión API.
 
 Evidencia local: pruebas nuevas 85/85; suite completa offline 1289 tests, 1288 pass, 0 fail, 1 skipped; check TypeScript sin diagnósticos y build API/worker exitoso. `express.json` ya tiene límite `20mb`, sin modificaciones. No se arrancó la API ni se hicieron operaciones reales de DB, HTTP, autenticación, correo, pagos o producción. `PATCH` Owner de nombres acepta sólo `firstName`/`lastName` (nullable para retirar estructura); la edición operativa existente permanece intacta. Tracking interno exige `?customerId=<titular>` además del secreto; tRPC usa exclusivamente el titular autenticado. Avatares legacy no raster/no verificables se omiten, nunca se buscan en documentos. GPS conserva 90s tRPC/120s interno y chat conserva sus gates actuales de entrega, sin exigir una frescura nueva.
+
+## Inventario privado de PDAs Partner · 18 noviembre 2026
+
+- [ ] Registrar unidades físicas por establecimiento mediante rutas protegidas del propietario, sin publicar S/N ni IMEI en GitHub.
+- [ ] Normalizar S/N y evitar duplicados o reasignaciones silenciosas; reintentos idénticos deben conservar el mismo registro.
+- [ ] No confundir el inventario con enrolamiento, restricción autoritativa de una sesión multitienda o quiosco activo. Estado inicial: configuración física pendiente, quiosco sin verificar.
+- [ ] Mantener intactos cuentas, permisos, cartas, tarifas, acuerdos comerciales de PDA, horarios y estados de comercios.
+- [ ] Validar TypeScript y pruebas de alcance, permisos, formato y minimización de identificadores.
+- [ ] Tras despliegue, guardar únicamente las dos asignaciones que ha confirmado el propietario.
+- [ ] Enrolamiento/restricción física y quiosco: pendientes de acceso legítimo a gestión Sunmi/DPC y salida administrativa recuperable; no bypass, root ni borrado.
