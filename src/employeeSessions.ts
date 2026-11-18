@@ -85,10 +85,21 @@ export function sessionRole(employee: { email: string; apiRole: string; roles?: 
   return permitted[surface] && !permitted[surface].includes(selectedRole) ? null : selectedRole;
 }
 
+export class RiderAccountNotLinkedError extends Error {
+  readonly code = "RIDER_ACCOUNT_NOT_LINKED" as const;
+  constructor() {
+    super("Esta cuenta no está vinculada a un Rider de su organización. Contacta con Administración.");
+    this.name = "RiderAccountNotLinkedError";
+  }
+}
+
 export async function issueEmployeeSession(employee: any, surface: string, requestedRole?: string) {
   const role = sessionRole(employee, surface, requestedRole);
   const tenantId = frozenTenantId(employee?.tenantId);
   if (!role || !canIssueEmployeeSession(employee) || (!tenantId && role !== "admin")) return null;
+  if (role === "rider" && !(await Rider.exists({ email: employee.email, ...buildTenantScope(tenantId) }))) {
+    throw new RiderAccountNotLinkedError();
+  }
   const token = createSessionToken();
   const now = new Date();
   const expiresAt = new Date(now.getTime() + (role === "rider" ? RIDER_SESSION_IDLE_TTL_MS : SESSION_TTL_MS));

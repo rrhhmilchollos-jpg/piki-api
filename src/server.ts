@@ -40,7 +40,7 @@ import { mountStripeRoutes, mountStripeWebhook } from "./stripeRoutes.js";
 import { mountShiftRoutes } from "./shiftRoutes.js";
 import { shiftSweepWorkerStatus, startShiftSweepWorker } from "./shiftSweepWorker.js";
 import { startCodHoldSweepWorker, stopCodHoldSweepWorker } from "./codHoldSweepWorker.js";
-import { EmployeeSession, issueEmployeeSession, revokeEmployeeSessions, sessionRole } from "./employeeSessions.js";
+import { EmployeeSession, RiderAccountNotLinkedError, issueEmployeeSession, revokeEmployeeSessions, sessionRole } from "./employeeSessions.js";
 import { isStripeSignatureError, processStripeWebhook, stripeConfigured, createSignaturitSignature, signaturitBaseUrl, signaturitConfigured, signaturitMode, signatureWebhookUrl, webhookDigest, handleCustomerTrpc, currentCustomer, issueCustomerSession, setCustomerOrderDispatcher } from "./integrations/index.js";
 import { getVersionPolicy, isPikiSurface, requiresUpdate, setVersionPolicy, syncVersionPolicy, versionPolicySchema, type PikiSurface } from "./appVersion.js";
 import { fcmPushConfigured, probeFcmCredentials, pushConfigured, publicPushConfig, revokePushSubscription, saveFcmSubscription, savePushSubscription, sendPushToOwner, type PushDeliveryReport } from "./push.js";
@@ -1250,7 +1250,12 @@ app.post("/api/v1/auth/employee/login", async (req, res) => {
   const requestedRole = parsed.data.role;
   const role = sessionRole(employee, surface, requestedRole);
   if (!role) return res.status(403).json({ error: "SURFACE_ROLE_MISMATCH", message: "Esta cuenta no tiene acceso a esta aplicación." });
-  const issued = await issueEmployeeSession(employee, surface, requestedRole);
+  let issued;
+  try { issued = await issueEmployeeSession(employee, surface, requestedRole); }
+  catch (error) {
+    if (error instanceof RiderAccountNotLinkedError) return res.status(403).json({ error: error.code, message: error.message });
+    throw error;
+  }
   if (!issued) return res.status(403).json({ error: "SURFACE_ROLE_MISMATCH" });
   return res.json({ accessToken: issued.token, sessionExpiresAt: issued.expiresAt.toISOString(), requiresPasswordChange: Boolean(employee.mustChangePassword), employee: { id: employee.id, employeeCode: employee.employeeCode || employeeCodeFor(employee._id), name: employee.name, email: employee.email, jobRole: role === "rider" ? "rider" : employee.jobRole, roles: employee.roles?.length ? employee.roles : [employee.apiRole], primaryRole: employee.primaryRole || employee.apiRole, apiRole: issued.role, accessLevel: employee.accessLevel || (employee.email === ownerEmail ? "superadmin" : "subadmin"), authorizationStatus: employee.authorizationStatus || "approved", portfolioId: employee.portfolioId, fleetId: employee.fleetId, zoneSlugs: employee.zoneSlugs } });
 });
@@ -1260,7 +1265,12 @@ app.post("/api/v1/auth/employee/switch-role", requireRole("admin", "partner", "r
   const employee = req.auth?.employeeId ? await EmployeeAccount.findOne({ _id: req.auth.employeeId, ...tenantScope(req) }).select("email tenantId accessLevel apiRole roles primaryRole ownerProtected authorizationStatus").lean().exec() as any : null;
   if (!employee || !requestedRole) return res.status(400).json({ error: "INVALID_ROLE" });
   const surface = String(req.headers["x-piki-surface"] || "admin").toLowerCase();
-  const issued = await issueEmployeeSession(employee, surface, requestedRole);
+  let issued;
+  try { issued = await issueEmployeeSession(employee, surface, requestedRole); }
+  catch (error) {
+    if (error instanceof RiderAccountNotLinkedError) return res.status(403).json({ error: error.code, message: error.message });
+    throw error;
+  }
   if (!issued) return res.status(403).json({ error: "ROLE_NOT_ALLOWED" });
   const oldToken = String(req.headers.authorization || "").replace(/^Bearer /i, "").trim();
   if (oldToken) await EmployeeSession.deleteOne({ tokenHash: hashSessionToken(oldToken) }).exec();
