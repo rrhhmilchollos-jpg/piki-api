@@ -506,7 +506,9 @@ async function fleetRiderFilter(req: express.Request): Promise<Record<string, un
 async function fleetCanAccessRider(req: express.Request, riderId: mongoose.Types.ObjectId | null) {
   if (!riderId) return false;
   const employee = await employeeScope(req);
-  return Boolean(await Rider.exists({ _id: riderId, ...buildFleetEntityScope({ tenantId: req.auth?.tenantId, role: req.auth?.role, fleetId: employee?.fleetId }) }));
+  // Fleet puede operar sus riders y reclamar los que aún no pertenecen a
+  // ninguna flota dentro del mismo tenant. Nunca puede ver los de otra flota.
+  return Boolean(await Rider.exists({ _id: riderId, ...buildFleetRiderPickerScope({ tenantId: req.auth?.tenantId, role: req.auth?.role, fleetId: employee?.fleetId }) }));
 }
 /**
  * Returns the only valid persisted ownership filter for a Rider resource.
