@@ -3938,7 +3938,7 @@ async function documentRequestSubject(subjectType: DocumentRequestSubjectType, s
   return subject ? { id: subject._id as mongoose.Types.ObjectId, tenantId: subject.tenantId || null, recipientName: String(subject.name || "Comercio"), recipientEmail: String(subject.email || "").toLowerCase(), hasProfile: Boolean(subject.partnerProfile) } : null;
 }
 function publicDocumentRequestResponse(request: any) {
-  return { request: { id: String(request._id), recipientName: request.recipientName, message: request.message, requirements: (request.requirements || []).map((item: any) => ({ type: item.type, inputMode: item.inputMode || "file", label: item.label, description: item.description || "" })), dueAt: request.dueAt || null, expiresAt: request.expiresAt, status: request.status, uploadedTypes: [...new Set((request.documents || []).map((item: any) => item.type))] } };
+  return { request: { id: String(request._id), recipientName: request.recipientName, message: request.message, requirements: (request.requirements || []).map((item: any) => ({ type: item.type, inputMode: item.inputMode || "file", label: item.label, description: item.description || "" })), dueAt: request.dueAt || null, expiresAt: request.expiresAt, status: request.status, uploadedTypes: [...new Set((request.documents || []).map((item: any) => item.type))], formResponses: (request.formResponses || []).map((response: any) => ({ type: String(response.type), value: String(response.value || "") })) } };
 }
 async function openDocumentRequest(rawToken: string) {
   if (!/^[A-Za-z0-9_-]{40,100}$/.test(rawToken)) return null;
