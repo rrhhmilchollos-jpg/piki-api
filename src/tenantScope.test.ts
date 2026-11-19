@@ -58,7 +58,7 @@ test("Fleet Rider picker includes its assigned fleet and unassigned Riders only 
   const { buildFleetRiderPickerScope } = await import("./tenantScope.js");
   assert.deepEqual(buildFleetRiderPickerScope({ tenantId: tenantA, role: "fleet", fleetId: fleetA }), {
     tenantId: tenantA,
-    $or: [{ fleetId: fleetA }, { fleetId: null }],
+    $or: [{ fleetId: fleetA }, { fleetId: fleetA.toString() }, { fleetId: null }, { fleetId: { $exists: false } }],
   });
   assert.deepEqual(buildFleetRiderPickerScope({ tenantId: tenantA, role: "fleet" }), { _id: null });
   assert.deepEqual(buildFleetRiderPickerScope({ tenantId: "invalid", role: "fleet", fleetId: fleetA }), { _id: null });

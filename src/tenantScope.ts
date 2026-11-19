@@ -109,5 +109,8 @@ export function buildFleetRiderPickerScope({ tenantId, role, fleetId }: FleetEnt
   const tenant = buildTenantScope(tenantId);
   if (role !== "fleet") return tenant;
   if (!isObjectIdLike(tenantId) || !isObjectIdLike(fleetId)) return denyTenantScope();
-  return { ...tenant, $or: [{ fleetId }, { fleetId: null }] };
+  // Include records written by older releases where fleetId was serialized as
+  // a string or the field was omitted. The tenant predicate remains mandatory.
+  const fleetValue = String(fleetId);
+  return { ...tenant, $or: [{ fleetId }, { fleetId: fleetValue }, { fleetId: null }, { fleetId: { $exists: false } }] };
 }

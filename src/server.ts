@@ -1616,22 +1616,40 @@ app.patch("/api/v1/admin/employees/:id/authorization", requireOwner(), async (re
   }
   if (!isPartnerEmployee(effectiveTarget) && (parsed.data.partnerRoles || parsed.data.restaurantIds)) return res.status(400).json({ error: "PARTNER_ROLE_REQUIRED" });
   const employee = await EmployeeAccount.findByIdAndUpdate(id, { $set: update }, { new: true }).select("name email tenantId jobRole apiRole roles primaryRole partnerRoles restaurantId restaurantIds accessLevel authorizationStatus authorizedAt authorizedBy authorizationReason fleetId zoneSlugs active mustChangePassword").lean().exec() as any;
+  let riderBindingSynced = false;
+  const riderRole = target.jobRole === "rider" || target.apiRole === "rider" || target.roles?.includes("rider") || effectiveTarget.jobRole === "rider" || effectiveTarget.apiRole === "rider";
+  if (employee && riderRole && (parsed.data.fleetId !== undefined || parsed.data.status !== "approved")) {
+    const riderResult = await Rider.updateOne(
+      { email: String(employee.email).trim().toLowerCase(), ...(target.tenantId ? { tenantId: target.tenantId } : {}) },
+      { $set: { tenantId: employee.tenantId || null, fleetId: employee.fleetId || null, status: "offline", lifecycleStatus: employee.active ? "active" : "suspended" } },
+    ).exec();
+    riderBindingSynced = riderResult.matchedCount > 0 || riderResult.modifiedCount > 0;
+  }
   await AccessAuthorization.create({ employeeId: id, action: parsed.data.apiRole || parsed.data.jobRole || parsed.data.roles || parsed.data.partnerRoles || parsed.data.restaurantIds || parsed.data.fleetId !== undefined ? "role_changed" : parsed.data.status, previousStatus: target.authorizationStatus || null, nextStatus: parsed.data.status, previousRole: JSON.stringify({ apiRole: target.apiRole, roles: target.roles || [], partnerRoles: target.partnerRoles || [], restaurantIds: assignedRestaurantIds(target), fleetId: target.fleetId || null, tenantId: target.tenantId || null }), nextRole: JSON.stringify({ apiRole: employee.apiRole, roles: employee.roles || [], partnerRoles: employee.partnerRoles || [], restaurantIds: assignedRestaurantIds(employee), fleetId: employee.fleetId || null, tenantId: employee.tenantId || null }), accessLevel: employee.accessLevel || "subadmin", actorEmployeeId: objectId(req.auth!.employeeId!), reason: parsed.data.reason });
   if (accessChanged) await revokeEmployeeSessions(id);
-  return res.json({ employee, authorization: { status: parsed.data.status, persisted: true } });
+  return res.json({ employee, riderBindingSynced, authorization: { status: parsed.data.status, persisted: true } });
 });
 
 app.patch("/api/v1/admin/employees/:id/active", requireOwner(), async (req, res) => {
   const id = objectId(Array.isArray(req.params.id) ? req.params.id[0] : req.params.id); if (!id) return res.status(400).json({ error: "INVALID_EMPLOYEE_ID" });
   const parsed = z.object({ active: z.boolean(), reason: z.string().max(500).default("") }).safeParse(req.body); if (!parsed.success) return res.status(400).json({ error: "INVALID_ACTIVE_STATE" });
-  const target = await EmployeeAccount.findById(id).select("email ownerProtected jobRole apiRole accessLevel authorizationStatus").lean().exec() as any;
+  const target = await EmployeeAccount.findById(id).select("email ownerProtected jobRole apiRole roles accessLevel authorizationStatus tenantId fleetId").lean().exec() as any;
   if (!target) return res.status(404).json({ error: "EMPLOYEE_NOT_FOUND" });
   if (target.ownerProtected || target.email === ownerEmail) return res.status(403).json({ error: "OWNER_ACCOUNT_PROTECTED" });
   const nextStatus = parsed.data.active ? "approved" : "suspended";
   const employee = await EmployeeAccount.findByIdAndUpdate(id, { $set: { active: parsed.data.active, authorizationStatus: nextStatus, authorizedAt: parsed.data.active ? new Date() : null, authorizedBy: req.auth?.employeeId ? objectId(req.auth.employeeId) : null, authorizationReason: parsed.data.reason, ...(parsed.data.active ? {} : { sessionHash: null }) } }, { new: true }).select("name email jobRole apiRole accessLevel authorizationStatus active mustChangePassword").lean().exec() as any;
+  const riderRole = target.jobRole === "rider" || target.apiRole === "rider" || target.roles?.includes("rider");
+  let riderBindingSynced = false;
+  if (employee && riderRole) {
+    const riderResult = await Rider.updateOne(
+      { email: String(employee.email).trim().toLowerCase(), ...(target.tenantId ? { tenantId: target.tenantId } : {}) },
+      { $set: { tenantId: target.tenantId || null, fleetId: target.fleetId || null, status: "offline", lifecycleStatus: parsed.data.active ? "active" : "suspended" } },
+    ).exec();
+    riderBindingSynced = riderResult.matchedCount > 0 || riderResult.modifiedCount > 0;
+  }
   await AccessAuthorization.create({ employeeId: id, action: nextStatus, previousStatus: target.authorizationStatus || null, nextStatus, previousRole: target.apiRole, nextRole: employee?.apiRole || target.apiRole, accessLevel: employee?.accessLevel || target.accessLevel || "subadmin", actorEmployeeId: objectId(req.auth!.employeeId!), reason: parsed.data.reason });
   if (!parsed.data.active) await revokeEmployeeSessions(id);
-  return res.json({ employee });
+  return res.json({ employee, riderBindingSynced });
 });
 app.post("/api/v1/admin/owner/bootstrap", requireOwner(), async (req, res) => {
   const parsed = z.object({ email: z.literal(ownerEmail), password: z.string().min(8).max(200), name: z.string().min(2).max(160).default("Propietario y CEO de PIKI") }).safeParse(req.body);
