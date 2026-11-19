@@ -3,7 +3,7 @@ services:
     name: piki-api
     runtime: docker
     region: frankfurt
-    plan: starter
+    plan: 2c-4g
     dockerfilePath: ./Dockerfile
     healthCheckPath: /ready
     autoDeploy: true
