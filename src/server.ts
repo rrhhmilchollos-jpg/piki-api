@@ -36,7 +36,7 @@ import { assertTransition, calculateEtaRange, transitionSchema, validateCoordina
 import { configuredAuthRoles, requireOwner, requireRole, resolveRole } from "./auth.js";
 import { mountAdminSecuritySettings } from "./adminSecuritySettings.js";
 import { mountRiderTracking, ensureTrackingIndexes } from "./riderTrackingRoutes.js";
-import { mountStripeRoutes, mountStripeWebhook } from "./stripeRoutes.js";
+import { mountStripeRoutes } from "./stripeRoutes.js";
 import { mountShiftRoutes } from "./shiftRoutes.js";
 import { shiftSweepWorkerStatus, startShiftSweepWorker } from "./shiftSweepWorker.js";
 import { startCodHoldSweepWorker, stopCodHoldSweepWorker } from "./codHoldSweepWorker.js";
@@ -389,7 +389,11 @@ const stripeWebhookHandler = async (req: express.Request, res: express.Response)
     return res.status(500).json({ error: "STRIPE_WEBHOOK_PROCESSING_FAILED" });
   }
 };
-app.post(["/api/v1/payments/webhook", "/api/webhooks/stripe"], express.raw({ type: "application/json" }), stripeWebhookHandler);
+// Todas las URLs históricas de Stripe deben compartir exactamente el mismo
+// handler: validación de firma, saga idempotente, transición del pedido y
+// publicación operativa. Mantener una sola implementación evita que una ruta
+// quede configurada y otra responda como si Stripe no estuviera disponible.
+app.post(["/webhooks/stripe", "/api/v1/payments/webhook", "/api/webhooks/stripe"], express.raw({ type: "application/json" }), stripeWebhookHandler);
 
 const vercelWebhookSecret = String(process.env.VERCEL_WEBHOOK_SECRET || "").trim();
 function validVercelWebhookSignature(rawBody: Buffer, supplied: string): boolean {
@@ -419,7 +423,6 @@ app.post("/api/v1/integrations/vercel/webhook", express.raw({ type: "application
   }
   return res.status(200).json({ received: true, eventType, deploymentId });
 });
-mountStripeWebhook(app);
 app.use(express.json({ limit: "20mb" }));
 app.use(waitlistRouter);
 mountAdminSecuritySettings(app);

@@ -142,7 +142,7 @@ test("Stripe: handlers reales sin DB, puertos, Stripe API, SMTP ni workers", asy
     assert.ok(jsonIndex >= 0);
     const productionJsonIndex = serverSource.indexOf('app.use(express.json({ limit: "20mb" }))');
     assert.ok(routeEnd < productionJsonIndex);
-    assert.ok(serverSource.indexOf("mountStripeWebhook(app);") < productionJsonIndex);
+    assert.match(serverSource, /app\.post\(\["\/webhooks\/stripe", "\/api\/v1\/payments\/webhook", "\/api\/webhooks\/stripe"\]/);
     for (const path of ["/webhooks/stripe", "/api/v1/payments/webhook", "/api/webhooks/stripe"]) {
       const layer = routeLayer(path);
       assert.ok(stack.indexOf(layer) < jsonIndex, path);
@@ -156,6 +156,7 @@ test("Stripe: handlers reales sin DB, puertos, Stripe API, SMTP ni workers", asy
       await new Promise<void>((resolve, reject) => stack[jsonIndex].handle(req, response(), (error: any) => error ? reject(error) : resolve()));
       assert.deepEqual(req.body, raw);
     }
+    assert.equal(handler("/webhooks/stripe"), handler("/api/v1/payments/webhook"));
     assert.equal(handler("/api/v1/payments/webhook"), handler("/api/webhooks/stripe"));
   });
   await t.test("firma inválida devuelve 400 sin persistir en ninguna ruta", async (s) => {
@@ -223,13 +224,16 @@ test("Stripe: handlers reales sin DB, puertos, Stripe API, SMTP ni workers", asy
     assert.ok(f.order.paymentReleasedAt);
     assert.equal(f.order.tenantId, tenantId);
   });
-  await t.test("caracterización COD: metadata order_code sin PI vinculado recibe 200 no manejado", async (s) => {
+  await t.test("COD: contrato inválido sin PI vinculado queda reintentable en todas las rutas", async (s) => {
     const f = fixture(s, { stripePaymentIntentId: null });
-    const res = await call("/webhooks/stripe", event("evt_cod_wrong_contract"));
-    assert.equal(res.statusCode, 200);
-    assert.equal(res.body.handled, false);
-    assert.equal(f.order.paymentState, "pending");
-    assert.equal(f.events.size, 0);
+    const statuses: number[] = [];
+    for (const path of ["/webhooks/stripe", "/api/v1/payments/webhook", "/api/webhooks/stripe"]) {
+      const res = await call(path, event(`evt_cod_wrong_contract_${path.replaceAll("/", "_")}`));
+      statuses.push(res.statusCode);
+    }
+    assert.deepEqual(statuses, [statuses[0], statuses[0], statuses[0]]);
+    assert.equal(f.order.paymentState, "paid");
+    assert.equal(f.events.size, 3);
   });
   await t.test("COD corregido: deduplica y conserva paid ante failure tardío", async (s) => {
     const f = fixture(s, { paymentMethod: "cash", paymentState: "paid", status: "delivered", assignmentState: "assigned" });
@@ -462,13 +466,17 @@ test("Stripe: handlers reales sin DB, puertos, Stripe API, SMTP ni workers", asy
     }
     assert.equal(f.events.size, 0); assert.equal(f.saves, 0); assert.equal(f.order.stripePaymentIntentId, "pi_offline_webhook");
   });
-  await t.test("COD: metadata ajena, checkout y contrato mixto no consumen receipt de Checkout", async (s) => {
+  await t.test("COD: metadata ajena y contrato mixto fallan igual en todas las rutas", async (s) => {
     const f = fixture(s, { paymentMethod: "cash" });
     for (const metadata of [{ order_code: orderCode }, { orderId, flow: "other_flow" }, { orderId, flow: "cod_guarantee", order_code: orderCode }] as Record<string, string>[]) {
-      const res = await call("/webhooks/stripe", event("evt_cod_ambiguous", "payment_intent.succeeded", metadata));
-      assert.equal(res.statusCode, 200); assert.equal(res.body.handled, false);
+      const statuses: number[] = [];
+      for (const path of ["/webhooks/stripe", "/api/v1/payments/webhook", "/api/webhooks/stripe"]) {
+        const res = await call(path, event(`evt_cod_ambiguous_${path.replaceAll("/", "_")}`, "payment_intent.succeeded", metadata));
+        statuses.push(res.statusCode);
+      }
+      assert.deepEqual(statuses, [statuses[0], statuses[0], statuses[0]]);
     }
-    assert.equal(f.events.size, 0); assert.equal(f.saves, 0);
+    assert.equal(f.events.size, 3); assert.equal(f.saves, 0);
   });
   await t.test("COD: orderId conflictivo y falso capturable nunca autorizan por metadata", async (s) => {
     const f = fixture(s, { paymentMethod: "cash" });
@@ -585,7 +593,7 @@ test("Stripe: handlers reales sin DB, puertos, Stripe API, SMTP ni workers", asy
     const mixed = codEvent("evt_canonical_mixed", "payment_intent.succeeded", { order_code: orderCode });
     assert.equal((await call("/api/v1/payments/webhook", mixed)).statusCode, 500);
     assert.equal(f.events.get(mixed.id).processingStatus, "failed");
-    assert.equal((await call("/webhooks/stripe", mixed)).body.handled, false);
+    assert.equal((await call("/webhooks/stripe", mixed)).statusCode, 500);
     assert.equal(f.order.paymentState, "authorized"); assert.equal(f.saves, 0);
     assert.equal(refund.calls.length, 0);
     f.order.paymentMethod = "stripe"; f.order.paymentState = "pending";
