@@ -149,6 +149,26 @@ test("contratos de catálogo y carta con handlers reales, consultas en memoria y
     assert.equal(writes.length, 0);
   });
 
+  await t.test("horario cerrado sincroniza catálogo, quote y checkout y no crea pedidos", async (child) => {
+    child.mock.method(CustomerAccount as any, "findOne", () => query({ _id: employeeId, pikiCreditsCents: 0 }));
+    const regular = Object.fromEntries(["lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo"].map((day) => [day, []]));
+    stored = fixture({ partnerProfile: { openingHours: { timeZone: "Europe/Madrid", regular, overrides: [] } } });
+    const restCatalog = await call("get", "/api/v1/catalog/restaurants", { query: {} });
+    assert.equal(restCatalog.body.restaurants[0].canOrder, false);
+    assert.equal(restCatalog.body.restaurants[0].isOpen, false);
+    const catalog = await trpc("catalog.byId", { id: restaurantId });
+    assert.equal(catalog.body.result.data.json.canOrder, false);
+    assert.equal(catalog.body.result.data.json.isOpen, false);
+    const input = { restaurantId, items: [{ id: "dish", quantity: 1 }], deliveryLocation: { latitude: 38.990276, longitude: -0.521111 }, paymentMethod: "stripe" };
+    const quote = await trpc("order.quote", input);
+    assert.notEqual(quote.statusCode, 200);
+    assert.equal(quote.body.error.json.data.code, "PARTNER_CLOSED");
+    const checkout = await trpc("order.checkout", input);
+    assert.notEqual(checkout.statusCode, 200);
+    assert.equal(checkout.body.error.json.data.code, "PARTNER_CLOSED");
+    assert.equal(writes.length, 0);
+  });
+
   await t.test("perfil válido prevalece incluso sobre slug legacy; inválido conserva defaults", () => {
     assert.equal(customerCommissionRate({ slug: "alibaba-kebab-xativa", partnerProfile: { commissionRateBps: 1800 } }), 0.18);
     assert.equal(customerCommissionRate({ slug: "alibaba-kebab-xativa" }), 0.18);

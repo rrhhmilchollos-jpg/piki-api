@@ -29,7 +29,7 @@ async function roundtrip(input: unknown, allowed = true) {
   const context = {
     openingHoursSchema,
     pikiManagedOpeningHours: helper("pikiManagedOpeningHours", { normalizeOpeningHours, legacyOpeningHoursProjection }),
-    partnerIsOpenNow: helper("partnerIsOpenNow", {}),
+    partnerIsOpenNow: helper("partnerIsOpenNow", { restaurantIsWithinOpeningHours }),
     partnerRequestAccess: async () => ({ allowed, access: { restaurantIds: [row._id] } }), employeeRestaurant: async () => row._id,
     tenantScope: () => ({ tenantId: "64b000000000000000000002" }),
     partnerTenantScope: () => ({ tenantId: "64b000000000000000000002" }),
@@ -76,9 +76,9 @@ test("hours permissions and invalid inputs still prevent any mocked write", asyn
   const denied = await roundtrip({}, false); assert.equal(denied.status, 403); assert.equal(denied.writes, 0);
 });
 
-test("Customer/checkout legacy 24h policy remains unchanged by split schedule normalization", () => {
+test("Customer y checkout aplican horario normalizado; el estado legacy cerrado no abre", () => {
   const hours = openingHoursSchema.parse({ lunes: { open: "10:00", close: "14:00", closed: true } });
   const now = new Date("2026-11-09T16:30:00Z");
   assert.equal(evaluateOpeningHours(hours, now).open, false);
-  assert.equal(restaurantIsWithinOpeningHours(hours, now), true);
+  assert.equal(restaurantIsWithinOpeningHours(hours, now), false);
 });

@@ -1,5 +1,6 @@
 import { isCashPaymentEnabledForRestaurant } from "./paymentPolicy.js";
-import { customerAvailability, CUSTOMER_OPERATING_24_7 } from "./customerAvailability.js";
+import { customerAvailability } from "./customerAvailability.js";
+import { evaluateOpeningHours } from "./openingHours.js";
 import { modifierGroupsForItem } from "./menuModifiers.js";
 
 export const COMING_SOON_SLUGS = ["eleven-burgers-xativa", "nakama-sushi-xativa", "kazoku-xativa", "kazoku-algemesi"] as const;
@@ -26,10 +27,9 @@ export function isPublishedCustomerPartner(restaurant: any): boolean {
     && (restaurant.listingType === undefined || restaurant.listingType === "official_partner" || restaurant.listingType === "restaurant");
 }
 export function restaurantIsWithinOpeningHours(openingHours: unknown, now = new Date()): boolean {
-  // This helper is shared by the customer catalogue and checkout guard.
-  // Keep the partner schedule for operations, but never reject a customer
-  // order because of it while PIKI runs in 24/7 customer mode.
-  return CUSTOMER_OPERATING_24_7;
+  // Single source of truth for customer catalog, quote, and order gates.
+  // Missing/empty schedules retain legacy compatibility; malformed schedules fail closed.
+  return evaluateOpeningHours(openingHours, now).open;
 }
 export function customerCatalogRestaurantName(restaurant: { name: string; slug?: string }) { return restaurant.name; }
 export function presentCustomerCatalogRestaurant<T extends { name: string; slug?: string; listingType?: string; goldFounder?: boolean; menu?: any[]; priceIncludesCommission?: boolean; availabilityStatus?: string; upcomingMessage?: string; isActive?: boolean; onboardingStatus?: string; cashPaymentsEnabled?: boolean; partnerProfile?: { openingHours?: unknown; commissionRateBps?: number } }>(restaurant: T) {
@@ -38,7 +38,7 @@ export function presentCustomerCatalogRestaurant<T extends { name: string; slug?
   const listingType = restaurant.listingType === "local_directory" ? "local_directory" : "official_partner";
   const goldFounder = Boolean(restaurant.goldFounder) || GOLDEN_FOUNDER_SLUGS.includes(restaurant.slug as typeof GOLDEN_FOUNDER_SLUGS[number]);
   const hasMenu = !Object.prototype.hasOwnProperty.call(restaurant, "menu") || (Array.isArray(restaurant.menu) && restaurant.menu.length > 0);
-  const availability = customerAvailability({ ...restaurant, comingSoon, listingType, hasMenu });
+  const availability = customerAvailability({ ...restaurant, openingHours: restaurant.partnerProfile?.openingHours, comingSoon, listingType, hasMenu });
   const orderable = availability.canOrder && listingType === "official_partner";
   // Do not leak a stale persisted announcement after a restaurant becomes live.
   // The public catalog must derive this label from the operational status.

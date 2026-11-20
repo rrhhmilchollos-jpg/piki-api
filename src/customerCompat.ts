@@ -191,7 +191,7 @@ function restaurantView(row: any) {
   const useReferenceFallback = usesReferenceAddOns(row);
   const comingSoon = row.availabilityStatus === "coming_soon";
   const withinHours = restaurantIsWithinOpeningHours(row.partnerProfile?.openingHours);
-  const availability = customerAvailability({ ...row, comingSoon, listingType: row.listingType || "official_partner", hasMenu: Array.isArray(row.menu) && row.menu.length > 0 });
+  const availability = customerAvailability({ ...row, openingHours: row.partnerProfile?.openingHours, comingSoon, listingType: row.listingType || "official_partner", hasMenu: Array.isArray(row.menu) && row.menu.length > 0 });
   // Both tRPC (Vercel/Android) and the REST catalogue read the same persisted
   // restaurant. Keep display fields instead of stripping categories and media.
   // Catalogue and quote share the final customer price and selectable options.
@@ -445,6 +445,7 @@ async function handleCustomerTrpcSingle(req: Request, res: Response) {
       const user = await currentCustomer(req) as any;
       const restaurant = await Restaurant.findOne({ _id: input?.restaurantId, ...CUSTOMER_ORDERABLE_RESTAURANT_FILTER }).lean().exec() as any;
       if (!restaurant) return fail(res, "Restaurante no encontrado", "NOT_FOUND");
+      if (!restaurantIsWithinOpeningHours(restaurant.partnerProfile?.openingHours)) return fail(res, "Este establecimiento está cerrado ahora. Elige otro horario para realizar el pedido.", "PARTNER_CLOSED");
       let items: ReturnType<typeof customerQuotedItems>;
       try { items = customerQuotedItems(restaurant, input?.items); }
       catch { return fail(res, "Revisa los productos y opciones de la cesta", "PRODUCT_UNAVAILABLE"); }

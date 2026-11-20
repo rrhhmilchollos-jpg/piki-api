@@ -33,11 +33,19 @@ test('un directorio conserva su presentación interna no pedible, sin publicarse
   assert.equal(view.orderable, false);
 });
 
-test('el catálogo customer permanece operativo 24/7 aunque exista un horario partido', () => {
+test('el catálogo customer obedece cada franja del horario partido Europe/Madrid', () => {
   const hours = { lunes: { morning: { open: '11:00', close: '14:00', closed: false }, evening: { open: '18:00', close: '23:00', closed: false }, closed: false } };
-  assert.equal(restaurantIsWithinOpeningHours(hours, new Date('2026-10-19T10:00:00Z')), true);
-  assert.equal(restaurantIsWithinOpeningHours(hours, new Date('2026-10-19T15:00:00Z')), true);
-  assert.equal(restaurantIsWithinOpeningHours(hours, new Date('2026-10-19T19:00:00Z')), true);
+  assert.equal(restaurantIsWithinOpeningHours(hours, new Date('2026-10-19T08:59:00Z')), false);
+  assert.equal(restaurantIsWithinOpeningHours(hours, new Date('2026-10-19T09:00:00Z')), true);
+  assert.equal(restaurantIsWithinOpeningHours(hours, new Date('2026-10-19T12:00:00Z')), false);
+  assert.equal(restaurantIsWithinOpeningHours(hours, new Date('2026-10-19T16:00:00Z')), true);
+  assert.equal(restaurantIsWithinOpeningHours(hours, new Date('2026-10-19T21:00:00Z')), false);
+});
+
+test('horario ausente o vacío conserva compatibilidad legacy; horario corrupto cierra', () => {
+  assert.equal(restaurantIsWithinOpeningHours(undefined), true);
+  assert.equal(restaurantIsWithinOpeningHours({}), true);
+  assert.equal(restaurantIsWithinOpeningHours({ regular: { lunes: [{ open: '99:00', close: '10:00' }] }, overrides: [] }), false);
 });
 
 test('la comisión se aplica una sola vez cuando el precio guardado ya la incluye', () => {

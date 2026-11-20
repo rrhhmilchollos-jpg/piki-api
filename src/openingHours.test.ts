@@ -79,3 +79,20 @@ test("00:00 apertura y turno nocturno anterior siguen siendo horarios válidos",
   assert.equal(evaluateOpeningHours(input, new Date("2026-11-10T00:30:00Z")).open, true);
   assert.equal(evaluateOpeningHours(input, new Date("2026-11-10T01:00:00Z")).open, false);
 });
+
+test("franjas tipo Kazoku usan fecha local, cierre exclusivo a medianoche, override y DST", () => {
+  const hours = {
+    timeZone: "Europe/Madrid",
+    regular: { lunes: [{ open: "11:30", close: "16:30" }], viernes: [{ open: "11:30", close: "16:30" }, { open: "19:30", close: "00:00" }] },
+    overrides: [{ date: "2026-11-20", closed: true, intervals: [] }],
+  };
+  assert.equal(evaluateOpeningHours(hours, new Date("2026-11-20T10:30:00Z")).open, false, "override del viernes prevalece sobre horario regular");
+  assert.equal(evaluateOpeningHours(hours, new Date("2026-11-21T00:30:00Z")).open, false, "después de medianoche la franja del viernes terminó a las 00:00");
+  const regular = { ...hours, overrides: [] };
+  assert.equal(evaluateOpeningHours(regular, new Date("2026-11-20T10:30:00Z")).open, true, "11:30 CET abre a las 10:30 UTC");
+  assert.equal(evaluateOpeningHours(regular, new Date("2026-11-20T15:30:00Z")).open, false, "16:30 CET es límite exclusivo");
+  assert.equal(evaluateOpeningHours(regular, new Date("2026-11-20T18:30:00Z")).open, true, "19:30 CET abre a las 18:30 UTC");
+  assert.equal(evaluateOpeningHours(regular, new Date("2026-11-20T23:00:00Z")).open, false, "00:00 CET cierra la franja");
+  assert.equal(evaluateOpeningHours(regular, new Date("2026-03-27T10:30:00Z")).open, true, "antes del cambio DST, 11:30 CET");
+  assert.equal(evaluateOpeningHours(regular, new Date("2026-03-30T09:30:00Z")).open, true, "después del cambio DST, 11:30 CEST");
+});
