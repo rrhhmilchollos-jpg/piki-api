@@ -78,6 +78,7 @@ test("shift continuity: real handlers and sweep with no listener, database or ne
   t.mock.method(Rider as any, "updateOne", (_filter: any, update: any) => { Object.assign(rider, update.$set); return query({ modifiedCount: 1 }); });
   t.mock.method(Rider as any, "findByIdAndUpdate", (_id: any, update: any) => { Object.assign(rider, update.$set); return query({ ...rider }); });
   t.mock.method(Order as any, "exists", () => query(hasOrders));
+  t.mock.method(shifts.RiderShiftPlanModel as any, "findOne", () => query({ riderId, tenantId, weeklyHours: 40, shifts: [{ weekday: 3, start: "12:00", end: "00:00" }] }));
   t.mock.method(RiderSlot as any, "find", (filter: any) => {
     const statuses = filter.status?.$in || [filter.status];
     return query(slot && statuses.includes(slot.status) ? [{ ...slot }] : []);

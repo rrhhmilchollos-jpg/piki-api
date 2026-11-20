@@ -9,6 +9,7 @@ import { registerEmployeeDeletionRoutes } from "./employeeDeletion.js";
 import { dispatchVehicleInputForOrder } from "./dispatchVehiclePolicy.js";
 import { confirmReservedDispatch, releaseRiderOrderSlot, reserveRiderOrderSlot } from "./dispatchReservation.js";
 import { confirmDispatchOnlineGuard, dispatchOfferIsCurrent, dispatchOrderCas, dispatchOrderIsOperational, loadDispatchIdentityGuard, loadDispatchOnlineGuard, type DispatchPrincipal } from "./dispatchOnlinePolicy.js";
+import { riderShiftPermission, riderShiftPermissionError } from "./riderShiftPermission.js";
 import { VEHICLE_CATALOG_VERSION, VEHICLE_TYPES, incompatibleVehicles, uniqueVehicles, vehicleTypeSchema, type VehicleType } from "./vehicleCatalog.js";
 import { registerTerritoryRoutes } from "./coverage/territoryRoutes.js";
 import { operationalZoneInputSchema } from "./coverage/zoneInput.js";
@@ -6848,9 +6849,11 @@ app.get("/api/v1/riders/:id/shift", requireRole("admin", "rider", "fleet"), asyn
   if (!rider) return res.status(404).json({ error: "RIDER_NOT_FOUND" });
   if (!(await canAccessRiderShift(riderId, req))) return res.status(403).json({ error: "RIDER_ACCESS_DENIED" });
   const { now, slot, selfStartAllowed } = await findCurrentRiderSlot(riderId);
+  const { allowed, ...permission } = await riderShiftPermission(rider, slot as any, new Date(now.iso));
   const visibleSlot = slot || await findNextRiderSlot(riderId, now);
   res.setHeader("Cache-Control", "no-store, max-age=0");
-  return res.json({ rider: { id: rider._id, riderCode: rider.riderCode, status: rider.status }, now, serverClock: now, eligible: Boolean(slot) && selfStartAllowed, selfStartAllowed, shift: visibleSlot });
+  const hasActiveShift = (slot as any)?.status === "active" && String((slot as any)?.tenantId ?? "") === String(rider.tenantId ?? "");
+  return res.json({ rider: { id: rider._id, riderCode: rider.riderCode, status: rider.status }, now, serverClock: now, eligible: Boolean(slot) && selfStartAllowed && allowed, selfStartAllowed: selfStartAllowed && allowed, hasActiveShift, shift: visibleSlot, ...permission });
 });
 
 app.post("/api/v1/riders/:id/shift/start", requireRole("admin", "rider", "fleet"), async (req, res) => {
@@ -6860,6 +6863,11 @@ app.post("/api/v1/riders/:id/shift/start", requireRole("admin", "rider", "fleet"
   if (!rider) return res.status(404).json({ error: "RIDER_NOT_FOUND" });
   if (!(await canAccessRiderShift(riderId, req))) return res.status(403).json({ error: "RIDER_ACCESS_DENIED" });
   const { now, slot } = await findCurrentRiderSlot(riderId);
+  const permission = await riderShiftPermission(rider, slot as any, new Date(now.iso));
+  if (!permission.allowed && permission.blockReason !== "fuera_de_tramo") {
+    const { allowed: _allowed, ...block } = permission;
+    return res.status(409).json({ error: riderShiftPermissionError(permission), message: permission.blockMessage, now, serverClock: now, ...block });
+  }
 if (!slot) {
     if (req.auth?.role === "rider") {
       const tenantId = req.auth?.tenantId ?? null;
@@ -6872,6 +6880,7 @@ if (!slot) {
     }
     return res.status(409).json({ error: "SHIFT_OUTSIDE_SCHEDULE", message: `Jornada bloqueada: solo puedes iniciar en la fecha y franja asignadas. Hora oficial: ${now.date} ${now.time} (${now.timeZone}).`, now, serverClock: now });
   }
+  if (!permission.allowed) return res.status(409).json({ error: riderShiftPermissionError(permission), message: permission.blockMessage, blockReason: permission.blockReason, serverClock: now });
   const currentSlot = slot as any;
   const hasFreshLocation = Boolean(rider.lastLocationAt && new Date(rider.lastLocationAt).getTime() >= Date.now() - 90_000);
   if (!hasFreshLocation) {
