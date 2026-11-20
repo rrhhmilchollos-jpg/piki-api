@@ -13,6 +13,7 @@ import { operationalZoneInputSchema } from "./coverage/zoneInput.js";
 import { stripeClient } from "./stripePayments.js";
 import { registerRootFleetZoneRepairRoutes } from "./rootFleetZoneRepair.js";
 import { registerRootFleetServiceZonesRoutes } from "./rootFleetServiceZones.js";
+import { registerXativaOperationsRoutes } from "./xativaOperationsRoutes.js";
 import { registerOwnerOperatingTenantRoutes } from "./ownerOperatingTenant.js";
 import { mountGeofenceRoutes } from "./geofenceRoutes.js";
 import { planWeek, weekStartOf } from "./glovoShiftPlanner.js";
@@ -7749,6 +7750,20 @@ registerRootFleetServiceZonesRoutes(app, {
   requireOwner, ownerEmail, objectId,
   tenants: Tenant.collection, employees: EmployeeAccount.collection,
   fleets: Fleet.collection, zones: Zone.collection,
+  startSession: () => mongoose.startSession(),
+  createAudit: async (row, session) => GovernanceAuditEvent.create([row], { session }),
+});
+
+registerXativaOperationsRoutes(app, {
+  requireRole, ownerEmail, objectId,
+  tenants: Tenant.collection, employees: EmployeeAccount.collection,
+  fleets: Fleet.collection, riders: Rider.collection, zones: Zone.collection,
+  slots: RiderSlot.collection, orders: Order.collection,
+  reservations: RiderAssignmentReservation.collection, tracking: TrackingSession.collection,
+  employeeSessions: EmployeeSession.collection,
+  // Snapshot/CAS cannot guard existing nontransactional operational writers,
+  // unscoped legacy GPS or concurrent destination capacity changes.
+  transferCoordinator: null,
   startSession: () => mongoose.startSession(),
   createAudit: async (row, session) => GovernanceAuditEvent.create([row], { session }),
 });
