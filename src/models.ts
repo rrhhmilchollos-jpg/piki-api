@@ -466,6 +466,16 @@ const riderSlotSchema = new Schema({
   tenantId: { type: Schema.Types.ObjectId, ref: "Tenant", default: null, index: true }, riderId: { type: Schema.Types.ObjectId, ref: "Rider", required: true, index: true }, zoneSlug: { type: String, required: true }, date: { type: String, required: true }, startTime: { type: String, required: true }, endTime: { type: String, required: true }, status: { type: String, enum: ["planned", "active", "completed", "cancelled"], default: "planned" }, notes: { type: String, default: "" }, startedAt: { type: Date, default: null }, stoppedAt: { type: Date, default: null }, stoppedReason: { type: String, default: "", trim: true, maxlength: 120 }, assignmentRevision: { type: Number, default: 1, min: 1 }, assignedAt: { type: Date, default: Date.now }, assignedByEmployeeId: { type: Schema.Types.ObjectId, ref: "EmployeeAccount", default: null }, assignedByRole: { type: String, default: null }, lastModifiedAt: { type: Date, default: Date.now }, lastModifiedByEmployeeId: { type: Schema.Types.ObjectId, ref: "EmployeeAccount", default: null }, lastModifiedByRole: { type: String, default: null } }, { timestamps: true, collection: "rider_slots" });
 riderSlotSchema.index({ tenantId: 1, riderId: 1, date: 1, startTime: 1 }, { unique: true });
 riderSlotSchema.index({ tenantId: 1, date: 1, status: 1 });
+const riderHoursAdjustmentSchema = new Schema({
+  tenantId: { type: Schema.Types.ObjectId, ref: "Tenant", default: null, index: true },
+  riderId: { type: Schema.Types.ObjectId, ref: "Rider", required: true, index: true },
+  weekStart: { type: String, required: true, index: true },
+  minutesDelta: { type: Number, required: true, min: -10080, max: 10080 },
+  reason: { type: String, required: true, trim: true, maxlength: 2000 },
+  operationKey: { type: String, required: true, trim: true, maxlength: 120, unique: true },
+  actorEmployeeId: { type: Schema.Types.ObjectId, ref: "EmployeeAccount", default: null, index: true },
+}, { timestamps: true, collection: "rider_hours_adjustments" });
+riderHoursAdjustmentSchema.index({ tenantId: 1, riderId: 1, weekStart: 1, createdAt: -1 });
 
 const fleetSchema = new Schema({
   tenantId: { type: Schema.Types.ObjectId, ref: "Tenant", default: null, index: true }, createdBy: { type: Schema.Types.ObjectId, ref: "EmployeeAccount", default: null, index: true }, createdByRole: { type: String, default: null }, managerEmployeeId: { type: Schema.Types.ObjectId, ref: "EmployeeAccount", default: null, index: true }, name: { type: String, required: true, trim: true }, localityCode: { type: String, default: null, index: true }, localityName: { type: String, default: "", trim: true }, provinceCode: { type: String, default: null, index: true }, provinceName: { type: String, default: "", trim: true }, managerName: { type: String, default: "", trim: true }, managerDni: { type: String, default: "", trim: true, uppercase: true, select: false }, contactEmail: { type: String, default: "", trim: true, lowercase: true }, contactPhone: { type: String, default: "", trim: true }, address: { type: String, default: "", trim: true }, postalCode: { type: String, default: "", trim: true }, city: { type: String, default: "", trim: true }, vehicleTypes: { type: [String], enum: VEHICLE_TYPES, default: [] }, vehicleCatalogVersion: { type: Number, default: VEHICLE_CATALOG_VERSION, min: 1 }, maxRiders: { type: Number, default: 50, min: 1, max: 10000 }, notes: { type: String, default: "", trim: true, maxlength: 2000 }, isActive: { type: Boolean, default: true }, serviceZones: { type: [String], default: [] } }, { timestamps: true, collection: "fleets" });
@@ -551,6 +561,7 @@ export const AccessAuthorization = mongoose.models.AccessAuthorization || mongoo
 export const GovernanceAuditEvent = mongoose.models.GovernanceAuditEvent || mongoose.model("GovernanceAuditEvent", governanceAuditEventSchema);
 export const OnboardingRequest = mongoose.models.OnboardingRequest || mongoose.model("OnboardingRequest", onboardingRequestSchema);
 export const RiderSlot = mongoose.models.RiderSlot || mongoose.model("RiderSlot", riderSlotSchema);
+export const RiderHoursAdjustment = mongoose.models.RiderHoursAdjustment || mongoose.model("RiderHoursAdjustment", riderHoursAdjustmentSchema);
 export const SignatureRequest = mongoose.models.SignatureRequest || mongoose.model("SignatureRequest", signatureRequestSchema);
 export const PasskeyCredential = mongoose.models.PasskeyCredential || mongoose.model("PasskeyCredential", passkeyCredentialSchema);
 export const PasskeyChallenge = mongoose.models.PasskeyChallenge || mongoose.model("PasskeyChallenge", passkeyChallengeSchema);

@@ -10,7 +10,7 @@
  */
 
 import mongoose, { Schema } from "mongoose";
-import { EmployeeAccount, Order, Rider, RiderSlot } from "./models.js";
+import { EmployeeAccount, Order, Rider, RiderHoursAdjustment, RiderSlot } from "./models.js";
 import { revokeEmployeeSessions } from "./employeeSessions.js";
 import { publishRealtimeEvent } from "./realtime.js";
 import { riderSlotIsCurrent } from "./riderSchedulePolicy.js";
@@ -364,10 +364,69 @@ export async function computeWorkedMinutesThisWeek(
     });
     grouped.set(key, list);
   }
+  const adjustmentsByRider = new Map<string, Array<{ minutesDelta?: number }>>();
+  if (mongoose.connection.readyState === 1) {
+    const adjustments = (await RiderHoursAdjustment.find({ riderId: { $in: oids }, weekStart })
+      .select("riderId minutesDelta")
+      .lean()
+      .exec()) as Array<{ riderId?: unknown; minutesDelta?: number }>;
+    for (const adjustment of adjustments) {
+      const key = String(adjustment.riderId);
+      const list = adjustmentsByRider.get(key) ?? [];
+      list.push(adjustment);
+      adjustmentsByRider.set(key, list);
+    }
+  }
   for (const riderId of riderIds) {
-    result.set(riderId, workedMinutesFromSlots(grouped.get(riderId) ?? [], now, riderId));
+    const workedFromSlots = workedMinutesFromSlots(grouped.get(riderId) ?? [], now, riderId);
+    const adjustments = adjustmentsByRider.get(riderId) ?? [];
+    const adjustmentMinutes = adjustments.reduce((total, adjustment) => total + Number(adjustment.minutesDelta || 0), 0);
+    result.set(riderId, Math.max(0, workedFromSlots + adjustmentMinutes));
   }
   return result;
+}
+
+export type WeeklyHoursAdjustment = {
+  riderId: string;
+  tenantId?: string | null;
+  weekStart: string;
+  minutesDelta: number;
+  reason: string;
+  operationKey: string;
+  actorEmployeeId?: string | null;
+};
+
+export async function saveWeeklyHoursAdjustment(input: WeeklyHoursAdjustment) {
+  if (!mongoose.isValidObjectId(input.riderId)) throw new Error("INVALID_RIDER_ID");
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(input.weekStart)) throw new Error("INVALID_WEEK_START");
+  const existing = await RiderHoursAdjustment.findOne({ operationKey: input.operationKey }).lean().exec() as any;
+  if (existing) {
+    if (String(existing.riderId) !== input.riderId || String(existing.weekStart) !== input.weekStart) {
+      throw new Error("ADJUSTMENT_OPERATION_KEY_CONFLICT");
+    }
+    return { created: false, adjustment: existing };
+  }
+  let adjustment;
+  try {
+    adjustment = await RiderHoursAdjustment.create({
+      riderId: new mongoose.Types.ObjectId(input.riderId),
+      tenantId: input.tenantId && mongoose.isValidObjectId(input.tenantId) ? new mongoose.Types.ObjectId(input.tenantId) : null,
+      weekStart: input.weekStart,
+      minutesDelta: input.minutesDelta,
+      reason: input.reason,
+      operationKey: input.operationKey,
+      actorEmployeeId: input.actorEmployeeId && mongoose.isValidObjectId(input.actorEmployeeId) ? new mongoose.Types.ObjectId(input.actorEmployeeId) : null,
+    });
+  } catch (error: any) {
+    if (error?.code !== 11000) throw error;
+    const concurrent = await RiderHoursAdjustment.findOne({ operationKey: input.operationKey }).lean().exec() as any;
+    if (!concurrent) throw error;
+    if (String(concurrent.riderId) !== input.riderId || String(concurrent.weekStart) !== input.weekStart) {
+      throw new Error("ADJUSTMENT_OPERATION_KEY_CONFLICT");
+    }
+    return { created: false, adjustment: concurrent };
+  }
+  return { created: true, adjustment: adjustment.toObject() };
 }
 
 /* ------------------------------------------------------------------ */

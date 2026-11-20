@@ -10,7 +10,7 @@
 import type { Express, Request, Response } from "express";
 import mongoose from "mongoose";
 import { z } from "zod";
-import { EmployeeAccount, Rider } from "./models.js";
+import { EmployeeAccount, GovernanceAuditEvent, Rider } from "./models.js";
 import { requireOwner, requireRole } from "./auth.js";
 import { buildFleetEntityScope, buildTenantScope } from "./tenantScope.js";
 import {
@@ -20,6 +20,9 @@ import {
   normalizeShiftSweepRunErrors,
   runShiftSweep,
   saveShiftPlan,
+  saveWeeklyHoursAdjustment,
+  operationsClock,
+  weekStart,
   ShiftSweepRun,
 } from "./shiftPlans.js";
 import { shiftSweepWorkerStatus } from "./shiftSweepWorker.js";
@@ -39,6 +42,14 @@ const shiftPlanSchema = z
       )
       .min(1)
       .max(21),
+  })
+  .strict();
+
+const weeklyHoursAdjustmentSchema = z
+  .object({
+    minutesDelta: z.number().int().min(-10080).max(10080),
+    reason: z.string().trim().min(1).max(2000),
+    operationKey: z.string().trim().min(8).max(120),
   })
   .strict();
 
@@ -122,6 +133,55 @@ export function mountShiftRoutes(app: Express): void {
     return response.json({
       message: `Contrato de ${snapshot.weeklyHours} h guardado con ${parsed.data.shifts.length} tramo(s).`,
       shift: snapshot,
+    });
+  });
+
+  /** Registra un ajuste semanal auditable sin borrar fichajes ni RiderSlots. */
+  app.post("/api/v1/riders/:id/shift-plan/weekly-adjustment", requireRole("admin", "fleet"), async (request: Request, response: Response) => {
+    const riderId = riderIdParam(request);
+    if (!riderId) return response.status(400).json({ error: "INVALID_RIDER_ID" });
+    const parsed = weeklyHoursAdjustmentSchema.safeParse(request.body);
+    if (!parsed.success) return response.status(400).json({ error: "INVALID_WEEKLY_HOURS_ADJUSTMENT", details: parsed.error.flatten() });
+    const rider = (await Rider.findOne(await riderScope(request, riderId)).select("_id name email tenantId").lean().exec()) as any;
+    if (!rider) return response.status(403).json({ error: "RIDER_ACCESS_DENIED" });
+    const now = new Date();
+    const currentWeekStart = weekStart(operationsClock(now).date);
+    const before = await buildShiftSnapshot(String(rider._id), now);
+    let saved;
+    try {
+      saved = await saveWeeklyHoursAdjustment({
+        riderId: String(rider._id),
+        tenantId: rider.tenantId ? String(rider.tenantId) : request.auth?.tenantId ?? null,
+        weekStart: currentWeekStart,
+        minutesDelta: parsed.data.minutesDelta,
+        reason: parsed.data.reason,
+        operationKey: parsed.data.operationKey,
+        actorEmployeeId: request.auth?.employeeId ?? null,
+      });
+    } catch (error: any) {
+      if (error?.message === "ADJUSTMENT_OPERATION_KEY_CONFLICT") return response.status(409).json({ error: error.message });
+      throw error;
+    }
+    if (saved.created) {
+      await GovernanceAuditEvent.create({
+        tenantId: rider.tenantId || (request.auth?.tenantId && mongoose.isValidObjectId(request.auth.tenantId) ? new mongoose.Types.ObjectId(request.auth.tenantId) : null),
+        actorEmployeeId: request.auth?.employeeId ?? null,
+        actorRole: request.auth?.role || "admin",
+        action: "rider_weekly_hours_adjusted",
+        targetType: "rider",
+        targetId: rider._id,
+        before: { workedMinutesThisWeek: before.workedMinutesThisWeek, remainingMinutes: before.remainingMinutes },
+        after: { minutesDelta: parsed.data.minutesDelta, weekStart: currentWeekStart },
+        reason: parsed.data.reason,
+      });
+    }
+    const after = await buildShiftSnapshot(String(rider._id), now);
+    return response.status(saved.created ? 201 : 200).json({
+      message: saved.created ? "Ajuste semanal registrado y auditado." : "El ajuste semanal ya estaba registrado.",
+      created: saved.created,
+      adjustment: saved.adjustment,
+      before,
+      shift: after,
     });
   });
 
