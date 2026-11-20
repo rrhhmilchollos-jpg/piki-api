@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import ts from "typescript";
 import { AccessAuthorization, GovernanceAuditEvent, TenantMembership } from "./models.js";
-import { EmployeeSession, OWNER_EMAIL, isRootOwnerAccount, sessionTenantMatchesEmployee } from "./employeeSessions.js";
+import { EmployeeSession, OWNER_EMAIL, employeeCredentialFingerprint, isRootOwnerAccount, sessionTenantMatchesEmployee } from "./employeeSessions.js";
 import { hashSessionToken } from "./employeeAuth.js";
 import { registerOwnerOperatingTenantRoutes, ownerOperatingTenantSchema, type OwnerOperatingTenantDependencies } from "./ownerOperatingTenant.js";
 
@@ -275,4 +275,26 @@ test("actual server injects real model transaction adaptors and no runtime boots
   assert.equal(deps.orders, "Order"); assert.equal(deps.sessions, "EmployeeSession"); assert.equal(deps.memberships, "TenantMembership"); assert.equal(await deps.startSession(), "offline-session");
   for (const method of ["createMembership", "createSession"]) assert.deepEqual(await deps[method]({ safe: true }, "offline-session"), { safe: true, session: "offline-session" });
   for (const method of ["createAudit", "createAuthorization"]) assert.deepEqual((await deps[method]({ safe: true }, "offline-session"))[0].toObject(), { safe: true, session: "offline-session" });
+});
+
+
+test("root tenant rotation persists only the validated internal credential snapshot without public secrets", async () => {
+  const h = harness(); const fingerprint = employeeCredentialFingerprint(h.db.employees[0].passwordHash);
+  h.db.sessions[0].credentialFingerprint = fingerprint;
+  const result = await h.call(); assert.equal(result.status, 200);
+  const rotated = h.db.sessions.find((row: any) => row.employeeId === ids.owner);
+  assert.equal(rotated.credentialFingerprint, fingerprint);
+  assert(!JSON.stringify(result.body).includes("credentialFingerprint"));
+  assert(!JSON.stringify(result.body).includes(fingerprint!));
+  assert(!JSON.stringify(h.db.audits).includes(fingerprint!));
+  assert(!JSON.stringify(h.db.authorizations).includes(fingerprint!));
+});
+
+test("root tenant rotation rejects obsolete credentials despite issuedAt later than passwordChangedAt", async () => {
+  const h = harness(); h.db.sessions[0].credentialFingerprint = employeeCredentialFingerprint("OFFLINE_OLD_HASH");
+  h.db.employees[0].passwordHash = "OFFLINE_NEW_HASH";
+  h.db.employees[0].passwordChangedAt = new Date(sourceTime.getTime() - 1000);
+  const before = clone(h.db); const result = await h.call();
+  assert.equal(result.status, 401); assert.equal(result.body.error, "OWNER_SESSION_CHANGED");
+  assert.deepEqual(h.db, before); assert.equal(h.effects.includes("revoke"), false);
 });

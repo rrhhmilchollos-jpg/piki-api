@@ -110,7 +110,7 @@ export async function sendCorporateEmail(input: CorporateEmail): Promise<Corpora
     });
     const payload = await response.json().catch(() => ({})) as { id?: string };
     if (!response.ok || !payload.id) {
-      console.warn("Corporate email delivery rejected", { status: response.status, key: input.idempotencyKey });
+      console.warn("Corporate email delivery rejected", { status: response.status, provider: "resend" });
       return { sent: false, error: response.status === 401 || response.status === 403 ? "CORPORATE_EMAIL_CONFIGURATION_REJECTED" : "CORPORATE_EMAIL_PROVIDER_ERROR" };
     }
     return { sent: true, providerId: payload.id };

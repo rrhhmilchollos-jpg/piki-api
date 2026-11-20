@@ -5,6 +5,8 @@ const employeePasswordResetSchema = new mongoose.Schema({
   email: { type: String, required: true, lowercase: true, trim: true, index: true },
   tokenHash: { type: String, required: true, unique: true, index: true },
   expiresAt: { type: Date, required: true },
+  // Historical links have no surface; newly issued links are app-specific.
+  surface: { type: String, enum: ["admin", "partner", "rider", "fleet"], default: null },
   usedAt: { type: Date, default: null },
 }, { timestamps: true, collection: "employee_password_resets" });
 

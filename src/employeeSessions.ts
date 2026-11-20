@@ -1,4 +1,5 @@
 import mongoose, { Schema } from "mongoose";
+import { createHash } from "node:crypto";
 import { EmployeeAccount, Rider } from "./models.js";
 import { createSessionToken, hashSessionToken } from "./employeeAuth.js";
 import { buildTenantScope } from "./tenantScope.js";
@@ -22,8 +23,12 @@ const schema = new Schema({
   surface: { type: String, required: true },
   expiresAt: { type: Date, required: true },
   issuedAt: { type: Date, required: true },
+  // Internal credential snapshot, never a password/hash returned to a client.
+  // No default: absence identifies historical sessions, not failed issuance.
+  credentialFingerprint: { type: String, select: false },
 }, { collection: "employee_sessions" });
 schema.index({ expiresAt: 1 }, { expireAfterSeconds: 0 });
+schema.set("toJSON", { transform(_doc, result) { delete result.credentialFingerprint; return result; } });
 export const EmployeeSession = mongoose.models.EmployeeSession || mongoose.model("EmployeeSession", schema);
 
 type SessionEmployee = {
@@ -64,6 +69,24 @@ export function canIssueEmployeeSession(employee: SessionEmployee | null | undef
   return Boolean(frozenTenantId(employee?.tenantId) || isRootOwnerAccount(employee));
 }
 
+/** Capture only the credential hash actually read/verified, never re-fetch it. */
+export function employeeCredentialFingerprint(passwordHash: unknown): string | null {
+  if (typeof passwordHash !== "string" || !passwordHash) return null;
+  return createHash("sha256").update("piki:employee-credential:v1\0").update(passwordHash).digest("hex");
+}
+
+/** Callers must explicitly select the internal fingerprint and password hash. */
+export function sessionCredentialsMatchEmployee(session: any, employee: any): boolean {
+  if (!session || !employee) return false;
+  if (Object.prototype.hasOwnProperty.call(session, "credentialFingerprint")) {
+    const fingerprint = employeeCredentialFingerprint(employee.passwordHash);
+    return fingerprint !== null && session.credentialFingerprint === fingerprint;
+  }
+  // Existing sessions retain the historical timestamp rule until normal expiry
+  // or revocation. A malformed/present fingerprint never falls back to it.
+  return !employee.passwordChangedAt || new Date(employee.passwordChangedAt) <= new Date(session.issuedAt);
+}
+
 /** A surface can narrow a role, never grant privileges from a request header. */
 export function sessionRole(employee: { email: string; apiRole: string; roles?: string[]; primaryRole?: string | null; ownerProtected?: boolean; authorizationStatus?: string }, surface: string, requestedRole?: string): string | null {
   if (employee.authorizationStatus && employee.authorizationStatus !== "approved") return null;
@@ -93,10 +116,21 @@ export class RiderAccountNotLinkedError extends Error {
   }
 }
 
-export async function issueEmployeeSession(employee: any, surface: string, requestedRole?: string) {
+export async function issueEmployeeSession(employee: any, surface: string, requestedRole?: string, sourceToken?: string) {
   const role = sessionRole(employee, surface, requestedRole);
   const tenantId = frozenTenantId(employee?.tenantId);
   if (!role || !canIssueEmployeeSession(employee) || (!tenantId && role !== "admin")) return null;
+  const credentialFingerprint = employeeCredentialFingerprint(employee.passwordHash);
+  if (!credentialFingerprint) return null;
+  // Role switching must prove the original token against this same credential
+  // snapshot. A reset between middleware and this read cannot renew old auth.
+  if (sourceToken !== undefined) {
+    const source = await EmployeeSession.findOne({ tokenHash: hashSessionToken(sourceToken), expiresAt: { $gt: new Date() } }).select("+credentialFingerprint").lean().exec() as any;
+    if (!source || String(source.employeeId) !== String(employee._id)
+      || !sessionTenantMatchesEmployee(source.tenantId, employee.tenantId)
+      || !sessionCredentialsMatchEmployee(source, employee)
+      || sessionRole(employee, source.surface, source.role) !== source.role) return null;
+  }
   if (role === "rider" && !(await Rider.exists({ email: employee.email, ...buildTenantScope(tenantId) }))) {
     throw new RiderAccountNotLinkedError();
   }
@@ -111,16 +145,17 @@ export async function issueEmployeeSession(employee: any, surface: string, reque
     surface: surface || employee.apiRole,
     issuedAt: now,
     expiresAt,
+    credentialFingerprint,
   });
   await EmployeeAccount.updateOne({ _id: employee._id }, { $set: { lastLoginAt: now } }).exec();
   return { token, role, expiresAt };
 }
 
 export async function resolveEmployeeSession(token: string) {
-  const session = await EmployeeSession.findOne({ tokenHash: hashSessionToken(token), expiresAt: { $gt: new Date() } }).lean().exec() as any;
+  const session = await EmployeeSession.findOne({ tokenHash: hashSessionToken(token), expiresAt: { $gt: new Date() } }).select("+credentialFingerprint").lean().exec() as any;
   if (!session) return null;
-  const employee = await EmployeeAccount.findOne({ _id: session.employeeId, active: true }).lean().exec() as any;
-  if (!employee || (employee.passwordChangedAt && new Date(employee.passwordChangedAt) > new Date(session.issuedAt))) return null;
+  const employee = await EmployeeAccount.findOne({ _id: session.employeeId, active: true }).select("+passwordHash").lean().exec() as any;
+  if (!sessionCredentialsMatchEmployee(session, employee)) return null;
   // Sessions issued before tenant binding are intentionally not upgraded from
   // EmployeeAccount, except the pre-existing protected root-admin session.
   // That narrow path is converted once and can no longer silently switch.
@@ -164,10 +199,12 @@ export async function resolveEmployeeSession(token: string) {
  */
 export async function adoptLegacyRootOwnerSession(token: string) {
   const tokenHash = hashSessionToken(token);
-  const employee = await EmployeeAccount.findOne({ sessionHash: tokenHash, active: true }).lean().exec() as any;
+  const employee = await EmployeeAccount.findOne({ sessionHash: tokenHash, active: true }).select("+passwordHash").lean().exec() as any;
   if (!isRootOwnerAccount(employee)) return null;
   const role = sessionRole(employee, "admin", "admin");
   if (role !== "admin") return null;
+  const credentialFingerprint = employeeCredentialFingerprint(employee.passwordHash);
+  if (!credentialFingerprint) return null;
   const now = new Date();
   await EmployeeSession.updateOne(
     { tokenHash },
@@ -179,6 +216,7 @@ export async function adoptLegacyRootOwnerSession(token: string) {
         surface: "admin",
         issuedAt: now,
         expiresAt: new Date(now.getTime() + SESSION_TTL_MS),
+        credentialFingerprint,
       },
     },
     { upsert: true },
@@ -187,6 +225,8 @@ export async function adoptLegacyRootOwnerSession(token: string) {
   return resolveEmployeeSession(token);
 }
 
-export async function revokeEmployeeSessions(employeeId: unknown) {
-  await EmployeeSession.deleteMany({ employeeId }).exec();
+export async function revokeEmployeeSessions(employeeId: unknown, session?: mongoose.ClientSession) {
+  const query = EmployeeSession.deleteMany({ employeeId });
+  if (session) query.session(session);
+  await query.exec();
 }

@@ -207,7 +207,7 @@ test("real persisted Owner may use Partner or admin session; environmental/root-
 });
 
 test("legacy protected Owner token adoption retains actual Admin SSE and ordinary legacy token is rejected", async (t) => {
-  const f = fixture(t); f.db.sessions = []; Object.assign(f.db.employees[0], { email: OWNER_EMAIL, sessionHash: hashSessionToken(token), jobRole: "admin", apiRole: "admin", primaryRole: "admin", roles: ["admin"], ownerProtected: true, accessLevel: "superadmin", kitchenAccessSetupVersion: null });
+  const f = fixture(t); f.db.sessions = []; Object.assign(f.db.employees[0], { email: OWNER_EMAIL, passwordHash: "OFFLINE_OWNER_HASH", sessionHash: hashSessionToken(token), jobRole: "admin", apiRole: "admin", primaryRole: "admin", roles: ["admin"], ownerProtected: true, accessLevel: "superadmin", kitchenAccessSetupVersion: null });
   t.mock.method(EmployeeSession, "updateOne", (_filter: any, update: any) => ({ exec: async () => { if (update.$setOnInsert) f.db.sessions.push({ tokenHash: hashSessionToken(token), ...update.$setOnInsert }); return {}; } }));
   t.mock.method(EmployeeAccount, "updateOne", (_filter: any, update: any) => ({ exec: async () => { Object.assign(f.db.employees[0], update.$set); return {}; } }));
   const req = request({ "x-piki-surface": "admin" }); const res = response(); await serveRealtimeEvents(req, res);

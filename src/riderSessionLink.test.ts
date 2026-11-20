@@ -6,6 +6,7 @@ import ts from "typescript";
 import { z } from "zod";
 import { EmployeeAccount, Rider } from "./models.js";
 import { EmployeeSession, RiderAccountNotLinkedError, issueEmployeeSession, resolveEmployeeSession, sessionRole } from "./employeeSessions.js";
+import { hashSessionToken } from "./employeeAuth.js";
 
 const tenantA = "aaaaaaaaaaaaaaaaaaaaaaaa";
 const tenantB = "bbbbbbbbbbbbbbbbbbbbbbbb";
@@ -15,6 +16,7 @@ function query(value: any): any {
 function harness(t: TestContext, linked: any = { email: "linked@example.test", tenantId: tenantA }) {
   const employee: any = { _id: "cccccccccccccccccccccccc", id: "cccccccccccccccccccccccc", email: "linked@example.test", tenantId: tenantA, active: true, authorizationStatus: "approved", apiRole: "admin", primaryRole: "admin", jobRole: "admin", roles: ["admin", "fleet", "rider"], passwordHash: "OFFLINE" };
   const sessions: any[] = [];
+  const sourceSession = { tokenHash: hashSessionToken("OLD_OFFLINE_TOKEN"), employeeId: employee._id, tenantId: tenantA, role: "admin", surface: "admin", issuedAt: new Date(), expiresAt: new Date(Date.now() + 60_000) };
   const state = { linked, writes: 0, riderReads: 0, deleted: 0 };
   t.mock.method(mongoose.Query.prototype as any, "exec", () => { throw new Error("UNMOCKED_DB_FORBIDDEN"); });
   t.mock.method(Rider as any, "exists", async (filter: any) => {
@@ -25,7 +27,7 @@ function harness(t: TestContext, linked: any = { email: "linked@example.test", t
   t.mock.method(EmployeeSession as any, "create", async (row: any) => { state.writes++; sessions.push({ ...row, _id: "eeeeeeeeeeeeeeeeeeeeeeee" }); return row; });
   t.mock.method(EmployeeAccount as any, "updateOne", () => { state.writes++; return query({ matchedCount: 1 }); });
   t.mock.method(EmployeeAccount as any, "findOne", () => query(employee));
-  t.mock.method(EmployeeSession as any, "findOne", (filter: any) => query(sessions.find((s) => s.tokenHash === filter.tokenHash) || null));
+  t.mock.method(EmployeeSession as any, "findOne", (filter: any) => query(sessions.find((s) => s.tokenHash === filter.tokenHash) || (sourceSession.tokenHash === filter.tokenHash ? sourceSession : null)));
   t.mock.method(EmployeeSession as any, "updateOne", () => query({ matchedCount: 1 }));
   t.mock.method(EmployeeSession as any, "deleteOne", () => { state.deleted++; return query({ deletedCount: 1 }); });
   return { employee, sessions, state };

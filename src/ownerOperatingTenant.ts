@@ -1,7 +1,7 @@
 import type { Express, Request, RequestHandler } from "express";
 import { z } from "zod";
 import { createSessionToken, hashSessionToken } from "./employeeAuth.js";
-import { isRootOwnerAccount, sessionRole, sessionTenantMatchesEmployee } from "./employeeSessions.js";
+import { employeeCredentialFingerprint, isRootOwnerAccount, sessionCredentialsMatchEmployee, sessionRole, sessionTenantMatchesEmployee } from "./employeeSessions.js";
 import { isObjectIdLike } from "./tenantScope.js";
 
 const idSchema = z.string().regex(/^[a-f\d]{24}$/i).transform((id) => id.toLowerCase());
@@ -37,7 +37,7 @@ class BindingError extends Error { constructor(public status: number, public cod
 const fail = (code: string, status = 409): never => { throw new BindingError(status, code); };
 const sameId = (a: unknown, b: unknown) => isObjectIdLike(a) && isObjectIdLike(b) && String(a).toLowerCase() === String(b).toLowerCase();
 const time = (value: unknown) => value instanceof Date ? value.getTime() : NaN;
-const ownerProjection = { _id: 1, tenantId: 1, updatedAt: 1, email: 1, apiRole: 1, roles: 1, primaryRole: 1, ownerProtected: 1, accessLevel: 1, active: 1, authorizationStatus: 1, mustChangePassword: 1, passwordChangedAt: 1, restaurantId: 1, restaurantIds: 1, fleetId: 1, riderId: 1 };
+const ownerProjection = { _id: 1, tenantId: 1, updatedAt: 1, email: 1, apiRole: 1, roles: 1, primaryRole: 1, ownerProtected: 1, accessLevel: 1, active: 1, authorizationStatus: 1, mustChangePassword: 1, passwordChangedAt: 1, passwordHash: 1, restaurantId: 1, restaurantIds: 1, fleetId: 1, riderId: 1 };
 
 /** No arbitrary employee parameter, no role elevation, no resource reassignment. */
 export function registerOwnerOperatingTenantRoutes(app: Express, deps: OwnerOperatingTenantDependencies) {
@@ -166,10 +166,12 @@ export function registerOwnerOperatingTenantRoutes(app: Express, deps: OwnerOper
           if (legacy) fail("OWNER_LEGACY_SESSION_CONFLICT");
           const rawToken = (req.header("authorization") || "").split(" ")[1];
           if (!rawToken) fail("AUTHENTICATION_REQUIRED", 401);
-          const oldSession = await deps.sessions.findOne({ tokenHash: hashSessionToken(rawToken), employeeId: s.employeeId, role: "admin", tenantId: null, expiresAt: { $gt: new Date() } }, { session, projection: { _id: 1, employeeId: 1, role: 1, tenantId: 1, issuedAt: 1, expiresAt: 1 } });
+          const oldSession = await deps.sessions.findOne({ tokenHash: hashSessionToken(rawToken), employeeId: s.employeeId, role: "admin", tenantId: null, expiresAt: { $gt: new Date() } }, { session, projection: { _id: 1, employeeId: 1, role: 1, tenantId: 1, issuedAt: 1, expiresAt: 1, credentialFingerprint: 1 } });
           if (!oldSession || !Object.prototype.hasOwnProperty.call(oldSession, "tenantId") || oldSession.tenantId !== null
             || !sameId(oldSession.employeeId, s.employeeId) || oldSession.role !== "admin" || !Number.isFinite(time(oldSession.issuedAt))
-            || !(time(oldSession.expiresAt) > Date.now()) || (s.employee.passwordChangedAt && time(s.employee.passwordChangedAt) > time(oldSession.issuedAt))) fail("OWNER_SESSION_CHANGED", 401);
+            || !(time(oldSession.expiresAt) > Date.now()) || !sessionCredentialsMatchEmployee(oldSession, s.employee)) fail("OWNER_SESSION_CHANGED", 401);
+          const credentialFingerprint = employeeCredentialFingerprint(s.employee.passwordHash);
+          if (!credentialFingerprint) fail("OWNER_SESSION_CHANGED", 401);
           const now = new Date(); const expiresAt = new Date(now.getTime() + ADMIN_BIND_SESSION_TTL_MS);
           const moved = await deps.employees.updateOne({ _id: s.employeeId, tenantId: null, updatedAt: new Date(body.expectedUpdatedAt), sessionHash: null,
             email: s.employee.email, ownerProtected: true, accessLevel: "superadmin", active: true, authorizationStatus: "approved", mustChangePassword: false },
@@ -182,10 +184,11 @@ export function registerOwnerOperatingTenantRoutes(app: Express, deps: OwnerOper
           const revoked = await deps.sessions.deleteMany({ employeeId: s.employeeId }, { session });
           if (!revoked.acknowledged || revoked.deletedCount < 1) fail("OWNER_SESSION_REVOKE_FAILED", 503);
           const token = createSessionToken();
-          const row = { tokenHash: hashSessionToken(token), employeeId: s.employeeId, tenantId: targetId, role: "admin", surface: "admin", issuedAt: now, expiresAt };
+          const row = { tokenHash: hashSessionToken(token), employeeId: s.employeeId, tenantId: targetId, role: "admin", surface: "admin", issuedAt: now, expiresAt, credentialFingerprint };
           const created = await deps.createSession(row, session);
           if (!created || created.tokenHash !== row.tokenHash || !sameId(created.employeeId, s.employeeId) || !sameId(created.tenantId, targetId)
-            || created.role !== "admin" || created.surface !== "admin" || time(created.issuedAt) !== time(now) || time(created.expiresAt) !== time(expiresAt)) fail("OWNER_SESSION_WRITE_FAILED", 503);
+            || created.role !== "admin" || created.surface !== "admin" || time(created.issuedAt) !== time(now) || time(created.expiresAt) !== time(expiresAt)
+            || created.credentialFingerprint !== credentialFingerprint) fail("OWNER_SESSION_WRITE_FAILED", 503);
           const authorization = await deps.createAuthorization({ tenantId: targetId, employeeId: s.employeeId, action: "profile_updated", previousStatus: "approved", nextStatus: "approved",
             previousRole: s.employee.apiRole, nextRole: s.employee.apiRole, accessLevel: "superadmin", actorEmployeeId: s.employeeId,
             reason: "Explicit protected root Owner operating tenant binding; business roles and credentials preserved." }, session);

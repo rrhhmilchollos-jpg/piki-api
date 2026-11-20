@@ -176,6 +176,14 @@ test("dispatch online P0: guarded real handlers, memory CAS and forbidden extern
     ["revoked account", (f) => { f.employee.authorizationStatus = "revoked"; }],
     ["revoked role", (f) => { f.employee.roles = ["partner"]; }],
     ["password changed", (f) => { f.employee.passwordChangedAt = new Date(now - 1); }],
+    ["credential snapshot stale despite later issuedAt", (f) => {
+      f.session.credentialFingerprint = sessions.employeeCredentialFingerprint("OFFLINE_OLD_HASH");
+      f.employee.passwordHash = "OFFLINE_NEW_HASH";
+      f.employee.passwordChangedAt = new Date(now - 7200_000);
+    }],
+    ["credential snapshot present but missing current hash", (f) => {
+      f.session.credentialFingerprint = sessions.employeeCredentialFingerprint("OFFLINE_HASH");
+    }],
     ["temporary password", (f) => { f.employee.mustChangePassword = true; }],
     ["suspended lifecycle", (f) => { f.rider.lifecycleStatus = "suspended"; }],
     ["suspended tenant", (f) => { f.tenant.status = "suspended"; }],
@@ -204,6 +212,14 @@ test("dispatch online P0: guarded real handlers, memory CAS and forbidden extern
       assert.ok(r.state.status >= 400, JSON.stringify(r.state.body)); assert.equal(f.controls.orderWrites, 0); assert.equal(f.events.length, 0);
     });
   }
+  await t.test("current credential snapshot is eligible without propagating hash or fingerprint in the guard", async (s) => {
+    const f = fixture(s); f.employee.passwordHash = "OFFLINE_CURRENT_HASH";
+    f.session.credentialFingerprint = sessions.employeeCredentialFingerprint(f.employee.passwordHash);
+    const guard = await policy.loadDispatchOnlineGuard(f.riderId, f.tenantId, 1);
+    assert(guard); assert.equal(Object.hasOwn(guard.employee, "passwordHash"), false);
+    assert.equal(Object.hasOwn(guard.session, "credentialFingerprint"), false);
+    assert(f.session.credentialFingerprint); // Persistence is not mutated.
+  });
   await t.test("active punched 12–00 slot stays eligible after the shorter recurrent plan end without modifying the contract", async (s) => {
     const f = fixture(s); f.plan.shifts[0].end = "18:00";
     const guard = await policy.loadDispatchOnlineGuard(f.riderId, f.tenantId, 1);

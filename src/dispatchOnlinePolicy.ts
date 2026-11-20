@@ -1,5 +1,5 @@
 import { EmployeeAccount, Order, Rider, RiderAssignmentReservation, RiderSlot, Tenant } from "./models.js";
-import { EmployeeSession, frozenTenantId, sessionRole, sessionTenantMatchesEmployee } from "./employeeSessions.js";
+import { EmployeeSession, frozenTenantId, sessionCredentialsMatchEmployee, sessionRole, sessionTenantMatchesEmployee } from "./employeeSessions.js";
 import { dispatchableOrderStatuses, dispatchablePaymentFilter, isDispatchableOrderStatus, isDispatchablePayment } from "./dispatchEligibility.js";
 import { riderSlotIsCurrent } from "./riderSchedulePolicy.js";
 import { addDays, operationsClock, RiderShiftPlanModel, shiftPlanForSweep, weekStart, workedMinutesFromSlots } from "./shiftPlans.js";
@@ -57,7 +57,7 @@ export async function loadDispatchIdentityGuard(riderId: unknown, tenantId: unkn
   const employee = await EmployeeAccount.findOne({ email: rider.email, tenantId, active: true,
     authorizationStatus: "approved", mustChangePassword: false,
     ...(options.principal ? { _id: options.principal.employeeId } : {}),
-  }).lean().exec() as any;
+  }).select("+passwordHash").lean().exec() as any;
   if (!employee || employee.active !== true || employee.authorizationStatus !== "approved"
     || employee.mustChangePassword !== false || employee.email !== rider.email
     || !sessionTenantMatchesEmployee(tenantId, employee.tenantId)) return null;
@@ -66,16 +66,19 @@ export async function loadDispatchIdentityGuard(riderId: unknown, tenantId: unkn
     expiresAt: { $gt: now }, issuedAt: { $lte: now },
     ...(options.sessionId ? { _id: options.sessionId } : {}),
     ...(options.principal ? { tokenHash: options.principal.tokenHash } : {}),
-  }).lean().exec() as any[];
+  }).select("+credentialFingerprint").lean().exec() as any[];
   const session = sessions.find((candidate) => candidate.role === "rider"
     && String(candidate.employeeId) === String(employee._id)
     && sessionTenantMatchesEmployee(candidate.tenantId, employee.tenantId)
     && instant(candidate.expiresAt) > now.getTime() && instant(candidate.issuedAt) <= now.getTime()
-    && (!employee.passwordChangedAt || instant(employee.passwordChangedAt) <= instant(candidate.issuedAt))
+    && sessionCredentialsMatchEmployee(candidate, employee)
     && sessionRole(employee, candidate.surface, candidate.role) === "rider"
     && (!options.sessionId || String(candidate._id) === String(options.sessionId))
     && (!options.principal || candidate.tokenHash === options.principal.tokenHash));
   if (!session) return null;
+  // The guard is internal, but do not propagate secret credential material.
+  delete employee.passwordHash;
+  delete session.credentialFingerprint;
   return { rider, employee, session };
 }
 

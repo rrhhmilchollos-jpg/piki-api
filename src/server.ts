@@ -1,5 +1,7 @@
 import { pendingPartnerDraft } from "./partnerDrafts.js";
 import { isPartnerEmployee, partnerBindingForEmployee, partnerBindingErrorResponse, persistPartnerBinding, validatePartnerCredentialTarget } from "./employeePartnerBinding.js";
+import { confirmEmployeePasswordReset, type PasswordResetConfirmDependencies } from "./employeePasswordResetConfirm.js";
+import { registerPartnerPasswordRecoveryRoutes, partnerRecoverySendRateLimit } from "./partnerPasswordRecovery.js";
 import { nativeReleasePolicy, riderClientReleasePolicy } from "./nativeReleasePolicy.js";
 import { customerDeliveryIsActive, employeeProfileUpdateSchema, riderAdminProfileUpdateSchema } from "./profileIdentityPolicy.js";
 import { customerAssignedRider } from "./customerRiderTracking.js";
@@ -41,7 +43,7 @@ import { mountStripeRoutes } from "./stripeRoutes.js";
 import { mountShiftRoutes } from "./shiftRoutes.js";
 import { shiftSweepWorkerStatus, startShiftSweepWorker } from "./shiftSweepWorker.js";
 import { startCodHoldSweepWorker, stopCodHoldSweepWorker } from "./codHoldSweepWorker.js";
-import { EmployeeSession, RiderAccountNotLinkedError, issueEmployeeSession, revokeEmployeeSessions, sessionRole } from "./employeeSessions.js";
+import { EmployeeSession, RiderAccountNotLinkedError, employeeCredentialFingerprint, issueEmployeeSession, revokeEmployeeSessions, sessionRole } from "./employeeSessions.js";
 import { isStripeSignatureError, processStripeWebhook, stripeConfigured, createSignaturitSignature, signaturitBaseUrl, signaturitConfigured, signaturitMode, signatureWebhookUrl, webhookDigest, handleCustomerTrpc, currentCustomer, issueCustomerSession, setCustomerOrderDispatcher } from "./integrations/index.js";
 import { getVersionPolicy, isPikiSurface, requiresUpdate, setVersionPolicy, syncVersionPolicy, versionPolicySchema, type PikiSurface } from "./appVersion.js";
 import { fcmPushConfigured, probeFcmCredentials, pushConfigured, publicPushConfig, revokePushSubscription, saveFcmSubscription, savePushSubscription, sendPushToOwner, type PushDeliveryReport } from "./push.js";
@@ -1172,7 +1174,7 @@ async function createEmployeePasswordReset(employee: any, surface: EmployeeCrede
   const tokenHash = createHash("sha256").update(rawToken).digest("hex");
   const expiresAt = new Date(Date.now() + ttlMs);
   await EmployeePasswordReset.updateMany({ employeeId: employee._id, usedAt: null }, { $set: { usedAt: new Date() } }).exec();
-  await EmployeePasswordReset.create({ employeeId: employee._id, email: String(employee.email).trim().toLowerCase(), tokenHash, expiresAt });
+  await EmployeePasswordReset.create({ employeeId: employee._id, email: String(employee.email).trim().toLowerCase(), tokenHash, expiresAt, surface });
   return { tokenHash, expiresAt, resetUrl: `${employeeCredentialAppUrls[surface]}/?reset=${encodeURIComponent(rawToken)}` };
 }
 
@@ -1219,19 +1221,10 @@ app.post("/api/v1/auth/employee/password-reset/request", rateLimit(3, 15 * 60_00
 app.post("/api/v1/auth/employee/password-reset/confirm", rateLimit(8, 15 * 60_000, "employee-password-reset-confirm"), async (req, res) => {
   const parsed = employeePasswordResetConfirmSchema.safeParse(req.body);
   const surface = employeeCredentialSurface(req.header("x-piki-surface"));
-  if (!parsed.success || !surface) return res.status(400).json({ error: "INVALID_PASSWORD_CHANGE", message: "La nueva contraseña debe tener 12 caracteres e incluir mayúscula, minúscula y número." });
-  const tokenHash = createHash("sha256").update(parsed.data.token).digest("hex");
-  // Claim the single-use token before changing credentials. A read followed by
-  // save lets two concurrent confirmations reuse the same reset link.
-  const reset = await EmployeePasswordReset.findOneAndUpdate({ tokenHash, usedAt: null, expiresAt: { $gt: new Date() } }, { $set: { usedAt: new Date() } }, { new: true }).exec() as any;
-  if (!reset) return res.status(400).json({ error: "PASSWORD_RESET_INVALID", message: "El enlace no es válido o ya ha caducado. Solicita otro enlace." });
-  const employee = await EmployeeAccount.findOne({ _id: reset.employeeId, active: true, authorizationStatus: "approved" }).select("+passwordHash").exec() as any;
-  if (!employee || !employeeCanUseCredentialSurface(employee, surface)) return res.status(400).json({ error: "PASSWORD_RESET_INVALID", message: "El enlace no es válido o ya ha caducado. Solicita otro enlace." });
-  try { if (isPartnerEmployee(employee)) await partnerBindingForEmployee(employee, kitchenAccessDependencies); }
-  catch (error) { if (partnerBindingErrorResponse(error)) return res.status(400).json({ error: "PASSWORD_RESET_INVALID" }); throw error; }
-  employee.passwordHash = hashPassword(parsed.data.newPassword); employee.mustChangePassword = false; employee.passwordChangedAt = new Date(); employee.sessionHash = null; await employee.save();
-  await EmployeeSession.deleteMany({ employeeId: employee._id }).exec();
-  return res.json({ changed: true });
+  if (!surface) return res.status(400).json({ error: "INVALID_PASSWORD_CHANGE", message: "Abre el enlace desde la aplicación PIKI a la que corresponde." });
+  if (!parsed.success) return res.status(400).json({ error: "INVALID_PASSWORD_CHANGE", message: "El enlace y la contraseña deben ser válidos. La nueva contraseña debe tener 12 caracteres e incluir mayúscula, minúscula y número." });
+  const result = await confirmEmployeePasswordReset({ ...parsed.data, surface }, employeePasswordResetConfirmDependencies);
+  return res.status(result.status).json(result.body);
 });
 app.post("/api/v1/auth/employee/login", async (req, res) => {
   const parsed = employeeLoginSchema.safeParse(req.body); if (!parsed.success) return res.status(400).json({ error: "INVALID_LOGIN" });
@@ -1269,17 +1262,18 @@ app.post("/api/v1/auth/employee/login", async (req, res) => {
 app.post("/api/v1/auth/employee/switch-role", requireRole("admin", "partner", "rider", "fleet", "commercial", "gerente_comercial_zona", "finance", "support"), async (req, res) => {
   const parsed = z.object({ role: z.enum(employeeSessionRoles) }).safeParse(req.body);
   const requestedRole = parsed.success ? parsed.data.role : "";
-  const employee = req.auth?.employeeId ? await EmployeeAccount.findOne({ _id: req.auth.employeeId, ...tenantScope(req) }).select("email tenantId accessLevel apiRole roles primaryRole ownerProtected authorizationStatus").lean().exec() as any : null;
+  const employee = req.auth?.employeeId ? await EmployeeAccount.findOne({ _id: req.auth.employeeId, active: true, ...tenantScope(req) }).select("email tenantId accessLevel apiRole roles primaryRole ownerProtected authorizationStatus passwordChangedAt +passwordHash").lean().exec() as any : null;
   if (!employee || !requestedRole) return res.status(400).json({ error: "INVALID_ROLE" });
   const surface = String(req.headers["x-piki-surface"] || "admin").toLowerCase();
+  const oldToken = String(req.headers.authorization || "").replace(/^Bearer /i, "").trim();
+  if (!oldToken) return res.status(401).json({ error: "AUTHENTICATION_REQUIRED" });
   let issued;
-  try { issued = await issueEmployeeSession(employee, surface, requestedRole); }
+  try { issued = await issueEmployeeSession(employee, surface, requestedRole, oldToken); }
   catch (error) {
     if (error instanceof RiderAccountNotLinkedError) return res.status(403).json({ error: error.code, message: error.message });
     throw error;
   }
   if (!issued) return res.status(403).json({ error: "ROLE_NOT_ALLOWED" });
-  const oldToken = String(req.headers.authorization || "").replace(/^Bearer /i, "").trim();
   if (oldToken) await EmployeeSession.deleteOne({ tokenHash: hashSessionToken(oldToken) }).exec();
   return res.json({ accessToken: issued.token, role: issued.role, roles: employee.roles?.length ? employee.roles : [employee.apiRole] });
 });
@@ -1320,7 +1314,7 @@ app.post("/api/v1/auth/employee/change-password", requireRole("admin", "partner"
   // Keep the current session for the completed mandatory-password gate; revoke others.
   const tokenHash = hashSessionToken(String(req.headers.authorization || "").replace(/^Bearer /i, ""));
   await EmployeeSession.deleteMany({ employeeId: employee._id, tokenHash: { $ne: tokenHash } }).exec();
-  await EmployeeSession.updateOne({ tokenHash }, { $set: { issuedAt: employee.passwordChangedAt } }).exec();
+  await EmployeeSession.updateOne({ tokenHash, employeeId: employee._id }, { $set: { issuedAt: employee.passwordChangedAt, credentialFingerprint: employeeCredentialFingerprint(employee.passwordHash) } }).exec();
   return res.json({ changed: true });
 });
 const employeeCreateSchema = z.object({ name: z.string().min(2).max(160), email: z.string().email(), jobRole: z.enum(["admin", "partner", "rider", "fleet", "zone_manager", "commercial", "gerente_comercial_zona", "finance", "support"]), roles: z.array(z.enum(["admin", "partner", "rider", "fleet", "commercial", "gerente_comercial_zona", "finance", "support"])).min(1).max(8).optional(), primaryRole: z.enum(["admin", "partner", "rider", "fleet", "commercial", "gerente_comercial_zona", "finance", "support"]).optional(), apiRole: z.enum(["admin", "partner", "rider", "fleet", "commercial", "gerente_comercial_zona", "finance", "support"]).optional(), restaurantId: z.string().regex(/^[a-f\d]{24}$/).nullable().optional(), fleetId: z.string().regex(/^[a-f\d]{24}$/).nullable().optional(), zoneSlugs: z.array(z.string().regex(/^[a-z0-9-]+$/)).max(100).default([]) });
@@ -1381,6 +1375,49 @@ const kitchenAccessDependencies: KitchenAccessDependencies = {
   sendActivation: async (employee) => (await sendEmployeePasswordLink(employee, "partner", "activation")).delivery,
 };
 registerPartnerKitchenAccessRoutes(app, kitchenAccessDependencies);
+const employeePasswordResetConfirmDependencies: PasswordResetConfirmDependencies = {
+  startSession: () => mongoose.startSession(),
+  findReset: (tokenHash, now, session) => EmployeePasswordReset.findOne({ tokenHash, usedAt: null, expiresAt: { $gt: now } }).select("_id employeeId email surface expiresAt usedAt").session(session as mongoose.ClientSession).lean().exec(),
+  findEmployee: (employeeId, session) => EmployeeAccount.findOne({ _id: employeeId, active: true, authorizationStatus: "approved" }).select("+passwordHash").session(session as mongoose.ClientSession).exec(),
+  validateEmployee: async (employee, surface, session) => {
+    if (!employeeCanUseCredentialSurface(employee, surface as EmployeeCredentialSurface)) return false;
+    if (isPartnerEmployee(employee)) {
+      // Keep the existing binding helper intact, but attach this transaction to
+      // every native read. Serialize its Promise.all reads on the Mongo session.
+      let pending: Promise<unknown> = Promise.resolve();
+      const read = <T>(fn: () => Promise<T>): Promise<T> => {
+        const result = pending.then(fn); pending = result.catch(() => undefined); return result;
+      };
+      const options = { session: session as mongoose.ClientSession };
+      try {
+        await partnerBindingForEmployee(employee, {
+          ownerEmail, objectId,
+          tenants: { findOne: (filter) => read(() => Tenant.collection.findOne(filter, options)) },
+          restaurants: { findOne: (filter) => read(() => Restaurant.collection.findOne(filter, options)) },
+          memberships: { find: (filter) => ({ toArray: () => read(() => TenantMembership.collection.find(filter, options).toArray()) }) },
+        });
+      } catch (error) { if (partnerBindingErrorResponse(error)) return false; throw error; }
+      finally { await pending; }
+    }
+    return true;
+  },
+  claimReset: async (reset, tokenHash, now, session) => Boolean(await EmployeePasswordReset.findOneAndUpdate({ _id: reset._id, employeeId: reset.employeeId, tokenHash, usedAt: null, expiresAt: { $gt: now } }, { $set: { usedAt: now } }, { new: true, session: session as mongoose.ClientSession }).select("_id").lean().exec()),
+  savePassword: async (employee, password, now, session) => {
+    employee.passwordHash = hashPassword(password); employee.mustChangePassword = false;
+    employee.passwordChangedAt = now; employee.sessionHash = null;
+    await employee.save({ session: session as mongoose.ClientSession });
+  },
+  revokeEmployeeSessions: (employeeId, session) => revokeEmployeeSessions(employeeId, session as mongoose.ClientSession),
+};
+registerPartnerPasswordRecoveryRoutes(app, {
+  requireOwner, objectId, binding: kitchenAccessDependencies,
+  sendRateLimit: partnerRecoverySendRateLimit({ increment: async (key, windowMs) => await incrementDistributedRateLimit(key, windowMs) ?? await incrementMongoRateLimit(key, windowMs) }),
+  restaurant: (filter) => Restaurant.findOne(filter).select("_id tenantId name email onboardingStatus listingType internalDemo updatedAt kitchenAccessRevision").lean().exec(),
+  employees: (filter) => EmployeeAccount.find(filter).select("_id name email tenantId active authorizationStatus apiRole jobRole primaryRole roles partnerRoles restaurantId restaurantIds accessLevel ownerProtected kitchenAccessSetupVersion partnerBindingVersion fleetId zoneSlugs updatedAt kitchenAccessRevision").lean().exec(),
+  canUsePartner: (employee) => employeeCanUseCredentialSurface(employee, "partner"),
+  sendEmployeePasswordLink,
+  audit: (event) => GovernanceAuditEvent.create({ tenantId: objectId(event.tenantId), actorEmployeeId: objectId(event.actorEmployeeId), actorRole: "admin", targetType: "employee", targetId: objectId(event.employeeId), action: event.sent ? "partner_password_recovery_sent" : "partner_password_recovery_delivery_unconfirmed", after: { restaurantId: event.restaurantId, sent: event.sent }, reason: "Recuperación Partner solicitada explícitamente por Owner; sin cambio de contraseña ni roles." }),
+});
 registerPartnerTerminalInventoryRoutes(app, {
   ownerMiddleware: requireOwner(),
   restaurantScope: (req, id) => ({ _id: objectId(id), ...tenantScope(req) }),

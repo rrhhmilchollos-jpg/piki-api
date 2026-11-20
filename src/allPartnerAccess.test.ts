@@ -4,6 +4,7 @@ import { readFileSync } from "node:fs";
 import ts from "typescript";
 import mongoose from "mongoose";
 import { z } from "zod";
+import { confirmEmployeePasswordReset } from "./employeePasswordResetConfirm.js";
 import { EmployeeAccount } from "./models.js";
 import { isPartnerEmployee, partnerBindingForEmployee, partnerBindingErrorResponse, persistPartnerBinding, validatePartnerCredentialTarget } from "./employeePartnerBinding.js";
 import { partnerRolesForEmployee, permissionsForPartnerRoles, partnerCan } from "./partnerAccess.js";
@@ -218,9 +219,18 @@ test("authorization edits persist role and restaurant changes through the same a
   assert.equal(res.body.employee.passwordHash, undefined); assert.equal(res.body.employee.sessionHash, undefined);
 });
 test("public reset confirmation cannot set password after losing restaurant association", async () => {
-  const h = harness(); const account: any = h.account({ tenantId: ids.tenant }); let saves = 0; account.save = async () => { saves++; };
-  const context = { employeePasswordResetConfirmSchema: z.object({ token: z.string(), newPassword: z.string() }), employeeCredentialSurface: () => "partner", createHash: () => ({ update() { return this; }, digest: () => "OFFLINE_HASH" }), EmployeePasswordReset: { findOneAndUpdate: () => query({ employeeId: ids.employee }) }, EmployeeAccount: { findOne: () => query(account) }, employeeCanUseCredentialSurface: () => true, kitchenAccessDependencies: h.deps };
-  const res = response(); await handler("/api/v1/auth/employee/password-reset/confirm", context)({ body: { token: "OFFLINE_TOKEN", newPassword: "OfflinePassword123" }, header: () => "partner" }, res); assert.equal(res.code, 400); assert.equal(saves, 0);
+  const h = harness(); const account: any = h.account({ tenantId: ids.tenant }); let saves = 0; let claims = 0; let revokes = 0;
+  const session = { withTransaction: async (fn: () => Promise<void>) => fn(), endSession: async () => undefined };
+  const employeePasswordResetConfirmDependencies = {
+    startSession: async () => session,
+    findReset: async () => ({ employeeId: ids.employee, expiresAt: new Date(Date.now() + 60_000), usedAt: null }),
+    findEmployee: async () => account,
+    validateEmployee: async () => { try { await partnerBindingForEmployee(account, h.deps); return true; } catch { return false; } },
+    claimReset: async () => { claims++; return true; },
+    savePassword: async () => { saves++; }, revokeEmployeeSessions: async () => { revokes++; },
+  };
+  const context = { employeePasswordResetConfirmSchema: z.object({ token: z.string(), newPassword: z.string() }), employeeCredentialSurface: () => "partner", confirmEmployeePasswordReset, employeePasswordResetConfirmDependencies };
+  const res = response(); await handler("/api/v1/auth/employee/password-reset/confirm", context)({ body: { token: "OFFLINE_TOKEN", newPassword: "OfflinePassword123" }, header: () => "partner" }, res); assert.equal(res.code, 400); assert.equal(saves, 0); assert.equal(claims, 0); assert.equal(revokes, 0); assert(res.body.message);
 });
 test("explicit activation preserves sent=true when SMTP accepted but audit failed", async () => {
   const h = harness(); const employee = await h.create(); let emails = 0; const context: any = routeContext(h, employee, async () => { emails++; return { delivery: { sent: true } }; });
