@@ -63,6 +63,7 @@ import { activeOperationalOrderStatuses, dispatchableOrderStatuses, dispatchable
 import { canReceivePartnerLocations, partnerCan, partnerPermissions, partnerRolesForEmployee, permissionsForPartnerRoles, type PartnerPermission } from "./partnerAccess.js";
 import { registerPartnerTerminalInventoryRoutes } from "./partnerTerminalInventory.js";
 import { KitchenAccessError, kitchenBindingForEmployee, kitchenRestaurantCanOperate, registerPartnerKitchenAccessRoutes, validateKitchenActivation, type KitchenAccessDependencies } from "./partnerKitchenAccess.js";
+import { partnerTicketContactEnabled } from "./partnerTicketContactPolicy.js";
 import { assignedRestaurantIds, partnerAccessForRequest as sharedPartnerAccessForRequest, partnerRequestAccess as sharedPartnerRequestAccess, partnerReadinessReason, requirePartnerSurface } from "./partnerOperationalAccess.js";
 import { awardRiderRecruitmentMilestones, claimRiderReferralCode, completeRiderShiftIncentiveTracking, incentiveProgramStatus, loadRiderIncentiveSnapshot, trackRiderLocationForIncentive, trackRiderShiftStart } from "./riderIncentives.js";
 import { buildApprovedRiderOperationalProfile } from "./riderApproval.js";
@@ -2660,27 +2661,33 @@ app.get("/api/v1/partners/kitchen/orders", requirePartnerSurface(), async (req, 
   if (!allowed) return res.status(403).json({ error: "PARTNER_PERMISSION_DENIED", permission: "orders:read" });
   const restaurantId = await employeeRestaurant(req, access);
   if (!restaurantId) return res.status(403).json({ error: access?.restaurantIds.length ? "PARTNER_RESTAURANT_ACCESS_DENIED" : "PARTNER_RESTAURANT_NOT_ASSIGNED" });
-  const orders = await Order.find({ restaurantId, ...partnerTenantScope(req), ...partnerKitchenPaymentFilter, archivedAt: null, status: { $in: ["pending", "accepted", "preparing", "ready_for_pickup", "picked_up", "on_the_way"] } }).sort({ createdAt: 1 }).lean().exec() as any[];
-  const [restaurantRecord, customers, riders] = await Promise.all([
-    Restaurant.findOne({ _id: restaurantId, ...partnerTenantScope(req) }).select("name address phone cuisine location").lean().exec(),
-    CustomerAccount.find({ _id: { $in: orders.map((order) => order.customerId).filter(Boolean) }, ...partnerTenantScope(req) }).select("name email").lean().exec(),
+  const restaurant = await Restaurant.findOne({ _id: restaurantId, ...partnerTenantScope(req) }).select("name slug address phone cuisine location").lean().exec() as any;
+  const printCustomerContactEnabled = partnerTicketContactEnabled(restaurant);
+  const ordersQuery = Order.find({ restaurantId, ...partnerTenantScope(req), ...partnerKitchenPaymentFilter, archivedAt: null, status: { $in: ["pending", "accepted", "preparing", "ready_for_pickup", "picked_up", "on_the_way"] } });
+  if (printCustomerContactEnabled) ordersQuery.select("+customerPhone");
+  const orders = await ordersQuery.sort({ createdAt: 1 }).lean().exec() as any[];
+  const [customers, riders] = await Promise.all([
+    CustomerAccount.find({ _id: { $in: orders.map((order) => order.customerId).filter(Boolean) }, ...partnerTenantScope(req) }).select(printCustomerContactEnabled ? "name email phone" : "name email").lean().exec(),
     Rider.find({ _id: { $in: orders.map((order) => order.riderId).filter(Boolean) } }).select("name vehicle location lastLocationAt status").lean().exec(),
   ]);
-  const restaurant = restaurantRecord as any;
   const customerMap = new Map(customers.map((customer: any) => [String(customer._id), customer]));
   const riderMap = new Map(riders.map((rider: any) => [String(rider._id), rider]));
   return res.json({ orders: orders.map((order: any) => {
     const linkedCustomer = order.customerId ? customerMap.get(String(order.customerId)) : null;
     const customerName = String(linkedCustomer?.name || order.customerName || "").trim();
+    const customerPhone = String(linkedCustomer?.phone || order.customerPhone || "").trim();
+    const orderWithoutCustomerPhone = { ...order };
+    delete orderWithoutCustomerPhone.customerPhone;
     return {
-      ...order,
+      ...orderWithoutCustomerPhone,
       // Código de entrega: las tres últimas cifras del número de pedido, el que
       // el rider canta en el mostrador y el cliente ve en su pantalla.
       deliveryCode: order.displayCode || String(order.publicCode || "").slice(-3) || null,
       pickupQrUrl: order.status === "ready_for_pickup" ? pickupQrUrl(order.publicCode) : null,
       pickupPin: order.status === "ready_for_pickup" ? pickupQrPin(order.publicCode) : null,
       restaurant: restaurant ? { name: restaurant.name, address: restaurant.address || "", phone: restaurant.phone || "", cuisine: restaurant.cuisine || "" } : null,
-      customer: customerName ? { name: customerName, email: linkedCustomer?.email || "" } : null,
+      customer: customerName || (printCustomerContactEnabled && customerPhone) ? { name: customerName, email: linkedCustomer?.email || "", ...(printCustomerContactEnabled ? { phone: customerPhone || null } : {}) } : null,
+      printCustomerContactEnabled,
       partnerPrepDeadlineAt: order.partnerPrepDeadlineAt || null,
       partnerPrepOverdue: Boolean(order.partnerPrepDeadlineAt && new Date(order.partnerPrepDeadlineAt).getTime() < Date.now()),
       riderTracking: (() => {
