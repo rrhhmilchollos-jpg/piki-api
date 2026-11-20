@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 import ts from "typescript";
-import { CUSTOMER_CATALOG_RESTAURANT_FILTER, customerCatalogRestaurantName, customerMenuForRestaurant, presentCustomerCatalogRestaurant, restaurantIsWithinOpeningHours } from "./customerCatalogPolicy.js";
+import { CUSTOMER_CATALOG_RESTAURANT_FILTER, customerCatalogRestaurantName, customerDeliveryHours, customerMenuForRestaurant, presentCustomerCatalogRestaurant, restaurantIsWithinOpeningHours } from "./customerCatalogPolicy.js";
 import { customerAvailability } from "./customerAvailability.js";
 import { modifierGroupsForItem, usesReferenceAddOns } from "./menuModifiers.js";
 import { canonicalRestaurantMenu } from "./menuContract.js";
@@ -37,7 +37,7 @@ const publicRestaurantPaymentCapabilities = enabledPolicy.publicRestaurantPaymen
 const compatSource = source("./customerCompat.ts");
 const restaurantView = evaluate(declaration(compatSource, "restaurantView"), "restaurantView", {
   publicRestaurantPaymentCapabilities, usesReferenceAddOns, restaurantIsWithinOpeningHours, customerAvailability,
-  customerCatalogRestaurantName, customerMenuForRestaurant, isCashPaymentEnabledForRestaurant: enabledPolicy.isCashPaymentEnabledForTest, modifierGroupsForItem,
+  customerCatalogRestaurantName, customerDeliveryHours, customerMenuForRestaurant, isCashPaymentEnabledForRestaurant: enabledPolicy.isCashPaymentEnabledForTest, modifierGroupsForItem,
 });
 const cases: Array<{ name: string; row: Record<string, any>; methods: string[]; bizumOnly?: boolean; model?: string }> = [
   { name: "legacy absent fields", row: {}, methods: ["stripe", "bizum", "cash"] },

@@ -25,7 +25,7 @@ function handler(method: string, context: Record<string, any>) {
 const query = (value: any) => ({ select() { return this; }, lean() { return this; }, exec: async () => value });
 async function roundtrip(input: unknown, allowed = true) {
   let writes = 0;
-  const row = { _id: "64b000000000000000000001", name: "Offline", isActive: true, onboardingStatus: "approved", partnerProfile: { openingHours: {} as any } };
+  const row = { _id: "64b000000000000000000001", name: "Offline", isActive: true, onboardingStatus: "approved", partnerProfile: { openingHours: {} as any, deliveryHours: undefined as any } };
   const context = {
     openingHoursSchema,
     pikiManagedOpeningHours: helper("pikiManagedOpeningHours", { normalizeOpeningHours, legacyOpeningHoursProjection }),
@@ -33,7 +33,7 @@ async function roundtrip(input: unknown, allowed = true) {
     partnerRequestAccess: async () => ({ allowed, access: { restaurantIds: [row._id] } }), employeeRestaurant: async () => row._id,
     tenantScope: () => ({ tenantId: "64b000000000000000000002" }),
     partnerTenantScope: () => ({ tenantId: "64b000000000000000000002" }),
-    Restaurant: { findOne: () => query(row), findOneAndUpdate: (filter: any, update: any) => { writes++; assert.equal(filter.tenantId, "64b000000000000000000002"); assert.deepEqual(filter.onboardingStatus, { $in: ["approved", "pending_review"] }); row.partnerProfile.openingHours = update.$set["partnerProfile.openingHours"]; return query(row); } },
+    Restaurant: { findOne: () => query(row), findOneAndUpdate: (filter: any, update: any) => { writes++; assert.equal(filter.tenantId, "64b000000000000000000002"); assert.deepEqual(filter.onboardingStatus, { $in: ["approved", "pending_review"] }); for (const [path, value] of Object.entries(update.$set)) (row.partnerProfile as any)[path.split(".").at(-1)!] = value; return query(row); } },
     invalidateCatalogCache: () => undefined, publishCatalogUpdate: () => undefined,
   };
   let status = 200; let body: any;
@@ -82,3 +82,21 @@ test("Customer y checkout aplican horario normalizado; el estado legacy cerrado 
   assert.equal(evaluateOpeningHours(hours, now).open, false);
   assert.equal(restaurantIsWithinOpeningHours(hours, now), false);
 });
+
+test("deliveryHours puede actualizarse parcialmente, preserva openingHours y GET devuelve ambos campos", async () => {
+  const deliveryInput = { lunes: { open: "11:00", close: "00:00", closed: false } };
+  const openingInput = { lunes: { open: "09:00", close: "18:00", closed: false } };
+  let writes = 0;
+  const originalOpening = pikiSchedule(openingInput);
+  const row: any = { _id: "64b000000000000000000001", name: "Offline", isActive: true, onboardingStatus: "approved", partnerProfile: { openingHours: originalOpening, deliveryHours: undefined } };
+  const context = { openingHoursSchema, pikiManagedOpeningHours: helper("pikiManagedOpeningHours", { normalizeOpeningHours, legacyOpeningHoursProjection }), partnerIsOpenNow: helper("partnerIsOpenNow", { restaurantIsWithinOpeningHours }), partnerRequestAccess: async () => ({ allowed: true, access: { restaurantIds: [row._id] } }), employeeRestaurant: async () => row._id, tenantScope: () => ({ tenantId: "64b000000000000000000002" }), partnerTenantScope: () => ({ tenantId: "64b000000000000000000002" }), Restaurant: { findOne: () => query(row), findOneAndUpdate: (_filter: any, update: any) => { writes++; Object.entries(update.$set).forEach(([key, value]) => { row.partnerProfile[key.split(".").at(-1)!] = value; }); return query(row); } }, invalidateCatalogCache: () => undefined, publishCatalogUpdate: () => undefined };
+  const res: any = { statusCode: 200, status(value: number) { this.statusCode = value; return this; }, json(value: any) { this.body = value; return this; } };
+  await handler("patch", context)({ body: { deliveryHours: deliveryInput } }, res);
+  assert.equal(res.statusCode, 200); assert.equal(writes, 1);
+  assert.deepEqual(row.partnerProfile.openingHours, originalOpening);
+  assert.deepEqual(res.body.deliveryHours.regular.lunes, [{ open: "11:00", close: "00:00", endsNextDay: true }]);
+  await handler("get", context)({}, res);
+  assert.deepEqual(res.body.openingHours, row.partnerProfile.openingHours);
+  assert.deepEqual(res.body.deliveryHours, row.partnerProfile.deliveryHours);
+});
+function pikiSchedule(value: unknown) { const schedule = normalizeOpeningHours(value)!; const managed = { ...schedule, source: { mode: "piki" as const, syncedAt: new Date() } }; return { ...legacyOpeningHoursProjection(managed), ...managed }; }

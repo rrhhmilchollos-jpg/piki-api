@@ -5,7 +5,7 @@ import { CustomerAccount, EmployeeAccount, Order, Restaurant, Tenant, TenantMemb
 import { EmployeeSession } from "./employeeSessions.js";
 import { hashSessionToken } from "./employeeAuth.js";
 import { handleCustomerTrpc } from "./customerCompat.js";
-import { COMING_SOON_SLUGS, CUSTOMER_ORDERABLE_RESTAURANT_FILTER, customerCommissionRate } from "./customerCatalogPolicy.js";
+import { COMING_SOON_SLUGS, CUSTOMER_CATALOG_VISIBLE_SLUGS, CUSTOMER_ORDERABLE_RESTAURANT_FILTER, customerCommissionRate } from "./customerCatalogPolicy.js";
 import { searchLocalities } from "./localities.js";
 import { preflightRestaurantCatalogIndexes } from "./catalogImportPreflight.js";
 import { customerAvailability } from "./customerAvailability.js";
@@ -35,7 +35,7 @@ function response(): any {
   return { statusCode: 200, headers: {}, body: undefined, status(code: number) { this.statusCode = code; return this; }, json(value: unknown) { this.body = value; return this; }, setHeader(key: string, value: string) { this.headers[key] = value; } };
 }
 function fixture(overrides: any = {}): any {
-  return { _id: restaurantId, tenantId, slug: "offline-partner", name: "Sintético", cuisine: "Test", category: "Test", listingType: "official_partner", isActive: true, onboardingStatus: "approved", availabilityStatus: "available", cashPaymentsEnabled: true, menuRevision: 0, menu: [{ id: "dish", name: "Plato", price: 10, available: true, modifiers: [{ id: "extra", name: "Extra", minSelections: 0, maxSelections: 1, options: [{ id: "stale", name: "No seleccionar", price: 9 }], optionItems: [{ id: "on", name: "Extra", price: 2, available: true }, { id: "off", name: "Pausada", price: 3, available: false }] }] }], ...overrides };
+  return { _id: restaurantId, tenantId, slug: "alibaba-kebab-xativa", name: "Sintético", cuisine: "Test", category: "Test", listingType: "official_partner", isActive: true, onboardingStatus: "approved", availabilityStatus: "available", cashPaymentsEnabled: true, menuRevision: 0, menu: [{ id: "dish", name: "Plato", price: 10, available: true, modifiers: [{ id: "extra", name: "Extra", minSelections: 0, maxSelections: 1, options: [{ id: "stale", name: "No seleccionar", price: 9 }], optionItems: [{ id: "on", name: "Extra", price: 2, available: true }, { id: "off", name: "Pausada", price: 3, available: false }] }] }], ...overrides };
 }
 async function trpc(procedure: string, input: unknown) {
   const res = response();
@@ -169,6 +169,24 @@ test("contratos de catálogo y carta con handlers reales, consultas en memoria y
     assert.equal(writes.length, 0);
   });
 
+  await t.test("deliveryHours cerrado prevalece sobre openingHours abierto para Customer, quote y checkout", async (child) => {
+    child.mock.method(CustomerAccount as any, "findOne", () => query({ _id: employeeId, pikiCreditsCents: 0 }));
+    const days = ["lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo"];
+    const open = Object.fromEntries(days.map((day) => [day, [{ open: "00:00", close: "23:59" }]]));
+    const closed = Object.fromEntries(days.map((day) => [day, []]));
+    stored = fixture({ partnerProfile: {
+      openingHours: { timeZone: "Europe/Madrid", regular: open, overrides: [] },
+      deliveryHours: { timeZone: "Europe/Madrid", regular: closed, overrides: [] },
+    } });
+    const input = { restaurantId, items: [{ id: "dish", quantity: 1 }], deliveryLocation: { latitude: 38.990276, longitude: -0.521111 }, paymentMethod: "stripe" };
+    assert.equal((await call("get", "/api/v1/catalog/restaurants", { query: {} })).body.restaurants[0].isOpen, false);
+    assert.equal((await trpc("catalog.byId", { id: restaurantId })).body.result.data.json.isOpen, false);
+    assert.equal((await trpc("order.quote", input)).body.error.json.data.code, "PARTNER_CLOSED");
+    assert.equal((await trpc("order.checkout", input)).body.error.json.data.code, "PARTNER_CLOSED");
+    const restOrder = await call("post", "/api/v1/orders", { body: { restaurantId, deliveryAddress: "Calle sintética 12", deliveryLocation: input.deliveryLocation, items: [{ itemId: "dish", quantity: 1 }], paymentMethod: "stripe" } });
+    assert.equal(restOrder.statusCode, 409); assert.equal(restOrder.body.error, "PARTNER_CLOSED");
+    assert.equal(writes.length, 0);
+  });
   await t.test("perfil válido prevalece incluso sobre slug legacy; inválido conserva defaults", () => {
     assert.equal(customerCommissionRate({ slug: "alibaba-kebab-xativa", partnerProfile: { commissionRateBps: 1800 } }), 0.18);
     assert.equal(customerCommissionRate({ slug: "alibaba-kebab-xativa" }), 0.18);
@@ -279,6 +297,20 @@ test("contratos de catálogo y carta con handlers reales, consultas en memoria y
     assert.equal(writes.length, before);
   });
 
+  await t.test("la allowlist exacta sólo limita visibilidad; no cambia la elegibilidad de pedido", async () => {
+    for (const slug of CUSTOMER_CATALOG_VISIBLE_SLUGS) {
+      stored = fixture({ slug });
+      assert.equal((await call("get", "/api/v1/catalog/restaurants", { query: {} })).body.restaurants[0].slug, slug);
+      assert.equal((await trpc("catalog.list", {})).body.result.data.json[0].slug, slug);
+      assert.equal((await trpc("catalog.byId", { id: slug })).body.result.data.json.slug, slug);
+    }
+    stored = fixture({ slug: "still-orderable-hidden-shop" });
+    assert.equal(matches(stored, CUSTOMER_ORDERABLE_RESTAURANT_FILTER), true);
+    assert.deepEqual((await call("get", "/api/v1/catalog/restaurants", { query: {} })).body.restaurants, []);
+    assert.deepEqual((await trpc("catalog.list", {})).body.result.data.json, []);
+    assert.equal((await trpc("catalog.byId", { id: stored.slug })).body.result.data.json, null);
+    assert.equal((await trpc("order.quote", { restaurantId, items: [{ id: "dish", quantity: 1 }] })).statusCode, 200);
+  });
   await t.test("PATCH por ID es atómico, preserva resto, replay no incrementa y PUT stale da 409", async () => {
     stored = fixture(); stored.menu.push({ id: "other", name: "Otro", price: 7, available: true });
     const old = structuredClone(stored.menu);

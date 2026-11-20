@@ -1,11 +1,15 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { CUSTOMER_CATALOG_RESTAURANT_FILTER, CUSTOMER_ORDERABLE_RESTAURANT_FILTER, COMING_SOON_SLUGS, presentCustomerCatalogRestaurant, restaurantIsWithinOpeningHours } from './customerCatalogPolicy.js';
+import { CUSTOMER_CATALOG_RESTAURANT_FILTER, CUSTOMER_ORDERABLE_RESTAURANT_FILTER, CUSTOMER_CATALOG_VISIBLE_SLUGS, COMING_SOON_SLUGS, customerDeliveryHours, presentCustomerCatalogRestaurant, restaurantIsWithinOpeningHours } from './customerCatalogPolicy.js';
 import { customerMenuForRestaurant } from './customerCatalogPolicy.js';
 
 test('el catálogo público usa exactamente la guarda operativa, sin excepciones de próximos o directorios', () => {
   assert.deepEqual(COMING_SOON_SLUGS, ['eleven-burgers-xativa', 'nakama-sushi-xativa', 'kazoku-xativa', 'kazoku-algemesi']);
-  assert.equal(CUSTOMER_CATALOG_RESTAURANT_FILTER, CUSTOMER_ORDERABLE_RESTAURANT_FILTER);
+  assert.notEqual(CUSTOMER_CATALOG_RESTAURANT_FILTER, CUSTOMER_ORDERABLE_RESTAURANT_FILTER);
+  assert.deepEqual(CUSTOMER_CATALOG_VISIBLE_SLUGS, ['kazoku-xativa-mwbj9yzr', 'kazoku-algemesi-mwdjf1zd', 'alibaba-kebab-xativa', 'rooster-kebab-xativa', 'eleven-burgers-xativa', 'kings-tacos-xativa']);
+  assert.deepEqual(CUSTOMER_CATALOG_RESTAURANT_FILTER.slug, { $in: [...CUSTOMER_CATALOG_VISIBLE_SLUGS], $nin: ['kfc-xativa-test', 'partner-test'] });
+  assert.equal((CUSTOMER_ORDERABLE_RESTAURANT_FILTER.slug as any).$in, undefined, 'the orderable predicate remains unrestricted by catalog display policy');
+  assert.equal(CUSTOMER_CATALOG_RESTAURANT_FILTER.isActive, CUSTOMER_ORDERABLE_RESTAURANT_FILTER.isActive);
   assert.equal(CUSTOMER_ORDERABLE_RESTAURANT_FILTER.availabilityStatus, 'available');
   assert.deepEqual(CUSTOMER_ORDERABLE_RESTAURANT_FILTER['menu.0'], { $exists: true });
   for (const slug of COMING_SOON_SLUGS) {
@@ -77,4 +81,14 @@ test('Alibaba conserva el configurador cuando el registro legacy trae complement
   assert.equal(view.menu[0].modifierGroups.length, 1);
   assert.equal(view.menu[0].modifierGroups[0].options.length, 5);
   assert.equal(view.menu[0].modifierGroups[0].minSelections, 1);
+});
+
+test('Customer usa deliveryHours preferentemente y cae a openingHours en registros históricos', () => {
+  const general = { timeZone: 'Europe/Madrid', regular: { lunes: [{ open: '09:00', close: '23:59' }] }, overrides: [] };
+  const delivery = { timeZone: 'Europe/Madrid', regular: { lunes: [] }, overrides: [] };
+  assert.equal(customerDeliveryHours({ partnerProfile: { openingHours: general, deliveryHours: delivery } }), delivery);
+  assert.equal(customerDeliveryHours({ partnerProfile: { openingHours: general } }), general);
+  const afterClose = new Date('2026-11-09T19:00:00Z');
+  assert.equal(restaurantIsWithinOpeningHours(delivery, afterClose), false);
+  assert.equal(restaurantIsWithinOpeningHours(customerDeliveryHours({ partnerProfile: { openingHours: general } }), afterClose), true);
 });

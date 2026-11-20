@@ -5,7 +5,7 @@ import { Order, Restaurant, CustomerAccount, RiderOrderMessage } from "./models.
 import { publishOrderIntakeEvents } from "./realtime.js";
 import { evaluateXativaCoverage } from "./coverage/xativaPolicy.js";
 import { quoteDeliveryRoute } from "./coverage/routing.js";
-import { CUSTOMER_CATALOG_RESTAURANT_FILTER, CUSTOMER_ORDERABLE_RESTAURANT_FILTER, customerMenuForRestaurant, customerCatalogRestaurantName, menuItemIsAvailable, restaurantIsWithinOpeningHours } from "./customerCatalogPolicy.js";
+import { CUSTOMER_CATALOG_RESTAURANT_FILTER, CUSTOMER_ORDERABLE_RESTAURANT_FILTER, customerDeliveryHours, customerMenuForRestaurant, customerCatalogRestaurantName, menuItemIsAvailable, restaurantIsWithinOpeningHours } from "./customerCatalogPolicy.js";
 import { customerAvailability } from "./customerAvailability.js";
 import { modifierGroupsForItem, quoteMenuItem, usesReferenceAddOns } from "./menuModifiers.js";
 import { cashOrderLimitError, cashPaymentDisabledError, isCashOrderWithinLimit, isCashPaymentEnabledForRestaurant } from "./paymentPolicy.js";
@@ -190,8 +190,8 @@ const deliveryPin = (orderCode: string) => {
 function restaurantView(row: any) {
   const useReferenceFallback = usesReferenceAddOns(row);
   const comingSoon = row.availabilityStatus === "coming_soon";
-  const withinHours = restaurantIsWithinOpeningHours(row.partnerProfile?.openingHours);
-  const availability = customerAvailability({ ...row, openingHours: row.partnerProfile?.openingHours, comingSoon, listingType: row.listingType || "official_partner", hasMenu: Array.isArray(row.menu) && row.menu.length > 0 });
+  const withinHours = restaurantIsWithinOpeningHours(customerDeliveryHours(row));
+  const availability = customerAvailability({ ...row, openingHours: customerDeliveryHours(row), comingSoon, listingType: row.listingType || "official_partner", hasMenu: Array.isArray(row.menu) && row.menu.length > 0 });
   // Both tRPC (Vercel/Android) and the REST catalogue read the same persisted
   // restaurant. Keep display fields instead of stripping categories and media.
   // Catalogue and quote share the final customer price and selectable options.
@@ -445,7 +445,7 @@ async function handleCustomerTrpcSingle(req: Request, res: Response) {
       const user = await currentCustomer(req) as any;
       const restaurant = await Restaurant.findOne({ _id: input?.restaurantId, ...CUSTOMER_ORDERABLE_RESTAURANT_FILTER }).lean().exec() as any;
       if (!restaurant) return fail(res, "Restaurante no encontrado", "NOT_FOUND");
-      if (!restaurantIsWithinOpeningHours(restaurant.partnerProfile?.openingHours)) return fail(res, "Este establecimiento está cerrado ahora. Elige otro horario para realizar el pedido.", "PARTNER_CLOSED");
+      if (!restaurantIsWithinOpeningHours(customerDeliveryHours(restaurant))) return fail(res, "Este establecimiento está cerrado ahora. Elige otro horario para realizar el pedido.", "PARTNER_CLOSED");
       let items: ReturnType<typeof customerQuotedItems>;
       try { items = customerQuotedItems(restaurant, input?.items); }
       catch { return fail(res, "Revisa los productos y opciones de la cesta", "PRODUCT_UNAVAILABLE"); }
@@ -471,7 +471,7 @@ async function handleCustomerTrpcSingle(req: Request, res: Response) {
       if (parsedExpectation && !parsedExpectation.success) return fail(res, "La expectativa de cotización no es válida.", "BAD_REQUEST");
       const restaurant = await Restaurant.findOne({ _id: input?.restaurantId, ...CUSTOMER_ORDERABLE_RESTAURANT_FILTER }).lean().exec() as any;
       if (!restaurant) return fail(res, "Restaurante no encontrado", "NOT_FOUND");
-      if (!restaurantIsWithinOpeningHours(restaurant.partnerProfile?.openingHours)) return fail(res, "Este establecimiento está cerrado ahora. Elige otro horario para realizar el pedido.", "PARTNER_CLOSED");
+      if (!restaurantIsWithinOpeningHours(customerDeliveryHours(restaurant))) return fail(res, "Este establecimiento está cerrado ahora. Elige otro horario para realizar el pedido.", "PARTNER_CLOSED");
       const requested = Array.isArray(input?.items) ? input.items : [];
       if (requested.some((line: any) => (restaurant.menu || []).some((item: any) => item.id === line.id && !menuItemIsAvailable(item)))) {
         return fail(res, "Un producto de tu cesta ya no está disponible. Actualiza la carta antes de continuar.", "PRODUCT_UNAVAILABLE");
@@ -520,7 +520,7 @@ async function handleCustomerTrpcSingle(req: Request, res: Response) {
       try {
         await orderSession.withTransaction(async () => {
           const freshRestaurant = await Restaurant.findOne({ _id: restaurant._id, ...CUSTOMER_ORDERABLE_RESTAURANT_FILTER }).session(orderSession).lean().exec() as any;
-          if (!freshRestaurant || !paymentDecision(freshRestaurant, paymentMethod).ok) throw new CustomerQuoteConflict();
+          if (!freshRestaurant || !paymentDecision(freshRestaurant, paymentMethod).ok || !restaurantIsWithinOpeningHours(customerDeliveryHours(freshRestaurant))) throw new CustomerQuoteConflict();
           let freshItems: ReturnType<typeof customerQuotedItems>;
           try { freshItems = customerQuotedItems(freshRestaurant, requested); }
           catch { throw new CustomerQuoteConflict(); }

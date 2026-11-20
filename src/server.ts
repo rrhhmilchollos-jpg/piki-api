@@ -1735,7 +1735,7 @@ app.get("/api/v1/catalog/restaurants", async (req, res) => {
   const restaurants = await Restaurant.find(filter)
     // Explicit inclusion avoids MongoDB path-collision errors caused by
     // partnerProfile.documents having select:false nested fields.
-    .select("slug name cuisine category locality partnerGroupKey listingType fulfillmentMode fulfillmentModel paymentMethods bizumOnly goldFounder tagline etaMinutes deliveryFeeCents cashPaymentsEnabled rating reviews promoted image accent phone address location menu menuRevision priceIncludesCommission isActive onboardingStatus availabilityStatus upcomingAt upcomingMessage partnerProfile.commissionRateBps partnerProfile.openingHours partnerProfile.postalCode partnerProfile.city partnerProfile.province")
+    .select("slug name cuisine category locality partnerGroupKey listingType fulfillmentMode fulfillmentModel paymentMethods bizumOnly goldFounder tagline etaMinutes deliveryFeeCents cashPaymentsEnabled rating reviews promoted image accent phone address location menu menuRevision priceIncludesCommission isActive onboardingStatus availabilityStatus upcomingAt upcomingMessage partnerProfile.commissionRateBps partnerProfile.openingHours partnerProfile.deliveryHours partnerProfile.postalCode partnerProfile.city partnerProfile.province")
     .sort({ promoted: -1, rating: -1, reviews: -1 }).lean().exec();
   const catalogPriority: Record<string, number> = {
     "alibaba-kebab-xativa": 0,
@@ -2428,23 +2428,31 @@ app.get("/api/v1/partners/store/hours", requirePartnerSurface(), async (req, res
   if (!allowed) return res.status(403).json({ error: "PARTNER_PERMISSION_DENIED", permission: "store:write" });
   const restaurantId = await employeeRestaurant(req, access);
   if (!restaurantId) return res.status(403).json({ error: "PARTNER_RESTAURANT_NOT_ASSIGNED" });
-  const restaurant = await Restaurant.findOne({ _id: restaurantId, onboardingStatus: { $in: ["approved", "pending_review"] }, ...partnerTenantScope(req) }).select("_id name isActive onboardingStatus partnerProfile.openingHours").lean().exec() as any;
+  const restaurant = await Restaurant.findOne({ _id: restaurantId, onboardingStatus: { $in: ["approved", "pending_review"] }, ...partnerTenantScope(req) }).select("_id name isActive onboardingStatus partnerProfile.openingHours partnerProfile.deliveryHours").lean().exec() as any;
   if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
-  return res.json({ restaurantId: String(restaurant._id), name: restaurant.name, isOpen: partnerIsOpenNow(restaurant), paused: !restaurant.isActive, openingHours: restaurant.partnerProfile?.openingHours || {} });
+  return res.json({ restaurantId: String(restaurant._id), name: restaurant.name, isOpen: partnerIsOpenNow(restaurant), paused: !restaurant.isActive, openingHours: restaurant.partnerProfile?.openingHours || {}, deliveryHours: restaurant.partnerProfile?.deliveryHours });
 });
 app.patch("/api/v1/partners/store/hours", requirePartnerSurface(), async (req, res) => {
   const { access, allowed } = await partnerRequestAccess(req, "store:write");
   if (!allowed) return res.status(403).json({ error: "PARTNER_PERMISSION_DENIED", permission: "store:write" });
   const restaurantId = await employeeRestaurant(req, access);
-  const parsed = openingHoursSchema.safeParse(req.body?.openingHours ?? req.body);
   if (!restaurantId) return res.status(403).json({ error: "PARTNER_RESTAURANT_NOT_ASSIGNED" });
-  if (!parsed.success) return res.status(400).json({ error: "INVALID_OPENING_HOURS", details: parsed.error.flatten() });
-  const openingHours = pikiManagedOpeningHours(parsed.data);
-  const restaurant = await Restaurant.findOneAndUpdate({ _id: restaurantId, onboardingStatus: { $in: ["approved", "pending_review"] }, ...partnerTenantScope(req) }, { $set: { "partnerProfile.openingHours": openingHours } }, { new: true }).select("_id name isActive onboardingStatus partnerProfile.openingHours").lean().exec() as any;
+  const body = req.body && typeof req.body === "object" ? req.body : {};
+  const hasNamedFields = Object.prototype.hasOwnProperty.call(body, "openingHours") || Object.prototype.hasOwnProperty.call(body, "deliveryHours");
+  // Preserve the historic PATCH shape where a schedule itself was the body.
+  const fields = hasNamedFields ? ["openingHours", "deliveryHours"].filter((key) => Object.prototype.hasOwnProperty.call(body, key)) : ["openingHours"];
+  if (!fields.length) return res.status(400).json({ error: "INVALID_OPENING_HOURS" });
+  const updates: Record<string, unknown> = {};
+  for (const field of fields) {
+    const parsed = openingHoursSchema.safeParse(hasNamedFields ? body[field] : body);
+    if (!parsed.success) return res.status(400).json({ error: field === "deliveryHours" ? "INVALID_DELIVERY_HOURS" : "INVALID_OPENING_HOURS", details: parsed.error.flatten() });
+    updates[`partnerProfile.${field}`] = pikiManagedOpeningHours(parsed.data);
+  }
+  const restaurant = await Restaurant.findOneAndUpdate({ _id: restaurantId, onboardingStatus: { $in: ["approved", "pending_review"] }, ...partnerTenantScope(req) }, { $set: updates }, { new: true }).select("_id name isActive onboardingStatus partnerProfile.openingHours partnerProfile.deliveryHours").lean().exec() as any;
   if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
   invalidateCatalogCache();
   void publishCatalogUpdate(restaurant._id, "partner.store.hours.updated");
-  return res.json({ restaurantId: String(restaurant._id), name: restaurant.name, isOpen: partnerIsOpenNow(restaurant), paused: !restaurant.isActive, openingHours: restaurant.partnerProfile?.openingHours || openingHours });
+  return res.json({ restaurantId: String(restaurant._id), name: restaurant.name, isOpen: partnerIsOpenNow(restaurant), paused: !restaurant.isActive, openingHours: restaurant.partnerProfile?.openingHours || {}, deliveryHours: restaurant.partnerProfile?.deliveryHours });
 });
 app.get("/api/v1/partners/google-business/status", requirePartnerSurface(), async (req, res) => {
   const { access, allowed } = await partnerRequestAccess(req, "store:write");
@@ -4989,7 +4997,7 @@ app.post("/api/v1/orders", rateLimit(20, 60_000, "orders-create"), async (req, r
   if (!restaurantObjectId) return res.status(400).json({ error: "INVALID_RESTAURANT_ID" });
   const restaurant = await Restaurant.findOne({ _id: restaurantObjectId, ...CUSTOMER_ORDERABLE_RESTAURANT_FILTER }).lean().exec() as any;
   if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_AVAILABLE" });
-  if (!restaurantIsWithinOpeningHours(restaurant.partnerProfile?.openingHours)) return res.status(409).json({ error: "PARTNER_CLOSED", message: "Este establecimiento está cerrado ahora. Elige otro horario para realizar el pedido." });
+  if (!restaurantIsWithinOpeningHours(restaurant.partnerProfile?.deliveryHours ?? restaurant.partnerProfile?.openingHours)) return res.status(409).json({ error: "PARTNER_CLOSED", message: "Este establecimiento está cerrado ahora. Elige otro horario para realizar el pedido." });
   if (parsed.data.paymentMethod === "cash" && !isCashPaymentEnabledForRestaurant(restaurant)) return res.status(409).json(cashPaymentDisabledError(restaurant));
   // El catálogo público y el checkout deben compartir exactamente la misma política de precio.
   // Respeta el perfil explícito y la base de precio persistida del restaurante.
@@ -5311,7 +5319,7 @@ app.get("/feed/home", async (req, res) => {
     const coords = row.location?.coordinates;
     const distance = hasPoint && Array.isArray(coords) && coords.length >= 2 ? distanceKm({ lat, lon }, { lat: Number(coords[1]), lon: Number(coords[0]) }) : null;
     const baseEta = `${row.etaMinutes?.[0] || 20}–${row.etaMinutes?.[1] || 35} min`;
-    return { id: String(row._id), slug: row.slug, name: row.name, cuisine: row.cuisine, category: row.category, rating: row.rating || 0, reviews: row.reviews || 0, promoted: Boolean(row.promoted), isFavorite: favoriteIds.some((id) => String(id) === String(row._id)), isOpen: restaurantIsWithinOpeningHours(row.partnerProfile?.openingHours, now), eta: adjustEtaLabel(baseEta, weather.etaExtraMinutes), distanceKm: distance === null ? null : Math.round(distance * 10) / 10, image: row.image || "", menu: Array.isArray(row.menu) ? row.menu : [] };
+    return { id: String(row._id), slug: row.slug, name: row.name, cuisine: row.cuisine, category: row.category, rating: row.rating || 0, reviews: row.reviews || 0, promoted: Boolean(row.promoted), isFavorite: favoriteIds.some((id) => String(id) === String(row._id)), isOpen: restaurantIsWithinOpeningHours(row.partnerProfile?.deliveryHours ?? row.partnerProfile?.openingHours, now), eta: adjustEtaLabel(baseEta, weather.etaExtraMinutes), distanceKm: distance === null ? null : Math.round(distance * 10) / 10, image: row.image || "", menu: Array.isArray(row.menu) ? row.menu : [] };
   });
   restaurants.sort((a: any, b: any) => {
     // Nearby first only while the weather is bad; on a clear day quality wins.

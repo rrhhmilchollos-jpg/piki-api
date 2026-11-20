@@ -67,7 +67,7 @@ function request(options: {
 function publicRestaurant(overrides: Partial<RestaurantRow> = {}): RestaurantRow {
   return {
     _id: IDs.primary,
-    slug: "persisted-menu-xativa",
+    slug: "alibaba-kebab-xativa",
     name: "Carta persistida",
     cuisine: "Mediterránea",
     category: "Mediterránea",
@@ -171,8 +171,8 @@ function containsField(value: unknown, field: string, expected: string): boolean
 
 test("single catalog.list batches are arrays for GET and POST while a bare call remains an object", async () => {
   const rows = [
-    publicRestaurant({ _id: IDs.xativaPizza, slug: "pizza-needle", name: "Pizza Needle", category: "Pizza", cuisine: "Pizza" }),
-    publicRestaurant({ _id: IDs.xativaOther, slug: "pizza-other", name: "Pizza Other", category: "Pizza", cuisine: "Pizza" }),
+    publicRestaurant({ _id: IDs.xativaPizza, slug: "alibaba-kebab-xativa", name: "Pizza Needle", category: "Pizza", cuisine: "Pizza" }),
+    publicRestaurant({ _id: IDs.xativaOther, slug: "rooster-kebab-xativa", name: "Pizza Other", category: "Pizza", cuisine: "Pizza" }),
     publicRestaurant({ _id: IDs.postalAddress, slug: "other-category", name: "Needle elsewhere", category: "Hamburguesas", cuisine: "Hamburguesas" }),
   ];
   const originalFind = (Restaurant as any).find;
@@ -195,7 +195,7 @@ test("single catalog.list batches are arrays for GET and POST while a bare call 
       assert.equal(res.state.statusCode, 200);
       assert.ok(Array.isArray(res.state.body), `${method} single-procedure batch must return a tRPC result array`);
       assert.equal((res.state.body as unknown[]).length, 1);
-      assert.deepEqual((jsonOf((res.state.body as unknown[])[0]) as any[]).map((row) => row.slug), ["pizza-needle"]);
+      assert.deepEqual((jsonOf((res.state.body as unknown[])[0]) as any[]).map((row) => row.slug), ["alibaba-kebab-xativa"]);
     }
 
     assert.equal((findFilters as any[]).filter((filter) => containsField(filter, "category", "Pizza")).length, 2);
@@ -203,7 +203,7 @@ test("single catalog.list batches are arrays for GET and POST while a bare call 
     const bare = response();
     await handleCustomerTrpc(request({ method: "POST", body: { json: filters } }), bare.value);
     assert.equal(Array.isArray(bare.state.body), false, "non-batch tRPC calls retain their object response envelope");
-    assert.deepEqual((jsonOf(bare.state.body) as any[]).map((row) => row.slug), ["pizza-needle"]);
+    assert.deepEqual((jsonOf(bare.state.body) as any[]).map((row) => row.slug), ["alibaba-kebab-xativa"]);
   } finally {
     (Restaurant as any).find = originalFind;
   }
@@ -327,7 +327,7 @@ test("catalog.list keeps configured stores visible with incomplete postal metada
   const rows = [
     publicRestaurant({
       _id: IDs.xativaPizza,
-      slug: "pizza-xativa",
+      slug: "alibaba-kebab-xativa",
       name: "Pizza Xàtiva",
       cuisine: "Pizza",
       category: "Pizza",
@@ -336,7 +336,7 @@ test("catalog.list keeps configured stores visible with incomplete postal metada
     }),
     publicRestaurant({
       _id: IDs.xativaOther,
-      slug: "pizza-gandia",
+      slug: "rooster-kebab-xativa",
       name: "Pizza Gandia",
       cuisine: "Pizza",
       category: "Pizza",
@@ -345,7 +345,7 @@ test("catalog.list keeps configured stores visible with incomplete postal metada
     }),
     publicRestaurant({
       _id: IDs.postalAddress,
-      slug: "postal-address-only",
+      slug: "kings-tacos-xativa",
       name: "Arroz Canals",
       cuisine: "Arroces",
       category: "Arroces",
@@ -364,11 +364,11 @@ test("catalog.list keeps configured stores visible with incomplete postal metada
   try {
     const locality = response();
     await handleCustomerTrpc(request({ body: { json: { locality: "Xativa", category: "Pizza", query: "pizza" } } }), locality.value);
-    assert.deepEqual((jsonOf(locality.state.body) as any[]).map((row) => row.slug), ["pizza-xativa", "pizza-gandia"], "the repair retains existing delivery-area behavior and category/query narrowing");
+    assert.deepEqual((jsonOf(locality.state.body) as any[]).map((row) => row.slug), ["alibaba-kebab-xativa", "rooster-kebab-xativa"], "the repair retains existing delivery-area behavior and category/query narrowing");
 
     const postal = response();
     await handleCustomerTrpc(request({ body: { json: { postalCode: "46650" } } }), postal.value);
-    assert.deepEqual((jsonOf(postal.state.body) as any[]).map((row) => row.slug), ["pizza-xativa", "pizza-gandia", "postal-address-only"], "postal input does not introduce a new visibility gate during a catalogue repair");
+    assert.deepEqual((jsonOf(postal.state.body) as any[]).map((row) => row.slug), ["alibaba-kebab-xativa", "rooster-kebab-xativa", "kings-tacos-xativa"], "postal input does not introduce a new visibility gate during a catalogue repair");
 
     assert.equal(filters.length, 2);
     assert.ok(containsCatalogFilter(filters[0]));
