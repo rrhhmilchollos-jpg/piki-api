@@ -1413,7 +1413,9 @@ registerPartnerPasswordRecoveryRoutes(app, {
   requireOwner, objectId, binding: kitchenAccessDependencies,
   sendRateLimit: partnerRecoverySendRateLimit({ increment: async (key, windowMs) => await incrementDistributedRateLimit(key, windowMs) ?? await incrementMongoRateLimit(key, windowMs) }),
   restaurant: (filter) => Restaurant.findOne(filter).select("_id tenantId name email onboardingStatus listingType internalDemo updatedAt kitchenAccessRevision").lean().exec(),
-  employees: (filter) => EmployeeAccount.find(filter).select("_id name email tenantId active authorizationStatus apiRole jobRole primaryRole roles partnerRoles restaurantId restaurantIds accessLevel ownerProtected kitchenAccessSetupVersion partnerBindingVersion fleetId zoneSlugs updatedAt kitchenAccessRevision").lean().exec(),
+  // Mongoose would recast legacy string IDs in $in to ObjectId; keep the exact
+  // BSON alternatives and return only the existing recovery/binding whitelist.
+  employees: (filter) => EmployeeAccount.collection.find(filter, { projection: { _id: 1, name: 1, email: 1, tenantId: 1, active: 1, authorizationStatus: 1, apiRole: 1, jobRole: 1, primaryRole: 1, roles: 1, partnerRoles: 1, restaurantId: 1, restaurantIds: 1, accessLevel: 1, ownerProtected: 1, kitchenAccessSetupVersion: 1, partnerBindingVersion: 1, fleetId: 1, zoneSlugs: 1, updatedAt: 1, kitchenAccessRevision: 1 } }).toArray(),
   canUsePartner: (employee) => employeeCanUseCredentialSurface(employee, "partner"),
   sendEmployeePasswordLink,
   audit: (event) => GovernanceAuditEvent.create({ tenantId: objectId(event.tenantId), actorEmployeeId: objectId(event.actorEmployeeId), actorRole: "admin", targetType: "employee", targetId: objectId(event.employeeId), action: event.sent ? "partner_password_recovery_sent" : "partner_password_recovery_delivery_unconfirmed", after: { restaurantId: event.restaurantId, sent: event.sent }, reason: "Recuperación Partner solicitada explícitamente por Owner; sin cambio de contraseña ni roles." }),

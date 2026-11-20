@@ -42,7 +42,7 @@ const diagnosticMessages = {
   ACCOUNT_RESTAURANT_ASSOCIATION_MISSING: "La cuenta con el correo de contacto no tiene una asociación persistida válida al restaurante seleccionado.",
   ACCOUNT_AMBIGUOUS_IN_TENANT: "El correo de contacto es ambiguo en el tenant seleccionado; no se elegirá una cuenta sin asociación.",
   ACCOUNT_LOOKUP_SCOPE_CONFLICT: "La cuenta devuelta no cumple los límites de correo, tenant y asociación del destino.",
-  ACCOUNT_LOOKUP_CHANGED: "La asociación cambió durante la comprobación. Actualiza la vista previa; este diagnóstico no habilita el envío.",
+  ACCOUNT_LOOKUP_CHANGED: "Las consultas de comprobación no coinciden sobre la asociación persistida. Actualiza la vista previa; este diagnóstico no habilita el envío.",
   ACCOUNT_INACTIVE: "Una cuenta asociada con el correo de contacto no está activa.",
   ACCOUNT_NOT_APPROVED: "Una cuenta asociada con el correo de contacto no está aprobada.",
   ACCOUNT_NOT_PARTNER: "Una cuenta asociada con el correo de contacto no tiene rol Partner.",
@@ -98,7 +98,10 @@ export async function buildPartnerRecoveryPreview(target: { tenantId: string; re
     contact = emailOf(restaurant.email);
     if (!z.string().email().max(254).safeParse(contact).success) add("RESTAURANT_CONTACT_EMAIL_REQUIRED", "El restaurante no tiene un correo de contacto válido.");
     else {
-      const candidates = await deps.employees({ tenantId: deps.objectId(target.tenantId), email: contact, $or: [{ restaurantId: deps.objectId(target.restaurantId) }, { restaurantIds: deps.objectId(target.restaurantId) }] });
+      // Native reads preserve both BSON types: legacy string associations are
+      // exact persisted IDs, not a fallback account or an inferred binding.
+      const restaurantIds = [deps.objectId(target.restaurantId), target.restaurantId];
+      const candidates = await deps.employees({ tenantId: deps.objectId(target.tenantId), email: contact, $or: [{ restaurantId: { $in: restaurantIds } }, { restaurantIds: { $in: restaurantIds } }] });
       for (const employee of candidates) {
         const reasons: DiagnosticCode[] = [];
         const reject = (code: DiagnosticCode) => { reasons.push(code); diagnostics.add(code); };

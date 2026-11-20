@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import ts from "typescript";
+import { Types } from "mongoose";
 import { buildPartnerRecoveryPreview, registerPartnerPasswordRecoveryRoutes, partnerRecoverySendRateLimit, PARTNER_PASSWORD_RECOVERY_PATH, type PartnerPasswordRecoveryDependencies } from "./partnerPasswordRecovery.js";
 import { GovernanceAuditEvent } from "./models.js";
 import { sessionRole } from "./employeeSessions.js";
@@ -19,6 +20,7 @@ const ownerCode = ts.transpileModule(ownerStatement.getText(authSource).replace(
 function matches(row: any, filter: any): boolean {
   return Object.entries(filter).every(([key, value]: [string, any]) => {
     if (key === "$or") return value.some((v: any) => matches(row, v));
+    if (value?.$in) return value.$in.some((candidate: any) => matches(row, { [key]: candidate }));
     if (Array.isArray(row?.[key])) return row[key].includes(value);
     return row?.[key] === value;
   });
@@ -68,7 +70,7 @@ test("preview contract is read-only, contact-normalized and exact-tenant/exact-a
   assert.equal(res.code, 200); assert.deepEqual(Object.keys(res.body).sort(), ["tenantId", "restaurant", "employee", "ready", "blockers", "manifestHash"].sort());
   assert.equal(res.body.ready, true); assert.deepEqual(res.body.employee, { id: ids.employee, name: "OFFLINE Partner", email: contact }); assert.deepEqual(res.body.restaurant, { id: ids.restaurant, name: "OFFLINE Alibaba" }); assert.deepEqual(res.body.blockers, []); assert.match(res.body.manifestHash, /^[a-f0-9]{64}$/); assert.equal(res.headers["Cache-Control"], "no-store");
   assert.deepEqual(h.db, before); assert(!h.effects.some((event) => event.mail || event.audit));
-  assert.deepEqual(h.effects.find((event) => event.employeeFilter).employeeFilter, { tenantId: ids.tenant, email: contact, $or: [{ restaurantId: ids.restaurant }, { restaurantIds: ids.restaurant }] });
+  assert.deepEqual(h.effects.find((event) => event.employeeFilter).employeeFilter, eligibilityFilter);
   for (const event of h.effects.filter((event) => event.restaurantFilter || event.bindingRestaurantFilter)) assert.equal((event.restaurantFilter || event.bindingRestaurantFilter).tenantId, ids.tenant);
 });
 test("send uses existing helper once with partner recovery, no credential mutation or secret response/audit", async () => {
@@ -182,7 +184,7 @@ test("production audit row satisfies actual GovernanceAuditEvent schema with no 
   for (const row of rows) { assert.equal(row.tenantId, ids.tenant); assert.equal(row.targetType, "employee"); assert.equal(row.targetId, ids.employee); assert.equal(row.actorEmployeeId, ids.owner); assert.deepEqual(Object.keys(row.after).sort(), ["restaurantId", "sent"]); assert(!/token|passwordHash|resetUrl|recipient|email/.test(JSON.stringify(row))); }
 });
 
-const eligibilityFilter = { tenantId: ids.tenant, email: contact, $or: [{ restaurantId: ids.restaurant }, { restaurantIds: ids.restaurant }] };
+const eligibilityFilter = { tenantId: ids.tenant, email: contact, $or: [{ restaurantId: { $in: [ids.restaurant, ids.restaurant] } }, { restaurantIds: { $in: [ids.restaurant, ids.restaurant] } }] };
 const diagnosticFilter = { tenantId: ids.tenant, email: contact };
 function assertBlockedDiagnostic(body: any, code: string) {
   assert.equal(body.ready, false); assert.equal(body.employee, null);
@@ -249,10 +251,12 @@ test("ambiguous contact-only accounts have a specific count-safe reason, not fir
   const body = await assertReadOnlyBlocked(h, "ACCOUNT_AMBIGUOUS_IN_TENANT"); assert.equal(body.blockers.length, 2);
   assert(!body.blockers.some((blocker: any) => blocker.code === "ACCOUNT_RESTAURANT_ASSOCIATION_MISSING"));
 });
-test("a racing contact-only lookup returning an associated account is diagnostic only and never eligible", async () => {
+test("a discrepant contact-only lookup returning an associated account is diagnostic only, not proof of a race", async () => {
   const h = harness(); h.deps.employees = async (filter) => { h.effects.push({ employeeFilter: filter }); return filter.$or ? [] : clone(h.db.employees); };
   h.deps.canUsePartner = () => { throw new Error("Contact-only rows must not be eligibility candidates"); };
-  await assertReadOnlyBlocked(h, "ACCOUNT_LOOKUP_CHANGED");
+  const body = await assertReadOnlyBlocked(h, "ACCOUNT_LOOKUP_CHANGED");
+  const message = body.blockers.find((blocker: any) => blocker.code === "ACCOUNT_LOOKUP_CHANGED").message;
+  assert.match(message, /no coinciden/); assert(!/cambió|concurrencia/.test(message));
   assert.deepEqual(h.effects.filter((event) => event.employeeFilter).map((event) => event.employeeFilter), [eligibilityFilter, diagnosticFilter, eligibilityFilter, diagnosticFilter]);
 });
 for (const fault of ["tenant", "email", "association"]) test(`candidate postfilter rejects unexpected ${fault} scope without repair lookup`, async () => {
@@ -348,4 +352,148 @@ test("contact-only diagnostic read failure returns safe 503 without sends or inv
   const h = harness(); h.deps.employees = async (filter) => { h.effects.push({ employeeFilter: filter }); if (filter.$or) return []; throw new Error("OFFLINE_INTERNAL_SECRET"); };
   const res = await h.preview(); assert.equal(res.code, 503); assert.deepEqual(res.body, { error: "PARTNER_RECOVERY_UNAVAILABLE", message: "No se pudo verificar el destino. Inténtalo más tarde." });
   assert(!h.effects.some((event) => event.mail || event.audit)); assert.deepEqual(h.effects.filter((event) => event.employeeFilter).map((event) => event.employeeFilter), [eligibilityFilter, diagnosticFilter]);
+});
+
+// Model Mongo equality without coercion: a 24hex string is NOT an ObjectId.
+const bsonEqual = (a: unknown, b: unknown) => a instanceof Types.ObjectId || b instanceof Types.ObjectId
+  ? a instanceof Types.ObjectId && b instanceof Types.ObjectId && a.equals(b) : a === b;
+function bsonMatches(row: any, filter: any): boolean {
+  return Object.entries(filter).every(([key, value]: [string, any]) => {
+    if (key === "$or") return value.some((branch: any) => bsonMatches(row, branch));
+    const values = Array.isArray(row?.[key]) ? row[key] : [row?.[key]];
+    return values.some((stored: any) => value?.$in ? value.$in.some((candidate: any) => bsonEqual(stored, candidate)) : bsonEqual(stored, value));
+  });
+}
+const serverSource = ts.createSourceFile("server.ts", readFileSync(new URL("./server.ts", import.meta.url), "utf8"), ts.ScriptTarget.Latest, true);
+function compileServerCode(code: string, context: Record<string, any>) {
+  return new Function(...Object.keys(context), ts.transpileModule(code, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS } }).outputText)(...Object.values(context));
+}
+function productionRecoveryDependencies(employeeModel: any): PartnerPasswordRecoveryDependencies {
+  const statement = serverSource.statements.find((s) => ts.isExpressionStatement(s) && ts.isCallExpression(s.expression) && s.expression.expression.getText(serverSource) === "registerPartnerPasswordRecoveryRoutes");
+  assert(statement);
+  let dependencies: PartnerPasswordRecoveryDependencies | undefined;
+  compileServerCode(statement.getText(serverSource), {
+    registerPartnerPasswordRecoveryRoutes: (_app: any, deps: PartnerPasswordRecoveryDependencies) => { dependencies = deps; }, app: {},
+    requireOwner: () => undefined, objectId: (id: string) => new Types.ObjectId(id), kitchenAccessDependencies: {},
+    partnerRecoverySendRateLimit: () => undefined, incrementDistributedRateLimit: async () => null, incrementMongoRateLimit: async () => null,
+    Restaurant: {}, EmployeeAccount: employeeModel, employeeCanUseCredentialSurface: (employee: any, surface: any) => Boolean(sessionRole(employee, surface)),
+    sendEmployeePasswordLink: async () => ({ delivery: { sent: true } }), GovernanceAuditEvent: {},
+  });
+  assert(dependencies); return dependencies;
+}
+const projectionKeys = "_id name email tenantId active authorizationStatus apiRole jobRole primaryRole roles partnerRoles restaurantId restaurantIds accessLevel ownerProtected kitchenAccessSetupVersion partnerBindingVersion fleetId zoneSlugs updatedAt kitchenAccessRevision".split(" ");
+function bsonHarness() {
+  const h = harness(); const nativeReads: { filter: any; projection: Record<string, number>; matched: any[] }[] = []; const bindingReads: any[] = [];
+  for (const rows of [h.db.tenants, h.db.restaurants, h.db.employees, h.db.memberships]) for (const row of rows) {
+    for (const key of ["_id", "tenantId", "employeeId", "restaurantId"]) if (row[key]) row[key] = new Types.ObjectId(row[key]);
+    if (row.restaurantIds) row.restaurantIds = row.restaurantIds.map((id: string) => new Types.ObjectId(id));
+  }
+  const employeeModel = {
+    find() { throw new Error("MONGOOSE_RECAST_FORBIDDEN"); },
+    collection: { find(filter: any, options: any) {
+      assert.deepEqual(Object.keys(options), ["projection"]);
+      assert.deepEqual(Object.keys(options.projection).sort(), [...projectionKeys].sort());
+      assert(Object.values(options.projection).every((value) => value === 1));
+      const matched = h.db.employees.filter((row: any) => bsonMatches(row, filter));
+      nativeReads.push({ filter, projection: options.projection, matched });
+      return { toArray: async () => matched.map((row: any) => Object.fromEntries(Object.keys(options.projection).filter((key) => Object.hasOwn(row, key)).map((key) => [key, row[key]]))) };
+    } },
+  };
+  const production = productionRecoveryDependencies(employeeModel);
+  h.deps.objectId = (id) => new Types.ObjectId(id);
+  h.deps.employees = production.employees;
+  h.deps.canUsePartner = production.canUsePartner;
+  h.deps.restaurant = async (filter) => h.db.restaurants.find((row: any) => bsonMatches(row, filter)) || null;
+  h.deps.binding = {
+    ownerEmail, objectId: h.deps.objectId,
+    tenants: { findOne: async (filter) => { bindingReads.push({ tenant: filter }); return h.db.tenants.find((row: any) => bsonMatches(row, filter)) || null; } },
+    restaurants: { findOne: async (filter) => { bindingReads.push({ restaurant: filter }); return h.db.restaurants.find((row: any) => bsonMatches(row, filter)) || null; } },
+    memberships: { find: (filter) => ({ toArray: async () => { bindingReads.push({ membership: filter }); return h.db.memberships.filter((row: any) => bsonMatches(row, filter)); } }) },
+  };
+  return { ...h, nativeReads, bindingReads };
+}
+function assertBsonEligibilityFilter(filter: any) {
+  assert.deepEqual(Object.keys(filter).sort(), ["$or", "email", "tenantId"]);
+  assert(filter.tenantId instanceof Types.ObjectId); assert.equal(String(filter.tenantId), ids.tenant); assert.equal(filter.email, contact);
+  assert.equal(filter.$or.length, 2);
+  for (const [index, key] of ["restaurantId", "restaurantIds"].entries()) {
+    assert.deepEqual(Object.keys(filter.$or[index]), [key]);
+    assert.deepEqual(Object.keys(filter.$or[index][key]), ["$in"]);
+    const alternatives = filter.$or[index][key].$in;
+    assert.equal(alternatives.length, 2); assert(alternatives[0] instanceof Types.ObjectId);
+    assert.equal(String(alternatives[0]), ids.restaurant); assert.equal(alternatives[1], ids.restaurant); assert.equal(typeof alternatives[1], "string");
+  }
+}
+for (const representation of ["scalar-string", "scalar-objectid", "array-string", "array-objectid", "mixed"]) test(`native exact BSON query accepts persisted ${representation} association with unchanged binding/send`, async () => {
+  const h = bsonHarness(); const employee = h.db.employees[0];
+  employee.restaurantId = representation === "scalar-string" || representation === "mixed" ? ids.restaurant : representation === "scalar-objectid" ? new Types.ObjectId(ids.restaurant) : null;
+  employee.restaurantIds = representation === "array-string" ? [ids.restaurant] : representation === "array-objectid" || representation === "mixed" ? [new Types.ObjectId(ids.restaurant)] : [];
+  const before = JSON.stringify(h.db); const res = await h.preview();
+  assert.equal(res.code, 200); assert.equal(res.body.ready, true); assert.equal(res.body.employee.id, ids.employee); assert.deepEqual(res.body.blockers, []);
+  assert.equal(h.nativeReads.length, 1); assertBsonEligibilityFilter(h.nativeReads[0].filter); assert.equal(h.nativeReads[0].matched.length, 1);
+  const resolved = await buildPartnerRecoveryPreview(target, h.deps);
+  assert(resolved.employee._id instanceof Types.ObjectId); assert(resolved.employee.tenantId instanceof Types.ObjectId);
+  assert.equal(typeof resolved.employee.restaurantId, typeof employee.restaurantId);
+  assert.deepEqual(resolved.employee.restaurantIds, employee.restaurantIds);
+  assert.equal(resolved.employee.passwordHash, undefined); assert.equal(resolved.employee.sessionHash, undefined);
+  const send = await h.send({}, res.body); assert.equal(send.code, 200); assert.equal(h.effects.filter((event) => event.mail).length, 1);
+  for (const read of h.nativeReads) assertBsonEligibilityFilter(read.filter);
+  assert(h.bindingReads.some((read) => read.tenant)); assert(h.bindingReads.some((read) => read.membership)); assert(h.bindingReads.some((read) => read.restaurant));
+  assert.equal(JSON.stringify(h.db), before);
+});
+test("BSON native eligibility excludes other tenant/email/restaurants and string tenant without widening or ambiguity", async () => {
+  const h = bsonHarness(); const employee = h.db.employees[0]; employee.restaurantId = ids.restaurant; employee.restaurantIds = [];
+  h.db.employees.push(
+    { ...employee, _id: new Types.ObjectId(ids.second), tenantId: new Types.ObjectId(ids.other) },
+    { ...employee, _id: new Types.ObjectId(ids.second), email: "foreign@example.test" },
+    { ...employee, _id: new Types.ObjectId(ids.second), restaurantId: ids.other, restaurantIds: [new Types.ObjectId(ids.other)] },
+    { ...employee, _id: new Types.ObjectId(ids.second), restaurantId: new Types.ObjectId(ids.other), restaurantIds: [ids.other] },
+    { ...employee, _id: new Types.ObjectId(ids.second), tenantId: ids.tenant },
+  );
+  const res = await h.preview(); assert.equal(res.body.ready, true); assert.equal(res.body.employee.id, ids.employee);
+  assert.equal(h.nativeReads.length, 1); assertBsonEligibilityFilter(h.nativeReads[0].filter); assert.deepEqual(h.nativeReads[0].matched, [employee]);
+});
+for (const fault of ["role", "tenant", "membership", "restaurant"]) test(`raw legacy association still fails unchanged persisted ${fault} validation`, async () => {
+  const h = bsonHarness(); h.db.employees[0].restaurantId = ids.restaurant; h.db.employees[0].restaurantIds = [];
+  if (fault === "role") h.db.employees[0].partnerRoles = ["invalid"];
+  if (fault === "tenant") h.db.tenants[0].status = "suspended";
+  if (fault === "membership") h.db.memberships[0].restaurantIds = [new Types.ObjectId(ids.other)];
+  if (fault === "restaurant") h.db.restaurants[0].internalDemo = true;
+  const code = { role: "PARTNER_ROLES_REQUIRED", tenant: "PARTNER_TENANT_NOT_ACTIVE", membership: "PARTNER_MEMBERSHIP_BINDING_REQUIRED", restaurant: "PARTNER_RESTAURANT_SETUP_INVALID" }[fault]!;
+  const res = await h.preview(); assertBlockedDiagnostic(res.body, code); assert.equal(h.nativeReads.length, 1); assertBsonEligibilityFilter(h.nativeReads[0].filter);
+  const send = await h.send({}, res.body); assert.equal(send.code, 409); assert(!h.effects.some((event) => event.mail || event.audit));
+});
+test("production native adapter uses inclusion whitelist for eligibility AND diagnostics, preserving raw IDs without secrets", async () => {
+  const h = bsonHarness(); const employee = h.db.employees[0]; employee.restaurantId = ids.other; employee.restaurantIds = [ids.other];
+  Object.assign(employee, { tokenHash: "OFFLINE_TOKEN_SECRET", resetUrl: "OFFLINE_URL_SECRET", sessions: ["OFFLINE_SESSION_SECRET"], arbitrary: "OFFLINE_INTERNAL_SECRET" });
+  const resolved = await buildPartnerRecoveryPreview(target, h.deps); assertBlockedDiagnostic(resolved.preview, "ACCOUNT_RESTAURANT_ASSOCIATION_MISSING");
+  assert.equal(h.nativeReads.length, 2); assertBsonEligibilityFilter(h.nativeReads[0].filter);
+  assert.deepEqual(Object.keys(h.nativeReads[1].filter).sort(), ["email", "tenantId"]); assert(h.nativeReads[1].filter.tenantId instanceof Types.ObjectId);
+  assert.equal(String(h.nativeReads[1].filter.tenantId), ids.tenant); assert.equal(h.nativeReads[1].filter.email, contact);
+  const rows = await h.deps.employees(h.nativeReads[1].filter); assert.equal(rows.length, 1); assert.equal(rows[0].restaurantId, ids.other); assert(rows[0]._id instanceof Types.ObjectId);
+  for (const key of ["passwordHash", "sessionHash", "tokenHash", "resetUrl", "sessions", "arbitrary"]) { assert.equal(rows[0][key], undefined); assert(!projectionKeys.includes(key)); }
+  assert(!JSON.stringify(rows).includes("SECRET")); assert.equal(h.bindingReads.length, 0);
+});
+test("existing real sendEmployeePasswordLink accepts projected native plain employee and revalidates binding before offline reset/mail mocks", async () => {
+  const h = bsonHarness(); h.db.employees[0].restaurantId = ids.restaurant; h.db.employees[0].restaurantIds = [];
+  const { employee } = await buildPartnerRecoveryPreview(target, h.deps); assert(employee); assert.equal(Object.getPrototypeOf(employee), Object.prototype); assert.equal(employee.save, undefined);
+  const statement = serverSource.statements.find((s) => ts.isFunctionDeclaration(s) && s.name?.text === "sendEmployeePasswordLink"); assert(statement);
+  const bindingStatement = serverSource.statements.find((s) => ts.isFunctionDeclaration(s) && s.name?.text === "createEmployeePasswordReset"); assert(bindingStatement);
+  const resets: any[] = []; const mails: any[] = []; const order: string[] = []; const before = JSON.stringify(h.db);
+  const { isPartnerEmployee, partnerBindingForEmployee } = await import("./employeePartnerBinding.js");
+  const helper = compileServerCode(`${statement.getText(serverSource)}; return sendEmployeePasswordLink;`, {
+    isPartnerEmployee, kitchenAccessDependencies: h.deps.binding,
+    partnerBindingForEmployee: async (row: any, deps: any) => { order.push("binding"); return partnerBindingForEmployee(row, deps); },
+    createEmployeePasswordReset: async (row: any, surface: any, ttl: any) => { order.push("reset"); resets.push({ row, surface, ttl }); return { tokenHash: "OFFLINE_HASH", resetUrl: "https://offline.invalid/?reset=OFFLINE_TOKEN" }; },
+    employeeCredentialLabels: { partner: "PIKI Partner Orders" }, escapeCorporateHtml: (value: string) => value,
+    sendCorporateEmail: async (payload: any) => { order.push("mail"); mails.push(payload); return { sent: true }; },
+  });
+  const result = await helper(employee, "partner", "recovery"); assert.equal(result.delivery.sent, true);
+  assert.deepEqual(order, ["binding", "reset", "mail"]); assert.equal(resets[0].row, employee); assert.equal(resets[0].surface, "partner"); assert.equal(resets[0].ttl, 30 * 60_000);
+  assert.equal(mails[0].recipientEmail, contact); assert.equal(JSON.stringify(h.db), before);
+  // The reset helper also reads only raw _id/email, never employee document methods.
+  assert(!/employee\.(save|toObject|set|markModified)\(/.test(bindingStatement.getText(serverSource)));
+  h.db.memberships[0].status = "suspended";
+  await assert.rejects(() => helper(employee, "partner", "recovery"), /PARTNER_MEMBERSHIP_BINDING_REQUIRED/);
+  assert.equal(resets.length, 1); assert.equal(mails.length, 1);
 });

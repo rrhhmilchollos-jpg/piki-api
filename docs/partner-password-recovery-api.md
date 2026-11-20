@@ -31,6 +31,8 @@ Respuesta 200 con `Cache-Control: no-store`:
 
 La API carga únicamente el restaurante con ese ID en ese tenant. Normaliza su campo de contacto `Restaurant.email` mediante trim y minúsculas. Busca `EmployeeAccount` por ese email, ese tenant y asociación persistida a ese restaurante (`restaurantId` o `restaurantIds`). Debe existir una única cuenta elegible: activa, aprobada, Partner y con acceso a la superficie Partner; además, el helper existente `partnerBindingForEmployee` debe validar su binding.
 
+Compatibilidad de lectura BSON: cada rama de asociación usa `$in: [ObjectId(restaurantId), restaurantId]`, con el string 24hex exacto normalizado del destino. `tenantId` sigue siendo exclusivamente el ObjectId exacto. El adaptador de empleados usa `EmployeeAccount.collection.find(filter, { projection: whitelist }).toArray()` para evitar que Mongoose recaste el string del `$in` a ObjectId. La whitelist conserva únicamente los campos previos de recuperación/binding; excluye contraseñas, hashes de sesión, tokens y campos arbitrarios tanto en elegibilidad como en diagnóstico. No hay migración, cambio de binding ni asociación automática. El empleado raw es compatible con el helper de envío existente: este lee campos y revalida el binding, sin métodos de documento; el helper y sus validaciones permanecen intactos.
+
 Si los correos no coinciden, no hay asociación, la cuenta no es elegible o hay ambigüedad, devuelve `ready: false`, `employee: null` y bloqueos. No busca otra cuenta fuera de esos límites, no crea nada, no corrige email ni roles. Un restaurante inexistente devuelve igualmente el contrato con el ID solicitado, nombre vacío y bloqueo.
 
 Códigos de bloqueo:
@@ -52,10 +54,10 @@ Se conserva `PARTNER_RECOVERY_ACCOUNT_NOT_ELIGIBLE` como primer bloqueo cuando n
 | `ACCOUNT_RESTAURANT_ASSOCIATION_MISSING` | Se encuentra una cuenta con el contacto exacto en ese tenant, pero sin asociación válida al restaurante. |
 | `ACCOUNT_AMBIGUOUS_IN_TENANT` | El lookup diagnóstico exacto de contacto y tenant es ambiguo; no se selecciona la primera cuenta. |
 | `ACCOUNT_LOOKUP_SCOPE_CONFLICT` | Una fila devuelta por el adaptador no cumple los límites esperados. |
-| `ACCOUNT_LOOKUP_CHANGED` | El lookup diagnóstico observa una asociación que no apareció en la consulta principal; exige otra vista previa y nunca habilita envío. |
+| `ACCOUNT_LOOKUP_CHANGED` | El lookup diagnóstico observa una asociación que no apareció en la consulta principal; indica discrepancia entre consultas, no prueba de concurrencia real. Exige otra vista previa y nunca habilita envío. |
 | `ACCOUNT_BINDING_VALIDATION_UNAVAILABLE` | La validación de binding falla sin un código permitido y reconocido por el helper existente. |
 
-La consulta principal de elegibilidad permanece exactamente igual: contacto `Restaurant.email` normalizado, tenant explícito y `$or` de asociación por `restaurantId`/`restaurantIds`. **Solo si devuelve cero candidatos asociados** se realiza un segundo lookup de solo lectura con exactamente `{ tenantId, email: contactoNormalizado }`. No busca globalmente, no usa otro correo y no introduce `loginEmail` en los schemas estrictos de preview/send. Las cuentas de este segundo lookup nunca pasan al conjunto elegible, ni aunque una asociación aparezca durante esas lecturas. Una cuenta no elegible asociada tampoco dispara el segundo lookup.
+La consulta principal de elegibilidad conserva los mismos límites: contacto `Restaurant.email` normalizado, tenant explícito y `$or` de asociación por `restaurantId`/`restaurantIds`, ahora con las dos representaciones BSON exactas indicadas. **Solo si devuelve cero candidatos asociados** se realiza un segundo lookup de solo lectura con exactamente `{ tenantId, email: contactoNormalizado }`. No busca globalmente, no usa otro correo y no introduce `loginEmail` en los schemas estrictos de preview/send. Las cuentas de este segundo lookup nunca pasan al conjunto elegible, ni aunque una asociación aparezca durante esas lecturas. Una cuenta no elegible asociada tampoco dispara el segundo lookup.
 
 Los fallos del binding se filtran primero con `partnerBindingErrorResponse` y después por una whitelist local de códigos de lectura: `PARTNER_TENANT_BINDING_REQUIRED`, `EMPLOYEE_NOT_APPROVED`, `PARTNER_RESTAURANT_ASSIGNMENT_INVALID`, `PARTNER_RESTAURANT_NOT_ASSIGNED`, `PARTNER_TENANT_NOT_ACTIVE`, `PARTNER_RESTAURANT_NOT_FOUND_IN_TENANT`, `PARTNER_RESTAURANT_SETUP_INVALID`, `PARTNER_MEMBERSHIP_BINDING_REQUIRED`, `PARTNER_ROLES_REQUIRED`, `PARTNER_MEMBERSHIP_SCOPE_CONFLICT`, `KITCHEN_ACCOUNT_BINDING_CONFLICT`, `KITCHEN_TENANT_NOT_ACTIVE`, `KITCHEN_RESTAURANT_NOT_FOUND_IN_TENANT`, `KITCHEN_RESTAURANT_SETUP_INVALID`, `KITCHEN_RESTAURANT_CONTACT_CONFLICT` y `KITCHEN_MEMBERSHIP_CONFLICT`. Cada uno tiene un mensaje fijo local. Códigos arbitrarios, errores sin la clase reconocida, conflictos de escritura y mensajes internos quedan excluidos y usan el fallback seguro.
 
@@ -173,3 +175,19 @@ Check y pruebas focalizadas usan además `scripts/partner-offline-guard.mjs`, qu
 Logs: `/tmp/piki-recovery-diagnostics-check.log`, `/tmp/piki-recovery-diagnostics-targeted.log`, `/tmp/piki-recovery-diagnostics-related.log`, `/tmp/piki-recovery-diagnostics-full.log` y `/tmp/piki-recovery-diagnostics-build.log`.
 
 La causa real persistida del destino aún no se puede afirmar: esta tarea no ha leído producción. El siguiente preview autenticado podrá mostrar el motivo seguro exacto que observen sus consultas, además del código agregado existente, sin modificar ni habilitar automáticamente ninguna cuenta.
+
+## Validación de compatibilidad BSON (20 de noviembre de 2026)
+
+Corrección limitada a `src/partnerPasswordRecovery.ts`, su test, el adaptador de recuperación en `src/server.ts` y este documento. Contratos HTTP, schemas estrictos, guard Owner, rate limit, hash/confirmación, helper de envío y validaciones de rol/tenant/membresía/restaurante se mantienen. `package.json`, modelos y helpers de binding no se modifican. No se accedió a red, Mongo, SMTP, secretos, otros repositorios ni producción; no se realizaron escrituras Git, push o deploy. Como excepción de procedimiento, al inicio se ejecutaron consultas Git de solo lectura de estado/HEAD, pese a la restricción de no usar Git; no se volvió a utilizar.
+
+Se añadieron 12 pruebas offline: igualdad BSON sin coerción para asociación escalar/array string u ObjectId y mezcla; exclusión de otro tenant/email/restaurante y de tenant string; validación de binding intacta; adaptador real compilado desde AST con proyección de inclusión y sin Mongoose `find`; y helper real compatible con empleado raw, con reset/correo exclusivamente simulados. No equivalen a una comprobación del BSON persistido real ni confirman la causa del hallazgo live facilitado.
+
+- Check TypeScript offline: aprobado, sin diagnósticos.
+- Suite específica: **123 pruebas aprobadas, 0 fallos**.
+- Suite focalizada ampliada: **240 pruebas aprobadas, 0 fallos**.
+- Suite completa: **1.731 pruebas, 1.730 aprobadas, 1 omitida, 0 fallos**.
+- Build API/worker: aprobado en `/tmp/piki-recovery-bson-build.tkFZWg/`; no se modifica `dist/` ni se instalan paquetes.
+
+Check y suites focalizadas: entorno limpio `env -i PATH="$PATH" HOME="$HOME"`, `node --import ./scripts/partner-offline-guard.mjs scripts/offline-validation.mjs check|test ...`. Suite completa: mismo entorno limpio y runner offline existente, con red/operaciones reales Mongo bloqueadas, sin listener y dotenv dirigido a `/dev/null`. Build con esbuild ya instalado, entorno limpio y salida temporal.
+
+Logs: `/tmp/piki-recovery-bson-check.log`, `/tmp/piki-recovery-bson-targeted.log`, `/tmp/piki-recovery-bson-related.log`, `/tmp/piki-recovery-bson-full.log`, `/tmp/piki-recovery-bson-build.log`.
