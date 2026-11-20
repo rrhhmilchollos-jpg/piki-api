@@ -270,16 +270,20 @@ test("Partner header-flush disconnect and inconsistent historical payload never 
   f.events.emit("event", event(4, { payload: { restaurantId: ids.otherRestaurant } })); await settle(); assert.deepEqual(deliveredIds(live), []); liveReq.emit("close");
 });
 
-test("unrelated real Rider SSE still uses its existing audience/replay without Partner readiness or tenant-null changes", async (t) => {
+test("real Rider SSE preserves its audience and ignores Partner readiness, but replay requires its frozen tenant", async (t) => {
   const f = fixture(t); const riderId = "65d000000000000000000020";
   Object.assign(f.db.employees[0], { apiRole: "rider", jobRole: "rider", primaryRole: "rider", roles: ["rider"], mustChangePassword: true });
   Object.assign(f.db.sessions[0], { role: "rider", surface: "rider" });
   t.mock.method(Rider, "exists", async () => ({ _id: riderId }));
-  t.mock.method(Rider, "findOne", () => ({ select() { return this; }, lean() { return this; }, exec: async () => ({ _id: riderId }) }));
+  t.mock.method(Rider, "findOne", (filter: any) => {
+    assert.equal(filter.email, f.db.employees[0].email); assert.equal(String(filter.tenantId), ids.tenant);
+    return { select() { return this; }, lean() { return this; }, exec: async () => ({ _id: riderId, tenantId: ids.tenant }) };
+  });
   t.mock.method(EmployeeSession, "updateOne", () => ({ exec: async () => ({ modifiedCount: 1 }) }));
-  f.db.events = [event(4000, { channel: "rider", audienceKey: `rider:${riderId}`, tenantId: null })];
+  f.db.events = [event(4000, { channel: "rider", audienceKey: `rider:${riderId}`, tenantId: null }), event(4001, { channel: "rider", audienceKey: `rider:${riderId}` })];
   const req = request({ "x-piki-surface": "rider" }); const res = response(); await serveRealtimeEvents(req, res);
-  assert.equal(res.statusCode, 200); assert.equal(res.flushed, true); assert.equal(f.reads[0].channel, "rider"); assert.deepEqual(f.reads[0].audienceKey.$in, [`rider:${riderId}`]); assert.deepEqual(deliveredIds(res), [String(event(4000)._id)]); req.emit("close");
+  assert.equal(res.statusCode, 200); assert.equal(res.flushed, true); assert.equal(f.reads[0].channel, "rider"); assert.equal(String(f.reads[0].tenantId), ids.tenant);
+  assert.deepEqual(f.reads[0].audienceKey.$in, [`rider:${riderId}`]); assert.deepEqual(deliveredIds(res), [String(event(4001)._id)]); req.emit("close");
 });
 
 function ownerFixture(t: TestContext) {

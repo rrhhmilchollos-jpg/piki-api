@@ -11,7 +11,8 @@ import { partnerRequestAccess } from "./partnerOperationalAccess.js";
 export type RealtimeChannel = "partner" | "fleet" | "admin" | "rider" | "customer";
 export type RealtimeEventPayload = Record<string, unknown>;
 type PersistedRealtimeEvent = { _id: mongoose.Types.ObjectId; tenantId?: mongoose.Types.ObjectId | null; channel: RealtimeChannel; audienceKey: string; type: string; payload: RealtimeEventPayload; createdAt: Date };
-type ResolvedAudience = { channel: RealtimeChannel; audienceKeys: string[] };
+type ResolvedAudience = { channel: Exclude<RealtimeChannel, "rider">; audienceKeys: string[] }
+  | { channel: "rider"; audienceKeys: string[]; tenantId: mongoose.Types.ObjectId };
 
 const stream = new EventEmitter();
 stream.setMaxListeners(0);
@@ -305,9 +306,14 @@ async function resolveAudience(request: Request): Promise<ResolvedAudience | nul
     return employee ? { channel: "fleet", audienceKeys: [tenantAudienceKey(employee.tenantId, "fleet")] } : null;
   }
   if (surface === "rider" && auth.role === "rider") {
-    const employee = await EmployeeAccount.findById(auth.employeeId).select("email").lean().exec() as any;
-    const rider = employee?.email ? await Rider.findOne({ email: employee.email }).select("_id").lean().exec() as any : null;
-    return rider ? { channel: "rider", audienceKeys: [`rider:${String(rider._id)}`] } : null;
+    // Pin the persisted session tenant, never a request claim or mutable email-only lookup.
+    const tenantId = validTenantId(auth.tenantId);
+    if (!tenantId) return null;
+    const employee = await EmployeeAccount.findById(auth.employeeId).select("email tenantId").lean().exec() as any;
+    if (!employee?.email || String(employee.tenantId) !== String(tenantId)) return null;
+    const rider = await Rider.findOne({ email: employee.email, tenantId }).select("_id tenantId").lean().exec() as any;
+    return rider && String(rider.tenantId) === String(tenantId)
+      ? { channel: "rider", audienceKeys: [`rider:${String(rider._id)}`], tenantId } : null;
   }
   return null;
 }
@@ -434,36 +440,63 @@ export async function serveRealtimeEvents(request: Request, response: Response) 
   }
   const suppliedId = String(request.header("last-event-id") || request.query.since || "");
   const after = mongoose.isValidObjectId(suppliedId) ? new mongoose.Types.ObjectId(suppliedId) : null;
-  response.status(200);
-  response.setHeader("Content-Type", "text/event-stream; charset=utf-8");
-  response.setHeader("Cache-Control", "no-cache, no-transform");
-  response.setHeader("Connection", "keep-alive");
-  response.setHeader("X-Accel-Buffering", "no");
-  response.flushHeaders();
-  response.write(`event: ready\ndata: ${JSON.stringify({ channel: audience.channel })}\n\n`);
   const query: Record<string, unknown> = { channel: audience.channel, audienceKey: { $in: audience.audienceKeys } };
+  if (audience.channel === "rider") query.tenantId = audience.tenantId;
   if (after) query._id = { $gt: after };
   const delivered = new Set<string>();
   const audienceKeySet = new Set(audience.audienceKeys);
+  let closed = false;
+  let heartbeat: ReturnType<typeof setInterval> | undefined;
+  const matches = (event: PersistedRealtimeEvent) => event.channel === audience.channel && audienceKeySet.has(event.audienceKey)
+    && (audience.channel !== "rider" || (validTenantId(event.tenantId) !== null && String(event.tenantId) === String(audience.tenantId)))
+    && (!after || String(event._id) > String(after));
   const writeUniqueEvent = (event: PersistedRealtimeEvent) => {
+    if (closed || !matches(event)) return;
     const eventId = String(event._id);
     if (delivered.has(eventId)) return;
     delivered.add(eventId);
     writeEvent(response, event);
   };
   const listener = (event: PersistedRealtimeEvent) => {
-    if (event.channel === audience.channel && audienceKeySet.has(event.audienceKey)) writeUniqueEvent(event);
+    try { writeUniqueEvent(event); }
+    catch { terminate(); }
   };
-  const heartbeat = setInterval(() => response.write(`: heartbeat ${Date.now()}\n\n`), HEARTBEAT_MS);
-  stream.on("event", listener);
-  const backlog = (after
-    ? await RealtimeEvent.find(query).sort({ _id: 1 }).limit(REPLAY_LIMIT).lean().exec()
-    : (await RealtimeEvent.find(query).sort({ _id: -1 }).limit(REPLAY_LIMIT).lean().exec()).reverse()
-  ) as unknown as PersistedRealtimeEvent[];
-  backlog.forEach((event) => writeUniqueEvent(event));
-  const close = () => { clearInterval(heartbeat); stream.off("event", listener); };
+  const close = () => {
+    if (closed) return;
+    closed = true;
+    if (heartbeat !== undefined) clearInterval(heartbeat);
+    stream.off("event", listener);
+    request.off("close", close);
+    response.off("close", close);
+  };
+  const terminate = () => { close(); if (!response.writableEnded && !response.destroyed) response.end(); };
+  // Disconnects during a slow/failed replay must release live listeners and timers immediately.
   request.on("close", close);
   response.on("close", close);
+  if (response.destroyed || response.writableEnded || request.destroyed) { close(); return; }
+  try {
+    response.status(200);
+    response.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+    response.setHeader("Cache-Control", "no-cache, no-transform");
+    response.setHeader("Connection", "keep-alive");
+    response.setHeader("X-Accel-Buffering", "no");
+    response.flushHeaders();
+    if (closed) return;
+    response.write(`event: ready\ndata: ${JSON.stringify({ channel: audience.channel })}\n\n`);
+    if (closed) return;
+    heartbeat = setInterval(() => {
+      if (closed) return;
+      try { response.write(`: heartbeat ${Date.now()}\n\n`); }
+      catch { terminate(); }
+    }, HEARTBEAT_MS);
+    stream.on("event", listener);
+    const backlog = (after
+      ? await RealtimeEvent.find(query).sort({ _id: 1 }).limit(REPLAY_LIMIT).lean().exec()
+      : (await RealtimeEvent.find(query).sort({ _id: -1 }).limit(REPLAY_LIMIT).lean().exec()).reverse()
+    ) as unknown as PersistedRealtimeEvent[];
+    if (closed) return;
+    backlog.forEach(writeUniqueEvent);
+  } catch { if (!closed) terminate(); }
 }
 
 export async function getRestaurantForOrder(order: any) {
