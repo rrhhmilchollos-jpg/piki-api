@@ -5,6 +5,8 @@ import ts from "typescript";
 import { buildPartnerRecoveryPreview, registerPartnerPasswordRecoveryRoutes, partnerRecoverySendRateLimit, PARTNER_PASSWORD_RECOVERY_PATH, type PartnerPasswordRecoveryDependencies } from "./partnerPasswordRecovery.js";
 import { GovernanceAuditEvent } from "./models.js";
 import { sessionRole } from "./employeeSessions.js";
+import { PartnerBindingError } from "./employeePartnerBinding.js";
+import { KitchenAccessError } from "./partnerKitchenAccess.js";
 const ids = { tenant: "6ab891dbc9ebf588e74114f2", restaurant: "6acad53e7f55ddba7e05c18a", employee: "64c000000000000000000001", owner: "64c000000000000000000002", other: "64c000000000000000000003", second: "64c000000000000000000004" };
 const target = { tenantId: ids.tenant, restaurantId: ids.restaurant };
 const ownerEmail = "rrhh.milchollos@gmail.com";
@@ -178,4 +180,172 @@ test("production audit row satisfies actual GovernanceAuditEvent schema with no 
   await deps.audit({ ...target, employeeId: ids.employee, actorEmployeeId: ids.owner, sent: false });
   assert.equal(rows.length, 2); assert.equal(rows[0].action, "partner_password_recovery_sent"); assert.equal(rows[1].action, "partner_password_recovery_delivery_unconfirmed");
   for (const row of rows) { assert.equal(row.tenantId, ids.tenant); assert.equal(row.targetType, "employee"); assert.equal(row.targetId, ids.employee); assert.equal(row.actorEmployeeId, ids.owner); assert.deepEqual(Object.keys(row.after).sort(), ["restaurantId", "sent"]); assert(!/token|passwordHash|resetUrl|recipient|email/.test(JSON.stringify(row))); }
+});
+
+const eligibilityFilter = { tenantId: ids.tenant, email: contact, $or: [{ restaurantId: ids.restaurant }, { restaurantIds: ids.restaurant }] };
+const diagnosticFilter = { tenantId: ids.tenant, email: contact };
+function assertBlockedDiagnostic(body: any, code: string) {
+  assert.equal(body.ready, false); assert.equal(body.employee, null);
+  assert.equal(body.blockers[0].code, "PARTNER_RECOVERY_ACCOUNT_NOT_ELIGIBLE");
+  assert(body.blockers.some((blocker: any) => blocker.code === code), JSON.stringify(body.blockers));
+  for (const blocker of body.blockers) assert.deepEqual(Object.keys(blocker).sort(), ["code", "message"]);
+  assert.equal(new Set(body.blockers.map((blocker: any) => blocker.code)).size, body.blockers.length);
+  const publicData = JSON.stringify(body);
+  for (const privateValue of [ids.employee, ids.second, ids.other, contact, "OFFLINE_PASSWORD_SECRET", "OFFLINE_SESSION_SECRET", "OFFLINE_INTERNAL_SECRET", "other-login@example.test", "foreign@example.test"]) assert(!publicData.includes(privateValue), privateValue);
+}
+async function assertReadOnlyBlocked(h: ReturnType<typeof harness>, code: string) {
+  const before = clone(h.db); const res = await h.preview(); assert.equal(res.code, 200);
+  assertBlockedDiagnostic(res.body, code); assert.deepEqual(h.db, before);
+  const send = await h.send({}, res.body); assert.equal(send.code, 409); assert.equal(send.body.error, "PARTNER_RECOVERY_BLOCKED");
+  assert.deepEqual(send.body.blockers, res.body.blockers); assert.deepEqual(h.db, before);
+  assert(!h.effects.some((event) => event.mail || event.audit));
+  return res.body;
+}
+for (const [fault, code] of [
+  ["inactive", "ACCOUNT_INACTIVE"], ["not-approved", "ACCOUNT_NOT_APPROVED"],
+  ["not-partner", "ACCOUNT_NOT_PARTNER"], ["surface", "ACCOUNT_PARTNER_SURFACE_NOT_ALLOWED"],
+] as const) test(`diagnostic candidate ${fault} has a fixed safe reason and no fallback lookup`, async () => {
+  const h = harness(); const employee = h.db.employees[0];
+  if (fault === "inactive") employee.active = false;
+  if (fault === "not-approved") employee.authorizationStatus = "pending";
+  if (fault === "not-partner") { employee.apiRole = "rider"; employee.jobRole = "rider"; employee.roles = ["rider"]; }
+  if (fault === "surface") { employee.roles = ["rider"]; employee.primaryRole = "rider"; }
+  const body = await assertReadOnlyBlocked(h, code);
+  assert.equal(body.blockers.length, 2);
+  assert(h.effects.filter((event) => event.employeeFilter).every((event) => JSON.stringify(event.employeeFilter) === JSON.stringify(eligibilityFilter)));
+});
+test("candidate reasons are deduplicated, count-safe and never expose account details", async () => {
+  const h = harness(); h.db.employees[0].active = false; h.db.employees[0].authorizationStatus = "revoked";
+  h.db.employees.push({ ...clone(h.db.employees[0]), _id: ids.second, name: "OFFLINE_INTERNAL_SECRET" });
+  const body = await assertReadOnlyBlocked(h, "ACCOUNT_INACTIVE"); assertBlockedDiagnostic(body, "ACCOUNT_NOT_APPROVED");
+  assert.deepEqual(body.blockers.map((blocker: any) => blocker.code), ["PARTNER_RECOVERY_ACCOUNT_NOT_ELIGIBLE", "ACCOUNT_INACTIVE", "ACCOUNT_NOT_APPROVED"]);
+});
+test("one eligible associated account remains eligible despite a rejected same-contact candidate", async () => {
+  const h = harness(); h.db.employees.push({ ...clone(h.db.employees[0]), _id: ids.second, active: false });
+  const res = await h.preview(); assert.equal(res.body.ready, true); assert.equal(res.body.employee.id, ids.employee); assert.deepEqual(res.body.blockers, []);
+  assert.deepEqual(h.effects.filter((event) => event.employeeFilter).map((event) => event.employeeFilter), [eligibilityFilter]);
+});
+for (const fault of ["no-account", "other-email", "other-tenant"]) test(`zero associated candidates diagnose ${fault} only by exact contact and tenant`, async () => {
+  const h = harness();
+  if (fault === "no-account") h.db.employees = [];
+  if (fault === "other-email") h.db.employees[0].email = "other-login@example.test";
+  if (fault === "other-tenant") h.db.employees[0].tenantId = ids.other;
+  h.deps.canUsePartner = () => { throw new Error("Diagnostic must not run eligibility"); };
+  h.deps.binding.tenants.findOne = async () => { throw new Error("Diagnostic must not validate binding"); };
+  const body = await assertReadOnlyBlocked(h, "ACCOUNT_NOT_FOUND_IN_TENANT"); assert.equal(body.blockers.length, 2);
+  assert.deepEqual(h.effects.filter((event) => event.employeeFilter).map((event) => event.employeeFilter), [eligibilityFilter, diagnosticFilter, eligibilityFilter, diagnosticFilter]);
+});
+test("fully active approved Partner in exact tenant and contact but unassociated can never become eligible", async () => {
+  const h = harness(); const employee = h.db.employees[0]; employee.restaurantId = ids.second; employee.restaurantIds = [ids.second];
+  h.db.employees.push({ ...clone(employee), _id: ids.other, email: "foreign@example.test", restaurantId: ids.restaurant, restaurantIds: [ids.restaurant] });
+  h.deps.canUsePartner = () => { throw new Error("Unassociated diagnostic must not run eligibility"); };
+  h.deps.binding.tenants.findOne = async () => { throw new Error("Unassociated diagnostic must not validate binding"); };
+  await assertReadOnlyBlocked(h, "ACCOUNT_RESTAURANT_ASSOCIATION_MISSING");
+  assert.deepEqual(h.effects.filter((event) => event.employeeFilter).map((event) => event.employeeFilter), [eligibilityFilter, diagnosticFilter, eligibilityFilter, diagnosticFilter]);
+});
+test("ambiguous contact-only accounts have a specific count-safe reason, not first-match selection", async () => {
+  const h = harness(); delete h.db.employees[0].restaurantId; h.db.employees[0].restaurantIds = [];
+  h.db.employees.push({ ...clone(h.db.employees[0]), _id: ids.second, name: "OFFLINE_INTERNAL_SECRET" });
+  const body = await assertReadOnlyBlocked(h, "ACCOUNT_AMBIGUOUS_IN_TENANT"); assert.equal(body.blockers.length, 2);
+  assert(!body.blockers.some((blocker: any) => blocker.code === "ACCOUNT_RESTAURANT_ASSOCIATION_MISSING"));
+});
+test("a racing contact-only lookup returning an associated account is diagnostic only and never eligible", async () => {
+  const h = harness(); h.deps.employees = async (filter) => { h.effects.push({ employeeFilter: filter }); return filter.$or ? [] : clone(h.db.employees); };
+  h.deps.canUsePartner = () => { throw new Error("Contact-only rows must not be eligibility candidates"); };
+  await assertReadOnlyBlocked(h, "ACCOUNT_LOOKUP_CHANGED");
+  assert.deepEqual(h.effects.filter((event) => event.employeeFilter).map((event) => event.employeeFilter), [eligibilityFilter, diagnosticFilter, eligibilityFilter, diagnosticFilter]);
+});
+for (const fault of ["tenant", "email", "association"]) test(`candidate postfilter rejects unexpected ${fault} scope without repair lookup`, async () => {
+  const h = harness();
+  if (fault === "tenant") h.db.employees[0].tenantId = ids.other;
+  if (fault === "email") h.db.employees[0].email = "other-login@example.test";
+  if (fault === "association") { delete h.db.employees[0].restaurantId; h.db.employees[0].restaurantIds = []; }
+  h.deps.employees = async (filter) => { h.effects.push({ employeeFilter: filter }); return clone(h.db.employees); };
+  await assertReadOnlyBlocked(h, "ACCOUNT_LOOKUP_SCOPE_CONFLICT");
+  assert.deepEqual(h.effects.filter((event) => event.employeeFilter).map((event) => event.employeeFilter), [eligibilityFilter, eligibilityFilter]);
+});
+test("contact diagnostic independently rejects out-of-tenant and alternate-email rows returned by adapter", async () => {
+  const h = harness(); const base = h.db.employees[0];
+  const outside = [{ ...clone(base), tenantId: ids.other }, { ...clone(base), _id: ids.second, email: "foreign@example.test" }];
+  h.deps.employees = async (filter) => { h.effects.push({ employeeFilter: filter }); return filter.$or ? [] : outside; };
+  const body = await assertReadOnlyBlocked(h, "ACCOUNT_NOT_FOUND_IN_TENANT"); assertBlockedDiagnostic(body, "ACCOUNT_LOOKUP_SCOPE_CONFLICT");
+  assert(!body.blockers.some((blocker: any) => blocker.code === "ACCOUNT_AMBIGUOUS_IN_TENANT"));
+});
+for (const [fault, code] of [
+  ["identity", "PARTNER_TENANT_BINDING_REQUIRED"], ["assignment", "PARTNER_RESTAURANT_ASSIGNMENT_INVALID"],
+  ["tenant", "PARTNER_TENANT_NOT_ACTIVE"], ["restaurant-missing", "PARTNER_RESTAURANT_NOT_FOUND_IN_TENANT"],
+  ["restaurant-setup", "PARTNER_RESTAURANT_SETUP_INVALID"], ["membership", "PARTNER_MEMBERSHIP_BINDING_REQUIRED"],
+  ["roles", "PARTNER_ROLES_REQUIRED"], ["scopes", "PARTNER_MEMBERSHIP_SCOPE_CONFLICT"],
+  ["kitchen-account", "KITCHEN_ACCOUNT_BINDING_CONFLICT"], ["kitchen-tenant", "KITCHEN_TENANT_NOT_ACTIVE"],
+  ["kitchen-restaurant", "KITCHEN_RESTAURANT_SETUP_INVALID"], ["kitchen-membership", "KITCHEN_MEMBERSHIP_CONFLICT"],
+] as const) test(`persisted binding fault ${fault} exposes only its whitelisted fixed code`, async () => {
+  const h = harness(); const employee = h.db.employees[0]; const restaurant = h.db.restaurants[0]; const member = h.db.memberships[0];
+  if (fault.startsWith("kitchen-")) {
+    Object.assign(employee, { kitchenAccessSetupVersion: 1, partnerRoles: ["kitchen"] });
+    Object.assign(member, { role: "partner", scopes: ["orders:read", "orders:prepare"] });
+  }
+  if (fault === "identity") employee._id = "OFFLINE_INTERNAL_SECRET";
+  if (fault === "assignment") employee.restaurantIds.push("OFFLINE_INTERNAL_SECRET");
+  if (fault === "tenant" || fault === "kitchen-tenant") h.db.tenants[0].status = "suspended";
+  if (fault === "restaurant-missing") employee.restaurantIds.push(ids.second);
+  if (fault === "restaurant-setup" || fault === "kitchen-restaurant") restaurant.internalDemo = true;
+  if (fault === "membership") member.status = "suspended";
+  if (fault === "roles") employee.partnerRoles = ["invalid"];
+  if (fault === "scopes") { member.role = "partner"; member.scopes = ["orders:read"]; }
+  if (fault === "kitchen-account") employee.ownerProtected = true;
+  if (fault === "kitchen-membership") member.scopes = ["orders:read"];
+  const body = await assertReadOnlyBlocked(h, code); assert.equal(body.blockers.length, 2);
+  assert.deepEqual(h.effects.filter((event) => event.employeeFilter).map((event) => event.employeeFilter), [eligibilityFilter, eligibilityFilter]);
+});
+for (const [ErrorClass, codes] of [
+  [PartnerBindingError, ["PARTNER_TENANT_BINDING_REQUIRED", "EMPLOYEE_NOT_APPROVED", "PARTNER_RESTAURANT_ASSIGNMENT_INVALID", "PARTNER_RESTAURANT_NOT_ASSIGNED", "PARTNER_TENANT_NOT_ACTIVE", "PARTNER_RESTAURANT_NOT_FOUND_IN_TENANT", "PARTNER_RESTAURANT_SETUP_INVALID", "PARTNER_MEMBERSHIP_BINDING_REQUIRED", "PARTNER_ROLES_REQUIRED", "PARTNER_MEMBERSHIP_SCOPE_CONFLICT"]],
+  [KitchenAccessError, ["KITCHEN_ACCOUNT_BINDING_CONFLICT", "KITCHEN_TENANT_NOT_ACTIVE", "KITCHEN_RESTAURANT_NOT_FOUND_IN_TENANT", "KITCHEN_RESTAURANT_SETUP_INVALID", "KITCHEN_RESTAURANT_CONTACT_CONFLICT", "KITCHEN_MEMBERSHIP_CONFLICT"]],
+] as const) for (const code of codes) test(`existing binding response helper accepts only fixed diagnostic message for ${code}`, async () => {
+  const h = harness();
+  h.deps.binding.tenants.findOne = async () => { const error = new ErrorClass(409, code); error.message = "OFFLINE_INTERNAL_SECRET"; throw error; };
+  const body = await assertReadOnlyBlocked(h, code); assert.equal(body.blockers.length, 2);
+});
+for (const error of [
+  new Error("OFFLINE_INTERNAL_SECRET"), Object.assign(new Error("OFFLINE_INTERNAL_SECRET"), { code: "PARTNER_TENANT_NOT_ACTIVE" }),
+  new PartnerBindingError(409, "OFFLINE_INTERNAL_SECRET"), new KitchenAccessError(409, "OFFLINE_INTERNAL_SECRET"),
+  new PartnerBindingError(409, "PARTNER_BINDING_CHANGED"), new KitchenAccessError(409, "KITCHEN_ACCESS_UNIQUE_INDEX_REQUIRED"),
+  Object.assign(new Error("OFFLINE_INTERNAL_SECRET"), { code: 11000 }), new PartnerBindingError(409, "__proto__"),
+]) test(`unknown, unbranded or write-only binding error ${error.constructor.name}/${(error as any).code || "none"} fails closed`, async () => {
+  const h = harness(); h.deps.binding.tenants.findOne = async () => { throw error; };
+  const body = await assertReadOnlyBlocked(h, "ACCOUNT_BINDING_VALIDATION_UNAVAILABLE"); assert.equal(body.blockers.length, 2);
+});
+test("unassociated diagnostic whitelist fields affect manifest while credentials and arbitrary fields do not", async () => {
+  const h = harness(); h.db.employees[0].restaurantId = ids.second; h.db.employees[0].restaurantIds = [ids.second];
+  const first = (await h.preview()).body; assertBlockedDiagnostic(first, "ACCOUNT_RESTAURANT_ASSOCIATION_MISSING");
+  Object.assign(h.db.employees[0], { passwordHash: "CHANGED_SECRET", tokenHash: "CHANGED_SECRET", sessionHash: "CHANGED_SECRET", resetUrl: "CHANGED_SECRET", arbitraryInternal: "CHANGED_SECRET" });
+  const secretsChanged = (await h.preview()).body; assert.equal(secretsChanged.manifestHash, first.manifestHash);
+  h.db.employees[0].active = false;
+  const persistedChanged = (await h.preview()).body; assert.notEqual(persistedChanged.manifestHash, first.manifestHash);
+  assert.deepEqual(persistedChanged.blockers, first.blockers); assert.equal(persistedChanged.employee, null);
+  const send = await h.send({}, first); assert.equal(send.code, 409); assert.equal(send.body.error, "PARTNER_RECOVERY_PREVIEW_CHANGED");
+  assert(!h.effects.some((event) => event.mail || event.audit));
+});
+test("diagnostic hash and codes are independent of account ordering and include validated fault changes", async () => {
+  const h = harness(); h.db.employees[0].active = false;
+  h.db.employees.push({ ...clone(h.db.employees[0]), _id: ids.second, active: true, authorizationStatus: "pending" });
+  const first = (await h.preview()).body; h.db.employees.reverse(); const reordered = (await h.preview()).body;
+  assert.equal(reordered.manifestHash, first.manifestHash); assert.deepEqual(reordered.blockers, first.blockers);
+  h.db.employees[0].authorizationStatus = "revoked"; const changed = (await h.preview()).body; assert.notEqual(changed.manifestHash, first.manifestHash);
+  assert.deepEqual(changed.blockers, first.blockers);
+});
+for (const endpoint of ["preview", "send"]) test(`strict ${endpoint} still rejects alternate loginEmail without any repair query`, async () => {
+  const h = harness(); const input = endpoint === "preview" ? { ...target, loginEmail: "injected@example.test" }
+    : { ...target, employeeId: ids.employee, manifestHash: "0".repeat(64), confirmation: "SEND_PARTNER_PASSWORD_RECOVERY", loginEmail: "injected@example.test" };
+  const res = await h.request(endpoint === "preview" ? "get" : "post", endpoint, input); assert.equal(res.code, 400);
+  assert(!h.effects.some((event) => event.restaurantFilter || event.employeeFilter || event.mail || event.audit));
+});
+test("associated candidate plus unassociated duplicate never triggers contact-only diagnosis or wider eligibility", async () => {
+  const h = harness(); h.db.employees.push({ ...clone(h.db.employees[0]), _id: ids.second, restaurantId: ids.other, restaurantIds: [ids.other] });
+  const res = await h.preview(); assert.equal(res.body.ready, true); assert.equal(res.body.employee.id, ids.employee);
+  assert.deepEqual(h.effects.filter((event) => event.employeeFilter).map((event) => event.employeeFilter), [eligibilityFilter]);
+});
+test("contact-only diagnostic read failure returns safe 503 without sends or invented reason", async () => {
+  const h = harness(); h.deps.employees = async (filter) => { h.effects.push({ employeeFilter: filter }); if (filter.$or) return []; throw new Error("OFFLINE_INTERNAL_SECRET"); };
+  const res = await h.preview(); assert.equal(res.code, 503); assert.deepEqual(res.body, { error: "PARTNER_RECOVERY_UNAVAILABLE", message: "No se pudo verificar el destino. Inténtalo más tarde." });
+  assert(!h.effects.some((event) => event.mail || event.audit)); assert.deepEqual(h.effects.filter((event) => event.employeeFilter).map((event) => event.employeeFilter), [eligibilityFilter, diagnosticFilter]);
 });

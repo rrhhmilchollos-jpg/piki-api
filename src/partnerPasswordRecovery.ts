@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import type { Express, Request, RequestHandler } from "express";
 import { z } from "zod";
-import { isPartnerEmployee, partnerBindingForEmployee } from "./employeePartnerBinding.js";
+import { isPartnerEmployee, partnerBindingErrorResponse, partnerBindingForEmployee } from "./employeePartnerBinding.js";
 import type { KitchenBindingDependencies } from "./partnerKitchenAccess.js";
 
 const id = z.string().regex(/^[a-f\d]{24}$/i).transform((value) => value.toLowerCase());
@@ -35,6 +35,42 @@ const fields = (row: any, keys: string[]) => Object.fromEntries(keys.map((key) =
 const employeeKeys = ["_id", "name", "email", "tenantId", "active", "authorizationStatus", "apiRole", "jobRole", "primaryRole", "roles", "partnerRoles", "restaurantId", "restaurantIds", "accessLevel", "ownerProtected", "kitchenAccessSetupVersion", "partnerBindingVersion", "fleetId", "zoneSlugs", "updatedAt", "kitchenAccessRevision"];
 const restaurantKeys = ["_id", "tenantId", "name", "email", "onboardingStatus", "listingType", "internalDemo", "updatedAt", "kitchenAccessRevision"];
 const membershipKeys = ["_id", "employeeId", "tenantId", "role", "status", "scopes", "restaurantIds", "updatedAt", "kitchenAccessRevision"];
+// Fixed, count-safe messages only. Binding errors must also pass the existing
+// response helper: neither arbitrary error.code nor error.message is public.
+const diagnosticMessages = {
+  ACCOUNT_NOT_FOUND_IN_TENANT: "No existe una cuenta con el correo de contacto del restaurante en el tenant seleccionado.",
+  ACCOUNT_RESTAURANT_ASSOCIATION_MISSING: "La cuenta con el correo de contacto no tiene una asociación persistida válida al restaurante seleccionado.",
+  ACCOUNT_AMBIGUOUS_IN_TENANT: "El correo de contacto es ambiguo en el tenant seleccionado; no se elegirá una cuenta sin asociación.",
+  ACCOUNT_LOOKUP_SCOPE_CONFLICT: "La cuenta devuelta no cumple los límites de correo, tenant y asociación del destino.",
+  ACCOUNT_LOOKUP_CHANGED: "La asociación cambió durante la comprobación. Actualiza la vista previa; este diagnóstico no habilita el envío.",
+  ACCOUNT_INACTIVE: "Una cuenta asociada con el correo de contacto no está activa.",
+  ACCOUNT_NOT_APPROVED: "Una cuenta asociada con el correo de contacto no está aprobada.",
+  ACCOUNT_NOT_PARTNER: "Una cuenta asociada con el correo de contacto no tiene rol Partner.",
+  ACCOUNT_PARTNER_SURFACE_NOT_ALLOWED: "Una cuenta asociada con el correo de contacto no tiene acceso a la superficie Partner.",
+  PARTNER_TENANT_BINDING_REQUIRED: "La cuenta Partner no tiene un vínculo de identidad y tenant válido.",
+  EMPLOYEE_NOT_APPROVED: "El binding requiere una cuenta activa y aprobada.",
+  PARTNER_RESTAURANT_ASSIGNMENT_INVALID: "La asignación persistida de restaurantes de la cuenta Partner no es válida.",
+  PARTNER_RESTAURANT_NOT_ASSIGNED: "La cuenta Partner no tiene una asignación de restaurantes válida.",
+  PARTNER_TENANT_NOT_ACTIVE: "El tenant vinculado a la cuenta Partner no está activo.",
+  PARTNER_RESTAURANT_NOT_FOUND_IN_TENANT: "Un restaurante del binding Partner no existe en el tenant de la cuenta.",
+  PARTNER_RESTAURANT_SETUP_INVALID: "La configuración persistida de un restaurante del binding Partner no es válida.",
+  PARTNER_MEMBERSHIP_BINDING_REQUIRED: "La membresía Partner persistida no coincide con el tenant, estado o restaurantes del binding.",
+  PARTNER_ROLES_REQUIRED: "La cuenta no tiene roles operativos Partner válidos.",
+  PARTNER_MEMBERSHIP_SCOPE_CONFLICT: "Los permisos persistidos de la membresía Partner no coinciden con sus roles operativos.",
+  KITCHEN_ACCOUNT_BINDING_CONFLICT: "La cuenta de cocina no cumple su contrato de binding persistido.",
+  KITCHEN_TENANT_NOT_ACTIVE: "El tenant vinculado a la cuenta de cocina no está activo.",
+  KITCHEN_RESTAURANT_NOT_FOUND_IN_TENANT: "El restaurante del binding de cocina no existe en el tenant de la cuenta.",
+  KITCHEN_RESTAURANT_SETUP_INVALID: "La configuración persistida del restaurante de cocina no es válida.",
+  KITCHEN_RESTAURANT_CONTACT_CONFLICT: "El correo persistido de la cuenta de cocina no coincide con el contacto de su restaurante vinculado.",
+  KITCHEN_MEMBERSHIP_CONFLICT: "La membresía de cocina no cumple el contrato persistido de tenant, rol, estado, restaurante y permisos.",
+  ACCOUNT_BINDING_VALIDATION_UNAVAILABLE: "No se pudo validar el binding persistido de la cuenta Partner. Actualiza la vista previa o inténtalo más tarde.",
+} as const;
+type DiagnosticCode = keyof typeof diagnosticMessages;
+function bindingDiagnostic(error: unknown): DiagnosticCode {
+  const code = partnerBindingErrorResponse(error)?.error;
+  return code && Object.hasOwn(diagnosticMessages, code) && (code.startsWith("PARTNER_") || code.startsWith("KITCHEN_") || code === "EMPLOYEE_NOT_APPROVED")
+    ? code as DiagnosticCode : "ACCOUNT_BINDING_VALIDATION_UNAVAILABLE";
+}
 function canonical(value: any): any {
   if (value === null || value === undefined) return null;
   if (value instanceof Date) return value.toISOString();
@@ -53,6 +89,8 @@ export async function buildPartnerRecoveryPreview(target: { tenantId: string; re
   const restaurant = await deps.restaurant({ _id: deps.objectId(target.restaurantId), tenantId: deps.objectId(target.tenantId) });
   const eligible: any[] = [];
   const snapshot: any[] = [];
+  const diagnostics = new Set<DiagnosticCode>();
+  let contactDiagnosticSnapshot: any[] = [];
   let contact = "";
   if (!restaurant || !sameId(restaurant.tenantId, target.tenantId) || !sameId(restaurant._id, target.restaurantId)) {
     add("RESTAURANT_NOT_FOUND_IN_TENANT", "El restaurante no existe en el tenant seleccionado.");
@@ -62,21 +100,44 @@ export async function buildPartnerRecoveryPreview(target: { tenantId: string; re
     else {
       const candidates = await deps.employees({ tenantId: deps.objectId(target.tenantId), email: contact, $or: [{ restaurantId: deps.objectId(target.restaurantId) }, { restaurantIds: deps.objectId(target.restaurantId) }] });
       for (const employee of candidates) {
-        const entry: any = { employee: fields(employee, employeeKeys), valid: false };
+        const reasons: DiagnosticCode[] = [];
+        const reject = (code: DiagnosticCode) => { reasons.push(code); diagnostics.add(code); };
+        const entry: any = { employee: fields(employee, employeeKeys), valid: false, diagnostics: reasons };
         snapshot.push(entry);
-        if (!sameId(employee.tenantId, target.tenantId) || emailOf(employee.email) !== contact || !associated(employee, target.restaurantId)
-          || employee.active !== true || employee.authorizationStatus !== "approved" || !isPartnerEmployee(employee) || !deps.canUsePartner(employee)) continue;
+        if (!sameId(employee.tenantId, target.tenantId) || emailOf(employee.email) !== contact || !associated(employee, target.restaurantId)) {
+          reject("ACCOUNT_LOOKUP_SCOPE_CONFLICT"); continue;
+        }
+        if (employee.active !== true) reject("ACCOUNT_INACTIVE");
+        if (employee.authorizationStatus !== "approved") reject("ACCOUNT_NOT_APPROVED");
+        if (!isPartnerEmployee(employee)) reject("ACCOUNT_NOT_PARTNER");
+        if (reasons.length) continue;
+        if (!deps.canUsePartner(employee)) { reject("ACCOUNT_PARTNER_SURFACE_NOT_ALLOWED"); continue; }
         try {
           const binding = await partnerBindingForEmployee(employee, deps.binding);
-          if (!binding.restaurants.some((row: any) => sameId(row._id, target.restaurantId) && sameId(row.tenantId, target.tenantId))) continue;
           entry.binding = { restaurants: binding.restaurants.map((row: any) => fields(row, restaurantKeys)), membership: fields(binding.membership, membershipKeys) };
+          if (!binding.restaurants.some((row: any) => sameId(row._id, target.restaurantId) && sameId(row.tenantId, target.tenantId))) {
+            reject("ACCOUNT_RESTAURANT_ASSOCIATION_MISSING"); continue;
+          }
           entry.valid = true; eligible.push(employee);
-        } catch {
-          // No internal error strings, membership data or credentials in public blockers.
-          entry.valid = false;
+        } catch (error) {
+          reject(bindingDiagnostic(error));
         }
       }
-      if (!eligible.length) add("PARTNER_RECOVERY_ACCOUNT_NOT_ELIGIBLE", "No hay una cuenta Partner activa y aprobada con este correo de contacto, este tenant y una asociación válida al restaurante. No se buscará otra cuenta ni se modificará su correo.");
+      if (!candidates.length) {
+        // Diagnostic only: exactly the same contact and tenant, never a global
+        // email search or an alternate login. These rows NEVER enter eligible.
+        const contactAccounts = await deps.employees({ tenantId: deps.objectId(target.tenantId), email: contact });
+        const scoped = contactAccounts.filter((row) => sameId(row.tenantId, target.tenantId) && emailOf(row.email) === contact);
+        contactDiagnosticSnapshot = scoped.map((row) => fields(row, employeeKeys));
+        if (scoped.length !== contactAccounts.length) diagnostics.add("ACCOUNT_LOOKUP_SCOPE_CONFLICT");
+        if (!scoped.length) diagnostics.add("ACCOUNT_NOT_FOUND_IN_TENANT");
+        else if (scoped.length !== 1) diagnostics.add("ACCOUNT_AMBIGUOUS_IN_TENANT");
+        else diagnostics.add(associated(scoped[0], target.restaurantId) ? "ACCOUNT_LOOKUP_CHANGED" : "ACCOUNT_RESTAURANT_ASSOCIATION_MISSING");
+      }
+      if (!eligible.length) {
+        add("PARTNER_RECOVERY_ACCOUNT_NOT_ELIGIBLE", "No hay una cuenta Partner activa y aprobada con este correo de contacto, este tenant y una asociación válida al restaurante. No se buscará otra cuenta ni se modificará su correo.");
+        for (const code of [...diagnostics].sort()) add(code, diagnosticMessages[code]);
+      }
       else if (eligible.length !== 1) add("PARTNER_RECOVERY_ACCOUNT_AMBIGUOUS", "Hay más de una cuenta Partner elegible. Revisa la asociación antes de enviar.");
     }
   }
@@ -84,7 +145,7 @@ export async function buildPartnerRecoveryPreview(target: { tenantId: string; re
   const publicEmployee = employee ? { id: String(employee._id), name: String(employee.name || ""), email: emailOf(employee.email) } : null;
   const publicRestaurant = { id: target.restaurantId, name: restaurant && sameId(restaurant.tenantId, target.tenantId) ? String(restaurant.name || "") : "" };
   // Explicit whitelist only: password/session/token fields never enter this hash.
-  const manifestHash = createHash("sha256").update(JSON.stringify(canonical({ version: 1, target, restaurant: fields(restaurant, restaurantKeys), contact, candidates: snapshot, employee: publicEmployee, blockers }))).digest("hex");
+  const manifestHash = createHash("sha256").update(JSON.stringify(canonical({ version: 1, target, restaurant: fields(restaurant, restaurantKeys), contact, candidates: snapshot, contactDiagnostic: contactDiagnosticSnapshot, employee: publicEmployee, blockers }))).digest("hex");
   return { preview: { tenantId: target.tenantId, restaurant: publicRestaurant, employee: publicEmployee, ready: Boolean(employee), blockers, manifestHash }, employee };
 }
 function tenantAllowed(req: Request, tenantId: string) {

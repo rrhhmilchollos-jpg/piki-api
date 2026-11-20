@@ -2,7 +2,7 @@
 
 ## Alcance
 
-Cambios locales de API para el mismo incidente de contraseña. No se han modificado Admin ni Partner, ni `package.json`, configuración, roles, cuentas o datos reales. No se han usado Git, credenciales, conexiones Mongo, envío de correo ni servicios en vivo. La referencia de HEAD facilitada es `694a958`; no se ha consultado Git.
+Cambios locales de API para el mismo incidente de contraseña. No se han modificado Admin ni Partner, ni `package.json`, configuración, roles, cuentas o datos reales. No se han usado Git, credenciales, conexiones Mongo, envío de correo ni servicios en vivo. La referencia de HEAD facilitada para esta mejora de diagnóstico es `5ec222e`; no se ha consultado Git ni verificado el despliegue.
 
 El contacto mostrado para Alibaba por el usuario es `Shanali1997@icloud.com`; no se asume que sea el correo del `EmployeeAccount`. El destino facilitado es tenant `6ab891dbc9ebf588e74114f2`, restaurante `6acad53e7f55ddba7e05c18a`. La API lee los datos persistidos cuando se invoque posteriormente desde la UI autenticada; estos datos no se han verificado en producción.
 
@@ -40,7 +40,26 @@ Códigos de bloqueo:
 - `PARTNER_RECOVERY_ACCOUNT_NOT_ELIGIBLE`
 - `PARTNER_RECOVERY_ACCOUNT_AMBIGUOUS`
 
-El hash es un SHA-256 determinista de un snapshot de campos autorizados de destino y binding, nunca de contraseñas, hashes de sesiones, tokens ni URLs de recuperación. No constituye un permiso ni una credencial.
+Se conserva `PARTNER_RECOVERY_ACCOUNT_NOT_ELIGIBLE` como primer bloqueo cuando no hay ninguna cuenta elegible. A continuación se incluyen motivos fijos y deduplicados en el mismo array `blockers`, con el contrato `{ code, message }`; la UI existente puede mostrarlos sin cambios. No se publican IDs, nombres, correos, cantidades ni datos internos de las cuentas rechazadas.
+
+| Código de diagnóstico | Condición comprobada |
+| --- | --- |
+| `ACCOUNT_INACTIVE` | Una cuenta asociada no tiene `active: true`. |
+| `ACCOUNT_NOT_APPROVED` | Una cuenta asociada no tiene `authorizationStatus: approved`. |
+| `ACCOUNT_NOT_PARTNER` | Una cuenta asociada no satisface `isPartnerEmployee`. |
+| `ACCOUNT_PARTNER_SURFACE_NOT_ALLOWED` | El resolver existente no permite la superficie Partner. |
+| `ACCOUNT_NOT_FOUND_IN_TENANT` | No se encuentra ninguna cuenta con el contacto exacto en ese tenant. |
+| `ACCOUNT_RESTAURANT_ASSOCIATION_MISSING` | Se encuentra una cuenta con el contacto exacto en ese tenant, pero sin asociación válida al restaurante. |
+| `ACCOUNT_AMBIGUOUS_IN_TENANT` | El lookup diagnóstico exacto de contacto y tenant es ambiguo; no se selecciona la primera cuenta. |
+| `ACCOUNT_LOOKUP_SCOPE_CONFLICT` | Una fila devuelta por el adaptador no cumple los límites esperados. |
+| `ACCOUNT_LOOKUP_CHANGED` | El lookup diagnóstico observa una asociación que no apareció en la consulta principal; exige otra vista previa y nunca habilita envío. |
+| `ACCOUNT_BINDING_VALIDATION_UNAVAILABLE` | La validación de binding falla sin un código permitido y reconocido por el helper existente. |
+
+La consulta principal de elegibilidad permanece exactamente igual: contacto `Restaurant.email` normalizado, tenant explícito y `$or` de asociación por `restaurantId`/`restaurantIds`. **Solo si devuelve cero candidatos asociados** se realiza un segundo lookup de solo lectura con exactamente `{ tenantId, email: contactoNormalizado }`. No busca globalmente, no usa otro correo y no introduce `loginEmail` en los schemas estrictos de preview/send. Las cuentas de este segundo lookup nunca pasan al conjunto elegible, ni aunque una asociación aparezca durante esas lecturas. Una cuenta no elegible asociada tampoco dispara el segundo lookup.
+
+Los fallos del binding se filtran primero con `partnerBindingErrorResponse` y después por una whitelist local de códigos de lectura: `PARTNER_TENANT_BINDING_REQUIRED`, `EMPLOYEE_NOT_APPROVED`, `PARTNER_RESTAURANT_ASSIGNMENT_INVALID`, `PARTNER_RESTAURANT_NOT_ASSIGNED`, `PARTNER_TENANT_NOT_ACTIVE`, `PARTNER_RESTAURANT_NOT_FOUND_IN_TENANT`, `PARTNER_RESTAURANT_SETUP_INVALID`, `PARTNER_MEMBERSHIP_BINDING_REQUIRED`, `PARTNER_ROLES_REQUIRED`, `PARTNER_MEMBERSHIP_SCOPE_CONFLICT`, `KITCHEN_ACCOUNT_BINDING_CONFLICT`, `KITCHEN_TENANT_NOT_ACTIVE`, `KITCHEN_RESTAURANT_NOT_FOUND_IN_TENANT`, `KITCHEN_RESTAURANT_SETUP_INVALID`, `KITCHEN_RESTAURANT_CONTACT_CONFLICT` y `KITCHEN_MEMBERSHIP_CONFLICT`. Cada uno tiene un mensaje fijo local. Códigos arbitrarios, errores sin la clase reconocida, conflictos de escritura y mensajes internos quedan excluidos y usan el fallback seguro.
+
+El hash es un SHA-256 determinista de un snapshot de campos autorizados de destino y binding, nunca de contraseñas, hashes de sesiones, tokens ni URLs de recuperación. Ahora incluye también los códigos seguros de rechazo de candidatos y el snapshot interno de campos ya autorizados de las cuentas del lookup diagnóstico. Los cambios en esos campos invalidan la confirmación anterior aunque el motivo visible no cambie. Los campos secretos y arbitrarios siguen excluidos. No constituye un permiso ni una credencial.
 
 ## Paso 2: confirmación y envío por clic explícito
 
@@ -136,3 +155,21 @@ Modificados: `src/server.ts`, `src/passwordReset.ts`, `src/employeeSessions.ts`,
 - Build local final de API y worker con esbuild: aprobado. Artefactos en `/tmp/piki-password-recovery-build/`; no se ha sobrescrito `dist/` ni instalado dependencias.
 
 Logs locales: `/tmp/piki-recovery-check.log`, `/tmp/piki-recovery-targeted.log`, `/tmp/piki-recovery-full-tests.log`, `/tmp/piki-recovery-build.log`. Los resultados se obtuvieron sin env real, sin conexiones de red/Mongo y sin correo real.
+
+## Validación de la mejora de diagnóstico (20 de noviembre de 2026)
+
+Esta mejora modifica únicamente `src/partnerPasswordRecovery.ts`, `src/partnerPasswordRecovery.test.ts` y este documento. No cambia el send/helper, guard Owner, permisos, schemas de entrada, wiring del servidor, paquetes ni configuración. No se han consultado Git, el despliegue indicado, Mongo o SMTP, ni leído secretos. El único correo de destino utilizado en fixtures y filtros es el contacto confirmado `shanali1997@icloud.com`; las cuentas sintéticas de otro correo/tenant se usan exclusivamente para verificar su rechazo, nunca como destinatarios alternativos.
+
+Validaciones locales con dependencias existentes y entorno limpio:
+
+- Check TypeScript offline: aprobado, sin diagnósticos.
+- Suite de recuperación: 111 pruebas, 111 aprobadas y 0 fallos.
+- Batería focalizada ampliada: 228 pruebas, 228 aprobadas y 0 fallos (`partnerPasswordRecovery`, `employeePasswordResetConfirm`, `employeePasswordResetRequest`, `employeePasswordRecoveryMailLogs`, `partnerKitchenAccess`, `allPartnerAccess`).
+- Suite completa: 1.719 pruebas, 1.718 aprobadas, 1 omitida y 0 fallos.
+- Build temporal de API y worker: aprobado, en `/tmp/piki-recovery-diagnostics-build.59yo4B/`, sin modificar `dist/`.
+
+Check y pruebas focalizadas usan además `scripts/partner-offline-guard.mjs`, que bloquea lecturas de secretos, red y arranque de aplicación. La suite completa usa el runner `scripts/offline-validation.mjs` con su entorno de pruebas sanitizado, red y operaciones reales Mongo bloqueadas, `PIKI_NO_LISTEN=true` y dotenv dirigido a `/dev/null`; sus integraciones existentes solo importan el servidor en modo offline.
+
+Logs: `/tmp/piki-recovery-diagnostics-check.log`, `/tmp/piki-recovery-diagnostics-targeted.log`, `/tmp/piki-recovery-diagnostics-related.log`, `/tmp/piki-recovery-diagnostics-full.log` y `/tmp/piki-recovery-diagnostics-build.log`.
+
+La causa real persistida del destino aún no se puede afirmar: esta tarea no ha leído producción. El siguiente preview autenticado podrá mostrar el motivo seguro exacto que observen sus consultas, además del código agregado existente, sin modificar ni habilitar automáticamente ninguna cuenta.
