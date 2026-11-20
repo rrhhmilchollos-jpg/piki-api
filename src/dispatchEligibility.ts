@@ -1,7 +1,6 @@
-import { cashOrderWithinLimitFilter, isDispatchableCashOrder } from "./paymentPolicy.js";
-// El filtro de efectivo sin garantía sigue existiendo para auditoría, pero no
-// habilita por sí solo el reparto a un Rider.
-void cashOrderWithinLimitFilter; void isDispatchableCashOrder;
+import { Types } from "mongoose";
+import { cashOrderWithinLimitFilter } from "./paymentPolicy.js";
+import { CASH_WITHOUT_CARD_RESTAURANT_IDS, CASH_WITHOUT_CARD_TENANT_ID, isApprovedCashWithoutCardOrder, type CashWithoutCardOrder } from "./cashCardGuaranteePolicy.js";
 
 export const dispatchableOrderStatuses = [
   "pending",
@@ -20,17 +19,27 @@ export function isDispatchableOrderStatus(status: string): boolean {
   return (dispatchableOrderStatuses as readonly string[]).includes(status);
 }
 
+export const approvedCashWithoutCardPaymentFilter = {
+  ...cashOrderWithinLimitFilter,
+  totalCents: { ...cashOrderWithinLimitFilter.totalCents, $mod: [1, 0] },
+  cashWithoutCardApproved: true,
+  tenantId: new Types.ObjectId(CASH_WITHOUT_CARD_TENANT_ID),
+  restaurantId: { $in: CASH_WITHOUT_CARD_RESTAURANT_IDS.map((id) => new Types.ObjectId(id)) },
+  customerId: { $regex: /^[a-f\d]{24}$/i },
+  stripeCheckoutSessionId: null,
+  stripePaymentIntentId: null,
+};
 export const dispatchablePaymentFilter = {
-  paymentState: { $in: ["authorized", "paid"] },
+  $or: [{ paymentState: { $in: ["authorized", "paid"] } }, approvedCashWithoutCardPaymentFilter],
 };
 
-// Partner Orders debe poder recibir y mostrar un contrarreembolso pendiente
-// para que el establecimiento lo acepte, pero dispatch sigue exigiendo una
-// garantía de pago viva hasta que Operaciones autorice ese flujo.
+// Kitchen intake of pending cash stays unchanged. Rider dispatch additionally
+// requires a live guarantee OR the narrowly scoped server approval snapshot.
 export const partnerKitchenPaymentFilter = {
-  $or: [dispatchablePaymentFilter, cashOrderWithinLimitFilter],
+  $or: [{ paymentState: { $in: ["authorized", "paid"] } }, cashOrderWithinLimitFilter],
 };
 
-export function isDispatchablePayment(paymentState: string, _paymentMethod?: string, _totalCents?: number): boolean {
-  return ["authorized", "paid"].includes(paymentState);
+export function isDispatchablePayment(paymentState: string, paymentMethod?: string, totalCents?: number, order?: CashWithoutCardOrder): boolean {
+  return ["authorized", "paid"].includes(paymentState)
+    || Boolean(order && isApprovedCashWithoutCardOrder({ ...order, paymentState, paymentMethod, totalCents }));
 }

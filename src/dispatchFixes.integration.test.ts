@@ -127,7 +127,7 @@ test("dispatch fixes: real handlers with in-memory persistence and forbidden ext
     s.mock.method(Restaurant as any, "findOne", (filter: any) => query(matchesRestaurant(persisted, filter) ? { ...persisted } : null));
     s.mock.method(Restaurant as any, "updateOne", (filter: any, update: any, options: any) => {
       if (update.$inc) {
-        assert.deepEqual(filter, { _id: restaurantId, ...CUSTOMER_ORDERABLE_RESTAURANT_FILTER });
+        assert.deepEqual(filter, { _id: initial._id, ...CUSTOMER_ORDERABLE_RESTAURANT_FILTER });
         assert.deepEqual(update, { $inc: { __v: 1 } });
         assert.equal(options?.session, session);
         assert.equal(options?.timestamps, false);
@@ -170,6 +170,7 @@ test("dispatch fixes: real handlers with in-memory persistence and forbidden ext
       assert.equal(stored.routeDistanceKm, 1);
       assert.equal(stored.paymentState, "pending");
       assert.equal(isDispatchablePayment(stored.paymentState, "cash", stored.totalCents), false);
+      assert.equal(stored.cashWithoutCardApproved, false, "default policy never approves unsecured cash");
       assert.equal(evaluateDispatchVehicleEligibility("electric_bike", dispatchVehicleInputForOrder(stored)).eligible, true);
       assert.equal(stored.subtotalCents, 600);
       assert.equal(stored.creditAppliedCents, 0);
@@ -179,6 +180,81 @@ test("dispatch fixes: real handlers with in-memory persistence and forbidden ext
       fixture.assertComplete();
     });
   }
+
+  const cashScope = await import("./cashCardGuaranteeScope.js");
+  for (const merchantId of cashScope.CASH_WITHOUT_CARD_RESTAURANT_IDS) for (const procedure of ["order.create", "order.checkout"]) {
+    await t.test(`${procedure}: persists approved pending cash only for Kazoku ${merchantId}`, async (s) => {
+      const previous = paymentPolicy.CASH_PAYMENTS_ENABLED;
+      paymentPolicy.setCashPaymentsEnabled(true); s.after(() => paymentPolicy.setCashPaymentsEnabled(previous));
+      const kazoku = { ...restaurant, _id: new mongoose.Types.ObjectId(merchantId), tenantId: new mongoose.Types.ObjectId(cashScope.CASH_WITHOUT_CARD_TENANT_ID), cashPaymentsEnabled: true, partnerProfile: { cashCardGuaranteeRequired: false } };
+      const fixture = customerRestaurantFixture(s, kazoku); let stored: any;
+      s.mock.method(Order as any, "create", async (input: any[], options: any) => { fixture.assertCreating(); assert.equal(options.session, fixture.session); const doc = new Order(input[0]); stored = doc.toObject(); return [doc]; });
+      s.mock.method(globalThis, "fetch", async () => new Response(JSON.stringify({ code: "Ok", routes: [{ distance: 1000, duration: 180 }] }), { status: 200 }));
+      const req: any = { path: `/api/trpc/${procedure}`, originalUrl: `/api/trpc/${procedure}`, params: { procedure }, query: {}, body: { json: { restaurantId: merchantId, items: [{ id: "item-1", quantity: 1 }], paymentMethod: "cash", cashWithoutCardApproved: false, address: "Calle ficticia 1", deliveryLocation: { latitude: point[1], longitude: point[0] } } }, header: (name: string) => name === "x-piki-session" ? "offline-session" : undefined };
+      const { res, state } = response(); await customer.handleCustomerTrpc(req, res);
+      assert.equal(state.status, 200, JSON.stringify(state.body)); assert.equal(stored.cashWithoutCardApproved, true);
+      assert.equal(stored.paymentState, "pending"); assert.equal(stored.customerId, String(customerId));
+      assert.equal(stored.stripePaymentIntentId, null); assert.equal(stored.stripeCheckoutSessionId, null);
+      assert.equal(isDispatchablePayment(stored.paymentState, stored.paymentMethod, stored.totalCents, stored), true);
+      assert.equal(state.body.result.data.json.cashWithoutCardApproved, true); assert.equal(state.body.result.data.json.checkoutUrl, null);
+      fixture.assertComplete();
+    });
+  }
+  await t.test("client approval claim cannot bypass missing customer authentication in checkout or REST create", async (s) => {
+    s.mock.method(CustomerAccount as any, "findOne", () => query(null));
+    const kazoku = { ...restaurant, _id: new mongoose.Types.ObjectId(cashScope.CASH_WITHOUT_CARD_RESTAURANT_IDS[0]), tenantId: new mongoose.Types.ObjectId(cashScope.CASH_WITHOUT_CARD_TENANT_ID), cashPaymentsEnabled: true, partnerProfile: { cashCardGuaranteeRequired: false } };
+    s.mock.method(Restaurant as any, "findOne", () => query(kazoku));
+    const input = { restaurantId: String(kazoku._id), cashWithoutCardApproved: true, paymentMethod: "cash", items: [{ id: "item-1", itemId: "item-1", quantity: 1 }], deliveryAddress: "Calle ficticia 1", deliveryLocation: { latitude: point[1], longitude: point[0] } };
+    for (const procedure of ["order.create", "order.checkout"]) {
+      const { res, state } = response();
+      await customer.handleCustomerTrpc({ path: `/api/trpc/${procedure}`, originalUrl: `/api/trpc/${procedure}`, params: { procedure }, query: {}, body: { json: input }, header: () => undefined } as any, res);
+      assert.ok(state.status >= 400);
+    }
+    const { res, state } = response();
+    const route = (server.app as any)._router.stack.find((layer: any) => layer.route?.path === "/api/v1/orders" && layer.route?.methods?.post).route;
+    await route.stack.at(-1).handle({ body: input, header: () => undefined }, res);
+    assert.equal(state.status, 401); assert.equal(state.body.error, "AUTH_REQUIRED");
+  });
+
+  await t.test("REST create persists server-approved cash and scoped payments/status capabilities", async (s) => {
+    const { PikiPassSubscription, CustomerDeliverySaving } = await import("./customerEngagement.js");
+    s.mock.method(PikiPassSubscription as any, "findOne", () => query(null));
+    s.mock.method(CustomerDeliverySaving as any, "find", () => query([]));
+    const kazoku = { ...restaurant, _id: new mongoose.Types.ObjectId(cashScope.CASH_WITHOUT_CARD_RESTAURANT_IDS[0]), tenantId: new mongoose.Types.ObjectId(cashScope.CASH_WITHOUT_CARD_TENANT_ID), cashPaymentsEnabled: true, partnerProfile: { cashCardGuaranteeRequired: false } };
+    s.mock.method(Restaurant as any, "findOne", () => query(kazoku));
+    s.mock.method(Restaurant as any, "updateOne", () => query({ matchedCount: 1 }));
+    s.mock.method(Order as any, "exists", () => query(false));
+    s.mock.method(globalThis, "fetch", async () => new Response(JSON.stringify({ code: "Ok", routes: [{ distance: 1000, duration: 180 }] }), { status: 200 }));
+    let stored: any;
+    s.mock.method(Order as any, "create", async (input: any[], options: any) => { assert.ok(options.session); const doc = new Order(input[0]); stored = doc.toObject(); return [doc]; });
+    const input = { restaurantId: String(kazoku._id), paymentMethod: "cash", cashWithoutCardApproved: false, items: [{ itemId: "item-1", quantity: 1 }], deliveryAddress: "Calle ficticia 1", deliveryLocation: { latitude: point[1], longitude: point[0] } };
+    const route = (server.app as any)._router.stack.find((layer: any) => layer.route?.path === "/api/v1/orders" && layer.route?.methods?.post).route;
+    const { res, state } = response(); await route.stack.at(-1).handle({ body: input, header: (name: string) => name === "x-piki-session" ? "offline-session" : undefined }, res);
+    assert.equal(state.status, 201, JSON.stringify(state.body)); assert.equal(stored.cashWithoutCardApproved, true);
+    assert.equal(stored.paymentState, "pending"); assert.equal(isDispatchablePayment(stored.paymentState, stored.paymentMethod, stored.totalCents, stored), true);
+    const scoped = response(); await handler("/api/v1/payments/status")({ query: { restaurantId: String(kazoku._id) } }, scoped.res);
+    assert.equal(scoped.state.body.cashCardGuaranteeRequired, false); assert.equal(scoped.state.body.cashPaymentsEnabled, true);
+    assert.equal(scoped.state.body.tenantId, undefined);
+  });
+
+  await t.test("order.get and customer.orders.list select/publish canonical cash approval booleans", async (s) => {
+    let selected: string[] = [];
+    const rows = [true, false, undefined, null, "true"].map((flag, index) => ({ _id: id(), publicCode: `OFFLINE-READ-${index}`, restaurantId, tenantId, customerId: String(customerId), status: "pending", paymentMethod: "cash", paymentState: "pending", cashWithoutCardApproved: flag, totalCents: 899, riderId: null }));
+    const projected = (value: any) => { const q = query(value); q.select = (fields: string) => { selected.push(fields); return q; }; return q; };
+    s.mock.method(Order as any, "find", (filter: any) => { assert.equal(filter.customerId, String(customerId)); return projected(rows); });
+    s.mock.method(Order as any, "findOne", (filter: any) => { assert.equal(filter.customerId, String(customerId)); return projected(rows.find((row) => row.publicCode === filter.publicCode)); });
+    s.mock.method(Restaurant as any, "find", () => query([]));
+    const req = (procedure: string, input = {}) => ({ path: `/api/trpc/${procedure}`, originalUrl: `/api/trpc/${procedure}`, params: { procedure }, query: {}, body: { json: input }, header: (name: string) => name === "x-piki-session" ? "offline-session" : undefined });
+    let r = response(); await customer.handleCustomerTrpc(req("customer.orders.list") as any, r.res);
+    assert.equal(r.state.status, 200, JSON.stringify(r.state.body));
+    assert.deepEqual(r.state.body.result.data.json.map((row: any) => row.cashWithoutCardApproved), [true, false, false, false, false]);
+    for (const [index, row] of rows.entries()) {
+      r = response(); await customer.handleCustomerTrpc(req("order.get", { id: row.publicCode, cashWithoutCardApproved: true }) as any, r.res);
+      assert.equal(r.state.body.result.data.json.cashWithoutCardApproved, index === 0);
+      assert.equal(r.state.body.result.data.json.paymentState, index === 0 ? "pending_cash_collection" : "pending");
+    }
+    assert.equal(selected.length, 6); assert.ok(selected.every((fields) => fields.split(" ").includes("cashWithoutCardApproved")));
+  });
 
   await t.test("Customer snapshots the geocoded point, even when the original row has no location", async (s) => {
     const missing = { ...restaurant, location: undefined, address: "Calle ficticia 123", locality: "Xativa" };
@@ -358,11 +434,52 @@ test("dispatch fixes: real handlers with in-memory persistence and forbidden ext
   });
 
   const syncInput: any = { publicCode: "OFFLINE-SYNC", restaurantSlug: restaurant.slug, deliveryAddress: "Calle ficticia 1", deliveryLocation: { latitude: point[1], longitude: point[0] }, items: [{ itemId: "item-1", name: "Producto", quantity: 1, unitPriceCents: 600 }], subtotalCents: 600, deliveryFeeCents: 299, serviceFeeCents: 0, totalCents: 899, paymentMethod: "stripe", paymentState: "pending" };
-  async function sync(input: any) {
+  async function sync(input: any, authenticated = false) {
     const { state, res } = response();
-    await handler("/api/v1/internal/customer-orders/sync")({ body: input, header: () => "offline-test-only" }, res, forbidden);
+    await handler("/api/v1/internal/customer-orders/sync")({ body: input, header: (name: string) => name === "x-piki-customer-sync-secret" ? "offline-test-only" : name === "x-piki-session" && authenticated ? "offline-session" : undefined }, res, forbidden);
     return state;
   }
+  await t.test("new sync needs actual customer auth, persists approval insert-only and cannot convert old Stripe", async (s) => {
+    const kazoku = { ...restaurant, _id: new mongoose.Types.ObjectId(cashScope.CASH_WITHOUT_CARD_RESTAURANT_IDS[0]), tenantId: new mongoose.Types.ObjectId(cashScope.CASH_WITHOUT_CARD_TENANT_ID), cashPaymentsEnabled: true, partnerProfile: { cashCardGuaranteeRequired: false } };
+    s.mock.method(Restaurant as any, "findOne", () => query(kazoku));
+    s.mock.method(Restaurant as any, "updateOne", () => query({ matchedCount: 1 }));
+    let existing: any = null; let stored: any; let writes = 0; let onReplayRead: (() => void) | null = null;
+    s.mock.method(Order as any, "findOne", (filter: any) => {
+      if (filter._id) { onReplayRead?.(); onReplayRead = null; return query(matchesRestaurant(existing, filter) ? existing : null); }
+      return query(existing);
+    });
+    s.mock.method(Order as any, "findById", () => query(stored));
+    s.mock.method(Order as any, "findOneAndUpdate", (_filter: any, update: any) => {
+      writes++; assert.equal(update.$set.cashWithoutCardApproved, undefined);
+      stored = { _id: id(), ...(existing || update.$setOnInsert), ...update.$set }; return query(stored);
+    });
+    s.mock.method(globalThis, "fetch", async () => new Response(JSON.stringify({ code: "Ok", routes: [{ distance: 1000, duration: 180 }] }), { status: 200 }));
+    const input = { ...syncInput, restaurantSlug: String(kazoku._id), customerId: String(customerId), paymentMethod: "cash", cashWithoutCardApproved: true };
+    const denied = await sync(input); assert.equal(denied.status, 401); assert.equal(writes, 0);
+    const wrong = await sync({ ...input, customerId: String(id()) }, true); assert.equal(wrong.status, 401); assert.equal(writes, 0);
+    const fakePaid = await sync({ ...input, paymentState: "paid" }, true); assert.equal(fakePaid.status, 409); assert.equal(writes, 0);
+    const created = await sync(input, true); assert.equal(created.status, 201, JSON.stringify(created.body));
+    assert.equal(stored.cashWithoutCardApproved, true); assert.equal(stored.paymentState, "pending");
+    existing = stored;
+    const noAuthReplay = await sync(input); assert.equal(noAuthReplay.status, 401); assert.equal(writes, 1);
+    const validReplay = await sync(input, true); assert.equal(validReplay.status, 200, JSON.stringify(validReplay.body));
+    assert.equal(validReplay.body.idempotent, true); assert.equal(validReplay.body.order.paymentState, "pending_cash_collection"); assert.equal(writes, 1);
+    const oldPrice = kazoku.menu[0].price; kazoku.menu[0].price = oldPrice + 1;
+    const stalePrice = await sync(input, true); assert.equal(stalePrice.status, 409); assert.equal(stalePrice.body.error, "SYNC_CASH_CANONICAL_SNAPSHOT_MISMATCH"); assert.equal(writes, 1);
+    kazoku.menu[0].price = oldPrice;
+    const changedCanonical = await sync({ ...input, items: [{ ...input.items[0], quantity: 2 }] }, true);
+    assert.equal(changedCanonical.status, 409); assert.equal(writes, 1);
+    onReplayRead = () => { existing.paymentState = "paid"; existing.version = (existing.version || 0) + 1; };
+    const concurrentCollection = await sync(input, true); assert.equal(concurrentCollection.status, 409); assert.equal(concurrentCollection.body.error, "SYNC_CASH_SNAPSHOT_CHANGED");
+    assert.equal(existing.paymentState, "paid"); assert.equal(writes, 1);
+    const pendingAfterPaid = await sync(input, true); assert.equal(pendingAfterPaid.status, 409); assert.equal(existing.paymentState, "paid");
+    const paidReplay = await sync({ ...input, paymentState: "paid" }, true); assert.equal(paidReplay.status, 200); assert.equal(paidReplay.body.order.paymentState, "paid"); assert.equal(writes, 1);
+    const replay = await sync({ ...input, paymentMethod: "stripe" }, true); assert.equal(replay.status, 409); assert.equal(writes, 1);
+    existing = { ...stored, paymentState: "pending", cashWithoutCardApproved: false, paymentMethod: "stripe", stripeCheckoutSessionId: "cs_original_pending" };
+    const legacy = await sync(input, true); assert.equal(legacy.status, 409); assert.equal(writes, 1);
+    assert.equal(existing.paymentMethod, "stripe"); assert.equal(existing.stripeCheckoutSessionId, "cs_original_pending");
+    assert.equal(isDispatchablePayment(existing.paymentState, existing.paymentMethod, existing.totalCents, existing), false);
+  });
   await t.test("sync insertion derives pickup/routing server-side; ignores client vehicle claims", async (s) => {
     s.mock.method(Order as any, "findOne", () => query(null));
     s.mock.method(globalThis, "fetch", async (url: any) => {

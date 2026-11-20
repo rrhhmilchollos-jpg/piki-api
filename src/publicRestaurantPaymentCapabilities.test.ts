@@ -7,6 +7,7 @@ import { customerAvailability } from "./customerAvailability.js";
 import { modifierGroupsForItem, usesReferenceAddOns } from "./menuModifiers.js";
 import { canonicalRestaurantMenu } from "./menuContract.js";
 import { CASH_PAYMENTS_ENABLED, setCashPaymentsEnabled } from "./paymentPolicy.js";
+import { cashCardGuaranteeRequiredForRestaurant } from "./cashCardGuaranteeScope.js";
 
 // Execute only AST-extracted functions: no server/customerCompat/fulfillment
 // module import, real Mongo query, socket, credentials or payment client.
@@ -28,7 +29,7 @@ const fulfillmentPolicySource = ["METHODS", "isMethod", "defaultPaymentMethods",
 function buildPolicy(cashPaymentsEnabled: boolean) {
   const isCashPaymentEnabledForTest = () => cashPaymentsEnabled;
   const policy = evaluate(fulfillmentPolicySource, "({ allowedPaymentMethods, isRiderPurchase, paymentDecision })", { CASH_PAYMENTS_ENABLED: cashPaymentsEnabled, isCashPaymentEnabledForRestaurant: isCashPaymentEnabledForTest });
-  const publicRestaurantPaymentCapabilities = evaluate(declaration(source("./publicRestaurantPaymentCapabilities.ts"), "publicRestaurantPaymentCapabilities"), "publicRestaurantPaymentCapabilities", policy);
+  const publicRestaurantPaymentCapabilities = evaluate(declaration(source("./publicRestaurantPaymentCapabilities.ts"), "publicRestaurantPaymentCapabilities"), "publicRestaurantPaymentCapabilities", { ...policy, cashCardGuaranteeRequiredForRestaurant, isCashPaymentEnabledForRestaurant: isCashPaymentEnabledForTest });
   return { policy, publicRestaurantPaymentCapabilities, isCashPaymentEnabledForTest };
 }
 const enabledPolicy = buildPolicy(true);
@@ -75,7 +76,8 @@ test("public helper preserves canonical methods, strict boolean and existing ful
   assertCapabilities(publicRestaurantPaymentCapabilities(null), cases[0]);
   assertCapabilities(publicRestaurantPaymentCapabilities(undefined), cases[0]);
   const dto = publicRestaurantPaymentCapabilities({ ...privateFields, bizumOnly: true });
-  assert.deepEqual(Object.keys(dto).sort(), ["allowedPaymentMethods", "paymentMethods", "bizumOnly", "fulfillmentModel"].sort());
+  assert.deepEqual(Object.keys(dto).sort(), ["allowedPaymentMethods", "paymentMethods", "bizumOnly", "fulfillmentModel", "cashPaymentsEnabled", "cashCardGuaranteeRequired"].sort());
+  assert.equal(dto.cashCardGuaranteeRequired, true);
   dto.paymentMethods.push("stripe");
   assert.deepEqual(dto.allowedPaymentMethods, ["bizum", "cash"], "compatibility alias must not mutate canonical array");
 });

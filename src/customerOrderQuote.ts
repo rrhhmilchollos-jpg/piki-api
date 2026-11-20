@@ -67,6 +67,8 @@ export function customerOrderQuote(input: {
     isActive: row.isActive, onboardingStatus: row.onboardingStatus, availabilityStatus: row.availabilityStatus,
     internalDemo: row.internalDemo, paymentMethods: row.paymentMethods, bizumOnly: row.bizumOnly,
     cashPaymentsEnabled: row.cashPaymentsEnabled, sourceDeliveryFeeCents: row.deliveryFeeCents,
+    cashCardGuaranteeRequired: row.partnerProfile?.cashCardGuaranteeRequired,
+    cashOrderMaxCents: row.cashOrderMaxCents, cashOrderMinCents: row.cashOrderMinCents,
     wallet: input.paymentMethod === "stripe" ? { balance: input.wallet?.pikiCreditsCents ?? null, expiresAt: input.wallet?.pikiCreditsExpiresAt ?? null } : null,
     items: input.items, deliveryPoint: input.deliveryPoint, paymentMethod: input.paymentMethod, amounts,
   };

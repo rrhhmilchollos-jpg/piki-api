@@ -28,7 +28,7 @@ export function hasFreshDispatchGps(rider: any, now = new Date()): boolean {
 
 export function dispatchOrderIsOperational(order: any): boolean {
   return Boolean(frozenTenantId(order?.tenantId) && isDispatchableOrderStatus(order?.status)
-    && isDispatchablePayment(order?.paymentState));
+    && isDispatchablePayment(order?.paymentState, order?.paymentMethod, order?.totalCents, order));
 }
 export function dispatchOfferIsCurrent(order: any, now = new Date()): boolean {
   return dispatchOrderIsOperational(order) && order.assignmentState === "offered"
@@ -38,6 +38,11 @@ export function dispatchOrderCas(order: any, accept = false, now = new Date()) {
   return {
     _id: order._id, tenantId: order.tenantId, version: order.version,
     status: { $in: [...dispatchableOrderStatuses] }, ...dispatchablePaymentFilter,
+    ...(order.cashWithoutCardApproved === true ? {
+      cashWithoutCardApproved: true, paymentMethod: "cash", customerId: order.customerId,
+      restaurantId: order.restaurantId, totalCents: order.totalCents,
+      stripeCheckoutSessionId: null, stripePaymentIntentId: null,
+    } : {}),
     ...(accept ? { riderId: order.riderId, assignmentState: "offered", offerId: order.offerId,
       assignmentExpiresAt: { $gt: now } } : {
       riderId: null, assignmentState: { $in: ["unassigned", "expired", "rejected"] },

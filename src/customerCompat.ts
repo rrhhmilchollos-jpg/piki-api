@@ -21,7 +21,7 @@ import { SourceOrderFeeError } from "./sourceOrderFee.js";
 import { customerDeliveryIsActive, profilePhotoSchema, publicProfilePhoto } from "./profileIdentityPolicy.js";
 import { customerAssignedRider } from "./customerRiderTracking.js";
 import { publicRestaurantPaymentCapabilities } from "./publicRestaurantPaymentCapabilities.js";
-
+import { approveCashWithoutCardForOrder, customerCashPaymentState } from "./cashCardGuaranteePolicy.js";
 const COOKIE = "piki_customer_session";
 let dispatchCustomerOrder: ((orderId: string) => Promise<unknown>) | null = null;
 export function setCustomerOrderDispatcher(dispatcher: (orderId: string) => Promise<unknown>) {
@@ -304,10 +304,10 @@ async function handleCustomerTrpcSingle(req: Request, res: Response) {
     if (procedure === "customer.orders.list") {
       const user = await currentCustomer(req) as any;
       if (!user) return fail(res, "Inicia sesión para consultar tus pedidos.", "AUTH_REQUIRED");
-      const orders = await Order.find({ customerId: String(user._id) }).sort({ createdAt: -1 }).limit(100).select("publicCode displayCode status restaurantId totalCents createdAt updatedAt paymentState paymentMethod assignmentState routeDurationMinutes items statusHistory deliveryAddress").lean().exec() as any[];
+      const orders = await Order.find({ customerId: String(user._id) }).sort({ createdAt: -1 }).limit(100).select("publicCode displayCode status restaurantId totalCents createdAt updatedAt paymentState paymentMethod cashWithoutCardApproved assignmentState routeDurationMinutes items statusHistory deliveryAddress").lean().exec() as any[];
       const restaurants = await Restaurant.find({ _id: { $in: orders.map((order) => order.restaurantId) } }).select("name").lean().exec() as any[];
       const names = new Map(restaurants.map((restaurant) => [String(restaurant._id), restaurant.name]));
-      return reply(res, orders.map((order) => ({ id: order.publicCode, shortOrderNumber: order.displayCode || null, restaurant: names.get(String(order.restaurantId)) || "Restaurante PIKI", status: customerDisplayStatus(order.status), operationalStatus: order.status, total: Number(order.totalCents || 0) / 100, createdAt: order.createdAt, updatedAt: order.updatedAt, active: !["delivered", "cancelled"].includes(order.status), paymentState: order.paymentState, paymentMethod: order.paymentMethod, assignmentState: order.assignmentState, eta: order.routeDurationMinutes ? `${order.routeDurationMinutes} min` : "actualizando…", items: order.items || [], timeline: customerOrderTimeline(order) })));
+      return reply(res, orders.map((order) => ({ id: order.publicCode, shortOrderNumber: order.displayCode || null, restaurant: names.get(String(order.restaurantId)) || "Restaurante PIKI", status: customerDisplayStatus(order.status), operationalStatus: order.status, total: Number(order.totalCents || 0) / 100, createdAt: order.createdAt, updatedAt: order.updatedAt, active: !["delivered", "cancelled"].includes(order.status), paymentState: customerCashPaymentState(order), paymentMethod: order.paymentMethod, cashWithoutCardApproved: order.cashWithoutCardApproved === true, assignmentState: order.assignmentState, eta: order.routeDurationMinutes ? `${order.routeDurationMinutes} min` : "actualizando…", items: order.items || [], timeline: customerOrderTimeline(order) })));
     }
     if (procedure === "customer.support.list") {
       const user = await currentCustomer(req) as any;
@@ -390,12 +390,12 @@ async function handleCustomerTrpcSingle(req: Request, res: Response) {
       const user = await currentCustomer(req) as any;
       if (!user) return fail(res, "Inicia sesión con la cuenta que realizó el pedido.", "AUTH_REQUIRED");
       const publicCode = String(input?.id || "").trim();
-      const order = await Order.findOne({ publicCode, customerId: String(user._id) }).select("_id publicCode displayCode tenantId status restaurantId riderId assignmentState routeDurationMinutes deliveryAddress deliveryNote paymentState paymentMethod paymentCapturedAt totalCents subtotalCents deliveryFeeCents serviceFeeCents creditAppliedCents items statusHistory createdAt updatedAt").lean().exec() as any;
+      const order = await Order.findOne({ publicCode, customerId: String(user._id) }).select("_id publicCode displayCode tenantId status restaurantId riderId assignmentState routeDurationMinutes deliveryAddress deliveryNote paymentState paymentMethod cashWithoutCardApproved paymentCapturedAt totalCents subtotalCents deliveryFeeCents serviceFeeCents creditAppliedCents items statusHistory createdAt updatedAt").lean().exec() as any;
       if (!order) return fail(res, "Pedido no encontrado", "NOT_FOUND");
       const restaurant = await Restaurant.findById(order.restaurantId).select("name").lean().exec() as any;
       res.setHeader("Cache-Control", "private, no-store");
       const { identity, rider } = await customerAssignedRider(order);
-      const publicOrder = { status: customerDisplayStatus(order.status), operationalStatus: order.status, assignmentState: order.assignmentState, shortOrderNumber: order.displayCode || null, active: !["delivered", "cancelled"].includes(String(order.status)), paymentState: order.paymentState, paymentMethod: order.paymentMethod, totalCents: order.totalCents, subtotalCents: order.subtotalCents, deliveryFeeCents: order.deliveryFeeCents, serviceFeeCents: order.serviceFeeCents, creditAppliedCents: order.creditAppliedCents, address: order.deliveryAddress || "", deliveryNote: order.deliveryNote || "", items: order.items || [], createdAt: order.createdAt, updatedAt: order.updatedAt, timeline: customerOrderTimeline(order), ...identity };
+      const publicOrder = { status: customerDisplayStatus(order.status), operationalStatus: order.status, assignmentState: order.assignmentState, shortOrderNumber: order.displayCode || null, active: !["delivered", "cancelled"].includes(String(order.status)), paymentState: customerCashPaymentState(order), paymentMethod: order.paymentMethod, cashWithoutCardApproved: order.cashWithoutCardApproved === true, totalCents: order.totalCents, subtotalCents: order.subtotalCents, deliveryFeeCents: order.deliveryFeeCents, serviceFeeCents: order.serviceFeeCents, creditAppliedCents: order.creditAppliedCents, address: order.deliveryAddress || "", deliveryNote: order.deliveryNote || "", items: order.items || [], createdAt: order.createdAt, updatedAt: order.updatedAt, timeline: customerOrderTimeline(order), ...identity };
       if (procedure === "order.get") {
         return reply(res, { id: order.publicCode, restaurant: restaurant?.name || "Pedido PIKI", ...publicOrder, eta: order.routeDurationMinutes ? `${order.routeDurationMinutes} min` : "actualizando…" });
       }
@@ -542,8 +542,9 @@ async function handleCustomerTrpcSingle(req: Request, res: Response) {
             await debitQuotedCustomerCredits(String(user._id), wallet, creditAppliedCents, orderSession);
             creditExpiresAt = (wallet as any)?.pikiCreditsExpiresAt;
           }
+          const cashWithoutCardApproved = approveCashWithoutCardForOrder(freshRestaurant, paymentMethod, freshQuote.totalCents, user);
           const orderPayload = { publicCode: code, fulfillmentModel: decision.riderPurchase ? "rider_purchase" : "partner_managed", bizumReference: decision.method === "bizum" ? bizumReferenceFor(code) : null, tenantId: restaurant.tenantId || null, restaurantId: restaurant._id, customerId: String(user._id), items: normalized, deliveryAddress: String(input.address || "").trim(), deliveryLocation: { type: "Point", coordinates: deliveryPoint }, pickupLocation: { type: "Point", coordinates: [...restaurantPoint] }, coveragePolicySlug: coverage.policySlug, coveragePolicyVersion: coverage.policyVersion, coverageDecision: coverage.reason, straightLineDistanceKm: coverage.straightLineDistanceKm, withinMunicipality: coverage.withinMunicipality, deliveryBaseFeeCents: coverage.deliveryBaseFeeCents, outsideMunicipalitySurchargeCents: coverage.outsideMunicipalitySurchargeCents, routeDistanceKm: route.routeDistanceKm, routeDurationMinutes: route.routeDurationMinutes, routeProvider: route.routeProvider, routingDegraded: route.routingDegraded, requiredVehicleClasses: route.requiredVehicleClasses, subtotalCents, deliveryFeeCents: deliveryCents, serviceFeeCents: serviceCents, creditAppliedCents, totalCents, paymentMethod, paymentState: "pending", statusHistory: [{ status: "pending", actorRole: "customer", reason: paymentMethod === "cash" ? "Pedido a contrarreembolso; cobro pendiente hasta la entrega" : "Pedido pendiente de confirmación del pago online" }]  };
-          const created = await Order.create([orderPayload], { session: orderSession });
+          const created = await Order.create([{ ...orderPayload, cashWithoutCardApproved }], { session: orderSession });
           order = created[0];
           if (paymentMethod === "cash") {
             await enqueueDispatchOutbox({
@@ -594,7 +595,7 @@ async function handleCustomerTrpcSingle(req: Request, res: Response) {
         if (attached.matchedCount !== 1) return fail(res, "No se pudo confirmar la sesión de pago.", "STRIPE_UNAVAILABLE");
       }
       if (paymentMethod === "cash") await publishOrderIntakeEvents(order, { settlement: "cash_due", message: "Pedido a contrarreembolso: el Rider cobrará en efectivo al entregar." });
-      return reply(res, { orderId: code, checkoutUrl, totalCents, paymentMethod, paymentState: decision.paymentState, cashDueAtDelivery: paymentMethod === "cash", creditAppliedCents, priceBreakdown: calculatePriceBreakdown({ subtotalCents, deliveryFeeCents: deliveryCents, serviceFeeCents: serviceCents, discountCents: creditAppliedCents }), coverage, route });
+      return reply(res, { orderId: code, checkoutUrl, totalCents, paymentMethod, paymentState: decision.paymentState, cashWithoutCardApproved: order.cashWithoutCardApproved === true, cashDueAtDelivery: paymentMethod === "cash", creditAppliedCents, priceBreakdown: calculatePriceBreakdown({ subtotalCents, deliveryFeeCents: deliveryCents, serviceFeeCents: serviceCents, discountCents: creditAppliedCents }), coverage, route });
     }
     return fail(res, `Procedimiento no soportado: ${procedure}`, "NOT_FOUND");
   } catch (error) {

@@ -1,4 +1,6 @@
 import { allowedPaymentMethods, isRiderPurchase, type FulfillmentModel, type FulfillmentRestaurant, type PaymentMethod } from "./fulfillment.js";
+import { cashCardGuaranteeRequiredForRestaurant } from "./cashCardGuaranteePolicy.js";
+import { isCashPaymentEnabledForRestaurant } from "./paymentPolicy.js";
 
 /** Public capabilities only; catalogue and quote use the same existing policy. */
 export function publicRestaurantPaymentCapabilities(restaurant: FulfillmentRestaurant | null | undefined): {
@@ -6,6 +8,8 @@ export function publicRestaurantPaymentCapabilities(restaurant: FulfillmentResta
   paymentMethods: PaymentMethod[];
   bizumOnly: boolean;
   fulfillmentModel: FulfillmentModel;
+  cashPaymentsEnabled: boolean;
+  cashCardGuaranteeRequired: boolean;
 } {
   const methods = allowedPaymentMethods(restaurant);
   return {
@@ -14,5 +18,7 @@ export function publicRestaurantPaymentCapabilities(restaurant: FulfillmentResta
     paymentMethods: [...methods],
     bizumOnly: restaurant?.bizumOnly === true,
     fulfillmentModel: isRiderPurchase(restaurant) ? "rider_purchase" : "partner_managed",
+    cashPaymentsEnabled: isCashPaymentEnabledForRestaurant(restaurant ?? {}),
+    cashCardGuaranteeRequired: cashCardGuaranteeRequiredForRestaurant(restaurant),
   };
 }

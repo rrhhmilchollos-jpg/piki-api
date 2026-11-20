@@ -16,9 +16,9 @@ test("el límite de efectivo se aplica al total final, incluyendo los bordes 4.8
   });
 });
 
-test("sin retención viva ningún pedido sale a reparto, tampoco el efectivo", () => {
-  // El efectivo ya no se reparte con la promesa de cobrar en la puerta: primero
-  // el cliente deja la tarjeta retenida y después el pedido sale al rider.
+test("cash pendiente por defecto sigue bloqueado sin garantía o snapshot servidor explícito", () => {
+  // No hay aprobación implícita por elegir cash ni por afirmar su importe.
+  // El rollout opt-in tiene tests separados con el snapshot completo.
   assert.equal(isDispatchablePayment("pending", "cash", 4_899), false);
   assert.equal(isDispatchablePayment("pending", "cash", 4_900), false);
   assert.equal(isDispatchablePayment("authorized", "cash", 4_899), true);

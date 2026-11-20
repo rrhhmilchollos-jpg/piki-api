@@ -64,6 +64,7 @@ import { startDailySummaryWorker, stopDailySummaryWorker } from "./dailySummaryW
 import { BUSINESS_SUMMARY_RECIPIENT, sendDailyBusinessSummary } from "./dailyBusinessSummary.js";
 import { corporateEmailConfiguration, corporateEmailDepartmentForRole, escapeCorporateHtml, sendCorporateEmail, sendLeadContactEmail, verifyCorporateEmailConnection } from "./corporateEmail.js";
 import { activeOperationalOrderStatuses, dispatchableOrderStatuses, dispatchablePaymentFilter, isDispatchableOrderStatus, isDispatchablePayment, partnerKitchenPaymentFilter } from "./dispatchEligibility.js";
+import { approveCashWithoutCardForOrder, customerCashPaymentState, cashCardGuaranteeRequiredForRestaurant, isCashWithoutCardRolloutRestaurant } from "./cashCardGuaranteePolicy.js";
 import { canReceivePartnerLocations, partnerCan, partnerPermissions, partnerRolesForEmployee, permissionsForPartnerRoles, type PartnerPermission } from "./partnerAccess.js";
 import { registerPartnerTerminalInventoryRoutes } from "./partnerTerminalInventory.js";
 import { KitchenAccessError, kitchenBindingForEmployee, kitchenRestaurantCanOperate, registerPartnerKitchenAccessRoutes, validateKitchenActivation, type KitchenAccessDependencies } from "./partnerKitchenAccess.js";
@@ -1722,7 +1723,15 @@ app.post("/api/v1/admin/orders/:id/confirm-bizum", requireRole("admin", "finance
   await Promise.all([dispatch, publishOrderIntakeEvents(updated, { settlement: "paid", message: "Bizum conciliado por PIKI; pedido liberado para dispatch." })]);
   return res.json({ order: { id: updated._id, publicCode: updated.publicCode, paymentState: updated.paymentState, totalCents: updated.totalCents }, idempotent: false });
 });
-app.get("/api/v1/payments/status", (_req, res) => res.json({ provider: "stripe", cashPaymentsEnabled: CASH_PAYMENTS_ENABLED }));
+app.get("/api/v1/payments/status", async (req, res) => {
+  res.setHeader("Cache-Control", "no-store");
+  if (req.query.restaurantId === undefined) return res.json({ provider: "stripe", cashPaymentsEnabled: CASH_PAYMENTS_ENABLED, cashCardGuaranteeRequired: true });
+  const id = objectId(String(req.query.restaurantId));
+  if (!id) return res.status(400).json({ error: "INVALID_RESTAURANT_ID" });
+  const restaurant = await Restaurant.findOne({ _id: id, ...CUSTOMER_ORDERABLE_RESTAURANT_FILTER }).select("_id tenantId name cashPaymentsEnabled fulfillmentModel paymentMethods bizumOnly partnerProfile.cashCardGuaranteeRequired").lean().exec() as any;
+  if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_AVAILABLE" });
+  return res.json({ provider: "stripe", ...publicRestaurantPaymentCapabilities(restaurant) });
+});
 app.get("/api/v1/signatures/status", (_req, res) => res.json({ provider: "signaturit" }));
 app.post("/api/v1/admin/signatures", requireRole("admin"), async (req, res) => {
   const parsed = z.object({ entityType: z.enum(["partner", "rider", "employee"]), entityId: z.string().regex(/^[a-f\d]{24}$/), signerName: z.string().min(2).max(160), signerEmail: z.string().email(), subject: z.string().min(2).max(200), documentName: z.string().min(1).max(180), documentBase64: z.string().min(20).max(8_000_000) }).safeParse(req.body);
@@ -1777,7 +1786,7 @@ app.get("/api/v1/catalog/restaurants", async (req, res) => {
   const restaurants = await Restaurant.find(filter)
     // Explicit inclusion avoids MongoDB path-collision errors caused by
     // partnerProfile.documents having select:false nested fields.
-    .select("slug name cuisine category locality partnerGroupKey listingType fulfillmentMode fulfillmentModel paymentMethods bizumOnly goldFounder tagline etaMinutes deliveryFeeCents cashPaymentsEnabled rating reviews promoted image accent phone address location menu menuRevision priceIncludesCommission isActive onboardingStatus availabilityStatus upcomingAt upcomingMessage partnerProfile.commissionRateBps partnerProfile.openingHours partnerProfile.deliveryHours partnerProfile.postalCode partnerProfile.city partnerProfile.province")
+    .select("tenantId partnerProfile.cashCardGuaranteeRequired slug name cuisine category locality partnerGroupKey listingType fulfillmentMode fulfillmentModel paymentMethods bizumOnly goldFounder tagline etaMinutes deliveryFeeCents cashPaymentsEnabled rating reviews promoted image accent phone address location menu menuRevision priceIncludesCommission isActive onboardingStatus availabilityStatus upcomingAt upcomingMessage partnerProfile.commissionRateBps partnerProfile.openingHours partnerProfile.deliveryHours partnerProfile.postalCode partnerProfile.city partnerProfile.province")
     .sort({ promoted: -1, rating: -1, reviews: -1 }).lean().exec();
   const catalogPriority: Record<string, number> = {
     "alibaba-kebab-xativa": 0,
@@ -1792,7 +1801,7 @@ app.get("/api/v1/catalog/restaurants", async (req, res) => {
   const orderCountByRestaurant = new Map(orderCounts.map((row: any) => [String(row._id), Number(row.count || 0)]));
   const body = { restaurants: restaurants.map((restaurant: any) => {
     const postalCodeFromAddress = String(restaurant.address || "").match(/\b\d{5}\b/)?.[0] || null;
-    const presented = presentCustomerCatalogRestaurant({ ...restaurant, postalCode: restaurant.partnerProfile?.postalCode || postalCodeFromAddress, locality: restaurant.locality || restaurant.partnerProfile?.city || null, menu: canonicalRestaurantMenu(restaurant) });
+    const { tenantId: _privateTenantId, ...presented } = presentCustomerCatalogRestaurant({ ...restaurant, postalCode: restaurant.partnerProfile?.postalCode || postalCodeFromAddress, locality: restaurant.locality || restaurant.partnerProfile?.city || null, menu: canonicalRestaurantMenu(restaurant) });
     const remaining = Math.max(0, FREE_DELIVERY_LAUNCH_LIMIT - (orderCountByRestaurant.get(String(restaurant._id)) || 0));
     const launchWindow = isFreeDeliveryLaunchWindow();
     return { ...presented, ...publicRestaurantPaymentCapabilities(restaurant), minimumOrderCents: Number(process.env.PIKI_MINIMUM_ORDER_CENTS || 500), fulfillmentMode: presented.fulfillmentMode || restaurant.fulfillmentMode || (restaurant.listingType === "local_directory" ? "assisted_purchase" : "partner_delivery"), freeDeliveryEligible: launchWindow && remaining > 0, freeDeliveryOrdersRemaining: launchWindow ? remaining : 0 };
@@ -5047,6 +5056,11 @@ app.post("/api/v1/orders", rateLimit(20, 60_000, "orders-create"), async (req, r
   if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_AVAILABLE" });
   if (!restaurantIsWithinOpeningHours(restaurant.partnerProfile?.deliveryHours ?? restaurant.partnerProfile?.openingHours)) return res.status(409).json({ error: "PARTNER_CLOSED", message: "Este establecimiento está cerrado ahora. Elige otro horario para realizar el pedido." });
   if (parsed.data.paymentMethod === "cash" && !isCashPaymentEnabledForRestaurant(restaurant)) return res.status(409).json(cashPaymentDisabledError(restaurant));
+  let authenticatedCustomer: any = null;
+  if (parsed.data.paymentMethod === "cash" && !cashCardGuaranteeRequiredForRestaurant(restaurant)) {
+    authenticatedCustomer = await currentCustomer(req);
+    if (!authenticatedCustomer) return res.status(401).json({ error: "AUTH_REQUIRED", message: "Debes iniciar sesión para realizar pedidos en efectivo sin garantía de tarjeta." });
+  }
   // El catálogo público y el checkout deben compartir exactamente la misma política de precio.
   // Respeta el perfil explícito y la base de precio persistida del restaurante.
   const pricedMenu = pricedRestaurantMenu(restaurant);
@@ -5091,7 +5105,7 @@ app.post("/api/v1/orders", rateLimit(20, 60_000, "orders-create"), async (req, r
     });
   }
   const freeDelivery = await freeDeliveryState(restaurant);
-  const authenticatedCustomer = await currentCustomer(req) as any;
+  if (!authenticatedCustomer) authenticatedCustomer = await currentCustomer(req);
   // PIKI Pass removes the delivery fee on the server, never from a client flag,
   // and the original fee stays recorded so the savings ledger is auditable.
   const passBenefit = await passDeliveryBenefit({ customerId: authenticatedCustomer?._id ? String(authenticatedCustomer._id) : null, subtotalCents, deliveryFeeCents: coverage.deliveryFeeCents });
@@ -5111,19 +5125,36 @@ app.post("/api/v1/orders", rateLimit(20, 60_000, "orders-create"), async (req, r
   if (!isCashOrderWithinLimit(parsed.data.paymentMethod, totalCents, partnerCashLimitCents)) return res.status(422).json(cashOrderLimitError(totalCents, partnerCashLimitCents));
   const { publicCode, displayCode, displayCodeDate } = await createOrderCodes();
   const dailyCode = { displayCode, displayCodeDate };
-  const order = await Order.create({ tenantId: restaurant.tenantId || null, publicCode, ...dailyCode, restaurantId: restaurant._id, customerId: authenticatedCustomer?._id || null, customerName: String(authenticatedCustomer?.name || "").trim(), items: normalizedItems, deliveryAddress: parsed.data.deliveryAddress, deliveryNote: parsed.data.deliveryNote, deliveryLocation: { type: "Point", coordinates: deliveryPoint }, pickupLocation: restaurant.location || undefined, coveragePolicySlug: coverage.policySlug, coveragePolicyVersion: coverage.policyVersion, coverageDecision: coverage.reason, straightLineDistanceKm: coverage.straightLineDistanceKm, withinMunicipality: withinSameOperationalCity(restaurant.location?.coordinates, deliveryPoint), deliveryBaseFeeCents: coverage.deliveryBaseFeeCents, outsideMunicipalitySurchargeCents: coverage.outsideMunicipalitySurchargeCents, routeDistanceKm: route.routeDistanceKm, routeDurationMinutes: route.routeDurationMinutes, routeProvider: route.routeProvider, routingDegraded: route.routingDegraded, requiredVehicleClasses: route.requiredVehicleClasses, subtotalCents, deliveryFeeCents, serviceFeeCents, totalCents,
+  const cashWithoutCardApproved = approveCashWithoutCardForOrder(restaurant, parsed.data.paymentMethod, totalCents, authenticatedCustomer);
+  const orderPayload = { tenantId: restaurant.tenantId || null, publicCode, ...dailyCode, restaurantId: restaurant._id, customerId: authenticatedCustomer?._id || null, customerName: String(authenticatedCustomer?.name || "").trim(), items: normalizedItems, deliveryAddress: parsed.data.deliveryAddress, deliveryNote: parsed.data.deliveryNote, deliveryLocation: { type: "Point", coordinates: deliveryPoint }, pickupLocation: restaurant.location || undefined, coveragePolicySlug: coverage.policySlug, coveragePolicyVersion: coverage.policyVersion, coverageDecision: coverage.reason, straightLineDistanceKm: coverage.straightLineDistanceKm, withinMunicipality: withinSameOperationalCity(restaurant.location?.coordinates, deliveryPoint), deliveryBaseFeeCents: coverage.deliveryBaseFeeCents, outsideMunicipalitySurchargeCents: coverage.outsideMunicipalitySurchargeCents, routeDistanceKm: route.routeDistanceKm, routeDurationMinutes: route.routeDurationMinutes, routeProvider: route.routeProvider, routingDegraded: route.routingDegraded, requiredVehicleClasses: route.requiredVehicleClasses, subtotalCents, deliveryFeeCents, serviceFeeCents, totalCents,
     marketplaceCommissionRateBps: marketplace.commissionRateBps,
     marketplaceCommissionCents: marketplace.platformCommissionCents,
     partnerPayoutCents: marketplace.partnerPayoutCents,
     riderEarningsCents: marketplace.riderEarningsCents,
     platformNetBeforeProcessingCents: marketplace.platformNetBeforeProcessingCents,
-    payoutStatus: "pending", paymentMethod: parsed.data.paymentMethod, paymentState: "pending", statusHistory: [{ status: "pending", actorRole: "customer", reason: parsed.data.paymentMethod === "cash" ? "Pedido a contrarreembolso; cobro pendiente hasta la entrega" : "Pedido creado con política de cobertura Xàtiva" }] });
+    payoutStatus: "pending", paymentMethod: parsed.data.paymentMethod, paymentState: "pending", cashWithoutCardApproved, statusHistory: [{ status: "pending", actorRole: "customer", reason: parsed.data.paymentMethod === "cash" ? "Pedido a contrarreembolso; cobro pendiente hasta la entrega" : "Pedido creado con política de cobertura Xàtiva" }] };
+  let order: any;
+  if (cashWithoutCardApproved) {
+    const session = await mongoose.startSession();
+    try {
+      await session.withTransaction(async () => {
+        const freshRestaurant = await Restaurant.findOne({ _id: restaurant._id, ...CUSTOMER_ORDERABLE_RESTAURANT_FILTER }).session(session).lean().exec() as any;
+        if (!freshRestaurant || !approveCashWithoutCardForOrder(freshRestaurant, parsed.data.paymentMethod, totalCents, authenticatedCustomer)) throw new Error("CASH_POLICY_CHANGED");
+        const locked = await Restaurant.updateOne({ _id: restaurant._id, tenantId: restaurant.tenantId, cashPaymentsEnabled: true, "partnerProfile.cashCardGuaranteeRequired": false }, { $inc: { __v: 1 } }, { session, timestamps: false }).exec();
+        if (locked.matchedCount !== 1) throw new Error("CASH_POLICY_CHANGED");
+        [order] = await Order.create([orderPayload], { session });
+      });
+    } catch (error) {
+      if (error instanceof Error && error.message === "CASH_POLICY_CHANGED") return res.status(409).json({ error: "CASH_POLICY_CHANGED", message: "La política de efectivo ha cambiado. Actualiza la cesta." });
+      throw error;
+    } finally { await session.endSession(); }
+  } else order = await Order.create(orderPayload);
   void notifyOrderPlaced(order).catch(() => undefined);
   if (parsed.data.paymentMethod === "cash") {
     const dispatch = enqueueOrderForDispatch(order._id as mongoose.Types.ObjectId).catch((error) => console.warn("Dispatch outbox enqueue failed", error instanceof Error ? error.message : error));
     await Promise.all([dispatch, publishOrderIntakeEvents(order, { settlement: "cash_due", message: "Contrarreembolso: el Rider cobrará en efectivo al entregar." })]);
   }
-  res.status(201).json({ order: { id: order.id, publicCode, displayCode: order.displayCode, displayCodeDate: order.displayCodeDate, status: order.status, paymentState: parsed.data.paymentMethod === "cash" ? "pending_cash_collection" : order.paymentState, paymentMethod: parsed.data.paymentMethod, cashDueAtDelivery: parsed.data.paymentMethod === "cash", subtotalCents, deliveryFeeCents, serviceFeeCents, totalCents,
+  res.status(201).json({ order: { id: order.id, publicCode, displayCode: order.displayCode, displayCodeDate: order.displayCodeDate, status: order.status, cashWithoutCardApproved: order.cashWithoutCardApproved === true, paymentState: parsed.data.paymentMethod === "cash" ? "pending_cash_collection" : order.paymentState, paymentMethod: parsed.data.paymentMethod, cashDueAtDelivery: parsed.data.paymentMethod === "cash", subtotalCents, deliveryFeeCents, serviceFeeCents, totalCents,
     marketplace: { commissionRateBps: marketplace.commissionRateBps, commissionCents: marketplace.platformCommissionCents, partnerPayoutCents: marketplace.partnerPayoutCents, riderEarningsCents: marketplace.riderEarningsCents, platformNetBeforeProcessingCents: marketplace.platformNetBeforeProcessingCents }, priceBreakdown: calculatePriceBreakdown({ subtotalCents, deliveryFeeCents, serviceFeeCents }), freeDeliveryApplied: freeDelivery.eligible, freeDeliveryOrdersRemaining: freeDelivery.remaining, coverage, route, partnerPreparationLimitMinutes: PARTNER_PREPARATION_LIMIT_MINUTES, customerDeliveryTargetMinutes: CUSTOMER_DELIVERY_TARGET_MINUTES, etaMinutes: calculateEtaRange([PARTNER_PREPARATION_LIMIT_MINUTES, PARTNER_PREPARATION_LIMIT_MINUTES], [5, 15]) } });
 });
 
@@ -5440,6 +5471,15 @@ app.post("/api/v1/internal/customer-orders/sync", async (req, res) => {
   if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_AVAILABLE" });
   if (input.paymentMethod === "cash" && !isCashPaymentEnabledForRestaurant(restaurant)) return res.status(409).json(cashPaymentDisabledError(restaurant));
   const existing = await Order.findOne({ publicCode: input.publicCode }).lean().exec() as any;
+  if (existing && String(existing.tenantId || "") !== String(restaurant.tenantId || "")) return res.status(409).json({ error: "SYNC_TENANT_MISMATCH" });
+  if (existing && input.paymentMethod === "cash" && !cashCardGuaranteeRequiredForRestaurant(restaurant) && existing.paymentMethod !== "cash") return res.status(409).json({ error: "SYNC_PAYMENT_METHOD_CHANGE_FORBIDDEN" });
+  if (existing?.cashWithoutCardApproved === true && (input.paymentMethod !== "cash" || input.paymentState !== existing.paymentState || input.customerId !== existing.customerId || input.totalCents !== existing.totalCents || input.stripeCheckoutSessionId != null || input.stripePaymentIntentId != null)) return res.status(409).json({ error: "SYNC_CASH_APPROVAL_CHANGE_FORBIDDEN" });
+  const requiresAuthenticatedCashSync = existing?.cashWithoutCardApproved === true || (!existing && input.paymentMethod === "cash" && !cashCardGuaranteeRequiredForRestaurant(restaurant));
+  const authenticatedSyncCustomer = requiresAuthenticatedCashSync ? await currentCustomer(req) as any : null;
+  if (requiresAuthenticatedCashSync && (!authenticatedSyncCustomer || String(authenticatedSyncCustomer._id) !== input.customerId)) return res.status(401).json({ error: "AUTH_REQUIRED" });
+  if (!existing && input.paymentMethod === "cash" && !cashCardGuaranteeRequiredForRestaurant(restaurant)) {
+    if (input.paymentState !== "pending" || input.stripeCheckoutSessionId != null || input.stripePaymentIntentId != null) return res.status(409).json({ error: "CASH_WITHOUT_CARD_REQUIRES_PENDING" });
+  }
   // A payment-only replay can omit coordinates; it must preserve the real
   // destination, never substitute the restaurant for the customer's address.
   const location = input.deliveryLocation ? { type: "Point", coordinates: [input.deliveryLocation.longitude, input.deliveryLocation.latitude] } : existing?.deliveryLocation;
@@ -5484,9 +5524,40 @@ app.post("/api/v1/internal/customer-orders/sync", async (req, res) => {
   const canonicalSubtotalCents = canonicalItems.reduce((sum, item) => sum + item.unitPriceCents * item.quantity, 0);
   const canonicalTotalCents = canonicalSubtotalCents + effectiveDeliveryFeeCents + input.serviceFeeCents;
   if (!isCashOrderWithinLimit(input.paymentMethod, canonicalTotalCents, partnerCashLimitCents)) return res.status(422).json(cashOrderLimitError(canonicalTotalCents, partnerCashLimitCents));
+  if (existing?.cashWithoutCardApproved === true) {
+    const lines = (items: any[]) => items.map((item) => ({ itemId: String(item.itemId), name: item.name, quantity: item.quantity, unitPriceCents: item.unitPriceCents }));
+    if (canonicalTotalCents !== existing.totalCents || canonicalSubtotalCents !== existing.subtotalCents || effectiveDeliveryFeeCents !== existing.deliveryFeeCents || input.serviceFeeCents !== existing.serviceFeeCents || JSON.stringify(lines(canonicalItems)) !== JSON.stringify(lines(existing.items || []))) return res.status(409).json({ error: "SYNC_CASH_CANONICAL_SNAPSHOT_MISMATCH" });
+    // Immutable, idempotent replay: no upsert, no payment/payout/assignment write,
+    // no dispatch side effects. Re-read the exact financial/version snapshot so
+    // a concurrent QR collection cannot be reported or reset as pending.
+    const fresh = await Order.findOne({ _id: existing._id, publicCode: input.publicCode, tenantId: existing.tenantId, restaurantId: existing.restaurantId, customerId: String(authenticatedSyncCustomer._id), cashWithoutCardApproved: true, paymentMethod: "cash", paymentState: existing.paymentState, totalCents: existing.totalCents, version: existing.version === undefined ? { $exists: false } : existing.version }).lean().exec() as any;
+    if (!fresh) return res.status(409).json({ error: "SYNC_CASH_SNAPSHOT_CHANGED" });
+    return res.json({ idempotent: true, order: { id: fresh._id, publicCode: fresh.publicCode, checkoutToken: checkoutToken(fresh.publicCode), status: fresh.status, paymentState: customerCashPaymentState(fresh), cashWithoutCardApproved: true, assignmentState: fresh.assignmentState } });
+  }
+  const cashWithoutCardApproved = !existing && approveCashWithoutCardForOrder(restaurant, input.paymentMethod, canonicalTotalCents, authenticatedSyncCustomer);
   const scheduledFor = input.scheduledFor ? new Date(input.scheduledFor) : null;
   if (scheduledFor && scheduledFor.getTime() <= Date.now()) return res.status(400).json({ error: "SCHEDULED_TIME_PAST" });
-  const order = await Order.findOneAndUpdate({ publicCode: input.publicCode }, { $set: { tenantId: restaurant.tenantId || null, restaurantId: restaurant._id, customerId: input.customerId || null, ...(input.customerName !== undefined ? { customerName: input.customerName || "" } : {}), items: canonicalItems, deliveryAddress: input.deliveryAddress, deliveryNote: input.deliveryNote, scheduledFor, deliveryLocation: location, subtotalCents: canonicalSubtotalCents, deliveryFeeCents: effectiveDeliveryFeeCents, serviceFeeCents: input.serviceFeeCents, totalCents: canonicalTotalCents, marketplaceCommissionRateBps: marketplace.commissionRateBps, marketplaceCommissionCents: marketplace.platformCommissionCents, partnerPayoutCents: marketplace.partnerPayoutCents, riderEarningsCents: marketplace.riderEarningsCents, platformNetBeforeProcessingCents: marketplace.platformNetBeforeProcessingCents, payoutStatus: "pending", paymentMethod: input.paymentMethod, paymentState: input.paymentState, ...(input.stripeCheckoutSessionId !== undefined ? { stripeCheckoutSessionId: input.stripeCheckoutSessionId } : {}), ...(input.stripePaymentIntentId !== undefined ? { stripePaymentIntentId: input.stripePaymentIntentId } : {}) }, $setOnInsert: { publicCode: input.publicCode, ...syncGeography, status: "pending", assignmentState: "unassigned", statusHistory: [{ status: "pending", actorRole: "system", reason: "Pedido sincronizado desde PIKI Customer" }] } }, { upsert: true, new: true, setDefaultsOnInsert: true }).lean().exec() as any;
+  // Pin a fresh _id for approved COD inserts: a concurrent existing code must
+  // fail the unique publicCode index, never turn an online order into cash.
+  const approvedCashInsertId = cashWithoutCardApproved ? new mongoose.Types.ObjectId() : null;
+  const writeSyncOrder = (session?: mongoose.ClientSession) => Order.findOneAndUpdate({ publicCode: input.publicCode, ...(approvedCashInsertId ? { _id: approvedCashInsertId } : {}) }, { $set: { tenantId: restaurant.tenantId || null, restaurantId: restaurant._id, customerId: input.customerId || null, ...(input.customerName !== undefined ? { customerName: input.customerName || "" } : {}), items: canonicalItems, deliveryAddress: input.deliveryAddress, deliveryNote: input.deliveryNote, scheduledFor, deliveryLocation: location, subtotalCents: canonicalSubtotalCents, deliveryFeeCents: effectiveDeliveryFeeCents, serviceFeeCents: input.serviceFeeCents, totalCents: canonicalTotalCents, marketplaceCommissionRateBps: marketplace.commissionRateBps, marketplaceCommissionCents: marketplace.platformCommissionCents, partnerPayoutCents: marketplace.partnerPayoutCents, riderEarningsCents: marketplace.riderEarningsCents, platformNetBeforeProcessingCents: marketplace.platformNetBeforeProcessingCents, payoutStatus: "pending", paymentMethod: input.paymentMethod, paymentState: input.paymentState, ...(input.stripeCheckoutSessionId !== undefined ? { stripeCheckoutSessionId: input.stripeCheckoutSessionId } : {}), ...(input.stripePaymentIntentId !== undefined ? { stripePaymentIntentId: input.stripePaymentIntentId } : {}) }, $setOnInsert: { publicCode: input.publicCode, cashWithoutCardApproved, ...syncGeography, status: "pending", assignmentState: "unassigned", statusHistory: [{ status: "pending", actorRole: "system", reason: "Pedido sincronizado desde PIKI Customer" }] } }, { upsert: true, new: true, setDefaultsOnInsert: true, ...(session ? { session } : {}) }).lean().exec();
+  let order: any;
+  if (cashWithoutCardApproved) {
+    const session = await mongoose.startSession();
+    try {
+      await session.withTransaction(async () => {
+        const freshRestaurant = await Restaurant.findOne({ _id: restaurant._id, tenantId: restaurant.tenantId, isActive: true, onboardingStatus: "approved" }).session(session).lean().exec() as any;
+        if (!freshRestaurant || !approveCashWithoutCardForOrder(freshRestaurant, input.paymentMethod, canonicalTotalCents, authenticatedSyncCustomer)) throw new Error("CASH_POLICY_CHANGED");
+        const locked = await Restaurant.updateOne({ _id: restaurant._id, tenantId: restaurant.tenantId, cashPaymentsEnabled: true, "partnerProfile.cashCardGuaranteeRequired": false }, { $inc: { __v: 1 } }, { session, timestamps: false }).exec();
+        if (locked.matchedCount !== 1) throw new Error("CASH_POLICY_CHANGED");
+        order = await writeSyncOrder(session);
+      });
+    } catch (error) {
+      if (error instanceof Error && error.message === "CASH_POLICY_CHANGED") return res.status(409).json({ error: "CASH_POLICY_CHANGED" });
+      if ((error as any)?.code === 11000) return res.status(409).json({ error: "SYNC_ORDER_ALREADY_EXISTS" });
+      throw error;
+    } finally { await session.endSession(); }
+  } else order = await writeSyncOrder();
   const newlyPaid = ["authorized", "paid"].includes(input.paymentState) && !["authorized", "paid"].includes(existing?.paymentState || "");
   const newCashOrder = input.paymentMethod === "cash" && !existing;
   if (newlyPaid || newCashOrder) {
@@ -5496,7 +5567,7 @@ app.post("/api/v1/internal/customer-orders/sync", async (req, res) => {
       : { settlement: "paid" as const, message: "Pago confirmado desde PIKI Customer." };
     await Promise.all([dispatch, publishOrderIntakeEvents(order, settlement)]);
   }
-  return res.status(existing ? 200 : 201).json({ order: { id: order._id, publicCode: order.publicCode, checkoutToken: checkoutToken(order.publicCode), status: order.status, paymentState: order.paymentState, assignmentState: order.assignmentState } });
+  return res.status(existing ? 200 : 201).json({ order: { id: order._id, publicCode: order.publicCode, checkoutToken: checkoutToken(order.publicCode), status: order.status, paymentState: customerCashPaymentState(order), cashWithoutCardApproved: order.cashWithoutCardApproved === true, assignmentState: order.assignmentState } });
 });
 
 function requireCustomerSyncSecret(req: express.Request, res: express.Response) {
@@ -7575,7 +7646,7 @@ app.post("/api/v1/dispatch/orders/:id/assign", requireRole("admin", "fleet"), as
   if (!orderId) return res.status(400).json({ error: "INVALID_ORDER_ID" });
   const order = await findDispatchOrder(orderId, req);
   if (!order) return res.status(404).json({ error: "ORDER_NOT_FOUND" });
-  if (!isDispatchablePayment(order.paymentState)) return res.status(409).json({ error: "ORDER_NOT_PAID" });
+  if (!isDispatchablePayment(order.paymentState, order.paymentMethod, order.totalCents, order)) return res.status(409).json({ error: "ORDER_NOT_PAID" });
   if (!isDispatchableOrderStatus(order.status)) return res.status(409).json({ error: "ORDER_NOT_DISPATCHABLE", status: order.status });
   if (order.riderId || order.assignmentState === "assigned") return res.status(409).json({ error: "ORDER_ALREADY_ASSIGNED" });
   const scope = dispatchScope(req, order);
@@ -7974,6 +8045,7 @@ app.get("/api/v1/admin/governance/audit", requireRole("admin"), async (req, res)
 });
 const cashPolicyInputSchema = z.object({
   enabled: z.boolean().optional(),
+  cashCardGuaranteeRequired: z.boolean().optional(),
   maxOrderCents: z.number().int().min(0).max(1_000_000).optional(),
   minOrderCents: z.number().int().min(0).max(1_000_000).optional(),
   outstandingMaxCents: z.number().int().min(0).max(10_000_000).optional(),
@@ -7982,25 +8054,27 @@ const cashPolicyInputSchema = z.object({
 app.get("/api/v1/admin/restaurants/:id/cash-policy", requireOwner(), async (req, res) => {
   const id = objectId(String(req.params.id));
   if (!id) return res.status(400).json({ error: "INVALID_RESTAURANT_ID" });
-  const restaurant = await Restaurant.findOne({ _id: id, ...tenantScope(req) }).select("_id slug name cashPaymentsEnabled cashOrderMaxCents cashOrderMinCents cashOutstandingMaxCents cashPolicyUpdatedAt cashPolicyUpdatedBy cashPolicyReason").lean().exec() as any;
+  const restaurant = await Restaurant.findOne({ _id: id, ...tenantScope(req) }).select("_id slug name cashPaymentsEnabled cashOrderMaxCents cashOrderMinCents cashOutstandingMaxCents cashPolicyUpdatedAt cashPolicyUpdatedBy cashPolicyReason tenantId partnerProfile.cashCardGuaranteeRequired").lean().exec() as any;
   if (!restaurant) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
-  return res.json({ policy: { restaurantId: String(restaurant._id), slug: restaurant.slug, name: restaurant.name, enabled: Boolean(restaurant.cashPaymentsEnabled), maxOrderCents: Number(restaurant.cashOrderMaxCents ?? 4_899), minOrderCents: Number(restaurant.cashOrderMinCents ?? 0), outstandingMaxCents: Number(restaurant.cashOutstandingMaxCents ?? 10_000), updatedAt: restaurant.cashPolicyUpdatedAt || null, updatedBy: restaurant.cashPolicyUpdatedBy || null, reason: restaurant.cashPolicyReason || "" } });
+  return res.json({ policy: { restaurantId: String(restaurant._id), slug: restaurant.slug, name: restaurant.name, enabled: Boolean(restaurant.cashPaymentsEnabled), cashCardGuaranteeRequired: cashCardGuaranteeRequiredForRestaurant(restaurant), maxOrderCents: Number(restaurant.cashOrderMaxCents ?? 4_899), minOrderCents: Number(restaurant.cashOrderMinCents ?? 0), outstandingMaxCents: Number(restaurant.cashOutstandingMaxCents ?? 10_000), updatedAt: restaurant.cashPolicyUpdatedAt || null, updatedBy: restaurant.cashPolicyUpdatedBy || null, reason: restaurant.cashPolicyReason || "" } });
 });
 app.patch("/api/v1/admin/restaurants/:id/cash-policy", requireOwner(), async (req, res) => {
   const id = objectId(String(req.params.id));
   const parsed = cashPolicyInputSchema.safeParse(req.body);
   if (!id || !parsed.success) return res.status(400).json({ error: "INVALID_CASH_POLICY", details: parsed.success ? undefined : parsed.error.flatten() });
   if (parsed.data.maxOrderCents !== undefined && parsed.data.minOrderCents !== undefined && parsed.data.minOrderCents > parsed.data.maxOrderCents) return res.status(400).json({ error: "CASH_MIN_EXCEEDS_MAX" });
-  const current = await Restaurant.findOne({ _id: id, ...tenantScope(req) }).select("_id slug name cashPaymentsEnabled cashOrderMaxCents cashOrderMinCents cashOutstandingMaxCents cashPolicyUpdatedAt cashPolicyUpdatedBy cashPolicyReason").lean().exec() as any;
+  const current = await Restaurant.findOne({ _id: id, ...tenantScope(req) }).select("_id slug name cashPaymentsEnabled cashOrderMaxCents cashOrderMinCents cashOutstandingMaxCents cashPolicyUpdatedAt cashPolicyUpdatedBy cashPolicyReason tenantId partnerProfile.cashCardGuaranteeRequired").lean().exec() as any;
   if (!current) return res.status(404).json({ error: "RESTAURANT_NOT_FOUND" });
+  if (parsed.data.cashCardGuaranteeRequired === false && !isCashWithoutCardRolloutRestaurant(current)) return res.status(403).json({ error: "CASH_WITHOUT_CARD_NOT_AUTHORIZED_FOR_PARTNER" });
   const update: Record<string, unknown> = { cashPolicyUpdatedAt: new Date(), cashPolicyUpdatedBy: objectId(String(req.auth?.employeeId || "")), cashPolicyReason: parsed.data.reason };
   if (parsed.data.enabled !== undefined) update.cashPaymentsEnabled = parsed.data.enabled;
+  if (parsed.data.cashCardGuaranteeRequired !== undefined) update["partnerProfile.cashCardGuaranteeRequired"] = parsed.data.cashCardGuaranteeRequired;
   if (parsed.data.maxOrderCents !== undefined) update.cashOrderMaxCents = parsed.data.maxOrderCents;
   if (parsed.data.minOrderCents !== undefined) update.cashOrderMinCents = parsed.data.minOrderCents;
   if (parsed.data.outstandingMaxCents !== undefined) update.cashOutstandingMaxCents = parsed.data.outstandingMaxCents;
-  const updated = await Restaurant.findOneAndUpdate({ _id: id, ...tenantScope(req) }, { $set: update }, { new: true }).select("_id slug name cashPaymentsEnabled cashOrderMaxCents cashOrderMinCents cashOutstandingMaxCents cashPolicyUpdatedAt cashPolicyUpdatedBy cashPolicyReason").lean().exec() as any;
+  const updated = await Restaurant.findOneAndUpdate({ _id: id, ...tenantScope(req) }, { $set: update }, { new: true }).select("_id slug name cashPaymentsEnabled cashOrderMaxCents cashOrderMinCents cashOutstandingMaxCents cashPolicyUpdatedAt cashPolicyUpdatedBy cashPolicyReason tenantId partnerProfile.cashCardGuaranteeRequired").lean().exec() as any;
   await recordGovernanceEvent({ actor: { employeeId: req.auth?.employeeId, role: "superadmin", tenantId: (req.auth as any)?.tenantId }, action: "partner_cash_policy_updated", targetType: "restaurant", targetId: id, before: current, after: updated, reason: parsed.data.reason || "Política de efectivo actualizada desde Admin." });
-  return res.json({ updated: true, policy: { restaurantId: String(updated._id), slug: updated.slug, name: updated.name, enabled: Boolean(updated.cashPaymentsEnabled), maxOrderCents: Number(updated.cashOrderMaxCents ?? 4_899), minOrderCents: Number(updated.cashOrderMinCents ?? 0), outstandingMaxCents: Number(updated.cashOutstandingMaxCents ?? 10_000), updatedAt: updated.cashPolicyUpdatedAt || null, updatedBy: updated.cashPolicyUpdatedBy || null, reason: updated.cashPolicyReason || "" } });
+  return res.json({ updated: true, policy: { restaurantId: String(updated._id), slug: updated.slug, name: updated.name, enabled: Boolean(updated.cashPaymentsEnabled), cashCardGuaranteeRequired: cashCardGuaranteeRequiredForRestaurant(updated), maxOrderCents: Number(updated.cashOrderMaxCents ?? 4_899), minOrderCents: Number(updated.cashOrderMinCents ?? 0), outstandingMaxCents: Number(updated.cashOutstandingMaxCents ?? 10_000), updatedAt: updated.cashPolicyUpdatedAt || null, updatedBy: updated.cashPolicyUpdatedBy || null, reason: updated.cashPolicyReason || "" } });
 });
 const cashSettlementPeriodSchema = z.object({ riderId: z.string().regex(/^[a-f\d]{24}$/i), periodStart: z.coerce.date(), periodEnd: z.coerce.date(), reference: z.string().trim().min(3).max(120).optional(), note: z.string().trim().max(1000).default("") }).refine((value) => value.periodEnd > value.periodStart, "INVALID_SETTLEMENT_PERIOD");
 app.get("/api/v1/finance/rider-cash-settlements", requireRole("admin", "finance"), async (req, res) => {

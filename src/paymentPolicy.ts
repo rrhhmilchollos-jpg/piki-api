@@ -1,3 +1,5 @@
+import { cashCardGuaranteeRequiredForRestaurant, type CashCardGuaranteeRestaurant } from "./cashCardGuaranteeScope.js";
+
 export const MAX_CASH_ORDER_CENTS = 4_899;
 /** Production kill-switch: COD is closed unless explicitly enabled in Render or Admin. */
 export let CASH_PAYMENTS_ENABLED = process.env.PIKI_CASH_PAYMENTS_ENABLED === "true";
@@ -22,7 +24,7 @@ export const ONLINE_PAYMENT_METHODS = ["stripe", "bizum"] as const;
 export function isOnlinePaymentMethod(value: unknown): value is (typeof ONLINE_PAYMENT_METHODS)[number] {
   return ONLINE_PAYMENT_METHODS.includes(value as (typeof ONLINE_PAYMENT_METHODS)[number]);
 }
-export type CashPaymentPartner = { slug?: string | null; name?: string | null; cashPaymentsEnabled?: boolean | null; cashOrderMaxCents?: number | null; cashOrderMinCents?: number | null };
+export type CashPaymentPartner = CashCardGuaranteeRestaurant;
 export function cashOrderLimitCents(restaurant?: CashPaymentPartner | null): number {
   const configured = Number(restaurant?.cashOrderMaxCents);
   return Number.isFinite(configured) ? Math.max(0, Math.min(MAX_CASH_ORDER_CENTS, Math.round(configured))) : MAX_CASH_ORDER_CENTS;
@@ -33,13 +35,13 @@ export function cashOrderMinimumCents(restaurant?: CashPaymentPartner | null): n
 }
 
 /**
- * Cash is controlled by the global operations kill-switch. Legacy partner
- * fields and client-provided payment methods cannot bypass a closed switch.
+ * Keep the existing global policy, with the separately authorized Kazoku
+ * rollout requiring BOTH persisted flags and its exact merchant/tenant scope.
+ * Legacy root cash flags alone and client flags never bypass a closed switch.
  */
-export function isCashPaymentEnabledForRestaurant(_restaurant: CashPaymentPartner): boolean {
-  // La garantía de tarjeta, el barrido y la liquidación ya están implementados;
-  // el interruptor global evita exponer COD hasta que Operaciones lo autorice.
-  return CASH_PAYMENTS_ENABLED;
+export function isCashPaymentEnabledForRestaurant(restaurant: CashPaymentPartner): boolean {
+  return CASH_PAYMENTS_ENABLED || (restaurant.cashPaymentsEnabled === true
+    && !cashCardGuaranteeRequiredForRestaurant(restaurant));
 }
 
 export function cashPaymentDisabledError(restaurant: CashPaymentPartner) {

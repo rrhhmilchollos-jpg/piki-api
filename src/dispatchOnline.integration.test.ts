@@ -19,6 +19,7 @@ function matches(doc: any, filter: any): boolean {
   if (!doc) return false;
   return Object.entries(filter).every(([key, expected]: [string, any]) => {
     if (key === "$or") return expected.some((part: any) => matches(doc, part));
+    if (key === "$and") return expected.every((part: any) => matches(doc, part));
     const actual = doc[key];
     if (expected && typeof expected === "object" && !(expected instanceof Date) && !(expected instanceof mongoose.Types.ObjectId)
       && Object.keys(expected).some((k) => k.startsWith("$"))) {
@@ -28,6 +29,8 @@ function matches(doc: any, filter: any): boolean {
         if (op === "$nin") return !v.some((item: any) => same(actual, item));
         if (op === "$ne") return !same(actual, v);
         if (op === "$exists") return (actual !== undefined) === v;
+        if (op === "$regex") return typeof actual === "string" && v.test(actual);
+        if (op === "$mod") return typeof actual === "number" && actual % v[0] === v[1];
         if (actual == null) return false;
         if (op === "$gt") return actual > v;
         if (op === "$gte") return actual >= v;
@@ -59,6 +62,7 @@ test("dispatch online P0: guarded real handlers, memory CAS and forbidden extern
   const reservation = await import("./dispatchReservation.js");
   const { hashSessionToken } = await import("./employeeAuth.js");
   const server = await import("./server.js"); // PIKI_NO_LISTEN from offline-validation; never import worker.
+  const cashScope = await import("./cashCardGuaranteeScope.js");
   const RealDate = Date;
   let now = RealDate.parse("2026-11-13T18:00:00Z"); // Friday 19:00 Madrid.
   class FixedDate extends RealDate { constructor(value?: any) { super(value === undefined ? now : value); } static now() { return now; } }
@@ -74,13 +78,15 @@ test("dispatch online P0: guarded real handlers, memory CAS and forbidden extern
   });
   const id = () => new mongoose.Types.ObjectId();
   const paths = ["/api/v1/riders/:riderId/orders/:orderId/accept-offer", "/api/v1/dispatch/orders/:id/offer-response"];
-  function handler(path: string) {
-    const route = (server.app as any)._router.stack.find((layer: any) => layer.route?.path === path).route;
+  function handler(path: string, method?: string) {
+    const route = (server.app as any)._router.stack.find((layer: any) => layer.route?.path === path && (!method || layer.route.methods[method])).route;
     return route.stack.at(-1).handle;
   }
-  function fixture(s: any, offered = false) {
+  function fixture(s: any, offered = false, approvedCash = false) {
     now = RealDate.parse("2026-11-13T18:00:00Z");
-    const tenantId = id(), riderId = id(), orderId = id(), employeeId = id(), restaurantId = id();
+    const tenantId = approvedCash ? new mongoose.Types.ObjectId(cashScope.CASH_WITHOUT_CARD_TENANT_ID) : id();
+    const riderId = id(), orderId = id(), employeeId = id();
+    const restaurantId = approvedCash ? new mongoose.Types.ObjectId(cashScope.CASH_WITHOUT_CARD_RESTAURANT_IDS[0]) : id();
     const point = { type: "Point", coordinates: [-0.521111, 38.990276] };
     const tenant: any = { _id: tenantId, status: "active" };
     const rider: any = { _id: riderId, tenantId, email: "rider@offline.invalid", lifecycleStatus: "active", status: offered ? "busy" : "available",
@@ -91,6 +97,7 @@ test("dispatch online P0: guarded real handlers, memory CAS and forbidden extern
     const plan: any = { _id: id(), riderId, tenantId, weeklyHours: 40, shifts: [{ weekday: 5, start: "12:00", end: "00:00" }] };
     const slots: any[] = [{ _id: id(), riderId, tenantId, date: "2026-11-13", startTime: "12:00", endTime: "00:00", status: "active", startedAt: new Date("2026-11-13T11:00:00Z"), stoppedAt: null }];
     const order: any = { _id: orderId, tenantId, restaurantId, publicCode: "OFFLINE-P0", status: "pending", paymentState: "authorized", paymentMethod: "stripe", totalCents: 899,
+      ...(approvedCash ? { paymentState: "pending", paymentMethod: "cash", cashWithoutCardApproved: true, customerId: String(id()) } : {}),
       version: 1, riderId: offered ? riderId : null, assignmentState: offered ? "offered" : "unassigned", offerId: offered ? "offer-p0" : null,
       assignmentExpiresAt: offered ? new Date(now + 180_000) : null, deliveryLocation: point, pickupLocation: point, routeDistanceKm: 1, routingDegraded: false, dispatchAttempts: 0 };
     const reservations: any[] = offered ? [{ _id: id(), tenantId, riderId, orderId, status: "reserved", slot: 1, expiresAt: new Date(now + 180_000) }] : [];
@@ -259,6 +266,52 @@ test("dispatch online P0: guarded real handlers, memory CAS and forbidden extern
     assert.equal(result.state, "offered"); assert.equal(f.rider.status, "busy"); assert.equal(f.reservations.filter((r) => r.status === "reserved").length, 1);
     assert.ok(f.order.assignmentExpiresAt > new Date()); assert.equal(f.controls.orderWrites, 1);
     assert.ok(f.controls.riderCas.every((filter: any) => filter.email && filter.lastLocationAt && filter.lifecycleStatus === "active"));
+  });
+  await t.test("cash pending server-approved gets automatic offer without payment authorization", async (s) => {
+    const f = fixture(s, false, true); const result = await server.queueAutomaticDispatch(f.orderId);
+    assert.equal(result.state, "offered"); assert.equal(f.order.paymentState, "pending");
+    assert.equal(f.order.cashWithoutCardApproved, true); assert.equal(f.controls.orderWrites, 1);
+  });
+  for (const path of paths) await t.test(`approved cash pending accepts with unchanged rider auth: ${path}`, async (s) => {
+    const f = fixture(s, true, true); const r = response(); await handler(path)(f.req, r.res);
+    assert.equal(r.state.status, 200, JSON.stringify(r.state.body));
+    assert.equal(f.order.assignmentState, "assigned"); assert.equal(f.order.paymentState, "pending");
+  });
+  for (const [name, change] of negatives) await t.test(`approved cash does not bypass ${name}`, async (s) => {
+    const f = fixture(s, true, true); change(f); const r = response(); await handler(paths[0])(f.req, r.res);
+    assert.ok(r.state.status >= 400); assert.equal(f.controls.orderWrites, 0);
+  });
+  for (const [name, change] of [
+    ["missing server approval", (f: any) => { f.order.cashWithoutCardApproved = false; }],
+    ["claim without authenticated customer", (f: any) => { f.order.customerId = null; }],
+    ["wrong merchant", (f: any) => { f.order.restaurantId = id(); }],
+    ["above 4899", (f: any) => { f.order.totalCents = 4_900; }],
+    ["Stripe conversion", (f: any) => { f.order.paymentMethod = "stripe"; }],
+    ["existing Stripe session", (f: any) => { f.order.stripeCheckoutSessionId = "cs_pending_online"; }],
+  ] as Array<[string, (f: any) => void]>) await t.test(`approved cash rejects ${name}`, async (s) => {
+    const f = fixture(s, true, true); change(f); const r = response(); await handler(paths[0])(f.req, r.res);
+    assert.ok(r.state.status >= 400); assert.equal(f.controls.orderWrites, 0);
+  });
+  for (const [name, change] of [
+    ["snapshot revoked", (f: any) => { f.order.cashWithoutCardApproved = false; }],
+    ["customer rebound", (f: any) => { f.order.customerId = String(id()); }],
+    ["total changes", (f: any) => { f.order.totalCents++; }],
+    ["payment refunded", (f: any) => { f.order.paymentState = "refunded"; }],
+  ] as Array<[string, (f: any) => void]>) await t.test(`cash acceptance CAS loses concurrent ${name}`, async (s) => {
+    const f = fixture(s, true, true); f.controls.beforeOrderCas = () => change(f);
+    const r = response(); await handler(paths[0])(f.req, r.res);
+    assert.equal(r.state.status, 409); assert.equal(f.controls.orderWrites, 0);
+  });
+  await t.test("active/dispatchable orders include approved pending cash, exclude legacy pending cash", async (s) => {
+    const f = fixture(s, false, true); f.req.auth.role = "admin";
+    for (const query of [{ active: "true" }, { operational: "true" }, { dispatchable: "true" }]) {
+      f.req.query = query;
+      const allowed = response(); await handler("/api/v1/orders", "get")(f.req, allowed.res);
+      assert.equal(allowed.state.body.orders.length, 1);
+      f.order.cashWithoutCardApproved = false;
+      const denied = response(); await handler("/api/v1/orders", "get")(f.req, denied.res);
+      assert.equal(denied.state.body.orders.length, 0); f.order.cashWithoutCardApproved = true;
+    }
   });
   for (const path of paths) await t.test(`valid offer accepted with operative payment and exact token: ${path}`, async (s) => {
     const f = fixture(s, true); const r = response(); await handler(path)(f.req, r.res);
