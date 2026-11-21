@@ -109,6 +109,7 @@ import { PRL_COURSE_VERSION, PRL_PASS_MARK, PrlEnrollment, certificateIssuer, ce
 import { GoogleBusinessConnection, GoogleOauthState, MunicipalExpansion } from "./expansionModels.js";
 import { decryptGoogleSecret, exchangeGoogleCode, fromGoogleLocationHours, googleAuthorizationUrl, googleBusinessConfiguration, googleBusinessConfigured, googleBusinessScopes, listGoogleAccounts, listGoogleLocations, readGoogleLocation, toGoogleLocationHours, updateGoogleLocationHours, encryptGoogleSecret } from "./googleBusinessProfile.js";
 import { deliveredConfirmationResponse, deliveryCredentialNotLockedFilter, deliveryFailureAtomicUpdate, deliveryFailureLock, parseDeliveryCredential, stripeDeliveryPaymentAction } from "./deliveryConfirmation.js";
+import { buildEcosystemAudit } from "./adminEcosystemAudit.js";
 import { fleetPublicView } from "./fleetView.js";
 import { prepareTrackingBatch } from "./riderLocationPolicy.js";
 import { resolveRecruitmentSelection } from "./recruitmentAreas.js";
@@ -759,6 +760,21 @@ app.get("/health", (_req, res) => res.json({ service: "piki-api", status: "ok", 
 app.get("/ready", (_req, res) => {
   if (!databaseReady || mongoose.connection.readyState !== 1) return res.status(503).json({ service: "piki-api", status: "not_ready" });
   return res.json({ service: "piki-api", status: "ready" });
+});
+app.get("/api/v1/admin/ecosystem-audit", requireOwner(), async (_req, res) => {
+  const started = Date.now();
+  const audit = buildEcosystemAudit({
+    databaseReady,
+    mongoReadyState: mongoose.connection.readyState,
+    commit: renderDeploymentCommit() || "",
+    nodeEnv: process.env.NODE_ENV || "unknown",
+    stripeConfigured: stripeConfigured(),
+    emailConfigured: corporateEmailConfiguration().configured,
+    pushConfigured: pushConfigured(),
+    realtimeEnabled: true,
+    qaMode: process.env.PIKI_QA_MODE === "true" || process.env.PIKI_TEST_MODE === "true",
+  });
+  return res.json({ ...audit, serverDurationMs: Date.now() - started });
 });
 app.get("/api/v1", (_req, res) => res.json({ name: "PIKI API", status: databaseReady ? "ready" : "initializing" }));
 app.get("/api/v1/catalog/events", serveCatalogEvents);
