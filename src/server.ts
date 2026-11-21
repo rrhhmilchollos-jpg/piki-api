@@ -2713,7 +2713,9 @@ app.get("/api/v1/partners/kitchen/orders", requirePartnerSurface(), async (req, 
   if (!restaurantId) return res.status(403).json({ error: access?.restaurantIds.length ? "PARTNER_RESTAURANT_ACCESS_DENIED" : "PARTNER_RESTAURANT_NOT_ASSIGNED" });
   const restaurant = await Restaurant.findOne({ _id: restaurantId, ...partnerTenantScope(req) }).select("name slug address phone cuisine location").lean().exec() as any;
   const printCustomerContactEnabled = partnerTicketContactEnabled(restaurant);
-  const ordersQuery = Order.find({ restaurantId, ...partnerTenantScope(req), ...partnerKitchenPaymentFilter, archivedAt: null, status: { $in: ["pending", "accepted", "preparing", "ready_for_pickup", "picked_up", "on_the_way"] } });
+  // QA orders remain available to the controlled admin test tools, but never
+  // enter the commercial Partner queue installed in a real establishment.
+  const ordersQuery = Order.find({ restaurantId, ...partnerTenantScope(req), isTestOrder: { $ne: true }, ...partnerKitchenPaymentFilter, archivedAt: null, status: { $in: ["pending", "accepted", "preparing", "ready_for_pickup", "picked_up", "on_the_way"] } });
   if (printCustomerContactEnabled) ordersQuery.select("+customerPhone");
   const orders = await ordersQuery.sort({ createdAt: 1 }).lean().exec() as any[];
   const [customers, riders] = await Promise.all([
@@ -2779,7 +2781,7 @@ app.get("/api/v1/partners/kitchen/orders/archive", requirePartnerSurface(), asyn
   const requestedLimit = Number(req.query.limit || 50);
   const limit = Number.isFinite(requestedLimit) ? Math.min(100, Math.max(1, Math.trunc(requestedLimit))) : 50;
   const before = typeof req.query.before === "string" && !Number.isNaN(Date.parse(req.query.before)) ? new Date(req.query.before) : null;
-  const filter: Record<string, unknown> = { restaurantId, ...partnerTenantScope(req), status: { $in: ["delivered", "cancelled"] } };
+  const filter: Record<string, unknown> = { restaurantId, ...partnerTenantScope(req), isTestOrder: { $ne: true }, status: { $in: ["delivered", "cancelled"] } };
   if (before) filter.$or = [{ archivedAt: { $lt: before } }, { archivedAt: null, deliveredAt: { $lt: before } }, { archivedAt: null, cancelledAt: { $lt: before } }];
   const orders = await Order.find(filter).sort({ archivedAt: -1, deliveredAt: -1, cancelledAt: -1 }).limit(limit + 1).lean().exec() as any[];
   const hasMore = orders.length > limit;
@@ -7721,7 +7723,9 @@ app.get("/api/v1/riders/:id/offers", requireRole("rider"), async (req, res) => {
   if (!rider) return res.status(403).json({ error: "RIDER_ACCESS_DENIED" });
   const principal = dispatchPrincipal(req);
   if (!principal || !(await loadDispatchIdentityGuard(riderId, req.auth?.tenantId, { principal }))) return res.status(409).json({ error: "RIDER_SESSION_NOT_ACTIVE" });
-  const offerPool = await Order.find({ riderId, ...tenantScope(req), assignmentState: { $in: ["offered", "assigned"] }, status: { $nin: ["delivered", "cancelled"] } })
+  // The production Rider surface must never expose QA offers. Controlled QA
+  // dispatch uses its own admin-only endpoints and a dedicated test rider.
+  const offerPool = await Order.find({ riderId, ...tenantScope(req), isTestOrder: { $ne: true }, assignmentState: { $in: ["offered", "assigned"] }, status: { $nin: ["delivered", "cancelled"] } })
 .select("_id tenantId offerId version publicCode displayCode displayCodeDate restaurantId customerId customerName riderId status paymentState paymentMethod partnerPaymentRequired partnerPaymentCents subtotalCents deliveryFeeCents serviceFeeCents totalCents tipCents tipGivenAt assignmentState assignmentExpiresAt pickupDeadlineAt riderHeadingToPartnerAt riderArrivedAt riderArrivalDistanceMeters partnerPrepDeadlineAt preparationMinutes deliveryAddress deliveryNote deliveryLocation items createdAt")
     .sort({ createdAt: -1 }).limit(10).lean().exec() as any[];
   const offers: any[] = [];
