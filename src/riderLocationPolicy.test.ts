@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { prepareTrackingBatch } from "./riderLocationPolicy.js";
+import { prepareTrackingBatch, riderTrackingMaxAccuracyMeters } from "./riderLocationPolicy.js";
 
 const now = new Date("2026-10-28T10:00:00.000Z");
 
@@ -26,4 +26,13 @@ test("GPS conserva una única muestra por sampleId y usa el orden temporal para 
   assert.deepEqual(result.candidates.map((sample) => sample.sampleId), ["first-sample", "later-sample"]);
   assert.deepEqual(result.duplicates, ["later-sample"]);
   assert.equal(result.candidates.at(-1)?.latitude, 39);
+});
+
+test("GPS acepta exactamente 150 m y rechaza una precisión peor", () => {
+  const result = prepareTrackingBatch([
+    { sampleId: "accuracy-limit", latitude: 38.99, longitude: -0.52, accuracyMeters: riderTrackingMaxAccuracyMeters, recordedAt: now },
+    { sampleId: "accuracy-worse", latitude: 38.99, longitude: -0.52, accuracyMeters: riderTrackingMaxAccuracyMeters + 0.001, recordedAt: now },
+  ], now);
+  assert.deepEqual(result.candidates.map((sample) => sample.sampleId), ["accuracy-limit"]);
+  assert.deepEqual(result.rejected, ["accuracy-worse"]);
 });

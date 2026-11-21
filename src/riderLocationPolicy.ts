@@ -8,6 +8,8 @@ export type TrackingLocationSample = {
   recordedAt: Date;
 };
 
+export const riderTrackingMaxAccuracyMeters = 150;
+
 export type PreparedTrackingBatch = {
   candidates: TrackingLocationSample[];
   duplicates: string[];
@@ -35,6 +37,7 @@ export function prepareTrackingBatch(samples: readonly TrackingLocationSample[],
       !validateCoordinates(sample.latitude, sample.longitude)
       || !Number.isFinite(sample.accuracyMeters)
       || sample.accuracyMeters < 0
+      || sample.accuracyMeters > riderTrackingMaxAccuracyMeters
       || sample.recordedAt.getTime() > now.getTime() + 60_000
       || Number.isNaN(sample.recordedAt.getTime())
     ) {

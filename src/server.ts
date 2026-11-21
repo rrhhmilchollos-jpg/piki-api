@@ -531,7 +531,8 @@ async function riderResourceScope(req: express.Request, riderId: mongoose.Types.
   if (req.auth?.role === "fleet") return { _id: riderId, ...(await fleetRiderFilter(req)) };
   return { _id: riderId, ...tenant };
 }
-const locationSchema = z.object({ latitude: z.number().finite().min(-90).max(90), longitude: z.number().finite().min(-180).max(180), accuracy: z.number().finite().min(0).max(500).optional() });
+const riderGpsMaxAccuracyMeters = 150;
+const locationSchema = z.object({ latitude: z.number().finite().min(-90).max(90), longitude: z.number().finite().min(-180).max(180), accuracy: z.number().finite().min(0).max(riderGpsMaxAccuracyMeters).optional() });
 const customerModifierSelectionSchema = z.object({ groupId: z.string().min(1).max(80), optionIds: z.array(z.string().min(1).max(80)).max(12) });
 const orderItemSchema = z.object({ itemId: z.string().min(1), quantity: z.number().int().min(1).max(20), selections: z.array(customerModifierSelectionSchema).max(12).optional() });
 const createOrderSchema = z.object({ restaurantId: z.string().min(1), deliveryAddress: z.string().min(5).max(280), deliveryNote: z.string().trim().max(500).default(""), deliveryLocation: locationSchema, items: z.array(orderItemSchema).min(1).max(50), paymentMethod: z.string().optional().default("cash") });
@@ -572,7 +573,7 @@ const checkoutTokenIsValid = (orderCode: string, raw: unknown) => typeof raw ===
 		};
 const riderLocationSchema = locationSchema.extend({ riderId: z.string().min(1) });
 const trackingSessionCreateSchema = z.object({ shiftId: z.string().regex(/^[a-f\d]{24}$/).optional(), platform: z.enum(["ios", "android", "web"]), appVersion: z.string().trim().min(1).max(80).default("unknown"), consentVersion: z.string().trim().min(1).max(80) });
-const trackingSampleSchema = z.object({ sampleId: z.string().trim().min(8).max(160), latitude: z.number().finite().min(-90).max(90), longitude: z.number().finite().min(-180).max(180), accuracyMeters: z.number().finite().min(0).max(500), recordedAt: z.coerce.date() });
+const trackingSampleSchema = z.object({ sampleId: z.string().trim().min(8).max(160), latitude: z.number().finite().min(-90).max(90), longitude: z.number().finite().min(-180).max(180), accuracyMeters: z.number().finite().min(0).max(riderGpsMaxAccuracyMeters), recordedAt: z.coerce.date() });
 const trackingBatchSchema = z.object({ sessionId: z.string().regex(/^[a-f\d]{24}$/), samples: z.array(trackingSampleSchema).min(1).max(100) });
 const zoneSchema = operationalZoneInputSchema;
 const dispatchSchema = z.object({ preparationMinutes: z.coerce.number().int().min(1).max(180).default(PARTNER_PREPARATION_LIMIT_MINUTES), offerSeconds: z.coerce.number().int().min(15).max(180).default(60), maxCustomerEtaMinutes: z.coerce.number().int().min(10).max(240).default(CUSTOMER_DELIVERY_TARGET_MINUTES) });
